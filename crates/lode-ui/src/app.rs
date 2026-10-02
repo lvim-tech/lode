@@ -34,6 +34,15 @@ use crate::workspace::{
 
 /// Rows fetched per page.
 const PAGE: usize = 200;
+
+/// Grid metrics. A data grid wants DENSITY — the complaint about the first
+/// version was that there was more air than data in it. 20px a row with 6px of
+/// side padding fits a third again as many rows on a screen and still leaves a
+/// line of space between them; 150px is a column that shows a short value whole
+/// without wasting half a screen on an id.
+const ROW_H: f32 = 20.0;
+const COL_W: f32 = 150.0;
+const NUM_W: f32 = 44.0;
 const BLOCKING: Duration = Duration::from_secs(15);
 
 /// What the icon rail selects. It changes the PANEL, never the work area.
@@ -1006,6 +1015,19 @@ impl Workspace {
         self.status = msg;
     }
 
+    /// Order the loaded page by a column; clicking the same one again reverses
+    /// it. The page, not the result — see `sort_rows`.
+    fn sort_by(&mut self, tab_id: u64, col: usize) {
+        let Some(tab) = self.tabs.iter_mut().find(|t| t.id == tab_id) else { return };
+        let ascending = match tab.sort {
+            Some((c, asc)) if c == col => !asc,
+            _ => true,
+        };
+        crate::workspace::sort_rows(&mut tab.rows, col, ascending);
+        tab.sort = Some((col, ascending));
+        tab.selected = None;
+    }
+
     fn cancel_active(&mut self) {
         let Some(tab) = self.tabs.get(self.active) else { return };
         let Some(call_id) = tab.call_id else { return };
@@ -1057,10 +1079,16 @@ impl Workspace {
                     .items_center()
                     .justify_center()
                     .w_full()
-                    .h(px(36.0))
-                    .text_size(px(15.0))
+                    .h(px(40.0))
+                    // Bigger, and the chosen one says so twice: a filled
+                    // background AND a bar down its leading edge. One of the two
+                    // alone was invisible on a palette whose surfaces sit 1.06
+                    // apart — which is most of them.
+                    .text_size(px(17.0))
                     .text_color(if on { t.accent() } else { t.muted() })
-                    .when(on, |d| d.bg(t.selected()))
+                    .when(on, |d| d.bg(t.selected()).border_l_2().border_color(t.accent()))
+                    .when(!on, |d| d.border_l_2().border_color(t.status()))
+                    .hover(|d| d.bg(t.hover()))
                     .cursor_pointer()
                     .child(SharedString::from(mode.glyph()))
                     .on_click(cx.listener(move |this, _, _, cx| {
@@ -1524,12 +1552,14 @@ impl Workspace {
                         .child(self.small(tab.title.clone(), t.fg()))
                         .child(self.small(count, t.muted()))
                         .child(self.small(format!("{} ms", tab.ms), t.muted())),
-                )
-                .child(sub_row),
+                ),
         );
 
         // ── view switch ─────────────────────────────────────────────────────
+        // The sub-tabs belong HERE, next to the views, not pinned to the far
+        // corner of the breadcrumbs: they are about the result below them.
         let mut views = div().flex().items_center().gap_2().px_3().py_1();
+        views = views.child(sub_row).child(self.small("│", t.border()));
         for v in [ResultView::Tree, ResultView::Table, ResultView::Json] {
             let on = tab.view == v;
             let tab_id = tab.id;
@@ -1797,22 +1827,41 @@ impl Workspace {
             return div().p_3().child(self.small("no columns", t.muted())).into_any_element();
         }
 
+        let sort = tab.sort;
+        let tab_id = tab.id;
         let mut header = div()
             .flex()
             .w_full()
             .bg(t.header_bg())
             .border_b_1()
             .border_color(t.border())
-            .child(div().w(px(50.0)).px_2().py_1().child(self.small("#", t.header_fg())));
-        for (_, name) in &cols {
+            .child(div().w(px(NUM_W)).px(px(6.0)).child(self.small("#", t.header_fg())));
+        for (ci, name) in &cols {
+            let (ci, name) = (*ci, name.clone());
+            let arrow = match sort {
+                Some((c, asc)) if c == ci => {
+                    if asc {
+                        " \u{f0de}"
+                    } else {
+                        " \u{f0dd}"
+                    }
+                }
+                _ => "",
+            };
             header = header.child(
                 div()
-                    .w(px(170.0))
-                    .px_2()
-                    .py_1()
+                    .id(SharedString::from(format!("hdr-{tab_id}-{ci}")))
+                    .w(px(tab.widths.get(&ci).copied().unwrap_or(COL_W)))
+                    .px(px(6.0))
+                    .cursor_pointer()
                     .text_size(px(11.0))
                     .text_color(t.header_fg())
-                    .child(SharedString::from(name.clone())),
+                    .hover(|d| d.bg(t.hover()))
+                    .child(SharedString::from(format!("{name}{arrow}")))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.sort_by(tab_id, ci);
+                        cx.notify();
+                    })),
             );
         }
 
@@ -1820,6 +1869,7 @@ impl Workspace {
         let first = tab.from;
         let (muted, null_fg, row_alt, fg) = (t.muted(), t.null_fg(), t.row_alt(), t.fg());
         let cols2 = cols.clone();
+        let widths: HashMap<usize, f32> = tab.widths.clone();
 
         let list = uniform_list(
             "rows",
@@ -1830,14 +1880,15 @@ impl Workspace {
                     let mut line = div()
                         .flex()
                         .w_full()
+                        .h(px(ROW_H))
                         // Alternating rows: the stripe is a surface from the
                         // theme, not a computed shade.
                         .when(i % 2 == 1, |d| d.bg(row_alt))
                         .child(
                             div()
-                                .w(px(50.0))
-                                .px_2()
-                                .text_size(px(11.0))
+                                .w(px(NUM_W))
+                                .px(px(6.0))
+                                .text_size(px(10.0))
                                 .text_color(muted)
                                 .child(SharedString::from((first + i + 1).to_string())),
                         );
@@ -1849,8 +1900,8 @@ impl Workspace {
                         };
                         line = line.child(
                             div()
-                                .w(px(170.0))
-                                .px_2()
+                                .w(px(widths.get(ci).copied().unwrap_or(COL_W)))
+                                .px(px(6.0))
                                 .text_size(px(12.0))
                                 .text_color(colour)
                                 .child(SharedString::from(text)),

@@ -132,6 +132,56 @@ pub struct Tab {
     pub sub: SubTab,
     /// Which rows are expanded in the Tree view.
     pub expanded: std::collections::HashSet<usize>,
+    /// Column widths the user has dragged, by column index.
+    pub widths: HashMap<usize, f32>,
+    /// Which column the loaded page is sorted by, and which way.
+    pub sort: Option<(usize, bool)>,
+}
+
+/// Order the loaded rows by one column.
+///
+/// This sorts the PAGE, not the result — the client does not rewrite the
+/// statement, because the statement is the driver's and a client that appended
+/// an ORDER BY would be a client that knows SQL. The header says which it is.
+///
+/// Within a column, values are compared by what they ARE: numbers numerically,
+/// so 9 comes before 10; everything else by its text. A NULL sorts last either
+/// way, because "no value" is not a small value.
+pub fn sort_rows(rows: &mut [Vec<Value>], col: usize, ascending: bool) {
+    rows.sort_by(|a, b| {
+        let (x, y) = (a.get(col), b.get(col));
+        let ord = match (x, y) {
+            (None, None) => std::cmp::Ordering::Equal,
+            (None, _) | (Some(Value::Null), _) if !matches!(y, None | Some(Value::Null)) => {
+                return std::cmp::Ordering::Greater
+            }
+            (_, None) | (_, Some(Value::Null)) if !matches!(x, None | Some(Value::Null)) => {
+                return std::cmp::Ordering::Less
+            }
+            (Some(Value::Number(p)), Some(Value::Number(q))) => p
+                .as_f64()
+                .unwrap_or(f64::NAN)
+                .partial_cmp(&q.as_f64().unwrap_or(f64::NAN))
+                .unwrap_or(std::cmp::Ordering::Equal),
+            (Some(p), Some(q)) => {
+                let (ps, qs) = (cell_sort_key(p), cell_sort_key(q));
+                ps.cmp(&qs)
+            }
+            _ => std::cmp::Ordering::Equal,
+        };
+        if ascending {
+            ord
+        } else {
+            ord.reverse()
+        }
+    });
+}
+
+fn cell_sort_key(v: &Value) -> String {
+    match v {
+        Value::String(s) => s.to_lowercase(),
+        other => other.to_string().to_lowercase(),
+    }
 }
 
 impl Tab {
@@ -167,6 +217,8 @@ impl Tab {
             view: ResultView::default_for(meta),
             sub: SubTab::Documents,
             expanded: Default::default(),
+            widths: HashMap::new(),
+            sort: None,
         }
     }
 
@@ -181,6 +233,8 @@ impl Tab {
         self.affected = None;
         self.selected = None;
         self.expanded.clear();
+        // A new result is not the old one re-ordered: its columns may differ.
+        self.sort = None;
     }
 
     /// The statement this tab would run: assembled from the engine's own
@@ -461,6 +515,49 @@ mod tests {
         t.rows = vec![vec![json!(1), Value::Null]];
         assert_eq!(t.document(0), json!({ "id": 1, "note": null }));
         assert_eq!(t.grid_columns().len(), 2);
+    }
+
+    /// Numbers compare as numbers and NULL goes last, both ways — a NULL is not
+    /// a small value and sorting it to the top would say it was.
+    #[test]
+    fn a_column_sorts_by_what_the_values_are() {
+        let mut rows = vec![
+            vec![json!(10)],
+            vec![json!(9)],
+            vec![Value::Null],
+            vec![json!(100)],
+        ];
+        sort_rows(&mut rows, 0, true);
+        assert_eq!(rows[0][0], json!(9), "9 before 10, not \"10\" before \"9\"");
+        assert_eq!(rows[1][0], json!(10));
+        assert_eq!(rows[2][0], json!(100));
+        assert_eq!(rows[3][0], Value::Null, "NULL last ascending");
+
+        sort_rows(&mut rows, 0, false);
+        assert_eq!(rows[0][0], json!(100));
+        assert_eq!(rows[3][0], Value::Null, "NULL last descending too");
+    }
+
+    #[test]
+    fn text_sorts_case_insensitively() {
+        let mut rows = vec![vec![json!("beta")], vec![json!("Alpha")], vec![json!("gamma")]];
+        sort_rows(&mut rows, 0, true);
+        assert_eq!(rows[0][0], json!("Alpha"));
+        assert_eq!(rows[1][0], json!("beta"));
+        assert_eq!(rows[2][0], json!("gamma"));
+    }
+
+    /// A re-run throws the ordering away: the new result's columns may not even
+    /// be the same ones.
+    #[test]
+    fn a_new_result_forgets_the_sort() {
+        let m = meta("postgres", true, false);
+        let mut t = Tab::new(1, "c".into(), "postgres".into(), "x".into(), Some(&m));
+        t.sort = Some((2, false));
+        t.widths.insert(0, 300.0);
+        t.reset_result();
+        assert!(t.sort.is_none());
+        assert_eq!(t.widths.get(&0), Some(&300.0), "a width the user dragged is theirs to keep");
     }
 
     #[test]
