@@ -1,0 +1,22 @@
+#!/bin/sh
+# Build the lode engine into build/loded — the path every client probes first.
+# Requires a Rust toolchain (cargo) and nothing else: TLS is rustls, the SSH
+# tunnel is russh, SQLite and DuckDB are bundled, so there is no OpenSSL and no
+# system database client library to install.
+#
+#   scripts/build
+#
+# By default it builds the standard driver set. To include an opt-in driver that
+# needs a system library at runtime (the Firebird native client), pass its
+# feature; any other cargo flag is forwarded unchanged:
+#
+#   scripts/build --features firebird-native
+#   scripts/build --no-default-features --features sqlite,postgres
+set -e
+cd "$(dirname "$0")/.."
+
+cargo build --release --bin loded "$@"
+
+mkdir -p build
+cp -f target/release/loded build/loded
+echo "installed build/loded"
