@@ -12,7 +12,7 @@
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
-use lode_proto::{Column, DriverMeta, Index, Node, SavedQuery, TableColumn};
+use lode_proto::{BuilderOp, Column, DriverMeta, Index, Node, SavedQuery, TableColumn};
 use serde_json::Value;
 
 /// How a result is shown.
@@ -75,7 +75,7 @@ impl SubTab {
     }
 
     pub fn implemented(self) -> bool {
-        matches!(self, SubTab::Documents | SubTab::Schema)
+        matches!(self, SubTab::Documents | SubTab::Schema | SubTab::Builder)
     }
 }
 
@@ -148,6 +148,8 @@ pub struct Tab {
     pub ddl: Option<String>,
     /// A cell being edited: which row, which column.
     pub editing: Option<(usize, usize)>,
+    /// What the visual builder has been told so far.
+    pub builder: Builder,
     /// A write waiting to be confirmed: the statement the ENGINE said it would
     /// run, why it is dangerous, and the plan to repeat with `confirm`.
     pub pending_write: Option<PendingWrite>,
@@ -262,6 +264,68 @@ fn sql_literal(v: &Value) -> String {
         Value::Number(n) => n.to_string(),
         Value::String(s) => format!("'{}'", s.replace('\'', "''")),
         other => format!("'{}'", other.to_string().replace('\'', "''")),
+    }
+}
+
+/// What the visual builder holds.
+///
+/// It holds CHOICES, not SQL. Turning them into a statement is `render` below,
+/// which uses the driver's own template and the driver's own comparison list —
+/// so the builder never learns a dialect, and a driver that spells its limit
+/// `TOP n` up by the SELECT gets it there without the builder knowing.
+#[derive(Default, Clone)]
+pub struct Builder {
+    /// The columns to show. Empty means every column, which is also what a
+    /// plain browse means, so an untouched builder produces the browse.
+    pub columns: Vec<String>,
+    pub conds: Vec<Cond>,
+    pub order: Option<(String, bool)>,
+}
+
+#[derive(Clone)]
+pub struct Cond {
+    pub col: String,
+    /// An index into the driver's `builder_ops`.
+    pub op: usize,
+    pub value: String,
+}
+
+impl Builder {
+    /// Whether anything has been chosen. An untouched builder must produce
+    /// exactly the browse statement, not a differently spelled equivalent.
+    pub fn is_empty(&self) -> bool {
+        self.columns.is_empty() && self.conds.is_empty() && self.order.is_none()
+    }
+
+    /// The projection and the clauses, for the driver's template.
+    ///
+    /// A condition whose operator takes a value and has none is LEFT OUT rather
+    /// than rendered half-written: `WHERE name =` makes every run fail, and
+    /// `WHERE name = \'\'` quietly returns nothing, and neither is what a
+    /// half-typed filter means.
+    pub fn render(&self, ops: &[BuilderOp]) -> (String, Vec<String>) {
+        let columns = self.columns.join(", ");
+        let mut clauses = Vec::new();
+        let conds: Vec<String> = self
+            .conds
+            .iter()
+            .filter_map(|c| {
+                let op = ops.get(c.op)?;
+                if c.col.is_empty() || (op.takes_value() && c.value.trim().is_empty()) {
+                    return None;
+                }
+                Some(op.render(&c.col, c.value.trim()))
+            })
+            .collect();
+        if !conds.is_empty() {
+            clauses.push(format!("WHERE {}", conds.join(" AND ")));
+        }
+        if let Some((col, asc)) = &self.order {
+            if !col.is_empty() {
+                clauses.push(format!("ORDER BY {col} {}", if *asc { "ASC" } else { "DESC" }));
+            }
+        }
+        (columns, clauses)
     }
 }
 
@@ -418,6 +482,7 @@ impl Tab {
             indexes: Vec::new(),
             ddl: None,
             editing: None,
+            builder: Builder::default(),
             pending_write: None,
             rendered: String::new(),
         }
@@ -735,6 +800,65 @@ mod tests {
         t
     }
 
+    fn ops() -> Vec<BuilderOp> {
+        vec![
+            BuilderOp { label: "=".into(), fragment: "{col} = {value}".into() },
+            BuilderOp { label: "IS NULL".into(), fragment: "{col} IS NULL".into() },
+        ]
+    }
+
+    /// An untouched builder has to produce the browse EXACTLY — not a
+    /// differently spelled equivalent, which would make opening the Builder tab
+    /// and touching nothing change what runs.
+    #[test]
+    fn an_untouched_builder_changes_nothing() {
+        let b = Builder::default();
+        assert!(b.is_empty());
+        let (cols, clauses) = b.render(&ops());
+        assert_eq!(cols, "");
+        assert!(clauses.is_empty());
+    }
+
+    #[test]
+    fn conditions_become_one_where_joined_with_and() {
+        let b = Builder {
+            columns: vec!["id".into(), "name".into()],
+            conds: vec![
+                Cond { col: "balance".into(), op: 0, value: "0".into() },
+                Cond { col: "note".into(), op: 1, value: String::new() },
+            ],
+            order: Some(("balance".into(), false)),
+        };
+        let (cols, clauses) = b.render(&ops());
+        assert_eq!(cols, "id, name");
+        assert_eq!(clauses, vec!["WHERE balance = 0 AND note IS NULL", "ORDER BY balance DESC"]);
+    }
+
+    /// A filter someone is halfway through typing is left OUT. Rendering it
+    /// half-written either breaks every run or silently matches nothing, and
+    /// both are worse than it not being there yet.
+    #[test]
+    fn a_half_typed_condition_is_left_out() {
+        let b = Builder {
+            conds: vec![Cond { col: "name".into(), op: 0, value: "   ".into() }],
+            ..Default::default()
+        };
+        let (_, clauses) = b.render(&ops());
+        assert!(clauses.is_empty(), "{clauses:?}");
+    }
+
+    /// An operator that takes no value does not need one — the box is not shown
+    /// for it, so requiring one would make it unusable.
+    #[test]
+    fn an_operator_without_a_value_still_renders() {
+        let b = Builder {
+            conds: vec![Cond { col: "note".into(), op: 1, value: String::new() }],
+            ..Default::default()
+        };
+        let (_, clauses) = b.render(&ops());
+        assert_eq!(clauses, vec!["WHERE note IS NULL"]);
+    }
+
     #[test]
     fn a_row_is_addressed_by_its_key_and_nothing_else() {
         let t = table_tab();
@@ -952,11 +1076,12 @@ mod tests {
     #[test]
     fn the_row_says_which_sub_tabs_actually_do_something() {
         assert_eq!(SubTab::all().len(), 4);
-        for s in [SubTab::Documents, SubTab::Schema] {
+        for s in [SubTab::Documents, SubTab::Schema, SubTab::Builder] {
             assert!(s.implemented(), "{} is built", s.label());
         }
-        for s in [SubTab::Aggregate, SubTab::Builder] {
-            assert!(!s.implemented(), "{} is laid out, not built", s.label());
-        }
+        assert!(
+            !SubTab::Aggregate.implemented(),
+            "Aggregate is laid out, not built"
+        );
     }
 }

@@ -131,6 +131,10 @@ pub struct ConnectionForm {
     auth_user: Entity<TextInput>,
     auth_secret: Field,
     tls_mode: String,
+    /// "read_only" | "confirm" | "open" — what the engine will let this
+    /// connection do. It belongs on the connection, not on a preference, so it
+    /// travels with the connection wherever it is opened from.
+    policy: String,
     tunnel_on: bool,
     tunnel_host: Entity<TextInput>,
     tunnel_port: Entity<TextInput>,
@@ -225,6 +229,13 @@ impl ConnectionForm {
                 .and_then(|t| t.get("mode"))
                 .and_then(Value::as_str)
                 .unwrap_or("prefer")
+                .to_string(),
+            // A connection saved before policies existed has none recorded, and
+            // comes back as "asks first" — the setting that fails toward asking.
+            policy: spec
+                .get("policy")
+                .and_then(Value::as_str)
+                .unwrap_or("confirm")
                 .to_string(),
             tunnel_on: !tunnel.is_null(),
             tunnel_host: mk(cx, "bastion.example", &get(&tunnel, "host")),
@@ -338,7 +349,8 @@ impl ConnectionForm {
             "params": Value::Object(params),
             "auth": auth,
             "tls": { "mode": self.tls_mode },
-            "tunnel": tunnel
+            "tunnel": tunnel,
+            "policy": self.policy
         })
     }
 
@@ -744,11 +756,60 @@ impl Render for ConnectionForm {
                 }
             }
             FormTab::Settings => {
+                body = body.child(
+                    div()
+                        .pt_1()
+                        .text_size(px(10.0))
+                        .text_color(t.header_fg())
+                        .child("WHAT THIS CONNECTION MAY DO"),
+                );
                 body = body.child(self.small(
-                    "Nothing here yet. Connection options that are neither identity nor transport \
-                     will land on this tab.",
+                    "Held by the engine, not by this window: a client that skips its own \
+                     confirmation still cannot get past it.",
                     t.muted(),
                 ));
+                for (key, label, what) in [
+                    (
+                        "read_only",
+                        "Read only",
+                        "refuses anything that changes the database \u{2014} an INSERT as firmly as a DROP",
+                    ),
+                    (
+                        "confirm",
+                        "Asks first",
+                        "writes are allowed; the dangerous ones have to be confirmed",
+                    ),
+                    (
+                        "open",
+                        "Unrestricted",
+                        "everything runs \u{2014} for a scratch database where the asking is the nuisance",
+                    ),
+                ] {
+                    let on = self.policy == key;
+                    body = body.child(
+                        div()
+                            .id(SharedString::from(format!("pol-{key}")))
+                            .flex()
+                            .flex_col()
+                            .px_2()
+                            .py_1()
+                            .cursor_pointer()
+                            .when(on, |d| d.bg(t.selected()).border_l_2().border_color(t.accent()))
+                            .when(!on, |d| d.border_l_2().border_color(t.panel()))
+                            .hover(|d| d.bg(t.hover()))
+                            .child(
+                                div()
+                                    .text_size(px(12.0))
+                                    .text_color(if on { t.accent() } else { t.fg() })
+                                    .child(label),
+                            )
+                            .child(self.small(what, t.muted()))
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.policy = key.to_string();
+                                cx.notify();
+                            })),
+                    );
+                }
             }
         }
 

@@ -32,7 +32,8 @@ use crate::input::{InputColors, InputEvent, TextInput};
 use crate::session::{self, Session, SessionTab};
 use crate::theme::{self, Theme};
 use crate::workspace::{
-    column_editable, copy_as_insert, copy_as_select, fuzzy_score, row_key, PendingWrite, Toast,
+    column_editable, copy_as_insert, copy_as_select, fuzzy_score, row_key, Cond,
+    PendingWrite, Toast,
     fmt_duration, preview, type_badge, Live, ResultView, RunState, SubTab, Tab, Task,
 };
 
@@ -1221,7 +1222,10 @@ impl Workspace {
         });
         self.subscribe_run(&input, id, cx);
         self.inputs.insert((id, String::new()), input);
-        self.run_tab(id);
+        // The approval travels with the run. Without it the engine refuses a
+        // destructive statement that the person has just been asked about and
+        // said yes to — the console would look broken, correctly but uselessly.
+        self.run_tab_confirmed(id, confirm);
     }
 
     /// Open the connection window. Editing passes what is stored; adding passes
@@ -1615,6 +1619,99 @@ impl Workspace {
             if as_insert { "row copied as INSERT" } else { "row copied as SELECT" },
             false,
         );
+    }
+
+    // ── the builder ─────────────────────────────────────────────────────────
+
+    /// Put the builder's choices into the statement box, through the DRIVER's
+    /// template. The builder never writes SQL itself; it supplies a projection
+    /// and a list of clauses, and the template decides where they go.
+    fn sync_builder(&mut self, tab_id: u64, cx: &mut Context<Self>) {
+        let Some(idx) = self.tabs.iter().position(|x| x.id == tab_id) else { return };
+        let driver = self.tabs[idx].driver.clone();
+        let Some(meta) = self.meta(&driver).cloned() else { return };
+        let Some((name, schema)) = self.tabs[idx].object.clone() else { return };
+
+        // Read the typed values back before rendering, or the statement lags a
+        // keystroke behind what is on the screen.
+        for i in 0..self.tabs[idx].builder.conds.len() {
+            if let Some(input) = self.inputs.get(&(tab_id, format!("b:{i}"))) {
+                let v = input.read(cx).text().to_string();
+                if let Some(c) = self.tabs[idx].builder.conds.get_mut(i) {
+                    c.value = v;
+                }
+            }
+        }
+
+        let kind = self.tabs[idx].kind.clone();
+        let (columns, clauses) = self.tabs[idx].builder.render(&meta.builder_ops);
+        let sql = lode_proto::render_full(
+            meta.browse_for(&kind),
+            &name,
+            schema.as_deref(),
+            PAGE,
+            &[],
+            &clauses,
+            &columns,
+        );
+        self.tabs[idx].sql = sql.clone();
+        self.tabs[idx].rendered = sql.clone();
+        if let Some(input) = self.inputs.get(&(tab_id, String::new())) {
+            input.update(cx, |i, cx| i.set_text(sql, cx));
+        }
+    }
+
+    fn add_condition(&mut self, tab_id: u64, cx: &mut Context<Self>) {
+        let Some(idx) = self.tabs.iter().position(|x| x.id == tab_id) else { return };
+        let first = self
+            .tabs[idx]
+            .meta_columns
+            .first()
+            .map(|c| c.name.clone())
+            .unwrap_or_default();
+        let i = self.tabs[idx].builder.conds.len();
+        self.tabs[idx].builder.conds.push(Cond { col: first, op: 0, value: String::new() });
+        let colors = input_colors(&self.theme);
+        let input = cx.new(|cx| TextInput::new(cx, "value", colors));
+        self.inputs.insert((tab_id, format!("b:{i}")), input);
+        self.sync_builder(tab_id, cx);
+    }
+
+    /// Step a condition to the next column. A list of the object's columns is
+    /// all there is to choose from — a free-text column name would be a place to
+    /// mistype one and find out at run time.
+    fn cycle_cond_column(&mut self, tab_id: u64, i: usize) {
+        let Some(idx) = self.tabs.iter().position(|x| x.id == tab_id) else { return };
+        let names: Vec<String> = self.tabs[idx].meta_columns.iter().map(|c| c.name.clone()).collect();
+        if names.is_empty() {
+            return;
+        }
+        if let Some(c) = self.tabs[idx].builder.conds.get_mut(i) {
+            let at = names.iter().position(|n| *n == c.col).map_or(0, |p| (p + 1) % names.len());
+            c.col = names[at].clone();
+        }
+    }
+
+    /// none \u{2192} first column ascending \u{2192} descending \u{2192} next column \u{2026}
+    fn cycle_order(&mut self, tab_id: u64) {
+        let Some(idx) = self.tabs.iter().position(|x| x.id == tab_id) else { return };
+        let names: Vec<String> = self.tabs[idx].meta_columns.iter().map(|c| c.name.clone()).collect();
+        if names.is_empty() {
+            return;
+        }
+        let b = &mut self.tabs[idx].builder;
+        b.order = match b.order.take() {
+            None => Some((names[0].clone(), true)),
+            Some((c, true)) => Some((c, false)),
+            Some((c, false)) => {
+                let at = names.iter().position(|n| *n == c).map_or(0, |p| p + 1);
+                if at >= names.len() {
+                    None
+                } else {
+                    Some((names[at].clone(), true))
+                }
+            }
+        };
     }
 
     // ── writing a row ───────────────────────────────────────────────────────
@@ -2392,6 +2489,9 @@ impl Workspace {
         if tab.sub == SubTab::Schema {
             return body.child(self.schema_el(tab)).into_any_element();
         }
+        if tab.sub == SubTab::Builder {
+            return body.child(self.builder_el(tab, cx)).into_any_element();
+        }
         let view = match tab.view {
             ResultView::Table => self.table_el(tab, cx),
             ResultView::Tree => self.tree_el(tab, cx),
@@ -2411,6 +2511,213 @@ impl Workspace {
             None => view,
         });
         body.into_any_element()
+    }
+
+    /// The visual builder: choices in, a statement out.
+    ///
+    /// What comes out goes into the statement box above, where it can be read
+    /// and edited before it runs — and when it runs it goes through everything
+    /// else does, including the connection's policy. The builder is a way of
+    /// WRITING a statement, not a way around the rules about running one.
+    fn builder_el(&self, tab: &Tab, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let t = self.t();
+        let tab_id = tab.id;
+        let ops = self.meta(&tab.driver).map(|m| m.builder_ops.clone()).unwrap_or_default();
+        let mut body = div().flex().flex_col().flex_1().overflow_hidden().p_3().gap_1();
+
+        if ops.is_empty() {
+            return body
+                .child(self.small(
+                    format!("the {} driver has no builder — its statements are not SQL", tab.driver),
+                    t.muted(),
+                ))
+                .into_any_element();
+        }
+        if tab.object.is_none() {
+            return body
+                .child(self.small(
+                    "the builder works on an object — open a table from the tree",
+                    t.muted(),
+                ))
+                .into_any_element();
+        }
+
+        // ── columns ─────────────────────────────────────────────────────────
+        body = body.child(self.section("Show"));
+        let all = tab.builder.columns.is_empty();
+        let mut cols_row = div().flex().flex_wrap().gap_2().child(
+            div()
+                .id("b-all")
+                .px_1()
+                .cursor_pointer()
+                .text_size(px(11.0))
+                .text_color(if all { t.inverted() } else { t.muted() })
+                .when(all, |d| d.bg(t.accent()))
+                .child("every column")
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    if let Some(tb) = this.tabs.iter_mut().find(|x| x.id == tab_id) {
+                        tb.builder.columns.clear();
+                    }
+                    this.sync_builder(tab_id, cx);
+                    cx.notify();
+                })),
+        );
+        for c in &tab.meta_columns {
+            let on = tab.builder.columns.contains(&c.name);
+            let name = c.name.clone();
+            cols_row = cols_row.child(
+                div()
+                    .id(SharedString::from(format!("b-col-{}", c.name)))
+                    .px_1()
+                    .cursor_pointer()
+                    .text_size(px(11.0))
+                    .text_color(if on { t.inverted() } else { t.fg() })
+                    .when(on, |d| d.bg(t.accent()))
+                    .hover(|d| d.bg(t.hover()))
+                    .child(SharedString::from(c.name.clone()))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        if let Some(tb) = this.tabs.iter_mut().find(|x| x.id == tab_id) {
+                            match tb.builder.columns.iter().position(|x| *x == name) {
+                                Some(i) => {
+                                    tb.builder.columns.remove(i);
+                                }
+                                None => tb.builder.columns.push(name.clone()),
+                            }
+                        }
+                        this.sync_builder(tab_id, cx);
+                        cx.notify();
+                    })),
+            );
+        }
+        body = body.child(cols_row);
+
+        // ── conditions ──────────────────────────────────────────────────────
+        body = body.child(self.section("Where"));
+        for (i, cond) in tab.builder.conds.iter().enumerate() {
+            let mut row = div().flex().items_center().gap_2();
+            // column
+            let cur = cond.col.clone();
+            row = row.child(
+                div()
+                    .id(SharedString::from(format!("b-cc-{i}")))
+                    .w(px(160.0))
+                    .px_1()
+                    .cursor_pointer()
+                    .text_size(px(11.0))
+                    .text_color(t.fg())
+                    .border_1()
+                    .border_color(t.border())
+                    .child(SharedString::from(if cur.is_empty() {
+                        "pick a column".to_string()
+                    } else {
+                        cur
+                    }))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.cycle_cond_column(tab_id, i);
+                        this.sync_builder(tab_id, cx);
+                        cx.notify();
+                    })),
+            );
+            // operator
+            let label = ops.get(cond.op).map(|o| o.label.clone()).unwrap_or_default();
+            row = row.child(
+                div()
+                    .id(SharedString::from(format!("b-op-{i}")))
+                    .w(px(110.0))
+                    .px_1()
+                    .cursor_pointer()
+                    .text_size(px(11.0))
+                    .text_color(t.accent())
+                    .border_1()
+                    .border_color(t.border())
+                    .child(SharedString::from(label))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        let n = this
+                            .meta(&this.tabs.iter().find(|x| x.id == tab_id).map(|x| x.driver.clone()).unwrap_or_default())
+                            .map(|m| m.builder_ops.len())
+                            .unwrap_or(1)
+                            .max(1);
+                        if let Some(tb) = this.tabs.iter_mut().find(|x| x.id == tab_id) {
+                            if let Some(c) = tb.builder.conds.get_mut(i) {
+                                c.op = (c.op + 1) % n;
+                            }
+                        }
+                        this.sync_builder(tab_id, cx);
+                        cx.notify();
+                    })),
+            );
+            // value, only where the operator takes one
+            if ops.get(cond.op).map_or(true, |o| o.takes_value()) {
+                if let Some(input) = self.inputs.get(&(tab_id, format!("b:{i}"))) {
+                    row = row.child(div().w(px(240.0)).child(input.clone()));
+                }
+            } else {
+                row = row.child(div().w(px(240.0)).child(self.small("takes no value", t.muted())));
+            }
+            row = row.child(
+                div()
+                    .id(SharedString::from(format!("b-rm-{i}")))
+                    .px_1()
+                    .cursor_pointer()
+                    .text_size(px(11.0))
+                    .text_color(t.muted())
+                    .child("\u{f00d}")
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        if let Some(tb) = this.tabs.iter_mut().find(|x| x.id == tab_id) {
+                            if i < tb.builder.conds.len() {
+                                tb.builder.conds.remove(i);
+                            }
+                        }
+                        this.sync_builder(tab_id, cx);
+                        cx.notify();
+                    })),
+            );
+            body = body.child(row);
+        }
+        body = body.child(
+            div()
+                .id("b-add")
+                .px_1()
+                .cursor_pointer()
+                .text_size(px(11.0))
+                .text_color(t.accent())
+                .child("+ condition")
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.add_condition(tab_id, cx);
+                    cx.notify();
+                })),
+        );
+
+        // ── order ───────────────────────────────────────────────────────────
+        body = body.child(self.section("Order"));
+        let order_label = match &tab.builder.order {
+            Some((c, asc)) => format!("{c} {}", if *asc { "ascending" } else { "descending" }),
+            None => "none".to_string(),
+        };
+        body = body.child(
+            div()
+                .id("b-order")
+                .w(px(300.0))
+                .px_1()
+                .cursor_pointer()
+                .text_size(px(11.0))
+                .text_color(t.fg())
+                .border_1()
+                .border_color(t.border())
+                .child(SharedString::from(order_label))
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.cycle_order(tab_id);
+                    this.sync_builder(tab_id, cx);
+                    cx.notify();
+                })),
+        );
+
+        body.child(self.small(
+            "the statement above is what runs \u{2014} it goes through the connection\u{2019}s policy \
+             like anything else",
+            t.muted(),
+        ))
+        .into_any_element()
     }
 
     /// What the object IS: its columns, which of them identify a row, its
