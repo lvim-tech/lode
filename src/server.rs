@@ -22,7 +22,7 @@ use crate::driver::{CancelHandle, Connection, ResultStream};
 use crate::net::NetContext;
 use crate::registry::Registry;
 use crate::rpc::{self, Request};
-use crate::spec::{AuthSpec, Column, ConnSpec, DriverMeta, ObjRef, ParamType, Value};
+use crate::spec::{AuthSpec, Column, ConnSpec, DriverMeta, ObjRef, ParamType, RowPlan, Value};
 use crate::store::Store;
 
 type Conn = Arc<AsyncMutex<Box<dyn Connection>>>;
@@ -36,6 +36,10 @@ const DIAL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 /// tunnel stays up as long as this entry lives, and is torn down on disconnect.
 struct ConnEntry {
     conn: Conn,
+    /// Which driver this connection IS. Recorded rather than taken from a
+    /// request, so a write is classified by the engine that will run it and not
+    /// by whatever the caller claims it is talking to.
+    driver: String,
     _net: NetContext,
 }
 
@@ -151,6 +155,17 @@ impl Server {
         let _ = self.inner.out.send(line);
     }
 
+    /// Which driver a live connection belongs to.
+    fn conn_driver(&self, id: u64) -> anyhow::Result<String> {
+        self.inner
+            .conns
+            .lock()
+            .unwrap()
+            .get(&id)
+            .map(|e| e.driver.clone())
+            .ok_or_else(|| anyhow::anyhow!("no such connection {id}"))
+    }
+
     fn conn(&self, id: u64) -> anyhow::Result<Conn> {
         self.inner
             .conns
@@ -195,6 +210,7 @@ impl Server {
             "query.release" => self.release(params).await,
             "query.cell" => self.cell(params).await,
             "query.classify" => self.classify(params),
+            "row.write" => self.row_write(params).await,
             // ── saved state (proto 2) ───────────────────────────────────────
             "store.status" => self.store_status(),
             "store.connections.list" => self.store_conn_list().await,
@@ -242,6 +258,7 @@ impl Server {
             id,
             ConnEntry {
                 conn: Arc::new(AsyncMutex::new(conn)),
+                driver: spec.driver.clone(),
                 _net: net,
             },
         );
@@ -705,6 +722,104 @@ impl Server {
         let driver = self.inner.registry.get(&p.driver)?;
         let reason = driver.classify(&p.statement);
         Ok(json!({ "dangerous": reason.is_some(), "reason": reason }))
+    }
+
+    /// Change or remove ONE row, named by its key.
+    ///
+    /// Three things stand between a click in a grid and a changed table, and all
+    /// three live HERE rather than in a client, because a client that forgets
+    /// one is a client that writes silently:
+    ///
+    /// 1. The object must HAVE an identifying key, and the key sent must be
+    ///    exactly it — not a subset, and not the other columns' values standing
+    ///    in for one. A table with no key is not editable and says so.
+    /// 2. Nothing is written without `confirm`. Called without it, this returns
+    ///    the statement the driver would run and why it is dangerous, and
+    ///    touches nothing. A client cannot skip the question by not asking it.
+    /// 3. The driver binds every value and rolls the write back if it turned
+    ///    out to match anything other than one row.
+    async fn row_write(&self, params: Json) -> anyhow::Result<Json> {
+        #[derive(Deserialize)]
+        struct P {
+            conn_id: u64,
+            #[serde(flatten)]
+            plan: RowPlan,
+            #[serde(default)]
+            confirm: bool,
+        }
+        let p: P = serde_json::from_value(params)?;
+        if !p.plan.delete && p.plan.set.is_empty() {
+            anyhow::bail!("nothing to change");
+        }
+        let driver_kind = self.conn_driver(p.conn_id)?;
+        let driver = self.inner.registry.get(&driver_kind)?;
+        if !driver.meta().caps.edit {
+            anyhow::bail!(
+                "the {driver_kind} driver does not edit rows \u{2014} it cannot promise to bind \
+                 values and undo a write that hit more than one row, and without both the \
+                 feature is a hazard rather than a convenience"
+            );
+        }
+
+        let conn = self.conn(p.conn_id)?;
+        let cols = conn.lock().await.columns(&p.plan.obj).await?;
+        let key_cols: Vec<&str> = cols
+            .iter()
+            .filter(|c| c.primary)
+            .map(|c| c.name.as_str())
+            .collect();
+        if key_cols.is_empty() {
+            anyhow::bail!(
+                "{} has no primary key, so one of its rows cannot be addressed exactly. \
+                 Matching on the other columns' values would be a guess, and a guess that \
+                 matches three rows writes three rows",
+                p.plan.obj.name
+            );
+        }
+        let sent: Vec<&str> = p.plan.key.iter().map(|(c, _)| c.as_str()).collect();
+        let mut want = key_cols.clone();
+        let mut got = sent.clone();
+        want.sort_unstable();
+        got.sort_unstable();
+        if want != got {
+            anyhow::bail!(
+                "the key must be exactly ({}) \u{2014} got ({})",
+                key_cols.join(", "),
+                sent.join(", ")
+            );
+        }
+        // Changing a key column would move the row rather than edit it, and the
+        // WHERE that found it would no longer describe it. That is a different
+        // operation and it is not this one.
+        if let Some((c, _)) = p
+            .plan
+            .set
+            .iter()
+            .find(|(c, _)| key_cols.contains(&c.as_str()))
+        {
+            anyhow::bail!(
+                "{c} is part of the key: changing it moves the row rather than editing it"
+            );
+        }
+
+        let statement = conn.lock().await.plan_row(&p.plan).await?;
+        let reason = driver.classify(&statement);
+        if !p.confirm {
+            return Ok(json!({
+                "applied": false,
+                "statement": statement,
+                "dangerous": reason.is_some(),
+                "reason": reason,
+            }));
+        }
+        let out = conn.lock().await.write_row(&p.plan).await?;
+        Ok(json!({
+            "applied": true,
+            "statement": out.statement,
+            "affected": out.affected,
+            "dangerous": reason.is_some(),
+            "reason": reason,
+        }))
     }
 
     async fn cell(&self, params: Json) -> anyhow::Result<Json> {

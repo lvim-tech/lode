@@ -59,6 +59,7 @@ const CAPS: Caps = Caps {
     kv: false,
     indexes: true,
     ddl: false, // system_schema.indexes; DESCRIBE is reconstructed CLIENT-side in CQL
+    edit: false,
 };
 
 const CASSANDRA_META: DriverMeta = DriverMeta {

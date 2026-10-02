@@ -35,6 +35,14 @@ pub struct Caps {
     // ONLY where its driver claims it, so no engine ever grows a row that dead-ends.
     pub indexes: bool, // can list an object's indexes (`schema.indexes`)
     pub ddl: bool,     // can return an object's CREATE statement (`schema.ddl`)
+    /// Can change ONE addressed row (`row.write`).
+    ///
+    /// Claimed only by a driver that can do it SAFELY — that is, one that binds
+    /// values as parameters rather than pasting them into a string, and that can
+    /// undo a write which turned out to touch more than the row it was aimed at.
+    /// A driver which can merely build an UPDATE does NOT claim this: the risk
+    /// is not writing the statement, it is being wrong about which rows it hits.
+    pub edit: bool,
 }
 
 /// The kinds of auth a driver can accept. A driver lists the subset it supports
@@ -386,6 +394,72 @@ pub struct TableColumn {
     pub type_name: String,
     /// Part of the object's identifying key (a PK column; mongo's `_id`; a CQL partition/clustering key).
     pub primary: bool,
+}
+
+/// Read a value that came in over the wire, back into the enum the drivers bind.
+///
+/// The tagged forms are read back deliberately: a client that received an
+/// `{"__oid": …}` and sent it back unchanged must address the SAME ObjectId,
+/// not a 24-character string that matches no document. This is the other half of
+/// the round trip `Value`'s doc comment describes — without it the type survives
+/// the way OUT and is lost on the way back, which is the same bug one direction
+/// later.
+pub fn value_from_json(v: &serde_json::Value) -> Value {
+    use serde_json::Value as J;
+    match v {
+        J::Null => Value::Null,
+        J::Bool(b) => Value::Bool(*b),
+        J::Number(n) => match n.as_i64() {
+            Some(i) => Value::Int(i),
+            None => Value::Float(n.as_f64().unwrap_or(f64::NAN)),
+        },
+        J::String(s) => Value::Text(s.clone()),
+        J::Object(m) => {
+            if let Some(J::String(hex)) = m.get("__oid") {
+                return Value::Oid(hex.clone());
+            }
+            if let (Some(J::String(key)), Some(J::String(text))) = (m.get("__ext"), m.get("v")) {
+                return Value::Ext { text: text.clone(), key: key.clone() };
+            }
+            if let (Some(J::String(b64)), Some(len)) = (m.get("b64"), m.get("len")) {
+                return Value::Bytes {
+                    b64: b64.clone(),
+                    len: len.as_u64().unwrap_or(0) as usize,
+                };
+            }
+            Value::Json(v.clone())
+        }
+        J::Array(_) => Value::Json(v.clone()),
+    }
+}
+
+/// A change to ONE row, named by its identifying key.
+///
+/// The client sends values, never SQL. The driver builds the statement in its
+/// own dialect and binds every value as a parameter, which is why there is no
+/// quoting anywhere in the client and no way for a value to become syntax.
+#[derive(Debug, Clone, Deserialize)]
+pub struct RowPlan {
+    pub obj: ObjRef,
+    /// The identifying columns and their values. The engine checks this covers
+    /// EXACTLY the object's key — not a subset, not a guess from the other
+    /// columns' values.
+    pub key: Vec<(String, serde_json::Value)>,
+    /// The columns to change. Empty with `delete` false is nothing to do.
+    #[serde(default)]
+    pub set: Vec<(String, serde_json::Value)>,
+    /// Remove the row instead of changing it.
+    #[serde(default)]
+    pub delete: bool,
+}
+
+/// What a row write did.
+#[derive(Debug, Clone, Serialize)]
+pub struct RowOutcome {
+    /// The statement the driver built, with its placeholders — shown to the
+    /// person, never re-parsed by anyone.
+    pub statement: String,
+    pub affected: u64,
 }
 
 /// A schema-tree node (schema → table/view/collection). `kind` drives the icon.

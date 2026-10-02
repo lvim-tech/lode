@@ -77,6 +77,7 @@ const META: DriverMeta = DriverMeta {
         kv: true,
         indexes: false,
         ddl: false, // a KV store has neither indexes nor a schema to describe
+        edit: false,
     },
     hint: "KEYS *",
     browse: "TYPE {name}",

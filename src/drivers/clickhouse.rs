@@ -61,6 +61,7 @@ const META: DriverMeta = DriverMeta {
         kv: false,
         indexes: true,
         ddl: true, // system.data_skipping_indices / SHOW CREATE TABLE
+        edit: false,
     },
     hint: "SELECT * FROM table LIMIT 100",
     browse: "SELECT * FROM {qualified} {clauses} LIMIT {limit};",

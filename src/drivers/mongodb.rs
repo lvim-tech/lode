@@ -124,6 +124,7 @@ const MONGO_META: DriverMeta = DriverMeta {
         kv: true,
         indexes: true, // listIndexes
         ddl: false,    // a document store has no CREATE statement to show
+        edit: false,
     },
     hint: "{\"find\": \"collection\", \"limit\": 50}",
     browse: "{\"find\": \"{name}\", \"limit\": {limit}}",

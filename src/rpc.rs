@@ -32,7 +32,14 @@ use serde_json::json;
 ///     destructive and why, before running it. A client cannot decide this —
 ///     what DROP means, whether an empty mongo filter deletes everything, and
 ///     whether FLUSHALL is a word are facts about the language.
-pub const PROTO: u32 = 4;
+/// 5 — added `row.write` and `DriverMeta.caps.edit`: change or remove ONE row
+///     by its key. The client sends VALUES, never SQL, and the engine refuses
+///     to write at all unless the key is exactly the object's identifying key
+///     and the caller passed `confirm` — so a client that forgets to ask
+///     cannot write anyway. Additive: an older client never calls it, and a
+///     newer client against an older engine sees `edit: false` and offers
+///     nothing.
+pub const PROTO: u32 = 5;
 
 /// One decoded incoming request.
 #[derive(Debug, Deserialize)]

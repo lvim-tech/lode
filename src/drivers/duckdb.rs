@@ -44,6 +44,7 @@ const META: DriverMeta = DriverMeta {
         kv: false,
         indexes: true,
         ddl: true, // duckdb_indexes() / duckdb_tables().sql
+        edit: false,
     },
     hint: "SELECT * FROM table LIMIT 100",
     browse: "SELECT * FROM {qualified} {clauses} LIMIT {limit};",

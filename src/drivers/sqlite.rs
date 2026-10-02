@@ -16,7 +16,8 @@ use rusqlite::Connection as SqliteConn;
 use crate::driver::{Connection, Driver, ResultStream};
 use crate::net::NetContext;
 use crate::spec::{
-    AuthKind, Caps, Column, ConnSpec, DriverMeta, Index, Node, ObjRef, ParamSpec, ParamType, TableColumn, Value,
+    AuthKind, Caps, Column, ConnSpec, DriverMeta, Index, Node, ObjRef, ParamSpec, ParamType,
+    RowOutcome, RowPlan, TableColumn, Value,
 };
 
 const PARAMS: &[ParamSpec] = &[ParamSpec {
@@ -44,6 +45,8 @@ const META: DriverMeta = DriverMeta {
         kv: false,
         indexes: true, // PRAGMA index_list / index_info
         ddl: true,     // sqlite_master.sql — the ORIGINAL CREATE text, verbatim
+        // sqlite binds every value and rolls back a write that was not one row.
+        edit: true,
     },
     hint: "SELECT * FROM table LIMIT 100",
     browse: "SELECT * FROM {qualified} {clauses} LIMIT {limit};",
@@ -96,6 +99,85 @@ fn cell(v: SqlValue) -> Value {
             b64: base64::engine::general_purpose::STANDARD.encode(&b),
             len: b.len(),
         },
+    }
+}
+
+/// Build the statement for a row write, and the values to bind to it.
+///
+/// Every value is a `?` — a name can be an identifier here because it came from
+/// the engine's own `columns()`, but a VALUE never becomes syntax. The order of
+/// the binds is the order of the placeholders: the SET values first, then the
+/// key's, because that is the order they appear in.
+fn row_statement(plan: &RowPlan) -> (String, Vec<SqlValue>) {
+    let table = qualify(&plan.obj);
+    let mut binds: Vec<SqlValue> = Vec::new();
+    let stmt = if plan.delete {
+        format!("DELETE FROM {table} WHERE {}", where_of(&plan.key, &mut binds))
+    } else {
+        let sets: Vec<String> = plan
+            .set
+            .iter()
+            .map(|(c, v)| {
+                binds.push(bind(&crate::spec::value_from_json(v)));
+                format!("{} = ?", ident(c))
+            })
+            .collect();
+        format!(
+            "UPDATE {table} SET {} WHERE {}",
+            sets.join(", "),
+            where_of(&plan.key, &mut binds)
+        )
+    };
+    (stmt, binds)
+}
+
+/// The WHERE for an identifying key. A NULL in a key is compared with `IS NULL`,
+/// since `= NULL` matches nothing and would silently write no rows — which this
+/// driver would then refuse as "matched 0 rows", correctly but confusingly.
+fn where_of(key: &[(String, serde_json::Value)], binds: &mut Vec<SqlValue>) -> String {
+    key.iter()
+        .map(|(c, v)| {
+            let v = crate::spec::value_from_json(v);
+            if matches!(v, Value::Null) {
+                format!("{} IS NULL", ident(c))
+            } else {
+                binds.push(bind(&v));
+                format!("{} = ?", ident(c))
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" AND ")
+}
+
+fn qualify(obj: &ObjRef) -> String {
+    match obj.schema.as_deref().filter(|s| !s.is_empty()) {
+        Some(s) => format!("{}.{}", ident(s), ident(&obj.name)),
+        None => ident(&obj.name),
+    }
+}
+
+fn ident(name: &str) -> String {
+    format!("\"{}\"", name.replace('"', "\"\""))
+}
+
+fn bind(v: &Value) -> SqlValue {
+    match v {
+        Value::Null => SqlValue::Null,
+        Value::Bool(b) => SqlValue::Integer(*b as i64),
+        Value::Int(i) => SqlValue::Integer(*i),
+        Value::Float(f) => SqlValue::Real(*f),
+        Value::Text(s) => SqlValue::Text(s.clone()),
+        Value::Bytes { b64, .. } => match base64::engine::general_purpose::STANDARD.decode(b64) {
+            Ok(bytes) => SqlValue::Blob(bytes),
+            // Undecodable base64 is a bug upstream, not a reason to write
+            // something else into the column.
+            Err(_) => SqlValue::Null,
+        },
+        // Everything left is a shape SQLite has no column type for. It goes in
+        // as the text it displays as, which is what SQLite would store anyway.
+        Value::Json(j) => SqlValue::Text(j.to_string()),
+        Value::Timestamp(s) | Value::Oid(s) => SqlValue::Text(s.clone()),
+        Value::Ext { text, .. } => SqlValue::Text(text.clone()),
     }
 }
 
@@ -269,6 +351,38 @@ impl Connection for SqliteConnection {
             Some(Value::Text(s)) => Some(s.clone()),
             _ => None,
         }))
+    }
+
+    async fn plan_row(&mut self, plan: &RowPlan) -> anyhow::Result<String> {
+        Ok(row_statement(plan).0)
+    }
+
+    async fn write_row(&mut self, plan: &RowPlan) -> anyhow::Result<RowOutcome> {
+        let (statement, binds) = row_statement(plan);
+        let arc = self.conn.clone();
+        let sql = statement.clone();
+        let affected = tokio::task::spawn_blocking(move || -> anyhow::Result<u64> {
+            let mut conn = arc.lock().unwrap();
+            // A TRANSACTION, not because two statements run, but because one
+            // might turn out to be wrong about how many rows it hits. rusqlite
+            // rolls this back on drop unless it is committed.
+            let tx = conn.transaction().map_err(|e| anyhow::anyhow!("{e}"))?;
+            let n = tx
+                .execute(&sql, rusqlite::params_from_iter(binds.iter()))
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+            if n != 1 {
+                // Dropping `tx` rolls it back. Say what happened and leave the
+                // table as it was: a write that hit three rows is not a write
+                // that succeeded with a surprising number.
+                anyhow::bail!(
+                    "that key matched {n} row(s), not one \u{2014} nothing was written"
+                );
+            }
+            tx.commit().map_err(|e| anyhow::anyhow!("{e}"))?;
+            Ok(n as u64)
+        })
+        .await??;
+        Ok(RowOutcome { statement, affected })
     }
 
     async fn execute(&mut self, stmt: &str) -> anyhow::Result<Box<dyn ResultStream>> {

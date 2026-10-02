@@ -66,6 +66,7 @@ const PG_META: DriverMeta = DriverMeta {
         kv: false,
         indexes: true, // pg_index + pg_attribute
         ddl: false,    // postgres has NO server-side CREATE TABLE (pg_dump is a client) — see the trait doc
+        edit: false,
     },
     hint: "SELECT * FROM table LIMIT 100",
     browse: "SELECT * FROM {qualified} {clauses} LIMIT {limit};",

@@ -13,7 +13,9 @@
 use async_trait::async_trait;
 
 use crate::net::NetContext;
-use crate::spec::{Column, ConnSpec, DriverMeta, Index, Node, ObjRef, TableColumn, Value};
+use crate::spec::{
+    Column, ConnSpec, DriverMeta, Index, Node, ObjRef, RowOutcome, RowPlan, TableColumn, Value,
+};
 
 /// A registered database type. Immutable, cheap; holds the static metadata and
 /// knows how to open a connection.
@@ -126,6 +128,34 @@ pub trait Connection: Send {
     /// while being wrong — so a driver that cannot ask the server for it does not claim the capability.
     async fn ddl(&mut self, _obj: &ObjRef) -> anyhow::Result<Option<String>> {
         Ok(None)
+    }
+
+    /// The statement a row write WOULD run, for showing before it does.
+    ///
+    /// Separate from doing it so that a person sees the real thing — not a
+    /// client's guess at what the driver might build, which is the version that
+    /// is reassuring and wrong.
+    async fn plan_row(&mut self, _plan: &RowPlan) -> anyhow::Result<String> {
+        anyhow::bail!("this engine cannot edit a row from the grid")
+    }
+
+    /// Change or remove ONE row.
+    ///
+    /// The contract a driver takes on by implementing this is not "build an
+    /// UPDATE" — it is:
+    ///
+    /// * every value is BOUND as a parameter, never pasted into the statement,
+    ///   so a value cannot become syntax;
+    /// * the write happens inside a transaction, and if it turns out to have
+    ///   touched anything other than the single addressed row, it is ROLLED
+    ///   BACK and the call fails. Being wrong about which rows a statement hits
+    ///   is the whole risk here, and `affected: 3` reported after the fact is a
+    ///   worse outcome than a refusal.
+    ///
+    /// A driver that cannot promise both does not implement this and does not
+    /// claim `Caps::edit`.
+    async fn write_row(&mut self, _plan: &RowPlan) -> anyhow::Result<RowOutcome> {
+        anyhow::bail!("this engine cannot edit a row from the grid")
     }
 
     /// Execute a statement, returning a paged result stream.
