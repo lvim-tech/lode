@@ -174,6 +174,27 @@ else
     printf '     %-42s %s\n' "duckdb not built in" "skipped"
 fi
 
+# ── mongodb, when there is one to talk to ────────────────────────────────────
+# The write path for mongo is WRITTEN but `caps.edit` is false, because nothing
+# here can prove it: no mongod, no network, and the one real MongoDB in reach is
+# somebody's data. Point $LODE_TEST_MONGO at a THROWAWAY server and this section
+# runs; when it passes, `edit: true` goes in with the commit that shows it.
+if [ -n "$LODE_TEST_MONGO" ]; then
+    send "$(jq -nc --arg u "$LODE_TEST_MONGO" '{jsonrpc:"2.0",id:30,method:"conn.connect",params:{driver:"mongodb",params:{uri:$u,database:"lode_row_test"},auth:{kind:"none"}}}')"
+    MID=$(await '.id == 30' | jq '.result.conn_id // empty')
+    if [ -n "$MID" ]; then
+        send "{\"jsonrpc\":\"2.0\",\"id\":31,\"method\":\"row.write\",\"params\":{\"conn_id\":$MID,\"obj\":{\"name\":\"t\"},\"key\":[[\"_id\",{\"__oid\":\"000000000000000000000000\"}]],\"set\":[[\"a\",1]],\"confirm\":true}}"
+        L=$(await '.id == 31')
+        # Until caps.edit is on, the engine refuses before reaching the driver —
+        # which is itself the thing to check: the switch is what gates it.
+        mentions "mongo is gated by caps.edit" "$L" "does not edit rows"
+    else
+        printf '     %-42s %s\n' "mongo: could not connect" "skipped"
+    fi
+else
+    printf '     %-42s %s\n' "mongo: no \$LODE_TEST_MONGO" "skipped"
+fi
+
 exec 3>&-
 wait $PID 2>/dev/null || true
 if [ "$FAILED" = "0" ]; then

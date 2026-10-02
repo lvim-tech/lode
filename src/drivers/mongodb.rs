@@ -21,8 +21,7 @@ use crate::driver::{Connection, Driver, ResultStream};
 use crate::net::NetContext;
 use crate::spec::{
     AuthKind, AuthSpec, Caps, Column, ConnSpec, DriverMeta, Index, Node, ObjRef, ParamSpec, ParamType,
-    QueryFieldSpec, TableColumn, Value,
-};
+    QueryFieldSpec, TableColumn, Value, RowOutcome, RowPlan,};
 
 const PARAMS: &[ParamSpec] = &[
     ParamSpec {
@@ -124,6 +123,14 @@ const MONGO_META: DriverMeta = DriverMeta {
         kv: true,
         indexes: true, // listIndexes
         ddl: false,    // a document store has no CREATE statement to show
+        // The code below is written and NOT switched on. `updateOne` cannot
+        // touch two documents, so the guarantee holds structurally — but the
+        // guarantee is not the risk. The risk is being wrong about this driver
+        // in some way nobody has looked for, and the only way to look is to run
+        // tests/row.sh against a throwaway mongod, which there is no way to do
+        // here (no server, no network, and the one real MongoDB in reach is
+        // somebody's data). Turn this on in the same commit that shows the
+        // mongo section of that test passing, and not before.
         edit: false,
     },
     hint: "{\"find\": \"collection\", \"limit\": 50}",
@@ -350,6 +357,61 @@ fn doc_to_row(doc: &Document, keys: &[String]) -> Vec<Value> {
 }
 
 /// The column set for a `keys` order (adds the trailing `_document`).
+/// The filter that addresses one document.
+///
+/// Values go in as BSON, built from the JSON the client sent — never spliced
+/// into a string. The tagged forms matter most here: an `_id` that came back as
+/// `{"__oid": …}` has to go back as an ObjectId, because matching a real
+/// ObjectId against its own hex STRING finds nothing, and an update that finds
+/// nothing is an update that reports success and changes no document.
+fn filter_document(plan: &RowPlan) -> anyhow::Result<Document> {
+    let mut d = Document::new();
+    for (k, v) in &plan.key {
+        d.insert(k.clone(), json_to_bson(v)?);
+    }
+    Ok(d)
+}
+
+fn set_document(plan: &RowPlan) -> anyhow::Result<Document> {
+    let mut set = Document::new();
+    for (k, v) in &plan.set {
+        set.insert(k.clone(), json_to_bson(v)?);
+    }
+    Ok(mongodb::bson::doc! { "$set": set })
+}
+
+fn row_documents(plan: &RowPlan) -> anyhow::Result<(String, String)> {
+    let f = filter_document(plan)?;
+    let u = if plan.delete { Document::new() } else { set_document(plan)? };
+    Ok((
+        mongodb::bson::to_bson(&f)
+            .map(|b| b.to_string())
+            .unwrap_or_default(),
+        mongodb::bson::to_bson(&u)
+            .map(|b| b.to_string())
+            .unwrap_or_default(),
+    ))
+}
+
+fn json_to_bson(v: &serde_json::Value) -> anyhow::Result<Bson> {
+    use crate::spec::{value_from_json, Value as V};
+    Ok(match value_from_json(v) {
+        V::Oid(hex) => Bson::ObjectId(
+            hex.parse()
+                .map_err(|e| anyhow::anyhow!("not an ObjectId: {hex} ({e})"))?,
+        ),
+        // The extended-JSON tag is re-emitted as the key it came in under, so
+        // `Bson::try_from` rebuilds the real BSON type rather than a string that
+        // merely looks like one.
+        V::Ext { text, key } => {
+            let doc = mongodb::bson::doc! { key: text };
+            Bson::try_from(serde_json::to_value(&doc)?)
+                .map_err(|e| anyhow::anyhow!("{e}"))?
+        }
+        _ => Bson::try_from(v.clone()).map_err(|e| anyhow::anyhow!("{e}"))?,
+    })
+}
+
 fn columns_for(keys: &[String]) -> Vec<Column> {
     let mut cols: Vec<Column> = keys
         .iter()
@@ -551,6 +613,44 @@ impl Connection for MongoConnection {
             });
         }
         Ok(out)
+    }
+
+    async fn plan_row(&mut self, plan: &RowPlan) -> anyhow::Result<String> {
+        let (filter, update) = row_documents(plan)?;
+        Ok(if plan.delete {
+            format!("db.{}.deleteOne({})", plan.obj.name, filter)
+        } else {
+            format!("db.{}.updateOne({}, {})", plan.obj.name, filter, update)
+        })
+    }
+
+    async fn write_row(&mut self, plan: &RowPlan) -> anyhow::Result<RowOutcome> {
+        let statement = self.plan_row(plan).await?;
+        let coll = self
+            .client
+            .database(&self.db)
+            .collection::<Document>(&plan.obj.name);
+        let filter = filter_document(plan)?;
+
+        // No transaction, and none is needed: `updateOne` and `deleteOne` touch
+        // at most ONE document by definition, so the thing a transaction would
+        // protect against here cannot happen. (A transaction would need a
+        // replica set anyway, which a standalone mongod is not.)
+        let matched = if plan.delete {
+            coll.delete_one(filter)
+                .await
+                .map_err(|e| anyhow::anyhow!("{e}"))?
+                .deleted_count
+        } else {
+            coll.update_one(filter, set_document(plan)?)
+                .await
+                .map_err(|e| anyhow::anyhow!("{e}"))?
+                .matched_count
+        };
+        if matched != 1 {
+            anyhow::bail!("that _id matched {matched} document(s), not one \u{2014} nothing was written");
+        }
+        Ok(RowOutcome { statement, affected: matched })
     }
 
     async fn execute(&mut self, stmt: &str) -> anyhow::Result<Box<dyn ResultStream>> {
