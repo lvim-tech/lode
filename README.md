@@ -288,16 +288,24 @@ Pick one in the Theme menu, or set `LODE_THEME` to a file's stem.
 `$LODE_THEME_DIR` overrides the search path. With no theme files at all a
 built-in palette applies, so a fresh build is usable immediately.
 
-A theme file is already contrast-grounded by its generator; the client copies it
-and corrects nothing, because a client that "improved" a theme would make the 48
-themes disagree with the same 48 themes in every other lvim tool. The file names
-the surfaces (`base`, `panel`, `raised`, `overlay`, `status`, `hover`, `border`),
-the inks, the accents, the editor's syntax colours and the grid's own set; there
-is not one colour value in the client's source.
+A theme file is **the editor's own colours**. The generator reads
+lvim-colorscheme's resolved highlight groups — `Normal`, `NormalSB`, `Pmenu`,
+`NormalFloat`, `StatusLine`, `CursorLine`, `PmenuSel`, `Visual`, `TabLine`,
+`Comment`, `Title` and the rest — and copies them unchanged, including the pairs
+that measure below WCAG AA. `Normal.fg` on base dark is `#5e8888` at 3.86:1 and
+arrives here as `#5e8888`.
 
-The METRICS are not in the theme file and never will be. Spacing, corner radii
-and text sizes belong to the application: they are the same whichever of the 48
-palettes is loaded, so switching a theme changes no measurement.
+That is deliberate and it is this target's whole point: a client that sits beside
+the editor all day has to be the same colour as the editor, and a "more readable"
+version of a theme is a different theme. The client therefore corrects nothing —
+there is not one colour value in its source.
+
+The METRICS are not in the theme file and never will be. Spacing and text sizes
+belong to the application: they are the same whichever of the 48 palettes is
+loaded, so switching a theme changes no measurement. **Corners are square
+everywhere** — buttons, fields, panels, dialogs, dropdowns, tabs — because a
+terminal editor has no rounded anything and this client is meant to look like it
+belongs next to one.
 
 ## Clients
 

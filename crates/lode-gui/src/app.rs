@@ -1202,11 +1202,20 @@ impl App {
                                     }
                                     ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
                                         if ui
-                                            .add(egui::Button::selectable(
-                                                is_live,
-                                                egui::RichText::new(format!("{dot}  {}", c.name))
-                                                    .color(colour),
-                                            ))
+                                            .add(
+                                                egui::Button::selectable(
+                                                    is_live,
+                                                    egui::RichText::new(format!("{dot}  {}", c.name))
+                                                        .color(colour),
+                                                )
+                                                // Truncate rather than overflow:
+                                                // the buttons have already taken
+                                                // their width from the right, and
+                                                // a name longer than the rest of
+                                                // the row has to end in an ellipsis
+                                                // instead of running into them.
+                                                .wrap_mode(egui::TextWrapMode::Truncate),
+                                            )
                                             .on_hover_text(format!(
                                                 "{} — double-click here, or press the link button, to connect",
                                                 c.driver
@@ -1352,6 +1361,9 @@ impl App {
             ui.add_space(8.0);
 
             let muted = theme.muted();
+            let line_nr = theme.line_nr();
+            let sel_bg = theme.selection_bg();
+            let sel_fg = theme.selection_fg();
             let null_fg = theme.null_fg();
             let header_fg = theme.header_fg();
             let header_bg = theme.header_bg();
@@ -1368,7 +1380,7 @@ impl App {
             egui::Frame::new()
                 .fill(base)
                 .stroke(egui::Stroke::new(1.0_f32, border))
-                .corner_radius(egui::CornerRadius::same(4))
+                .corner_radius(egui::CornerRadius::ZERO)
                 .inner_margin(egui::Margin::same(8))
                 .show(ui, |ui| {
                     egui::ScrollArea::vertical()
@@ -1426,7 +1438,7 @@ impl App {
                 egui::Frame::new()
                     .fill(base)
                     .stroke(egui::Stroke::new(1.0_f32, err_col))
-                    .corner_radius(egui::CornerRadius::same(4))
+                    .corner_radius(egui::CornerRadius::ZERO)
                     .inner_margin(egui::Margin::same(8))
                     .show(ui, |ui| {
                         ui.colored_label(err_col, e);
@@ -1482,18 +1494,32 @@ impl App {
                         // screen, so the loop cost does not grow with the page.
                         body.rows(row_h, rows.len(), |mut row| {
                             let i = row.index();
-                            row.set_selected(selected == Some(i));
+                            // NOT `row.set_selected`: that paints with egui's one
+                            // selection colour, which this theme takes from
+                            // `PmenuSel` — a LIST selection. Selected rows of data
+                            // are selected TEXT, which the editor draws with
+                            // `Visual`, so the grid paints its own.
+                            let is_sel = selected == Some(i);
                             row.col(|ui| {
+                                if is_sel {
+                                    fill(ui, sel_bg);
+                                }
                                 pad(ui, true, |ui| {
                                     ui.label(
                                         egui::RichText::new((first_row + i + 1).to_string())
                                             .small()
-                                            .color(muted),
+                                            // A row number IS a line number, so it
+                                            // takes the gutter's colour and is as
+                                            // quiet here as it is in the editor.
+                                            .color(if is_sel { sel_fg } else { line_nr }),
                                     );
                                 });
                             });
                             for ci in 0..ncols {
                                 row.col(|ui| {
+                                    if is_sel {
+                                        fill(ui, sel_bg);
+                                    }
                                     let v = rows[i].get(ci);
                                     // Numbers right, text left: a column of
                                     // figures is read by its last digit, and a
@@ -1509,8 +1535,11 @@ impl App {
                                         }
                                         Some(s) => {
                                             let one_line = s.replace('\n', "⏎");
-                                            ui.label(egui::RichText::new(one_line).monospace())
-                                                .on_hover_text(s);
+                                            let mut t = egui::RichText::new(one_line).monospace();
+                                            if is_sel {
+                                                t = t.color(sel_fg);
+                                            }
+                                            ui.label(t).on_hover_text(s);
                                         }
                                     });
                                 });
@@ -1560,7 +1589,7 @@ impl App {
                 egui::Frame::new()
                     .fill(theme.overlay())
                     .stroke(egui::Stroke::new(1.0_f32, theme.border()))
-                    .corner_radius(egui::CornerRadius::same(6))
+                    .corner_radius(egui::CornerRadius::ZERO)
                     .inner_margin(egui::Margin::same(14)),
             )
             .show(ctx, |ui| {
@@ -1844,7 +1873,7 @@ impl App {
                 egui::Frame::new()
                     .fill(theme.overlay())
                     .stroke(egui::Stroke::new(1.0_f32, theme.border()))
-                    .corner_radius(egui::CornerRadius::same(6))
+                    .corner_radius(egui::CornerRadius::ZERO)
                     .inner_margin(egui::Margin::same(14)),
             )
             .show(ctx, |ui| {
@@ -1938,11 +1967,13 @@ impl App {
 /// A section heading: quiet, small, and the only thing that tells a panel's
 /// regions apart once they all carry the same ink.
 fn section(ui: &mut egui::Ui, theme: &Theme, text: &str) {
+    // `Title`, which is what the editor uses for a heading. `text.muted` would
+    // be right for a label and wrong for the thing that names a region.
     ui.label(
         egui::RichText::new(text.to_uppercase())
             .small()
             .strong()
-            .color(theme.muted()),
+            .color(theme.title()),
     );
 }
 

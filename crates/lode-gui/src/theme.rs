@@ -5,11 +5,16 @@
 //! names the surfaces, the inks and the accents, and this module copies them
 //! into egui's `Style`. Adding a 49th palette means generating one more file.
 //!
-//! **The file is already grounded.** Every foreground in it has been floored for
-//! contrast against the surface it is actually drawn on, by the generator, using
-//! the same rule the rest of the ecosystem's targets use. So nothing here
-//! adjusts a colour: a GUI that "improved" the contrast of a theme file would
-//! make the 48 themes disagree with the 48 themes every other lvim tool loaded.
+//! **The file is the editor's own colours.** The generator reads lvim-colorscheme's
+//! RESOLVED HIGHLIGHT GROUPS — `Normal`, `NormalSB`, `Pmenu`, `NormalFloat`,
+//! `StatusLine`, `CursorLine`, `PmenuSel`, `Visual`, `TabLine`, `Comment` and the
+//! rest — and copies them unchanged, including the pairs that measure below
+//! 4.5:1. `Normal.fg` on base dark is `#5e8888` at 3.86:1 and arrives here as
+//! `#5e8888`.
+//!
+//! So nothing in this module adjusts a colour, and nothing may start to. A client
+//! that "improved" a theme would stop being the same colour as the editor beside
+//! it, which is the entire reason the theme is read from the editor's groups.
 //!
 //! Themes are searched for in `$LODE_THEME_DIR`, then `$XDG_CONFIG_HOME/lode/themes`,
 //! then `~/.config/lode/themes`. With no theme files at all the built-in
@@ -42,6 +47,8 @@ pub struct Theme {
     pub accent: Accent,
     #[serde(default)]
     pub syntax: Syntax,
+    #[serde(default, rename = "match")]
+    pub match_: Match,
     pub grid: Grid,
     /// The raw palette, carried verbatim for reference. NOT grounded and not
     /// drawn with — see the generator's note.
@@ -63,16 +70,31 @@ pub struct Surface {
     /// window's edge rather than as one more panel.
     #[serde(default)]
     pub status: String,
-    /// The row under the pointer: between the grid's stripe and a card.
+    /// The row under the pointer — the editor's `CursorLine`.
     #[serde(default)]
     pub hover: String,
+    /// A selected entry in a LIST — the editor's `PmenuSel`. Distinct from
+    /// `grid.selection_bg`, which is selected TEXT (`Visual`); the editor draws
+    /// those two differently and so does this.
+    #[serde(default)]
+    pub selected: String,
+    /// The editor's `WinSeparator`. On every lvim style it equals its own
+    /// background — the editor draws no line between windows — so frames here
+    /// are invisible and the structure is carried by the surfaces. That is the
+    /// editor's look, copied, not an omission.
     pub border: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct Text {
     pub primary: String,
+    /// `Comment`, deliberately not `LineNr`: both are quiet in the editor and
+    /// they are not interchangeable. A gutter number is meant to be nearly
+    /// invisible; a section heading is meant to be read.
     pub muted: String,
+    /// `Title` — section headings.
+    #[serde(default)]
+    pub title: String,
     /// Ink drawn ON an accent — a button label, a badge.
     pub inverted: String,
 }
@@ -119,6 +141,24 @@ pub struct Grid {
     /// SQL NULL. A different colour, never the word in the same ink — a NULL and
     /// a string reading "NULL" are different values and must not look alike.
     pub null_fg: String,
+    /// `LineNr` — the row-number column and nothing else. The one thing in this
+    /// client that is literally a line number, and as quiet as the editor's
+    /// gutter is.
+    #[serde(default)]
+    pub line_nr: String,
+}
+
+/// A search match — `Search` / `IncSearch`. Carried though the client does not
+/// paint with it yet, for the same reason `[syntax]` is: the file is the
+/// contract, and a role dropped because today's client has no use for it is a
+/// role the next version has to re-derive from somewhere else.
+#[allow(dead_code)] // see the note on `Theme`: the file is the contract
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct Match {
+    #[serde(default)]
+    pub bg: String,
+    #[serde(default)]
+    pub fg: String,
 }
 
 /// Parse `#rrggbb` (or `rrggbb`). An unparseable colour falls back to the given
@@ -165,6 +205,9 @@ impl Theme {
     pub fn hover(&self) -> egui::Color32 {
         self.c(&self.surface.hover, self.raised())
     }
+    pub fn selected(&self) -> egui::Color32 {
+        self.c(&self.surface.selected, self.hover())
+    }
     pub fn border(&self) -> egui::Color32 {
         self.c(&self.surface.border, egui::Color32::GRAY)
     }
@@ -173,6 +216,9 @@ impl Theme {
     }
     pub fn muted(&self) -> egui::Color32 {
         self.c(&self.text.muted, egui::Color32::GRAY)
+    }
+    pub fn title(&self) -> egui::Color32 {
+        self.c(&self.text.title, self.muted())
     }
     pub fn inverted(&self) -> egui::Color32 {
         self.c(&self.text.inverted, egui::Color32::BLACK)
@@ -197,6 +243,15 @@ impl Theme {
     }
     pub fn null_fg(&self) -> egui::Color32 {
         self.c(&self.grid.null_fg, self.muted())
+    }
+    pub fn line_nr(&self) -> egui::Color32 {
+        self.c(&self.grid.line_nr, self.muted())
+    }
+    pub fn selection_bg(&self) -> egui::Color32 {
+        self.c(&self.grid.selection_bg, self.selected())
+    }
+    pub fn selection_fg(&self) -> egui::Color32 {
+        self.c(&self.grid.selection_fg, self.fg())
     }
 
     /// Paint this theme onto an egui context: colours, AND the metrics.
@@ -236,8 +291,11 @@ impl Theme {
         v.faint_bg_color = self.c(&self.grid.row_alt, raised);
         v.code_bg_color = base;
         v.window_stroke = egui::Stroke::new(1.0_f32, border);
-        v.selection.bg_fill = self.c(&self.grid.selection_bg, primary);
-        v.selection.stroke = egui::Stroke::new(1.0_f32, self.c(&self.grid.selection_fg, inverted));
+        // A selected entry in a LIST: the editor's `PmenuSel`. The grid's own
+        // selected row is `Visual` and is painted by the grid, because egui has
+        // one selection colour and the editor has two different ones.
+        v.selection.bg_fill = self.selected();
+        v.selection.stroke = egui::Stroke::new(1.0_f32, fg);
         v.hyperlink_color = primary;
         v.warn_fg_color = self.c(&self.accent.warning, egui::Color32::YELLOW);
         v.error_fg_color = self.c(&self.accent.error, egui::Color32::RED);
@@ -279,10 +337,10 @@ impl Theme {
         v.widgets.hovered.weak_bg_fill = hover;
 
         // ── shape ───────────────────────────────────────────────────────────
-        // Small radii, not none and not pills: a data application wants its
-        // edges soft enough to group things and sharp enough that a cell still
-        // looks like a cell.
-        let r = egui::CornerRadius::same(4);
+        // SQUARE. Every corner, everywhere: buttons, fields, panels, dialogs,
+        // dropdowns, tabs. A terminal editor has no rounded anything, and this
+        // client is meant to sit beside one and look like it does. The air comes
+        // from the spacing below, not from the corners.
         for w in [
             &mut v.widgets.noninteractive,
             &mut v.widgets.inactive,
@@ -290,11 +348,11 @@ impl Theme {
             &mut v.widgets.active,
             &mut v.widgets.open,
         ] {
-            w.corner_radius = r;
+            w.corner_radius = egui::CornerRadius::ZERO;
             w.expansion = 0.0;
         }
-        v.window_corner_radius = egui::CornerRadius::same(6);
-        v.menu_corner_radius = egui::CornerRadius::same(6);
+        v.window_corner_radius = egui::CornerRadius::ZERO;
+        v.menu_corner_radius = egui::CornerRadius::ZERO;
         v.window_shadow = egui::epaint::Shadow {
             offset: [0, 4],
             blur: 16,
@@ -369,44 +427,55 @@ impl Theme {
             name: "LvimBaseDark (built in)".into(),
             style: "base_dark".into(),
             dark: true,
+            // Byte for byte the generated LvimBase_dark, which is byte for byte
+            // the editor's own groups. A built-in that differed from the file
+            // would mean the application looked like one thing before a theme
+            // was installed and another after.
             surface: Surface {
                 base: "#20272b".into(),
-                panel: "#1b2125".into(),
-                raised: "#2a3237".into(),
-                overlay: "#242b30".into(),
-                status: "#161b1e".into(),
-                hover: "#262e33".into(),
-                border: "#3a444a".into(),
+                panel: "#1c2327".into(),
+                raised: "#1e2529".into(),
+                overlay: "#1c2327".into(),
+                status: "#1e2529".into(),
+                hover: "#2a373d".into(),
+                selected: "#243037".into(),
+                border: "#1e2529".into(),
             },
             text: Text {
-                primary: "#b9c8c8".into(),
-                muted: "#7e9494".into(),
-                inverted: "#14191c".into(),
+                primary: "#5e8888".into(),
+                muted: "#5b7d7e".into(),
+                title: "#7d9753".into(),
+                inverted: "#1a1f22".into(),
             },
             accent: Accent {
-                primary: "#6ba3c7".into(),
-                secondary: "#58a08f".into(),
-                success: "#8bb06a".into(),
-                warning: "#d8b36f".into(),
-                error: "#d75e52".into(),
-                info: "#6b9fd0".into(),
+                primary: "#778e52".into(),
+                secondary: "#129f87".into(),
+                success: "#7d9753".into(),
+                warning: "#da8950".into(),
+                error: "#eb6157".into(),
+                info: "#1b97cf".into(),
             },
             syntax: Syntax {
-                keyword: "#c48fd0".into(),
-                string: "#8bb06a".into(),
+                keyword: "#448595".into(),
+                string: "#7e965a".into(),
                 number: "#e19556".into(),
-                comment: "#5e7070".into(),
-                function: "#6ba3c7".into(),
-                operator: "#9fb3b3".into(),
-                identifier: "#b9c8c8".into(),
+                comment: "#5b7d7e".into(),
+                function: "#3b6d8d".into(),
+                operator: "#3a7280".into(),
+                identifier: "#c6614d".into(),
+            },
+            match_: Match {
+                bg: "#22292d".into(),
+                fg: "#e19556".into(),
             },
             grid: Grid {
-                header_bg: "#2a3237".into(),
-                header_fg: "#cddada".into(),
-                row_alt: "#242b30".into(),
-                selection_bg: "#35505f".into(),
-                selection_fg: "#e3eded".into(),
-                null_fg: "#6f8080".into(),
+                header_bg: "#1e2529".into(),
+                header_fg: "#539595".into(),
+                row_alt: "#1a1f22".into(),
+                selection_bg: "#22292d".into(),
+                selection_fg: "#5e8888".into(),
+                null_fg: "#5b7d7e".into(),
+                line_nr: "#2a373d".into(),
             },
             palette: BTreeMap::new(),
         }
@@ -476,14 +545,18 @@ mod tests {
             dark = true
             [surface]
             base = "#20272b"
-            panel = "#1b2125"
-            raised = "#2a3237"
-            overlay = "#242b30"
-            border = "#3a444a"
+            panel = "#1c2327"
+            raised = "#1e2529"
+            overlay = "#1c2327"
+            status = "#1e2529"
+            hover = "#2a373d"
+            selected = "#243037"
+            border = "#1e2529"
             [text]
-            primary = "#b9c8c8"
-            muted = "#7e9494"
-            inverted = "#14191c"
+            primary = "#5e8888"
+            muted = "#5b7d7e"
+            title = "#7d9753"
+            inverted = "#1a1f22"
             [accent]
             primary = "#6ba3c7"
             secondary = "#58a08f"
@@ -532,18 +605,25 @@ mod tests {
                 ("surface.panel", &t.surface.panel),
                 ("surface.raised", &t.surface.raised),
                 ("surface.overlay", &t.surface.overlay),
+                ("surface.status", &t.surface.status),
+                ("surface.hover", &t.surface.hover),
+                ("surface.selected", &t.surface.selected),
                 ("surface.border", &t.surface.border),
                 ("text.primary", &t.text.primary),
                 ("text.muted", &t.text.muted),
+                ("text.title", &t.text.title),
                 ("text.inverted", &t.text.inverted),
                 ("accent.primary", &t.accent.primary),
                 ("accent.error", &t.accent.error),
+                ("match.bg", &t.match_.bg),
+                ("match.fg", &t.match_.fg),
                 ("grid.header_bg", &t.grid.header_bg),
                 ("grid.header_fg", &t.grid.header_fg),
                 ("grid.row_alt", &t.grid.row_alt),
                 ("grid.selection_bg", &t.grid.selection_bg),
                 ("grid.selection_fg", &t.grid.selection_fg),
                 ("grid.null_fg", &t.grid.null_fg),
+                ("grid.line_nr", &t.grid.line_nr),
             ] {
                 // A sentinel fallback here would mean an unparsed colour silently
                 // becoming magenta in the window; fail instead.
@@ -555,6 +635,14 @@ mod tests {
             }
             assert!(!t.syntax.keyword.is_empty(), "{name}: the editor needs a syntax block");
             assert!(!t.palette.is_empty(), "{name}: the reference palette block is missing");
+            // The theme is COPIED from the editor's groups, so the pair the
+            // editor leaves equal must arrive equal: `Visual` sets no
+            // foreground, which means selected text keeps `Normal.fg`. A
+            // generator that "helped" by lifting one of them would break this.
+            assert_eq!(
+                t.grid.selection_fg, t.text.primary,
+                "{name}: selected text must keep the body ink, as `Visual` does in the editor"
+            );
             assert_eq!(
                 t.dark,
                 !t.style.ends_with("_light"),
@@ -564,6 +652,23 @@ mod tests {
         eprintln!("checked {} generated theme(s)", found.len());
     }
 
+    /// The built-in theme must BE the generated LvimBase_dark, which is the
+    /// editor's own groups. If they drift, the application looks like one thing
+    /// before a theme is installed and another after.
+    #[test]
+    fn the_builtin_theme_is_the_editors_base_dark() {
+        let t = Theme::builtin();
+        assert_eq!(t.surface.base, "#20272b", "Normal.bg");
+        assert_eq!(t.text.primary, "#5e8888", "Normal.fg — NOT lifted for contrast");
+        assert_eq!(t.text.muted, "#5b7d7e", "Comment.fg");
+        assert_eq!(t.surface.status, "#1e2529", "StatusLine.bg");
+        assert_eq!(t.surface.hover, "#2a373d", "CursorLine.bg");
+        assert_eq!(t.surface.selected, "#243037", "PmenuSel.bg");
+        assert_eq!(t.grid.selection_bg, "#22292d", "Visual.bg");
+        assert_eq!(t.grid.selection_fg, t.text.primary, "Visual sets no fg");
+        assert_eq!(t.grid.line_nr, "#2a373d", "LineNr.fg");
+    }
+
     #[test]
     fn the_builtin_theme_is_complete() {
         let t = Theme::builtin();
@@ -571,10 +676,14 @@ mod tests {
             &t.surface.base,
             &t.surface.panel,
             &t.surface.raised,
+            &t.surface.status,
+            &t.surface.selected,
             &t.text.primary,
+            &t.text.title,
             &t.accent.primary,
             &t.grid.header_bg,
             &t.grid.null_fg,
+            &t.grid.line_nr,
         ] {
             assert_eq!(s.len(), 7, "{s} is not #rrggbb");
             assert_ne!(hex(s, egui::Color32::RED), egui::Color32::RED, "{s} must parse");
