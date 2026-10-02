@@ -14,11 +14,13 @@ use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
 use gpui::{
-    div, prelude::*, px, uniform_list, Context, Entity, MouseButton, Rgba, SharedString, Window,
+    div, prelude::*, px, size, uniform_list, Bounds, Context, Entity, MouseButton, Rgba,
+    SharedString, TitlebarOptions, WeakEntity, Window, WindowBounds, WindowHandle, WindowOptions,
 };
 use lode_proto::{cell_text, DriverMeta, Engine, Hello, Message, Node, QueryState, SavedConnection};
 use serde_json::{json, Value};
 
+use crate::form::ConnectionForm;
 use crate::input::{InputColors, InputEvent, TextInput};
 use crate::session::{self, Session, SessionTab};
 use crate::theme::{self, Theme};
@@ -66,6 +68,12 @@ enum Pending {
     Execute { tab: u64, task: u64 },
     Page { tab: u64 },
     Ignore(&'static str),
+    /// A console line, waiting to hear whether it destroys something.
+    Classify { conn: String, statement: String },
+    /// One `conn.test` stage asked from the connection window.
+    FormTest { stage: &'static str, form: WeakEntity<ConnectionForm> },
+    /// A connection saved from that window.
+    FormSave,
 }
 
 pub struct Workspace {
@@ -110,6 +118,16 @@ pub struct Workspace {
     /// Every field of every tab's query bar, keyed by (tab, field). The empty
     /// key is the statement box a typed driver gets instead of a form.
     inputs: HashMap<(u64, String), Entity<TextInput>>,
+
+    /// The console: a line typed straight at a connection.
+    console: Entity<TextInput>,
+    console_open: bool,
+    /// The connection window, while one is open. A WINDOW, not a layer: the
+    /// window manager owns it like any other.
+    form_window: Option<WindowHandle<ConnectionForm>>,
+    /// A statement the ENGINE called destructive, held with its reason until
+    /// someone says yes. Nothing runs from here without that.
+    confirm: Option<(String, String, String)>,
 }
 
 impl Workspace {
@@ -120,6 +138,19 @@ impl Workspace {
         cx.subscribe(&filter, |_this, _input, _ev: &InputEvent, cx| {
             // Typed into the filter: the panel is rebuilt from it each frame,
             // so there is nothing to do but ask for that frame.
+            cx.notify();
+        })
+        .detach();
+        let console = cx.new(|cx| {
+            TextInput::new(cx, "Type a command and press Enter — it runs against the open connection", colors)
+        });
+        cx.subscribe(&console, |this, input, ev: &InputEvent, cx| {
+            if matches!(ev, InputEvent::Submit) {
+                let line = input.read(cx).text().trim().to_string();
+                if !line.is_empty() {
+                    this.console_submit(line, cx);
+                }
+            }
             cx.notify();
         })
         .detach();
@@ -148,6 +179,10 @@ impl Workspace {
             restore: session::load(),
             filter,
             inputs: HashMap::new(),
+            console,
+            console_open: true,
+            form_window: None,
+            confirm: None,
         };
 
         match Engine::spawn(None) {
@@ -226,7 +261,7 @@ impl Workspace {
                     let Some(what) = self.pending.remove(&id) else { continue };
                     match result {
                         Ok(v) => self.on_result(what, v, cx),
-                        Err(e) => self.on_error(what, e),
+                        Err(e) => self.on_error(what, e, cx),
                     }
                 }
             }
@@ -299,6 +334,13 @@ impl Workspace {
             Pending::Connections => {
                 self.saved =
                     serde_json::from_value(v.get("connections").cloned().unwrap_or(json!([]))).unwrap_or_default();
+                // Nothing saved at all: the only useful thing a database client
+                // can do on a first run is offer to describe a database. Shown
+                // once, and only when the store is working — an unreachable
+                // store is a different problem and a form would not fix it.
+                if self.saved.is_empty() && self.store_ok && self.form_window.is_none() {
+                    self.open_form(None, cx);
+                }
                 // Reopen what was open. Only now: before the saved list arrived
                 // there was nothing to look a name up in.
                 let want: Vec<String> = self
@@ -371,10 +413,31 @@ impl Workspace {
                 }
             }
             Pending::Ignore(_) => {}
+            Pending::FormTest { stage, form } => {
+                let detail = v.get("detail").and_then(Value::as_str).unwrap_or("ok").to_string();
+                let ms = v.get("ms").and_then(Value::as_u64).unwrap_or(0);
+                let _ = form.update(cx, |f, cx| {
+                    f.test_answer(stage, Ok(format!("{detail} ({ms} ms)")), cx)
+                });
+            }
+            Pending::FormSave => {
+                self.ask(Pending::Connections, "store.connections.list", json!({}));
+            }
+            Pending::Classify { conn, statement } => {
+                match v.get("reason").and_then(Value::as_str) {
+                    // The engine named a reason, so it is held and shown. The
+                    // reason is what makes someone stop; a yes/no box would not.
+                    Some(reason) => self.confirm = Some((conn, statement, reason.to_string())),
+                    None => {
+                        self.run_statement(&conn, &statement, cx);
+                        self.console.update(cx, |i, cx| i.set_text("", cx));
+                    }
+                }
+            }
         }
     }
 
-    fn on_error(&mut self, what: Pending, e: String) {
+    fn on_error(&mut self, what: Pending, e: String, cx: &mut Context<Self>) {
         match what {
             Pending::Execute { tab, task } => {
                 if let Some(t) = self.tabs.iter_mut().find(|t| t.id == tab) {
@@ -396,6 +459,17 @@ impl Workspace {
                 self.status = format!("could not connect to {name}");
                 self.log.push(("error".into(), format!("{name}: {e}")));
             }
+            // A failed stage is the engine naming the layer that is wrong, so it
+            // goes back to the window beside the button that asked.
+            Pending::FormTest { stage, form } => {
+                let _ = form.update(cx, |f, cx| f.test_answer(stage, Err(e), cx));
+            }
+            // A classification that failed is NOT permission to run: the answer
+            // was "I do not know", and the whole point is to ask first.
+            Pending::Classify { statement, .. } => self.log.push((
+                "error".into(),
+                format!("could not check whether this is destructive, so it was not run: {statement} — {e}"),
+            )),
             _ => self.log.push(("error".into(), e)),
         }
     }
@@ -670,6 +744,131 @@ impl Workspace {
         );
     }
 
+    /// A console line. It is NOT run yet: first the engine is asked whether it
+    /// destroys anything, because only the engine knows what the statement means
+    /// in that driver's language.
+    fn console_submit(&mut self, line: String, _cx: &mut Context<Self>) {
+        let Some(conn) = self.conns.first().map(|c| c.name.clone()) else {
+            self.log.push(("warn".into(), "nothing is connected".into()));
+            return;
+        };
+        let Some(live) = self.live(&conn) else { return };
+        let driver = live.driver.clone();
+        self.ask(
+            Pending::Classify { conn, statement: line.clone() },
+            "query.classify",
+            json!({ "driver": driver, "statement": line }),
+        );
+    }
+
+    /// Run a statement typed at a connection, as its own tab — so it gets the
+    /// same grid, views, paging and task entry everything else gets.
+    fn run_statement(&mut self, conn: &str, statement: &str, cx: &mut Context<Self>) {
+        let Some(live) = self.live(conn) else { return };
+        let driver = live.driver.clone();
+        let meta = self.meta(&driver).cloned();
+        let id = self.next_tab;
+        self.next_tab += 1;
+        let title: String = statement.chars().take(40).collect();
+        let mut tab = Tab::new(id, conn.to_string(), driver, title, meta.as_ref());
+        tab.sql = statement.to_string();
+        self.tabs.push(tab);
+        self.active = self.tabs.len() - 1;
+        // A console statement is free text whatever the driver is: it was typed,
+        // not assembled, so the tab gets a statement box rather than a form.
+        let colors = input_colors(&self.theme);
+        let text = statement.to_string();
+        let input = cx.new(|cx| {
+            let mut i = TextInput::new(cx, "", colors);
+            i.set_text(text, cx);
+            i
+        });
+        self.subscribe_run(&input, id, cx);
+        self.inputs.insert((id, String::new()), input);
+        self.run_tab(id);
+    }
+
+    /// Open the connection window. Editing passes what is stored; adding passes
+    /// nothing and the driver's own defaults fill the fields.
+    fn open_form(&mut self, existing: Option<(String, String, Value)>, cx: &mut Context<Self>) {
+        // Already open: nothing is gained by a second one, and two would fight
+        // over the same saved connection.
+        if self.form_window.is_some() {
+            return;
+        }
+        let theme = self.theme.clone();
+        let drivers = self.hello.as_ref().map(|h| h.drivers.clone()).unwrap_or_default();
+        let me = cx.entity().downgrade();
+        let title = match &existing {
+            Some((_, d, _)) => format!("lode — Edit {d} connection"),
+            None => "lode — New connection".to_string(),
+        };
+        let bounds = Bounds::centered(None, size(px(720.0), px(560.0)), cx);
+        let opened = cx.open_window(
+            WindowOptions {
+                window_bounds: Some(WindowBounds::Windowed(bounds)),
+                titlebar: Some(TitlebarOptions {
+                    title: Some(title.into()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+            |_window, cx| cx.new(|cx| ConnectionForm::new(me, theme, drivers, existing, cx)),
+        );
+        match opened {
+            Ok(h) => self.form_window = Some(h),
+            Err(e) => self.log.push(("error".into(), format!("could not open the window: {e}"))),
+        }
+    }
+
+    pub fn close_form(&mut self, cx: &mut Context<Self>) {
+        if let Some(h) = self.form_window.take() {
+            let _ = h.update(cx, |_, window, _| window.remove_window());
+        }
+        cx.notify();
+    }
+
+    /// Run one `conn.test` stage for the connection window and send the answer
+    /// back to it. The engine's message goes across untouched.
+    pub fn form_test(
+        &mut self,
+        stage: &'static str,
+        spec: Value,
+        form: WeakEntity<ConnectionForm>,
+        _cx: &mut Context<Self>,
+    ) {
+        self.ask(
+            Pending::FormTest { stage, form },
+            "conn.test",
+            json!({ "stage": stage, "spec": spec }),
+        );
+    }
+
+    pub fn form_save(
+        &mut self,
+        name: String,
+        driver: String,
+        spec: Value,
+        renamed_from: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
+        self.ask(
+            Pending::FormSave,
+            "store.connections.save",
+            json!({ "name": name, "driver": driver, "spec": spec }),
+        );
+        // A rename is a save under the new name and a removal of the old: the
+        // store is keyed by name and has no rename of its own.
+        if let Some(old) = renamed_from.filter(|o| *o != name) {
+            self.ask(
+                Pending::Ignore("rename"),
+                "store.connections.remove",
+                json!({ "name": old }),
+            );
+        }
+        self.close_form(cx);
+    }
+
     fn cancel_active(&mut self) {
         let Some(tab) = self.tabs.get(self.active) else { return };
         let Some(call_id) = tab.call_id else { return };
@@ -780,6 +979,21 @@ impl Workspace {
         }
 
         panel = panel.child(div().px_2().py_1().child(self.filter.clone()));
+        panel = panel.child(
+            div()
+                .id("new-conn")
+                .px_2()
+                .py_1()
+                .cursor_pointer()
+                .hover(|d| d.bg(t.hover()))
+                .text_size(px(11.0))
+                .text_color(t.accent())
+                .child("\u{f067}  New connection")
+                .on_click(cx.listener(|this, _, _, cx| {
+                    this.open_form(None, cx);
+                    cx.notify();
+                })),
+        );
         let filter = self.filter.read(cx).text().to_string();
         let connected = self.conns.len();
         panel = panel.child(self.section(&format!(
@@ -819,6 +1033,20 @@ impl Workspace {
                             .child(SharedString::from(c.name.clone())),
                     )
                     .child(self.small(c.driver.clone(), t.muted()))
+                    .child(
+                        div()
+                            .id(SharedString::from(format!("edit-{}", c.name)))
+                            .text_size(px(10.0))
+                            .text_color(t.muted())
+                            .child("\u{f044}")
+                            .on_click(cx.listener({
+                                let (n, d, sp) = (c.name.clone(), c.driver.clone(), c.spec.clone());
+                                move |this, _, _, cx| {
+                                    this.open_form(Some((n.clone(), d.clone(), sp.clone())), cx);
+                                    cx.notify();
+                                }
+                            })),
+                    )
                     .on_click(cx.listener(move |this, _, _, cx| {
                         if this.conns.iter().any(|l| l.name == name) {
                             this.disconnect(&name);
@@ -1508,6 +1736,112 @@ impl Workspace {
         panel
     }
 
+    /// The console: a prompt named after what it runs against, one line, and —
+    /// when the engine says the line destroys something — its reason and two
+    /// buttons. Nothing runs from here without that answer.
+    fn console_el(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let t = self.t();
+        let target = self
+            .conns
+            .first()
+            .map(|c| c.name.clone())
+            .unwrap_or_else(|| "nothing connected".into());
+
+        let mut panel = div()
+            .flex()
+            .flex_col()
+            .w_full()
+            .bg(t.panel())
+            .border_t_1()
+            .border_color(t.border());
+
+        panel = panel.child(
+            div()
+                .id("console-header")
+                .flex()
+                .items_center()
+                .gap_2()
+                .px_3()
+                .py_1()
+                .cursor_pointer()
+                .child(self.small("Command", t.title()))
+                .child(self.small(
+                    format!("runs against {target}, dangerous commands ask first"),
+                    t.muted(),
+                ))
+                .on_click(cx.listener(|this, _, _, cx| {
+                    this.console_open = !this.console_open;
+                    cx.notify();
+                })),
+        );
+
+        if self.console_open {
+            panel = panel.child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .px_3()
+                    .pb_1()
+                    .child(self.small(format!("{target}>"), t.accent()))
+                    .child(div().flex_1().child(self.console.clone())),
+            );
+
+            // The confirmation. The REASON is the sentence, not a title bar.
+            if let Some((_, statement, reason)) = &self.confirm {
+                panel = panel.child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap_1()
+                        .mx_3()
+                        .mb_1()
+                        .p_2()
+                        .border_1()
+                        .border_color(t.error())
+                        .child(self.small(reason.clone(), t.error()))
+                        .child(self.small(statement.clone(), t.fg()))
+                        .child(
+                            div()
+                                .flex()
+                                .gap_2()
+                                .child(
+                                    div()
+                                        .id("confirm-run")
+                                        .px_2()
+                                        .cursor_pointer()
+                                        .text_size(px(11.0))
+                                        .bg(t.error())
+                                        .text_color(t.inverted())
+                                        .child("Run it")
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            if let Some((conn, stmt, _)) = this.confirm.take() {
+                                                this.run_statement(&conn, &stmt, cx);
+                                                this.console.update(cx, |i, cx| i.set_text("", cx));
+                                            }
+                                            cx.notify();
+                                        })),
+                                )
+                                .child(
+                                    div()
+                                        .id("confirm-cancel")
+                                        .px_2()
+                                        .cursor_pointer()
+                                        .text_size(px(11.0))
+                                        .text_color(t.muted())
+                                        .child("Cancel")
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            this.confirm = None;
+                                            cx.notify();
+                                        })),
+                                ),
+                        ),
+                );
+            }
+        }
+        panel
+    }
+
     fn status_el(&self) -> impl IntoElement {
         let t = self.t();
         let failed = self.tasks.iter().filter(|x| x.failed()).count();
@@ -1624,6 +1958,7 @@ impl Render for Workspace {
                         .child(div().flex_1().overflow_hidden().child(self.result_el(cx))),
                 ),
         )
+        .child(self.console_el(cx))
         .child(self.tasks_el(cx))
         .child(self.status_el())
     }

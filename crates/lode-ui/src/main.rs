@@ -16,6 +16,7 @@
 //! where there is nothing else to do yet.
 
 mod app;
+mod form;
 mod input;
 mod session;
 mod theme;
