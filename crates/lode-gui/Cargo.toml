@@ -5,8 +5,11 @@ edition = "2021"
 license = "BSD-3-Clause"
 description = "The lode desktop database client — a GUI client of the lode engine"
 
+# `lode-egui` while the GPUI client is being built: the binary name `lode`
+# belongs to the one that is going to survive. This crate goes when the new one
+# does everything it does.
 [[bin]]
-name = "lode"
+name = "lode-egui"
 path = "src/main.rs"
 
 [dependencies]

@@ -3,13 +3,15 @@
 # they were), and the client side lives under crates/ —
 #
 #   crates/lode-proto   the protocol client: spawn the engine, speak to it
-#   crates/lode-gui     the desktop application, a client like any other
+#   crates/lode-ui      the desktop application — GPUI, binary `lode`
+#   crates/lode-gui     the egui client it replaces, kept building until the new
+#                       one does the same (binary `lode-egui` while both exist)
 #
 # The engine does not depend on either. It cannot: its whole point is that a
 # client is a separate process, and the moment the engine knew about a client
 # there would be a reason for the next client to be different.
 [workspace]
-members = ["crates/lode-proto", "crates/lode-gui"]
+members = ["crates/lode-proto", "crates/lode-gui", "crates/lode-ui"]
 
 [package]
 name = "lode"

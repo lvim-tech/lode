@@ -109,6 +109,9 @@ pub struct Tab {
     pub title: String,
     /// The object this tab was opened on, if it came from the tree.
     pub object: Option<(String, Option<String>)>,
+    /// The node kind it was opened as — kept because the browse template is
+    /// chosen by kind, so reopening the tab has to ask the same question again.
+    pub kind: String,
     /// Free-text statement, for engines that are typed.
     pub sql: String,
     /// Structured values, for engines that declare a query form.
@@ -147,6 +150,7 @@ impl Tab {
             driver,
             title,
             object: None,
+            kind: String::new(),
             sql: String::new(),
             fields,
             call_id: None,

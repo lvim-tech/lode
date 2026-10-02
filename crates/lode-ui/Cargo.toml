@@ -1,0 +1,33 @@
+[package]
+name = "lode-ui"
+version = "0.1.0"
+edition = "2021"
+license = "BSD-3-Clause"
+description = "The lode desktop database client — a GPUI client of the lode engine"
+
+[[bin]]
+name = "lode"
+path = "src/main.rs"
+
+[dependencies]
+lode-proto = { path = "../lode-proto" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"
+toml = "0.8"
+
+# GPUI — Zed's framework, and dbflux's. Chosen over the egui client this
+# replaces because the measure for this client is dbflux, and matching what it
+# does on a different framework is a translation at every step.
+#
+# What it gives and what it does not, both measured against the published crate
+# rather than assumed:
+#   * uniform_list — a virtualised list, which is what the result grid needs.
+#   * open_window — SEVERAL windows, each with its own root view. There is no
+#     "modal layer" concept at all, so a dialog in its own OS window is the
+#     normal thing here rather than the special one.
+#   * NO text input of any kind. The crate's own examples/input.rs is a
+#     746-line implementation of a SINGLE-LINE field: an input handler for IME,
+#     a custom Element that lays out and paints the text and the cursor, and an
+#     action per key. Anything typed into this client has to be built on that.
+gpui = "0.2.2"

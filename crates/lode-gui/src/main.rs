@@ -13,15 +13,6 @@ mod app;
 mod export;
 mod font;
 mod theme;
-// The workspace MODEL: live connections, result tabs, background tasks, and the
-// rules around them — which view a driver opens in, how a statement is built
-// from the engine's template, what a document behind a row is. It is framework
-// independent on purpose: the client is moving from egui to GPUI, and these
-// rules do not change when the widgets do. Compiled and tested here while the
-// egui client is still the one that runs; the GPUI client is its first real
-// consumer.
-#[allow(dead_code)]
-mod workspace;
 
 fn main() -> eframe::Result {
     let options = eframe::NativeOptions {
