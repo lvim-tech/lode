@@ -29,6 +29,7 @@ fn main() {
     Application::new().run(|cx: &mut gpui::App| {
         // The field needs its keys before any window exists.
         input::bind_keys(cx);
+        app::bind_workspace_keys(cx);
         let bounds = Bounds::centered(None, size(px(1280.0), px(820.0)), cx);
         cx.open_window(
             WindowOptions {

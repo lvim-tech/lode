@@ -39,6 +39,11 @@ pub struct Session {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionTab {
     pub conn: String,
+    /// The object this tab was opened on. Empty for a tab that was typed rather
+    /// than clicked — those are kept too, because an unsent statement someone
+    /// was in the middle of writing is the LAST thing a restart should throw
+    /// away.
+    #[serde(default)]
     pub name: String,
     #[serde(default)]
     pub schema: Option<String>,
@@ -48,6 +53,12 @@ pub struct SessionTab {
     /// person and stable if the enum is reordered.
     #[serde(default)]
     pub view: String,
+    /// What the tab is called, for a typed tab that has no object to name it.
+    #[serde(default)]
+    pub title: String,
+    /// The statement in the box, run or not.
+    #[serde(default)]
+    pub draft: String,
 }
 
 /// Where the session lives: beside the engine's data, but its own file.
@@ -106,6 +117,8 @@ mod tests {
                 schema: Some("main".into()),
                 kind: "table".into(),
                 view: "table".into(),
+                title: String::new(),
+                draft: String::new(),
             }],
             active: 0,
             theme: Some("LvimBase_dark".into()),
@@ -119,6 +132,26 @@ mod tests {
         assert_eq!(back.tabs[0].schema.as_deref(), Some("main"));
         assert_eq!(back.theme.as_deref(), Some("LvimBase_dark"));
         assert_eq!(back.rail, "history");
+
+        // A tab with no object is a typed one, and its words come back.
+        let typed = Session {
+            connections: vec!["demo".into()],
+            tabs: vec![SessionTab {
+                conn: "demo".into(),
+                name: String::new(),
+                schema: None,
+                kind: String::new(),
+                view: "table".into(),
+                title: "Draft".into(),
+                draft: "SELECT 1 WHERE".into(),
+            }],
+            active: 0,
+            theme: None,
+            rail: String::new(),
+        };
+        let round: Session = serde_json::from_str(&serde_json::to_string(&typed).unwrap()).unwrap();
+        assert_eq!(round.tabs[0].draft, "SELECT 1 WHERE", "half a statement is still someone's work");
+        assert!(round.tabs[0].name.is_empty());
     }
 
     /// A tab from a version that did not record the view must still load.

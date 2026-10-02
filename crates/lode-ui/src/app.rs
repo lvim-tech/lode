@@ -13,9 +13,12 @@
 use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
+use std::time::Instant;
+
 use gpui::{
-    div, prelude::*, px, size, uniform_list, Bounds, Context, Entity, MouseButton, Rgba,
-    SharedString, TitlebarOptions, WeakEntity, Window, WindowBounds, WindowHandle, WindowOptions,
+    div, prelude::*, px, size, uniform_list, Bounds, ClipboardItem, Context, Entity, FocusHandle,
+    MouseButton, MouseMoveEvent, MouseUpEvent, Rgba, SharedString, TitlebarOptions, WeakEntity,
+    Window, WindowBounds, WindowHandle, WindowOptions,
 };
 use lode_proto::{
     cell_text, DriverMeta, Engine, Hello, HistoryRow, Message, Node, QueryState, SavedConnection,
@@ -29,8 +32,96 @@ use crate::input::{InputColors, InputEvent, TextInput};
 use crate::session::{self, Session, SessionTab};
 use crate::theme::{self, Theme};
 use crate::workspace::{
+    copy_as_insert, copy_as_select, fuzzy_score, Toast,
     fmt_duration, preview, type_badge, Live, ResultView, RunState, SubTab, Tab, Task,
 };
+
+gpui::actions!(
+    lode,
+    [
+        /// Down a row, up a row — j and k, and the arrows, because a grid that
+        /// only answers to vim keys is a grid half the people cannot drive.
+        NextRow,
+        PrevRow,
+        /// Left and right move between TABS: h and l are the only pair spare,
+        /// and moving between results is what this window is for.
+        PrevTab,
+        NextTab,
+        /// Page down and up, ctrl-f and ctrl-b.
+        PageDown,
+        PageUp,
+        /// First and last loaded row.
+        FirstRow,
+        LastRow,
+        /// Open the row under the cursor in the detail panel, or shut it.
+        ToggleDetail,
+        /// The palette, and the way out of anything.
+        TogglePalette,
+        Escape,
+        /// Run the active tab.
+        RunActive,
+        /// Move the palette's highlight without leaving the text field.
+        PaletteDown,
+        PaletteUp,
+        PaletteAccept,
+    ]
+);
+
+/// Bind the window's keys.
+///
+/// Every one of these is barred inside a text field (`!TextInput`), because a
+/// `j` typed into a filter box has to be a `j`. The field's own bindings — the
+/// arrows, home, end — stay as they are; these are what is left over when
+/// nothing is being typed into.
+pub fn bind_workspace_keys(cx: &mut gpui::App) {
+    use gpui::KeyBinding;
+    const OUTSIDE: Option<&str> = Some("Workspace && !TextInput");
+    cx.bind_keys([
+        KeyBinding::new("j", NextRow, OUTSIDE),
+        KeyBinding::new("down", NextRow, OUTSIDE),
+        KeyBinding::new("k", PrevRow, OUTSIDE),
+        KeyBinding::new("up", PrevRow, OUTSIDE),
+        KeyBinding::new("h", PrevTab, OUTSIDE),
+        KeyBinding::new("l", NextTab, OUTSIDE),
+        KeyBinding::new("ctrl-f", PageDown, OUTSIDE),
+        KeyBinding::new("ctrl-b", PageUp, OUTSIDE),
+        KeyBinding::new("g", FirstRow, OUTSIDE),
+        KeyBinding::new("shift-g", LastRow, OUTSIDE),
+        KeyBinding::new("enter", ToggleDetail, OUTSIDE),
+        KeyBinding::new("r", RunActive, OUTSIDE),
+        // The palette and escape work WHEREVER you are, including mid-word in a
+        // filter box — being unable to leave is the one thing a modal must not do.
+        KeyBinding::new("ctrl-p", TogglePalette, None),
+        KeyBinding::new("escape", Escape, None),
+        KeyBinding::new("ctrl-n", PaletteDown, Some("Palette")),
+        KeyBinding::new("ctrl-j", PaletteDown, Some("Palette")),
+        KeyBinding::new("ctrl-k", PaletteUp, Some("Palette")),
+        KeyBinding::new("ctrl-y", PaletteAccept, Some("Palette")),
+    ]);
+}
+
+/// One line in the command palette.
+pub struct PaletteItem {
+    pub label: String,
+    pub hint: String,
+    pub act: PaletteAct,
+}
+
+#[derive(Clone)]
+pub enum PaletteAct {
+    Rail(Rail),
+    View(ResultView),
+    GoTab(u64),
+    Connect(String),
+    Open { conn: String, object: String, schema: Option<String>, kind: String },
+    SavedQuery { conn: String, sql: String, name: String },
+    HistoryItem { conn: String, sql: String },
+    RunActive,
+    ToggleExport,
+    SaveQuery,
+    ToggleConsole,
+    NewConnection,
+}
 
 /// Rows fetched per page.
 const PAGE: usize = 200;
@@ -143,6 +234,24 @@ pub struct Workspace {
     console: Entity<TextInput>,
     console_open: bool,
     history: Vec<HistoryRow>,
+    /// The history panel's own search box.
+    history_filter: Entity<TextInput>,
+
+    /// The command palette, while it is open.
+    palette_open: bool,
+    palette_input: Entity<TextInput>,
+    palette_sel: usize,
+
+    /// Short-lived corner messages. Never the only place an error appears.
+    toasts: Vec<Toast>,
+    next_toast: u64,
+
+    /// A column being dragged wider: (tab, column, where the drag began, the
+    /// width it had then).
+    resizing: Option<(u64, usize, f32, f32)>,
+
+    /// The window's own focus, so the vim keys know whether a field has it.
+    focus: FocusHandle,
     /// The export row, while it is open, and where it would write.
     export_open: bool,
     export_format: Format,
@@ -167,6 +276,8 @@ impl Workspace {
         })
         .detach();
         let export_path = cx.new(|cx| TextInput::new(cx, "result.csv", colors));
+        let history_filter = cx.new(|cx| TextInput::new(cx, "Search history…", colors));
+        let palette_input = cx.new(|cx| TextInput::new(cx, "Type to find a command…", colors));
         let console = cx.new(|cx| {
             TextInput::new(cx, "Type a command and press Enter — it runs against the open connection", colors)
         });
@@ -208,6 +319,14 @@ impl Workspace {
             console,
             console_open: true,
             history: Vec::new(),
+            history_filter,
+            palette_open: false,
+            palette_input,
+            palette_sel: 0,
+            toasts: Vec::new(),
+            next_toast: 1,
+            resizing: None,
+            focus: cx.focus_handle(),
             export_open: false,
             export_format: Format::Csv,
             export_path,
@@ -523,8 +642,11 @@ impl Workspace {
                 }
                 if let Some(t) = self.tasks.iter_mut().find(|t| t.id == task) {
                     let d = t.duration();
-                    t.finish(d, Some(e));
+                    t.finish(d, Some(e.clone()));
                 }
+                // The grid shows the error in full; the toast is so it is seen
+                // when the eye is somewhere else.
+                self.toast(e.lines().next().unwrap_or("failed").to_string(), true);
             }
             Pending::Page { tab } => {
                 if let Some(t) = self.tabs.iter_mut().find(|t| t.id == tab) {
@@ -534,7 +656,7 @@ impl Workspace {
             }
             Pending::Connect { name, .. } => {
                 self.status = format!("could not connect to {name}");
-                self.log.push(("error".into(), format!("{name}: {e}")));
+                self.toast(format!("{name}: {e}"), true);
             }
             // A failed stage is the engine naming the layer that is wrong, so it
             // goes back to the window beside the button that asked.
@@ -744,6 +866,15 @@ impl Workspace {
             .collect();
         self.restore.tabs.retain(|t| t.conn != conn);
         for t in mine {
+            if t.name.is_empty() {
+                // A typed tab. It comes back with its words in the box and
+                // NOTHING run: a statement someone was halfway through writing
+                // is not a statement they asked for, and re-running it on a
+                // restart is how a client deletes a table nobody asked it to.
+                let title = if t.title.is_empty() { "Draft".into() } else { t.title.clone() };
+                self.open_draft(&t.conn, &title, &t.draft, cx);
+                continue;
+            }
             self.open_object(&t.conn, &t.name, t.schema.as_deref(), &t.kind, cx);
             if let (Some(tab), false) = (self.tabs.last_mut(), t.view.is_empty()) {
                 tab.view = match t.view.as_str() {
@@ -758,6 +889,20 @@ impl Workspace {
         }
     }
 
+    /// Open a tab holding a statement, without running it.
+    fn open_draft(&mut self, conn: &str, title: &str, sql: &str, cx: &mut Context<Self>) {
+        let Some(live) = self.live(conn) else { return };
+        let driver = live.driver.clone();
+        let meta = self.meta(&driver).cloned();
+        let id = self.next_tab;
+        self.next_tab += 1;
+        let mut tab = Tab::new(id, conn.to_string(), driver, title.to_string(), meta.as_ref());
+        tab.sql = sql.to_string();
+        self.make_inputs(id, meta.as_ref(), sql, cx);
+        self.tabs.push(tab);
+        self.active = self.tabs.len() - 1;
+    }
+
     /// Remember what is open. Called after anything that changes it; writing a
     /// small file on each change is cheaper than deciding when to.
     fn remember(&self) {
@@ -766,15 +911,17 @@ impl Workspace {
             tabs: self
                 .tabs
                 .iter()
-                .filter_map(|t| {
-                    let (name, schema) = t.object.clone()?;
-                    Some(SessionTab {
+                .map(|t| {
+                    let (name, schema) = t.object.clone().unzip();
+                    SessionTab {
                         conn: t.conn_name.clone(),
-                        name,
-                        schema,
+                        name: name.unwrap_or_default(),
+                        schema: schema.flatten(),
                         kind: t.kind.clone(),
                         view: t.view.label().to_lowercase(),
-                    })
+                        title: t.title.clone(),
+                        draft: t.sql.clone(),
+                    }
                 })
                 .collect(),
             active: self.active,
@@ -981,6 +1128,7 @@ impl Workspace {
             json!({ "conn": conn }),
         );
         self.status = format!("saved query: {name}");
+        self.toast(format!("saved query: {name}"), false);
     }
 
     /// Open a statement in its own tab on a connection — used by the history
@@ -1026,6 +1174,246 @@ impl Workspace {
         crate::workspace::sort_rows(&mut tab.rows, col, ascending);
         tab.sort = Some((col, ascending));
         tab.selected = None;
+    }
+
+    // ── keyboard ────────────────────────────────────────────────────────────
+
+    /// Move the highlighted row, and keep it inside the rows that are loaded.
+    /// `by` of 0 means "go to the end".
+    fn move_row(&mut self, by: isize, cx: &mut Context<Self>) {
+        let Some(tab) = self.tabs.get_mut(self.active) else { return };
+        if tab.rows.is_empty() {
+            return;
+        }
+        let last = tab.rows.len() - 1;
+        let now = tab.selected.unwrap_or(0) as isize;
+        tab.selected = Some(match by {
+            isize::MAX => last,
+            isize::MIN => 0,
+            d => (now + d).clamp(0, last as isize) as usize,
+        });
+        // A detail panel that is open follows the cursor — it is showing "the
+        // row", not "that row".
+        if tab.detail.is_some() {
+            tab.detail = tab.selected;
+        }
+        cx.notify();
+    }
+
+    fn step_tab(&mut self, by: isize, cx: &mut Context<Self>) {
+        if self.tabs.is_empty() {
+            return;
+        }
+        let n = self.tabs.len() as isize;
+        self.active = (((self.active as isize + by) % n + n) % n) as usize;
+        self.remember();
+        cx.notify();
+    }
+
+    // ── toasts ──────────────────────────────────────────────────────────────
+
+    /// Say something briefly in the corner. It goes to the console log too —
+    /// a toast expires, and an error that only ever appeared in one is an error
+    /// nobody can go back and read.
+    fn toast(&mut self, text: impl Into<String>, bad: bool) {
+        let text = text.into();
+        self.log
+            .push((if bad { "error".into() } else { "info".into() }, text.clone()));
+        let id = self.next_toast;
+        self.next_toast += 1;
+        self.toasts.push(Toast { id, text, bad, born: Instant::now() });
+    }
+
+    // ── the palette ─────────────────────────────────────────────────────────
+
+    /// Everything the palette can reach, before filtering.
+    ///
+    /// It is built fresh each time it is drawn, from the state as it is: there
+    /// is no registry to forget to update, so a connection opened a second ago
+    /// is in here, and one that was deleted is not.
+    fn palette_items(&self) -> Vec<PaletteItem> {
+        let mut out = Vec::new();
+        for s in &self.saved {
+            let live = self.live(&s.name).is_some();
+            out.push(PaletteItem {
+                label: format!("{} {}", if live { "Go to" } else { "Connect" }, s.name),
+                hint: s.driver.clone(),
+                act: PaletteAct::Connect(s.name.clone()),
+            });
+        }
+        for c in &self.conns {
+            for q in &c.queries {
+                out.push(PaletteItem {
+                    label: format!("Query: {}", q.name),
+                    hint: c.name.clone(),
+                    act: PaletteAct::SavedQuery {
+                        conn: c.name.clone(),
+                        sql: q.sql.clone(),
+                        name: q.name.clone(),
+                    },
+                });
+            }
+            for n in &c.nodes {
+                Self::palette_nodes(&c.name, n, None, &mut out);
+            }
+        }
+        for h in self.history.iter().take(40) {
+            let one: String = h.statement.replace('\n', " ").chars().take(60).collect();
+            out.push(PaletteItem {
+                label: format!("History: {one}"),
+                hint: h.conn.clone().unwrap_or_default(),
+                act: PaletteAct::HistoryItem {
+                    conn: h.conn.clone().unwrap_or_default(),
+                    sql: h.statement.clone(),
+                },
+            });
+        }
+        for (i, tb) in self.tabs.iter().enumerate() {
+            out.push(PaletteItem {
+                label: format!("Tab: {}", tb.title),
+                hint: format!("{} · {}", tb.conn_name, i + 1),
+                act: PaletteAct::GoTab(tb.id),
+            });
+        }
+        for v in [ResultView::Tree, ResultView::Table, ResultView::Json] {
+            out.push(PaletteItem {
+                label: format!("View as {}", v.label()),
+                hint: "result".into(),
+                act: PaletteAct::View(v),
+            });
+        }
+        for r in [Rail::Connections, Rail::History, Rail::Tasks, Rail::Settings] {
+            out.push(PaletteItem {
+                label: format!("Show {}", r.label()),
+                hint: "panel".into(),
+                act: PaletteAct::Rail(r),
+            });
+        }
+        out.push(PaletteItem { label: "Run this tab".into(), hint: "r".into(), act: PaletteAct::RunActive });
+        out.push(PaletteItem { label: "Export loaded rows".into(), hint: "result".into(), act: PaletteAct::ToggleExport });
+        out.push(PaletteItem { label: "Save this query".into(), hint: "result".into(), act: PaletteAct::SaveQuery });
+        out.push(PaletteItem { label: "Toggle console".into(), hint: "window".into(), act: PaletteAct::ToggleConsole });
+        out.push(PaletteItem { label: "New connection".into(), hint: "window".into(), act: PaletteAct::NewConnection });
+        out
+    }
+
+    fn palette_nodes(conn: &str, node: &Node, schema: Option<&str>, out: &mut Vec<PaletteItem>) {
+        let here = if node.kind == "schema" || node.kind == "database" {
+            Some(node.name.as_str())
+        } else {
+            schema
+        };
+        if !matches!(node.kind.as_str(), "schema" | "database" | "folder" | "group") {
+            out.push(PaletteItem {
+                label: format!("Open {}", node.name),
+                hint: format!("{conn} · {}", node.kind),
+                act: PaletteAct::Open {
+                    conn: conn.to_string(),
+                    object: node.name.clone(),
+                    schema: here.map(|s| s.to_string()),
+                    kind: node.kind.clone(),
+                },
+            });
+        }
+        for c in &node.children {
+            Self::palette_nodes(conn, c, here, out);
+        }
+    }
+
+    /// The items that match what has been typed, best first.
+    fn palette_matches(&self, cx: &gpui::App) -> Vec<(usize, PaletteItem)> {
+        let needle = self.palette_input.read(cx).text().to_string();
+        let mut scored: Vec<(i32, usize, PaletteItem)> = self
+            .palette_items()
+            .into_iter()
+            .enumerate()
+            .filter_map(|(i, it)| {
+                let s = fuzzy_score(&it.label, &needle)
+                    .or_else(|| fuzzy_score(&it.hint, &needle).map(|s| s + 50))?;
+                Some((s, i, it))
+            })
+            .collect();
+        scored.sort_by_key(|(s, i, _)| (*s, *i));
+        scored.into_iter().take(60).map(|(_, i, it)| (i, it)).collect()
+    }
+
+    fn palette_run(&mut self, act: PaletteAct, cx: &mut Context<Self>) {
+        self.palette_open = false;
+        match act {
+            PaletteAct::Rail(r) => {
+                self.rail = r;
+                if r == Rail::History && self.history.is_empty() {
+                    self.ask(Pending::History, "store.history.list", json!({ "limit": 200 }));
+                }
+                self.remember();
+            }
+            PaletteAct::View(v) => {
+                if let Some(tab) = self.tabs.get_mut(self.active) {
+                    tab.view = v;
+                }
+            }
+            PaletteAct::GoTab(id) => {
+                if let Some(i) = self.tabs.iter().position(|t| t.id == id) {
+                    self.active = i;
+                    self.remember();
+                }
+            }
+            PaletteAct::Connect(name) => {
+                if let Some(i) = self.tabs.iter().position(|t| t.conn_name == name) {
+                    self.active = i;
+                } else {
+                    self.connect(&name);
+                }
+            }
+            PaletteAct::Open { conn, object, schema, kind } => {
+                self.open_object(&conn, &object, schema.as_deref(), &kind, cx)
+            }
+            PaletteAct::SavedQuery { conn, sql, name } => self.open_sql(&conn, &name, &sql, cx),
+            PaletteAct::HistoryItem { conn, sql } => {
+                let title: String = sql.chars().take(40).collect();
+                self.open_sql(&conn, &title, &sql, cx);
+            }
+            PaletteAct::RunActive => {
+                if let Some(id) = self.tabs.get(self.active).map(|t| t.id) {
+                    self.run_tab(id);
+                }
+            }
+            PaletteAct::ToggleExport => self.export_open = !self.export_open,
+            PaletteAct::SaveQuery => self.save_query(cx),
+            PaletteAct::ToggleConsole => self.console_open = !self.console_open,
+            PaletteAct::NewConnection => self.open_form(None, cx),
+        }
+    }
+
+    // ── the clipboard ───────────────────────────────────────────────────────
+
+    /// Put the selected row on the clipboard as a statement. See
+    /// `copy_as_select` for why generating SQL is allowed HERE and nowhere else.
+    fn copy_row(&mut self, as_insert: bool, cx: &mut Context<Self>) {
+        let Some(tab) = self.tabs.get(self.active) else { return };
+        let Some(i) = tab.selected.or(tab.detail) else {
+            self.toast("pick a row first", true);
+            return;
+        };
+        let Some(row) = tab.rows.get(i) else { return };
+        let table = tab
+            .object
+            .as_ref()
+            .map(|(name, schema)| match schema {
+                Some(s) => format!("{s}.{name}"),
+                None => name.clone(),
+            })
+            .unwrap_or_else(|| tab.title.clone());
+        let sql = if as_insert {
+            copy_as_insert(&table, &tab.columns, row)
+        } else {
+            copy_as_select(&table, &tab.columns, row)
+        };
+        cx.write_to_clipboard(ClipboardItem::new_string(sql));
+        self.toast(
+            if as_insert { "row copied as INSERT" } else { "row copied as SELECT" },
+            false,
+        );
     }
 
     fn cancel_active(&mut self) {
@@ -1142,13 +1530,35 @@ impl Workspace {
                             cx.notify();
                         })),
                 );
-                panel = panel.child(self.section(&format!("History ({})", self.history.len())));
-                if self.history.is_empty() {
-                    panel = panel.child(
-                        div().px_2().child(self.small("nothing yet — press reload", t.muted())),
-                    );
+                panel = panel.child(div().px_2().py_1().child(self.history_filter.clone()));
+                let needle = self.history_filter.read(cx).text().to_string();
+                let shown: Vec<&HistoryRow> = self
+                    .history
+                    .iter()
+                    .filter(|h| {
+                        needle.is_empty()
+                            || fuzzy_score(&h.statement, &needle).is_some()
+                            || h.conn
+                                .as_deref()
+                                .map_or(false, |c| fuzzy_score(c, &needle).is_some())
+                    })
+                    .collect();
+                panel = panel.child(self.section(&if needle.is_empty() {
+                    format!("History ({})", self.history.len())
+                } else {
+                    format!("History ({} of {})", shown.len(), self.history.len())
+                }));
+                if shown.is_empty() {
+                    panel = panel.child(div().px_2().child(self.small(
+                        if self.history.is_empty() {
+                            "nothing yet — press reload"
+                        } else {
+                            "nothing matches"
+                        },
+                        t.muted(),
+                    )));
                 }
-                for h in self.history.iter().take(100) {
+                for h in shown.into_iter().take(100) {
                     let failed = h.state.as_deref() == Some("failed");
                     let conn = h.conn.clone().unwrap_or_default();
                     let stmt = h.statement.clone();
@@ -1600,7 +2010,7 @@ impl Workspace {
                 .px_2()
                 .cursor_pointer()
                 .text_size(px(11.0))
-                .text_color(t.muted())
+                .text_color(t.accent())
                 .child("Save query")
                 .on_click(cx.listener(|this, _, _, cx| {
                     this.save_query(cx);
@@ -1614,7 +2024,10 @@ impl Workspace {
                 .px_2()
                 .cursor_pointer()
                 .text_size(px(11.0))
-                .text_color(if has_rows { t.muted() } else { t.border() })
+                // A control nobody can use still has to be READABLE — greyed
+                // out to the border colour, it simply vanished, and a button
+                // that is invisible is not disabled, it is missing.
+                .text_color(if has_rows { t.accent() } else { t.muted() })
                 .child("Export")
                 .on_click(cx.listener(|this, _, _, cx| {
                     this.export_open = !this.export_open;
@@ -1647,12 +2060,151 @@ impl Workspace {
             return body.into_any_element();
         }
 
-        body = body.child(match tab.view {
+        let view = match tab.view {
             ResultView::Table => self.table_el(tab, cx),
             ResultView::Tree => self.tree_el(tab, cx),
             ResultView::Json => self.json_el(tab),
+        };
+        // The detail panel sits BESIDE the grid, not over it: the row it is
+        // showing stays visible in its place among the others, which is half of
+        // what you are looking at when you open one.
+        body = body.child(match self.detail_el(tab, cx) {
+            Some(detail) => div()
+                .flex()
+                .flex_1()
+                .overflow_hidden()
+                .child(div().flex_1().overflow_hidden().child(view))
+                .child(detail)
+                .into_any_element(),
+            None => view,
         });
         body.into_any_element()
+    }
+
+    /// One row, read downward — the only way to read a row with forty columns
+    /// in it, and the place the clipboard buttons belong.
+    fn detail_el(&self, tab: &Tab, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
+        let i = tab.detail?;
+        let row = tab.rows.get(i)?;
+        let t = self.t();
+
+        let mut panel = div()
+            .flex()
+            .flex_col()
+            .w(px(380.0))
+            .h_full()
+            .bg(t.panel())
+            .border_l_1()
+            .border_color(t.border())
+            .overflow_hidden();
+
+        panel = panel.child(
+            div()
+                .flex()
+                .items_center()
+                .justify_between()
+                .px_3()
+                .py_1()
+                .bg(t.header_bg())
+                .child(
+                    div()
+                        .text_size(px(11.0))
+                        .text_color(t.header_fg())
+                        .child(SharedString::from(format!("Row {}", tab.from + i + 1))),
+                )
+                .child(
+                    div()
+                        .id("detail-close")
+                        .px_1()
+                        .cursor_pointer()
+                        .text_size(px(11.0))
+                        .text_color(t.muted())
+                        .child("\u{f00d}")
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            if let Some(tb) = this.tabs.get_mut(this.active) {
+                                tb.detail = None;
+                            }
+                            cx.notify();
+                        })),
+                ),
+        );
+
+        let mut fields = div().flex().flex_col().flex_1().overflow_hidden().py_1();
+        for (ci, c) in tab.columns.iter().enumerate() {
+            let v = row.get(ci).unwrap_or(&serde_json::Value::Null);
+            let null = v.is_null();
+            fields = fields.child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .px_3()
+                    .py(px(2.0))
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .child(self.small(c.name.clone(), t.header_fg()))
+                            .child(self.small(
+                                crate::workspace::type_badge(v, Some(&c.type_name)),
+                                t.muted(),
+                            )),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(12.0))
+                            .text_color(if null { t.muted() } else { t.fg() })
+                            .child(SharedString::from(
+                                cell_text(v).unwrap_or_else(|| "NULL".to_string()),
+                            )),
+                    ),
+            );
+        }
+        panel = panel.child(fields);
+
+        // Copy as Query. See `copy_as_select` for why the client is allowed to
+        // write SQL here: this goes to a person, not to a database.
+        let sql = self.meta(&tab.driver).map_or(false, |m| m.caps.sql);
+        let mut foot = div()
+            .flex()
+            .items_center()
+            .gap_2()
+            .px_3()
+            .py_1()
+            .border_t_1()
+            .border_color(t.border());
+        if sql {
+            foot = foot
+                .child(
+                    div()
+                        .id("copy-select")
+                        .px_2()
+                        .cursor_pointer()
+                        .text_size(px(11.0))
+                        .text_color(t.accent())
+                        .child("Copy as SELECT")
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.copy_row(false, cx);
+                            cx.notify();
+                        })),
+                )
+                .child(
+                    div()
+                        .id("copy-insert")
+                        .px_2()
+                        .cursor_pointer()
+                        .text_size(px(11.0))
+                        .text_color(t.accent())
+                        .child("Copy as INSERT")
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.copy_row(true, cx);
+                            cx.notify();
+                        })),
+                );
+        } else {
+            foot = foot.child(self.small("this driver does not speak SQL", t.muted()));
+        }
+        Some(panel.child(foot).into_any_element())
     }
 
     /// The query bar: the driver's declared fields, or one statement box.
@@ -1863,6 +2415,25 @@ impl Workspace {
                         cx.notify();
                     })),
             );
+            // The handle between this column and the next. It is its own strip
+            // so that dragging never sorts: a click that moved is not a click.
+            let start_w = tab.widths.get(&ci).copied().unwrap_or(COL_W);
+            header = header.child(
+                div()
+                    .id(SharedString::from(format!("grip-{tab_id}-{ci}")))
+                    .w(px(3.0))
+                    .h_full()
+                    .bg(t.border())
+                    .cursor_col_resize()
+                    .hover(|d| d.bg(t.accent()))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, ev: &gpui::MouseDownEvent, _, cx| {
+                            this.resizing = Some((tab_id, ci, f32::from(ev.position.x), start_w));
+                            cx.notify();
+                        }),
+                    ),
+            );
         }
 
         let rows: Vec<Vec<Value>> = tab.rows.clone();
@@ -1898,14 +2469,16 @@ impl Workspace {
                             None => ("NULL".to_string(), null_fg),
                             Some(s) => (s.replace('\n', "⏎"), fg),
                         };
-                        line = line.child(
-                            div()
-                                .w(px(widths.get(ci).copied().unwrap_or(COL_W)))
-                                .px(px(6.0))
-                                .text_size(px(12.0))
-                                .text_color(colour)
-                                .child(SharedString::from(text)),
-                        );
+                        line = line
+                            .child(
+                                div()
+                                    .w(px(widths.get(ci).copied().unwrap_or(COL_W)))
+                                    .px(px(6.0))
+                                    .text_size(px(12.0))
+                                    .text_color(colour)
+                                    .child(SharedString::from(text)),
+                            )
+                            .child(div().w(px(3.0)));
                     }
                     out.push(line);
                 }
@@ -2289,10 +2862,209 @@ fn driver_glyph(driver: &str) -> &'static str {
     }
 }
 
+impl Workspace {
+    /// The corner messages. They stack upward from the bottom right, newest
+    /// nearest the corner, and they do not take clicks: nothing is hidden
+    /// behind one for longer than it lasts.
+    fn toasts_el(&self) -> Option<gpui::AnyElement> {
+        if self.toasts.is_empty() {
+            return None;
+        }
+        let t = self.t();
+        let mut stack = div().absolute().right(px(16.0)).bottom(px(16.0)).flex().flex_col().gap_1();
+        for x in self.toasts.iter().rev().take(5) {
+            stack = stack.child(
+                div()
+                    .px_3()
+                    .py_1()
+                    .bg(t.panel())
+                    .border_l_2()
+                    .border_color(if x.bad { t.error() } else { t.accent() })
+                    .text_size(px(12.0))
+                    .text_color(if x.bad { t.error() } else { t.fg() })
+                    .child(SharedString::from(x.text.clone())),
+            );
+        }
+        Some(stack.into_any_element())
+    }
+
+    /// The command palette: one box, and everything this window can do ranked
+    /// against what has been typed. ctrl-p opens it, escape leaves it,
+    /// ctrl-n/ctrl-k move, enter or ctrl-y takes the one highlighted.
+    fn palette_el(&self, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
+        if !self.palette_open {
+            return None;
+        }
+        let t = self.t();
+        let matches = self.palette_matches(cx);
+        let sel = self.palette_sel.min(matches.len().saturating_sub(1));
+
+        let mut list = div().flex().flex_col().max_h(px(420.0)).overflow_hidden();
+        if matches.is_empty() {
+            list = list.child(div().px_3().py_1().child(self.small("nothing matches", t.muted())));
+        }
+        for (n, (idx, it)) in matches.iter().enumerate().take(14) {
+            let on = n == sel;
+            let act = it.act.clone();
+            list = list.child(
+                div()
+                    .id(SharedString::from(format!("pal-{idx}")))
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .px_3()
+                    .py(px(3.0))
+                    .cursor_pointer()
+                    .when(on, |d| d.bg(t.selected()).border_l_2().border_color(t.accent()))
+                    .when(!on, |d| d.border_l_2().border_color(t.panel()))
+                    .hover(|d| d.bg(t.hover()))
+                    .child(
+                        div()
+                            .text_size(px(12.0))
+                            .text_color(t.fg())
+                            .child(SharedString::from(it.label.clone())),
+                    )
+                    .child(self.small(it.hint.clone(), t.muted()))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.palette_run(act.clone(), cx);
+                        cx.notify();
+                    })),
+            );
+        }
+
+        Some(
+            div()
+                .absolute()
+                .top(px(60.0))
+                .left_0()
+                .right_0()
+                .flex()
+                .justify_center()
+                .child(
+                    div()
+                        .key_context("Palette")
+                        .w(px(680.0))
+                        .bg(t.panel())
+                        .border_1()
+                        .border_color(t.accent())
+                        .flex()
+                        .flex_col()
+                        .child(div().px_2().py_1().child(self.palette_input.clone()))
+                        .child(div().h(px(1.0)).w_full().bg(t.border()))
+                        .child(list)
+                        .child(
+                            div().px_3().py(px(2.0)).child(self.small(
+                                format!(
+                                    "{} of {} \u{2014} ctrl-n / ctrl-k move, ctrl-y takes, esc leaves",
+                                    matches.len().min(14),
+                                    matches.len()
+                                ),
+                                t.muted(),
+                            )),
+                        ),
+                )
+                .into_any_element(),
+        )
+    }
+}
+
 impl Render for Workspace {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // Toasts expire on the next frame they are late for; the pump redraws
+        // often enough that nothing sits there after its time.
+        let now = Instant::now();
+        self.toasts.retain(|x| !x.expired(now));
+
         let t = self.t();
         let root = div()
+            .key_context("Workspace")
+            .track_focus(&self.focus)
+            .on_action(cx.listener(|this, _: &NextRow, _, cx| this.move_row(1, cx)))
+            .on_action(cx.listener(|this, _: &PrevRow, _, cx| this.move_row(-1, cx)))
+            .on_action(cx.listener(|this, _: &PageDown, _, cx| this.move_row(20, cx)))
+            .on_action(cx.listener(|this, _: &PageUp, _, cx| this.move_row(-20, cx)))
+            .on_action(cx.listener(|this, _: &FirstRow, _, cx| this.move_row(isize::MIN, cx)))
+            .on_action(cx.listener(|this, _: &LastRow, _, cx| this.move_row(isize::MAX, cx)))
+            .on_action(cx.listener(|this, _: &NextTab, _, cx| this.step_tab(1, cx)))
+            .on_action(cx.listener(|this, _: &PrevTab, _, cx| this.step_tab(-1, cx)))
+            .on_action(cx.listener(|this, _: &RunActive, _, cx| {
+                if let Some(id) = this.tabs.get(this.active).map(|x| x.id) {
+                    this.sync_tab_from_inputs(id, cx);
+                    this.run_tab(id);
+                    cx.notify();
+                }
+            }))
+            .on_action(cx.listener(|this, _: &ToggleDetail, _, cx| {
+                if let Some(tab) = this.tabs.get_mut(this.active) {
+                    tab.detail = match tab.detail {
+                        Some(_) => None,
+                        None => tab.selected.or(Some(0)),
+                    };
+                }
+                cx.notify();
+            }))
+            .on_action(cx.listener(|this, _: &TogglePalette, window, cx| {
+                this.palette_open = !this.palette_open;
+                this.palette_sel = 0;
+                if this.palette_open {
+                    this.palette_input.update(cx, |i, cx| i.set_text(String::new(), cx));
+                    let h = this.palette_input.read(cx).focus_handle.clone();
+                    window.focus(&h);
+                }
+                cx.notify();
+            }))
+            .on_action(cx.listener(|this, _: &Escape, window, cx| {
+                // Escape leaves whatever is in front, innermost first.
+                if this.palette_open {
+                    this.palette_open = false;
+                } else if this.export_open {
+                    this.export_open = false;
+                } else if this.tabs.get(this.active).map_or(false, |x| x.detail.is_some()) {
+                    if let Some(tab) = this.tabs.get_mut(this.active) {
+                        tab.detail = None;
+                    }
+                } else {
+                    // Nothing in front: take focus back from the text field, so
+                    // the keys work again.
+                    window.focus(&this.focus);
+                }
+                cx.notify();
+            }))
+            .on_action(cx.listener(|this, _: &PaletteDown, _, cx| {
+                this.palette_sel = this.palette_sel.saturating_add(1);
+                cx.notify();
+            }))
+            .on_action(cx.listener(|this, _: &PaletteUp, _, cx| {
+                this.palette_sel = this.palette_sel.saturating_sub(1);
+                cx.notify();
+            }))
+            .on_action(cx.listener(|this, _: &PaletteAccept, _, cx| {
+                let pick = this.palette_matches(cx).into_iter().nth(this.palette_sel);
+                if let Some((_, it)) = pick {
+                    this.palette_run(it.act, cx);
+                }
+                cx.notify();
+            }))
+            // A column being dragged is tracked at the root, because the mouse
+            // leaves the narrow handle long before the drag is over.
+            .on_mouse_move(cx.listener(|this, ev: &MouseMoveEvent, _, cx| {
+                if let Some((tab_id, col, from, was)) = this.resizing {
+                    let w = (was + (f32::from(ev.position.x) - from)).clamp(40.0, 900.0);
+                    if let Some(tab) = this.tabs.iter_mut().find(|x| x.id == tab_id) {
+                        tab.widths.insert(col, w);
+                    }
+                    cx.notify();
+                }
+            }))
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener(|this, _: &MouseUpEvent, _, cx| {
+                    if this.resizing.take().is_some() {
+                        this.remember();
+                        cx.notify();
+                    }
+                }),
+            )
             .flex()
             .flex_col()
             .size_full()
@@ -2340,5 +3112,7 @@ impl Render for Workspace {
         .child(self.console_el(cx))
         .child(self.tasks_el(cx))
         .child(self.status_el())
+        .children(self.toasts_el())
+        .children(self.palette_el(cx))
     }
 }

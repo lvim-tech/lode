@@ -136,6 +136,115 @@ pub struct Tab {
     pub widths: HashMap<usize, f32>,
     /// Which column the loaded page is sorted by, and which way.
     pub sort: Option<(usize, bool)>,
+    /// A row opened in the detail panel beside the grid.
+    pub detail: Option<usize>,
+}
+
+/// A short-lived message in the corner.
+///
+/// Toasts exist so that something which worked can say so without taking the
+/// status line hostage, and so a failure is seen even when the eye is on the
+/// grid. What a toast must NEVER be is the only place an error appears: every
+/// one of these is also in the console log, which does not expire.
+pub struct Toast {
+    pub id: u64,
+    pub text: String,
+    pub bad: bool,
+    pub born: Instant,
+}
+
+impl Toast {
+    /// Three seconds for good news, eight for bad — long enough to read twice.
+    pub fn expired(&self, now: Instant) -> bool {
+        now.duration_since(self.born) > Duration::from_secs(if self.bad { 8 } else { 3 })
+    }
+}
+
+/// Score `text` against a typed `needle`, letters in order but not adjacent.
+///
+/// `None` means it does not match at all. A lower score is a better match: a
+/// run of letters together beats the same letters scattered, and a match at the
+/// start of a word beats one in the middle, which is what makes "sq" find
+/// "sqlite" before "mysql: select".
+pub fn fuzzy_score(text: &str, needle: &str) -> Option<i32> {
+    if needle.is_empty() {
+        return Some(0);
+    }
+    let hay: Vec<char> = text.to_lowercase().chars().collect();
+    let pat: Vec<char> = needle.to_lowercase().chars().collect();
+    let (mut hi, mut score, mut last) = (0usize, 0i32, None::<usize>);
+    for p in &pat {
+        let found = hay[hi..].iter().position(|c| c == p)? + hi;
+        score += match last {
+            // Adjacent: free. A gap costs what it skips.
+            Some(l) if found == l + 1 => 0,
+            Some(l) => (found - l) as i32,
+            // The first letter costs its distance from a word boundary.
+            None => {
+                let boundary = found == 0
+                    || matches!(hay[found - 1], ' ' | '.' | '_' | '-' | '/' | ':');
+                if boundary {
+                    0
+                } else {
+                    found as i32 + 2
+                }
+            }
+        };
+        last = Some(found);
+        hi = found + 1;
+    }
+    Some(score)
+}
+
+/// Render a row as a statement a PERSON can read, for the clipboard.
+///
+/// This generates SQL, which the client otherwise refuses to do — the
+/// difference is where it goes. A statement the client would RUN has to be
+/// right in the driver's dialect, and getting that wrong runs the wrong thing.
+/// This one goes to the clipboard, where a human reads it, fixes the quoting
+/// their database wants and runs it themselves. It is offered only by drivers
+/// that said they speak SQL.
+///
+/// Literals are ANSI: a quote doubles, a NULL becomes `IS NULL` rather than
+/// `= NULL`, which matches nothing in every dialect that has ever shipped.
+pub fn copy_as_select(table: &str, columns: &[Column], row: &[Value]) -> String {
+    let mut parts = Vec::new();
+    for (i, c) in columns.iter().enumerate() {
+        let v = row.get(i).unwrap_or(&Value::Null);
+        parts.push(match v {
+            Value::Null => format!("{} IS NULL", c.name),
+            _ => format!("{} = {}", c.name, sql_literal(v)),
+        });
+    }
+    if parts.is_empty() {
+        return format!("SELECT * FROM {table};");
+    }
+    format!("SELECT * FROM {table}\n WHERE {};", parts.join("\n   AND "))
+}
+
+/// The same row as an INSERT — for copying it into another table or another
+/// database. NULL is spelled out, because an omitted column takes a default and
+/// that is a different row.
+pub fn copy_as_insert(table: &str, columns: &[Column], row: &[Value]) -> String {
+    let names: Vec<&str> = columns.iter().map(|c| c.name.as_str()).collect();
+    let vals: Vec<String> = (0..columns.len())
+        .map(|i| sql_literal(row.get(i).unwrap_or(&Value::Null)))
+        .collect();
+    format!(
+        "INSERT INTO {table} ({})\nVALUES ({});",
+        names.join(", "),
+        vals.join(", ")
+    )
+}
+
+fn sql_literal(v: &Value) -> String {
+    match v {
+        Value::Null => "NULL".into(),
+        Value::Bool(b) => b.to_string(),
+        Value::Number(n) => n.to_string(),
+        Value::String(s) => format!("'{}'", s.replace('\'', "''")),
+        other => format!("'{}'", other.to_string().replace('\'', "''")),
+    }
 }
 
 /// Order the loaded rows by one column.
@@ -219,6 +328,7 @@ impl Tab {
             expanded: Default::default(),
             widths: HashMap::new(),
             sort: None,
+            detail: None,
         }
     }
 
@@ -235,6 +345,7 @@ impl Tab {
         self.expanded.clear();
         // A new result is not the old one re-ordered: its columns may differ.
         self.sort = None;
+        self.detail = None;
     }
 
     /// The statement this tab would run: assembled from the engine's own
@@ -519,6 +630,59 @@ mod tests {
 
     /// Numbers compare as numbers and NULL goes last, both ways — a NULL is not
     /// a small value and sorting it to the top would say it was.
+    #[test]
+    fn letters_in_order_find_a_thing_and_a_tighter_run_wins() {
+        assert!(fuzzy_score("Export as CSV", "ecsv").is_some());
+        assert!(fuzzy_score("Export as CSV", "zz").is_none());
+        // Everything matches the empty needle, so an empty palette shows all.
+        assert_eq!(fuzzy_score("anything", ""), Some(0));
+
+        let tight = fuzzy_score("sqlite", "sql").unwrap();
+        let loose = fuzzy_score("set query limit", "sql").unwrap();
+        assert!(tight < loose, "a run together beats letters scattered: {tight} vs {loose}");
+    }
+
+    /// A match at the start of a WORD beats one buried mid-token — which is why
+    /// typing "qu" finds "Saved queries" rather than "Unique index".
+    #[test]
+    fn a_word_boundary_beats_the_middle_of_a_word() {
+        let boundary = fuzzy_score("saved queries", "qu").unwrap();
+        let middle = fuzzy_score("unique", "qu").unwrap();
+        assert!(boundary < middle, "{boundary} vs {middle}");
+    }
+
+    /// NULL has to become `IS NULL`: `= NULL` matches nothing, in every dialect
+    /// that has ever shipped, so a copied row would silently select none.
+    #[test]
+    fn a_copied_row_says_is_null_and_doubles_a_quote() {
+        let cols = vec![col("id"), col("name"), col("note")];
+        let row = vec![json!(7), json!("O'Hara"), Value::Null];
+        let sel = copy_as_select("main.people", &cols, &row);
+        assert!(sel.contains("id = 7"), "{sel}");
+        assert!(sel.contains("name = \'O\'\'Hara\'"), "{sel}");
+        assert!(sel.contains("note IS NULL"), "{sel}");
+        assert!(!sel.contains("= NULL"), "a NULL compared with = matches nothing: {sel}");
+
+        let ins = copy_as_insert("main.people", &cols, &row);
+        assert!(ins.contains("(id, name, note)"), "{ins}");
+        assert!(ins.contains("NULL)"), "an omitted column takes a default, which is a different row: {ins}");
+    }
+
+    /// Bad news stays up long enough to read; good news gets out of the way.
+    #[test]
+    fn a_failure_outlives_a_success() {
+        let now = Instant::now();
+        let born = now - Duration::from_secs(5);
+        let good = Toast { id: 1, text: "saved".into(), bad: false, born };
+        let bad = Toast { id: 2, text: "refused".into(), bad: true, born };
+        assert!(good.expired(now));
+        assert!(!bad.expired(now));
+    }
+
+    fn col(name: &str) -> Column {
+        Column { name: name.into(), type_name: String::new() }
+    }
+
     #[test]
     fn a_column_sorts_by_what_the_values_are() {
         let mut rows = vec![

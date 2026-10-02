@@ -93,7 +93,7 @@ pub struct InputColors {
 }
 
 pub struct TextInput {
-    focus_handle: FocusHandle,
+    pub focus_handle: FocusHandle,
     content: SharedString,
     placeholder: SharedString,
     selected_range: Range<usize>,
