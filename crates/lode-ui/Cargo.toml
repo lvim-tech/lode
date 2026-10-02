@@ -31,3 +31,7 @@ toml = "0.8"
 #     a custom Element that lays out and paints the text and the cursor, and an
 #     action per key. Anything typed into this client has to be built on that.
 gpui = "0.2.2"
+# Grapheme boundaries for the text field: one press of Left must step over a
+# whole character. gpui's own input example depends on this for the same reason.
+unicode-segmentation = "1"
+

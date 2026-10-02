@@ -16,6 +16,7 @@
 //! where there is nothing else to do yet.
 
 mod app;
+mod input;
 mod session;
 mod theme;
 mod workspace;
@@ -24,6 +25,8 @@ use gpui::{px, size, AppContext as _, Application, Bounds, WindowBounds, WindowO
 
 fn main() {
     Application::new().run(|cx: &mut gpui::App| {
+        // The field needs its keys before any window exists.
+        input::bind_keys(cx);
         let bounds = Bounds::centered(None, size(px(1280.0), px(820.0)), cx);
         cx.open_window(
             WindowOptions {

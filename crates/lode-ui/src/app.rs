@@ -14,11 +14,12 @@ use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
 use gpui::{
-    div, prelude::*, px, uniform_list, Context, MouseButton, Rgba, SharedString, Window,
+    div, prelude::*, px, uniform_list, Context, Entity, MouseButton, Rgba, SharedString, Window,
 };
 use lode_proto::{cell_text, DriverMeta, Engine, Hello, Message, Node, QueryState, SavedConnection};
 use serde_json::{json, Value};
 
+use crate::input::{InputColors, InputEvent, TextInput};
 use crate::session::{self, Session, SessionTab};
 use crate::theme::{self, Theme};
 use crate::workspace::{
@@ -103,11 +104,25 @@ pub struct Workspace {
     /// only be reopened once its connection has a schema again, which is several
     /// round trips after start.
     restore: Session,
+
+    /// The sidebar's filter box.
+    filter: Entity<TextInput>,
+    /// Every field of every tab's query bar, keyed by (tab, field). The empty
+    /// key is the statement box a typed driver gets instead of a form.
+    inputs: HashMap<(u64, String), Entity<TextInput>>,
 }
 
 impl Workspace {
     pub fn new(cx: &mut Context<Self>) -> Self {
         let (theme_name, theme) = theme::pick();
+        let colors = input_colors(&theme);
+        let filter = cx.new(|cx| TextInput::new(cx, "Filter connections and schema…", colors));
+        cx.subscribe(&filter, |_this, _input, _ev: &InputEvent, cx| {
+            // Typed into the filter: the panel is rebuilt from it each frame,
+            // so there is nothing to do but ask for that frame.
+            cx.notify();
+        })
+        .detach();
         let mut w = Workspace {
             theme,
             theme_name,
@@ -131,6 +146,8 @@ impl Workspace {
             status: "starting the engine…".into(),
             log: Vec::new(),
             restore: session::load(),
+            filter,
+            inputs: HashMap::new(),
         };
 
         match Engine::spawn(None) {
@@ -208,7 +225,7 @@ impl Workspace {
                 Message::Response { id, result } => {
                     let Some(what) = self.pending.remove(&id) else { continue };
                     match result {
-                        Ok(v) => self.on_result(what, v),
+                        Ok(v) => self.on_result(what, v, cx),
                         Err(e) => self.on_error(what, e),
                     }
                 }
@@ -274,7 +291,7 @@ impl Workspace {
         }
     }
 
-    fn on_result(&mut self, what: Pending, v: Value) {
+    fn on_result(&mut self, what: Pending, v: Value, cx: &mut Context<Self>) {
         match what {
             Pending::StoreStatus => {
                 self.store_ok = v.get("available").and_then(Value::as_bool).unwrap_or(false);
@@ -328,7 +345,7 @@ impl Workspace {
                 if let Some(c) = self.conns.iter_mut().find(|c| c.name == name) {
                     c.nodes = nodes;
                 }
-                self.reopen_tabs_for(&name);
+                self.reopen_tabs_for(&name, cx);
             }
             Pending::Execute { tab, task } => {
                 let call_id = v.get("call_id").and_then(Value::as_u64).unwrap_or(0);
@@ -413,7 +430,14 @@ impl Workspace {
     /// Open a tab on an object and RUN it. This is the whole point of the
     /// client: the rows appear on a click, with no statement typed and none
     /// invented here — `browse_for` is the driver's own template.
-    fn open_object(&mut self, conn_name: &str, name: &str, schema: Option<&str>, kind: &str) {
+    fn open_object(
+        &mut self,
+        conn_name: &str,
+        name: &str,
+        schema: Option<&str>,
+        kind: &str,
+        cx: &mut Context<Self>,
+    ) {
         let Some(live) = self.live(conn_name) else { return };
         let driver = live.driver.clone();
         let meta = self.meta(&driver).cloned();
@@ -440,10 +464,88 @@ impl Workspace {
         // The browse template wins over the structured form for the first run:
         // a click asks to SEE the object, and the form is for narrowing it.
         tab.sql = lode_proto::render_template(&template, name, schema, PAGE, &[]);
+        let statement = tab.sql.clone();
         self.tabs.push(tab);
         self.active = self.tabs.len() - 1;
+        self.make_inputs(id, meta.as_ref(), &statement, cx);
         self.run_tab(id);
         self.remember();
+    }
+
+    /// Build the query bar for a tab: the driver's declared fields where it has
+    /// them, a statement box where it does not. Created once per tab, because an
+    /// entity made during a render would be made again every frame.
+    fn make_inputs(
+        &mut self,
+        tab_id: u64,
+        meta: Option<&DriverMeta>,
+        statement: &str,
+        cx: &mut Context<Self>,
+    ) {
+        let colors = input_colors(&self.theme);
+        let structured = meta.map(|m| m.is_structured()).unwrap_or(false);
+        if structured {
+            for f in &meta.unwrap().query_form {
+                let (ph, default) = (f.placeholder.clone(), f.default.clone());
+                let input = cx.new(|cx| {
+                    let mut i = TextInput::new(cx, ph, colors);
+                    i.set_text(default, cx);
+                    i
+                });
+                self.subscribe_run(&input, tab_id, cx);
+                self.inputs.insert((tab_id, f.key.clone()), input);
+            }
+        } else {
+            let hint = meta.map(|m| m.hint.clone()).unwrap_or_default();
+            let text = statement.to_string();
+            let input = cx.new(|cx| {
+                let mut i = TextInput::new(cx, hint, colors);
+                i.set_text(text, cx);
+                i
+            });
+            self.subscribe_run(&input, tab_id, cx);
+            self.inputs.insert((tab_id, String::new()), input);
+        }
+    }
+
+    /// Enter in any field of a tab's bar runs that tab.
+    fn subscribe_run(&self, input: &Entity<TextInput>, tab_id: u64, cx: &mut Context<Self>) {
+        cx.subscribe(input, move |this, _input, ev: &InputEvent, cx| {
+            if matches!(ev, InputEvent::Submit) {
+                this.sync_tab_from_inputs(tab_id, cx);
+                this.run_tab(tab_id);
+            }
+            cx.notify();
+        })
+        .detach();
+    }
+
+    /// Copy what was typed into the tab, then rebuild its statement. For a
+    /// structured driver the statement is assembled from the engine's own
+    /// template; for a typed one it IS what was typed.
+    fn sync_tab_from_inputs(&mut self, tab_id: u64, cx: &mut Context<Self>) {
+        let Some(idx) = self.tabs.iter().position(|t| t.id == tab_id) else { return };
+        let driver = self.tabs[idx].driver.clone();
+        let meta = self.meta(&driver).cloned();
+        let structured = meta.as_ref().map(|m| m.is_structured()).unwrap_or(false);
+        if structured {
+            let keys: Vec<String> = meta
+                .as_ref()
+                .unwrap()
+                .query_form
+                .iter()
+                .map(|f| f.key.clone())
+                .collect();
+            for k in keys {
+                if let Some(i) = self.inputs.get(&(tab_id, k.clone())) {
+                    let v = i.read(cx).text().to_string();
+                    self.tabs[idx].fields.insert(k, v);
+                }
+            }
+            self.tabs[idx].sql = self.tabs[idx].statement(meta.as_ref(), PAGE);
+        } else if let Some(i) = self.inputs.get(&(tab_id, String::new())) {
+            self.tabs[idx].sql = i.read(cx).text().to_string();
+        }
     }
 
     fn run_tab(&mut self, tab_id: u64) {
@@ -481,7 +583,7 @@ impl Workspace {
     /// Reopen the remembered tabs that belong to a connection that has just
     /// come back. Taken from `restore` as they are opened, so a reconnect later
     /// in the session does not open them a second time.
-    fn reopen_tabs_for(&mut self, conn: &str) {
+    fn reopen_tabs_for(&mut self, conn: &str, cx: &mut Context<Self>) {
         let mine: Vec<SessionTab> = self
             .restore
             .tabs
@@ -491,7 +593,7 @@ impl Workspace {
             .collect();
         self.restore.tabs.retain(|t| t.conn != conn);
         for t in mine {
-            self.open_object(&t.conn, &t.name, t.schema.as_deref(), &t.kind);
+            self.open_object(&t.conn, &t.name, t.schema.as_deref(), &t.kind, cx);
             if let (Some(tab), false) = (self.tabs.last_mut(), t.view.is_empty()) {
                 tab.view = match t.view.as_str() {
                     "tree" => ResultView::Tree,
@@ -536,11 +638,36 @@ impl Workspace {
                 self.ask(Pending::Ignore("release"), "query.release", json!({ "call_id": call }));
             }
             self.tabs.remove(pos);
+            self.inputs.retain(|(t, _), _| *t != id);
             if self.active >= self.tabs.len() {
                 self.active = self.tabs.len().saturating_sub(1);
             }
             self.remember();
         }
+    }
+
+    /// Move the active tab's window by `pages`. The engine buffers the result,
+    /// so paging backwards costs nothing and re-runs nothing.
+    fn page_by(&mut self, pages: i64) {
+        let Some(tab) = self.tabs.get(self.active) else { return };
+        let Some(call_id) = tab.call_id else { return };
+        if tab.state != RunState::Done {
+            return;
+        }
+        let from = if pages >= 0 {
+            if !tab.has_more {
+                return;
+            }
+            tab.from + PAGE * pages as usize
+        } else {
+            tab.from.saturating_sub(PAGE * (-pages) as usize)
+        };
+        let tab_id = tab.id;
+        self.ask(
+            Pending::Page { tab: tab_id },
+            "query.page",
+            json!({ "call_id": call_id, "from": from, "n": PAGE }),
+        );
     }
 
     fn cancel_active(&mut self) {
@@ -652,13 +779,19 @@ impl Workspace {
             Rail::Connections => {}
         }
 
+        panel = panel.child(div().px_2().py_1().child(self.filter.clone()));
+        let filter = self.filter.read(cx).text().to_string();
         let connected = self.conns.len();
         panel = panel.child(self.section(&format!(
             "Connections ({connected} connected · {} idle)",
             self.saved.len().saturating_sub(connected)
         )));
 
-        for c in &self.saved {
+        for c in self
+            .saved
+            .iter()
+            .filter(|c| crate::workspace::matches_filter(&c.name, &filter))
+        {
             let is_live = self.conns.iter().any(|l| l.name == c.name);
             let name = c.name.clone();
             let name2 = c.name.clone();
@@ -706,7 +839,11 @@ impl Workspace {
             if live.nodes.is_empty() {
                 panel = panel.child(div().px_2().child(self.small("loading…", t.muted())));
             }
-            for node in &live.nodes {
+            for node in live
+                .nodes
+                .iter()
+                .filter(|n| crate::workspace::node_matches(n, &filter))
+            {
                 panel = panel.child(self.node_el(&live.name, node, 0, cx));
             }
         }
@@ -777,7 +914,7 @@ impl Workspace {
                             this.open_nodes.insert(key_s.clone());
                         }
                     } else {
-                        this.open_object(&conn_s, &name_s, schema_s.as_deref(), &kind_s);
+                        this.open_object(&conn_s, &name_s, schema_s.as_deref(), &kind_s, cx);
                     }
                     cx.notify();
                 }),
@@ -964,6 +1101,7 @@ impl Workspace {
                 })),
         );
         body = body.child(views);
+        body = body.child(self.query_bar(tab, cx));
 
         if let Some(err) = &tab.error {
             body = body.child(
@@ -991,6 +1129,105 @@ impl Workspace {
             ResultView::Json => self.json_el(tab),
         });
         body.into_any_element()
+    }
+
+    /// The query bar: the driver's declared fields, or one statement box.
+    ///
+    /// Which one is NOT decided here — `is_structured` is true exactly when the
+    /// engine sent a `query_form` for that driver. MongoDB sends four fields and
+    /// the JSON each contributes; every SQL driver sends none and gets a box.
+    fn query_bar(&self, tab: &Tab, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let t = self.t();
+        let meta = self.meta(&tab.driver);
+        let structured = meta.map(|m| m.is_structured()).unwrap_or(false);
+        let tab_id = tab.id;
+
+        let mut bar = div()
+            .flex()
+            .items_center()
+            .gap_2()
+            .w_full()
+            .px_3()
+            .py_1()
+            .bg(t.panel())
+            .border_b_1()
+            .border_color(t.border());
+
+        if structured {
+            for f in &meta.unwrap().query_form {
+                let Some(input) = self.inputs.get(&(tab_id, f.key.clone())) else { continue };
+                bar = bar.child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap_1()
+                        .child(self.small(f.label.clone(), t.muted()))
+                        // A limit box does not need the width a filter does.
+                        .child(div().w(px(if f.key == "limit" { 60.0 } else { 220.0 })).child(input.clone())),
+                );
+            }
+        } else if let Some(input) = self.inputs.get(&(tab_id, String::new())) {
+            bar = bar.child(div().flex_1().child(input.clone()));
+        }
+
+        // The run button says what it does in this engine's words.
+        let run_label = if structured { "Find" } else { "Run" };
+        bar = bar.child(
+            div()
+                .id(SharedString::from(format!("run-{tab_id}")))
+                .px_2()
+                .cursor_pointer()
+                .text_size(px(11.0))
+                .bg(t.accent())
+                .text_color(t.inverted())
+                .child(SharedString::from(format!("{run_label} (↵)")))
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.sync_tab_from_inputs(tab_id, cx);
+                    this.run_tab(tab_id);
+                    cx.notify();
+                })),
+        );
+
+        // Paging, beside what it pages.
+        let can_prev = tab.state == RunState::Done && tab.from > 0;
+        let can_next = tab.state == RunState::Done && tab.has_more;
+        bar = bar.child(
+            div()
+                .flex()
+                .items_center()
+                .gap_1()
+                .child(
+                    div()
+                        .id("prev")
+                        .px_2()
+                        .cursor_pointer()
+                        .text_size(px(11.0))
+                        .text_color(if can_prev { t.fg() } else { t.border() })
+                        .child("◀")
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.page_by(-1);
+                            cx.notify();
+                        })),
+                )
+                .child(self.small(
+                    format!("{}–{}", tab.from + 1, tab.from + tab.rows.len()),
+                    t.muted(),
+                ))
+                .child(
+                    div()
+                        .id("next")
+                        .px_2()
+                        .cursor_pointer()
+                        .text_size(px(11.0))
+                        .text_color(if can_next { t.fg() } else { t.border() })
+                        .child("▶")
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.page_by(1);
+                            cx.notify();
+                        })),
+                ),
+        );
+        bar.into_any_element()
     }
 
     fn table_el(&self, tab: &Tab, cx: &mut Context<Self>) -> gpui::AnyElement {
@@ -1311,6 +1548,20 @@ impl Workspace {
                         if failed > 0 { t.error() } else { t.muted() },
                     )),
             )
+    }
+}
+
+/// A field's colours, taken from the theme like everything else. The selection
+/// is `Visual` — selected TEXT — which is the same role the grid uses for a
+/// selected row and a different one from a selected list entry.
+fn input_colors(t: &Theme) -> InputColors {
+    InputColors {
+        text: t.fg(),
+        placeholder: t.muted(),
+        cursor: t.accent(),
+        selection: t.selection_bg(),
+        background: t.base(),
+        border: t.border(),
     }
 }
 
