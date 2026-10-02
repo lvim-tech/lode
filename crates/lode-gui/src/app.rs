@@ -146,6 +146,15 @@ struct ConnForm {
     name: String,
     driver: String,
     params: HashMap<String, String>,
+    /// The driver whose fields `params` currently holds.
+    ///
+    /// Without this the map is never reconciled with the chosen driver, and the
+    /// defaults are inserted with `or_insert_with`, which does nothing when the
+    /// key is already there. Pick Cassandra, then MongoDB, and the port stays
+    /// 9042 — the form shows Cassandra's default under Mongo's label and the
+    /// engine is blamed for it. The same applies to every key two drivers
+    /// share: `host`, `database`, `user`.
+    applied_driver: String,
 
     auth_kind: String,
     auth_user: String,
@@ -180,6 +189,7 @@ impl ConnForm {
     fn blank(driver: String) -> Self {
         ConnForm {
             name: String::new(),
+            applied_driver: driver.clone(),
             driver,
             params: HashMap::new(),
             auth_kind: "none".into(),
@@ -205,6 +215,44 @@ impl ConnForm {
             error: None,
             tests: HashMap::new(),
         }
+    }
+
+    /// Bring `params` into line with the chosen driver, once per real change.
+    ///
+    /// On a change the field set is REBUILT from the new driver's declared
+    /// parameters and their defaults, rather than kept and topped up. Keeping
+    /// them would mean carrying one database's values under another's labels,
+    /// and the value most likely to survive is a port — the one field where
+    /// being silently wrong looks exactly like being right. A connection to a
+    /// different kind of database is a different connection.
+    ///
+    /// The last test results go too: they were answers about another endpoint,
+    /// and a stale green is the same lie this form was just fixed for.
+    ///
+    /// Returns whether anything was reset, so a caller can say so if it wants.
+    fn sync_driver(&mut self, meta: Option<&DriverMeta>) -> bool {
+        if self.driver == self.applied_driver {
+            return false;
+        }
+        self.applied_driver = self.driver.clone();
+        let Some(m) = meta else {
+            // The engine does not know this driver, so there is no field set to
+            // rebuild from. Leaving the map alone is the only honest option;
+            // the form will show nothing to fill in either way.
+            return true;
+        };
+        self.params = m
+            .params
+            .iter()
+            .map(|p| (p.key.clone(), p.default.clone().unwrap_or_default()))
+            .collect();
+        // The auth method is the same kind of staleness: a driver that does not
+        // offer the selected one would show a method it cannot use.
+        if !m.auth.is_empty() && !m.auth.iter().any(|a| *a == self.auth_kind) {
+            self.auth_kind = m.auth[0].clone();
+        }
+        self.tests.clear();
+        true
     }
 
     /// The `ConnSpec` the engine accepts: driver, params, auth, tls, tunnel.
@@ -773,6 +821,10 @@ impl App {
         if let Some(c) = edit {
             form.name = c.name.clone();
             form.driver = c.driver.clone();
+            // The saved values ARE this driver's, so the form opens already in
+            // sync. Without this the first frame would see a driver change and
+            // throw the stored parameters away before they were ever shown.
+            form.applied_driver = c.driver.clone();
             form.editing = Some(c.name.clone());
             if let Some(p) = c.spec.get("params").and_then(Value::as_object) {
                 for (k, v) in p {
@@ -1569,6 +1621,11 @@ impl App {
             let kind = self.form.as_ref().map(|f| f.driver.clone())?;
             h.drivers.iter().find(|d| d.kind == kind).cloned()
         });
+        // BEFORE anything is drawn: if the driver combo changed last frame, the
+        // field set belongs to the previous driver.
+        if let Some(f) = &mut self.form {
+            f.sync_driver(meta.as_ref());
+        }
 
         let Some(form) = &mut self.form else { return };
         let mut open = true;
@@ -1630,6 +1687,9 @@ impl App {
                                         p.label.clone()
                                     };
                                     ui.label(label);
+                                    // `sync_driver` has already rebuilt the map
+                                    // for this driver; this only covers a field
+                                    // added to a DriverMeta between frames.
                                     let entry = form
                                         .params
                                         .entry(p.key.clone())
@@ -2211,6 +2271,100 @@ mod tests {
         reopened.tunnel_secret = na["passphrase"].as_str().unwrap().into();
 
         assert_eq!(original.spec(), reopened.spec());
+    }
+
+    /// Build a DriverMeta the way the engine sends one.
+    fn meta(kind: &str, auth: &[&str], params: &[(&str, &str)]) -> DriverMeta {
+        serde_json::from_value(json!({
+            "kind": kind,
+            "display": kind,
+            "params": params.iter().map(|(k, d)| json!({
+                "key": k, "label": k, "type": "string", "required": true,
+                "secret": false, "default": d
+            })).collect::<Vec<_>>(),
+            "auth": auth,
+            "caps": {}
+        }))
+        .unwrap()
+    }
+
+    /// The reported bug: pick Cassandra, then MongoDB, and the port stays 9042.
+    /// `or_insert_with` only fills a key that is ABSENT, and nothing ever
+    /// cleared the map, so every key two drivers share kept the first driver's
+    /// value under the second driver's label.
+    #[test]
+    fn changing_the_driver_reloads_that_drivers_defaults() {
+        let cassandra = meta("cassandra", &["none"], &[("host", "127.0.0.1"), ("port", "9042"), ("keyspace", "")]);
+        let mongodb = meta("mongodb", &["none", "password"], &[("host", "127.0.0.1"), ("port", "27017"), ("database", "")]);
+
+        let mut f = ConnForm::blank("cassandra".into());
+        assert!(!f.sync_driver(Some(&cassandra)), "the opening driver is not a change");
+        // What the form would hold after the user filled it in.
+        f.params.insert("port".into(), "9042".into());
+        f.params.insert("keyspace".into(), "events".into());
+        f.params.insert("host".into(), "cass.internal".into());
+
+        f.driver = "mongodb".into();
+        assert!(f.sync_driver(Some(&mongodb)), "a real change resets");
+
+        assert_eq!(f.params.get("port").map(String::as_str), Some("27017"), "the NEW driver's port");
+        assert!(!f.params.contains_key("keyspace"), "a field mongodb has no idea about must go");
+        assert!(f.params.contains_key("database"), "and mongodb's own field must appear");
+        assert_eq!(
+            f.params.get("host").map(String::as_str),
+            Some("127.0.0.1"),
+            "a shared key takes the new driver's default rather than carrying the old value"
+        );
+    }
+
+    /// The auth method is the same staleness in another field.
+    #[test]
+    fn changing_the_driver_clamps_an_auth_method_it_does_not_offer() {
+        let pg = meta("postgres", &["none", "password", "client_cert"], &[("host", "h")]);
+        let sqlite = meta("sqlite", &["none"], &[("file", ":memory:")]);
+        let mut f = ConnForm::blank("postgres".into());
+        f.auth_kind = "client_cert".into();
+        f.driver = "sqlite".into();
+        f.sync_driver(Some(&sqlite));
+        assert_eq!(f.auth_kind, "none", "sqlite offers nothing else");
+
+        // …and a method the new driver DOES offer survives.
+        let mut g = ConnForm::blank("sqlite".into());
+        g.auth_kind = "none".into();
+        g.driver = "postgres".into();
+        g.sync_driver(Some(&pg));
+        assert_eq!(g.auth_kind, "none");
+    }
+
+    /// A stale green from the previous driver is the same lie the endpoint stage
+    /// was just fixed for.
+    #[test]
+    fn changing_the_driver_drops_the_old_test_results() {
+        let a = meta("postgres", &["none"], &[("host", "h")]);
+        let b = meta("mysql", &["none"], &[("host", "h")]);
+        let mut f = ConnForm::blank("postgres".into());
+        f.tests.insert("endpoint", TestState::Ok("reachable".into(), 3));
+        let _ = a;
+        f.driver = "mysql".into();
+        f.sync_driver(Some(&b));
+        assert!(f.tests.is_empty(), "those answers were about another database");
+    }
+
+    /// Opening a SAVED connection must not look like a driver change, or the
+    /// stored parameters are thrown away before they are ever shown.
+    #[test]
+    fn opening_a_saved_connection_keeps_its_stored_values() {
+        let mongodb = meta("mongodb", &["none"], &[("host", "127.0.0.1"), ("port", "27017")]);
+        let mut f = ConnForm::blank("mongodb".into());
+        // what App::open_form does for an edit
+        f.driver = "mongodb".into();
+        f.applied_driver = "mongodb".into();
+        f.params.insert("host".into(), "db.internal".into());
+        f.params.insert("port".into(), "31017".into());
+
+        assert!(!f.sync_driver(Some(&mongodb)), "opening is not a change");
+        assert_eq!(f.params.get("port").map(String::as_str), Some("31017"));
+        assert_eq!(f.params.get("host").map(String::as_str), Some("db.internal"));
     }
 
     #[test]
