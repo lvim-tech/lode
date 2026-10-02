@@ -21,6 +21,15 @@ use std::path::PathBuf;
 use serde::Deserialize;
 
 /// One theme file.
+///
+/// The whole file is read, including roles this version does not paint with yet
+/// — the editor has no syntax highlighting, so `[syntax]` is parsed and held
+/// rather than used, and `[palette]` is reference data by design. They are kept
+/// because the FILE is the contract: a client that silently dropped a role
+/// would make the generator's output and the client's idea of a theme drift
+/// apart, and the test that loads all 48 real files checks what it parses, not
+/// what this version happens to draw.
+#[allow(dead_code)]
 #[derive(Debug, Clone, Deserialize)]
 pub struct Theme {
     pub name: String,
@@ -61,6 +70,7 @@ pub struct Text {
     pub inverted: String,
 }
 
+#[allow(dead_code)] // see the note on `Theme`: the file is the contract
 #[derive(Debug, Clone, Deserialize)]
 pub struct Accent {
     pub primary: String,
@@ -71,6 +81,7 @@ pub struct Accent {
     pub info: String,
 }
 
+#[allow(dead_code)] // see the note on `Theme`: the file is the contract
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct Syntax {
     #[serde(default)]
@@ -89,6 +100,7 @@ pub struct Syntax {
     pub identifier: String,
 }
 
+#[allow(dead_code)] // see the note on `Theme`: the file is the contract
 #[derive(Debug, Clone, Deserialize)]
 pub struct Grid {
     pub header_bg: String,

@@ -39,7 +39,12 @@ enum Pending {
     SavedQueries,
     Execute { tab: u64 },
     Page { tab: u64, from: usize },
+    /// A write that changed the SHARED saved state: its answer triggers a
+    /// re-read, because another client may have changed something else too.
     StoreWrite(&'static str),
+    /// Fire and forget: nothing to update on success, but a failure is still
+    /// worth a log line. Releasing a buffer, cancelling, recording history.
+    Ignore(&'static str),
 }
 
 #[derive(PartialEq, Eq, Clone, Copy)]
@@ -296,6 +301,27 @@ impl App {
                         json!({ "call_id": call_id, "from": from, "n": PAGE }),
                     );
                 }
+                // The history row is written HERE, once the statement is over,
+                // carrying the state it reached and the time it took. Writing it
+                // at launch instead would mean every row in a shared call log
+                // said "running" for ever.
+                if matches!(st.state.as_str(), "done" | "failed" | "cancelled") {
+                    let sql = self.tabs.iter().find(|t| t.id == tab_id).map(|t| t.sql.trim().to_string());
+                    let (conn, driver) = match &self.live {
+                        Some(l) => (Some(l.name.clone()), Some(l.driver.clone())),
+                        None => (None, None),
+                    };
+                    if let Some(sql) = sql.filter(|s| !s.is_empty()) {
+                        self.ask(
+                            Pending::Ignore("history"),
+                            "store.history.record",
+                            json!({
+                                "conn": conn, "driver": driver, "statement": sql,
+                                "state": st.state, "ms": st.ms, "rows": st.affected
+                            }),
+                        );
+                    }
+                }
             }
             "daemon.log" => {
                 let level = params
@@ -386,7 +412,11 @@ impl App {
                 if let Some(t) = self.tab_by_id(tab) {
                     t.columns = page.columns;
                     t.rows = page.rows;
-                    t.from = page.from.max(from.min(page.from));
+                    // The ENGINE's `from` wins over the one we asked for: it
+                    // clamps a request past the end of the buffer, and trusting
+                    // our own number would label the rows with an offset they
+                    // do not have.
+                    let _ = from;
                     t.from = page.from;
                     t.has_more = page.has_more;
                     t.total = page.total;
@@ -402,6 +432,7 @@ impl App {
                     self.ask(Pending::SavedQueries, "store.queries.list", json!({ "conn": name }));
                 }
             }
+            Pending::Ignore(_) => {}
         }
     }
 
@@ -424,7 +455,7 @@ impl App {
                     Pending::Disconnect => "disconnect",
                     Pending::Structure => "schema",
                     Pending::SavedQueries => "saved queries",
-                    Pending::StoreWrite(w) => w,
+                    Pending::StoreWrite(w) | Pending::Ignore(w) => w,
                     _ => "request",
                 };
                 self.log.push(("error".into(), format!("{label}: {e}")));
@@ -484,25 +515,20 @@ impl App {
         // would otherwise grow one buffer per run for the whole process.
         if let Some(old) = old_call {
             self.calls.remove(&old);
-            self.ask(Pending::StoreWrite("release"), "query.release", json!({ "call_id": old }));
+            self.ask(Pending::Ignore("release"), "query.release", json!({ "call_id": old }));
         }
+        let _ = (&conn_name, &driver); // recorded when it FINISHES, in on_notification
         self.ask(
             Pending::Execute { tab: tab_id },
             "query.execute",
             json!({ "conn_id": conn_id, "statement": sql }),
-        );
-        // History is the engine's, so the editor client and the GUI share one log.
-        self.ask(
-            Pending::StoreWrite("history"),
-            "store.history.record",
-            json!({ "conn": conn_name, "driver": driver, "statement": sql, "state": "running" }),
         );
     }
 
     fn cancel_active(&mut self) {
         let Some(tab) = self.tabs.get(self.active) else { return };
         let Some(call_id) = tab.call_id else { return };
-        self.ask(Pending::StoreWrite("cancel"), "query.cancel", json!({ "call_id": call_id }));
+        self.ask(Pending::Ignore("cancel"), "query.cancel", json!({ "call_id": call_id }));
     }
 
     /// Move the active tab's window by `pages` (negative goes back).
@@ -725,7 +751,7 @@ impl eframe::App for App {
                             if let Some(call) = self.tabs[pos].call_id {
                                 self.calls.remove(&call);
                                 self.ask(
-                                    Pending::StoreWrite("release"),
+                                    Pending::Ignore("release"),
                                     "query.release",
                                     json!({ "call_id": call }),
                                 );
@@ -999,6 +1025,7 @@ impl App {
             let muted = self.theme.c(&self.theme.text.muted, egui::Color32::GRAY);
             let null_fg = self.theme.c(&self.theme.grid.null_fg, muted);
             let header_fg = self.theme.c(&self.theme.grid.header_fg, egui::Color32::WHITE);
+            let header_bg = self.theme.c(&self.theme.grid.header_bg, muted);
             let err_col = self.theme.c(&self.theme.accent.error, egui::Color32::RED);
 
             let Some(tab) = self.tabs.get_mut(self.active) else { return };
@@ -1073,11 +1100,18 @@ impl App {
                 }
                 builder
                     .header(22.0, |mut header| {
+                        // The header strip is painted with the theme's own
+                        // header surface, not left on the panel fill: the
+                        // column names have to read as a HEADER over the rows,
+                        // and `header_fg` is the one ink the generator floored
+                        // against `header_bg` rather than against the page.
                         header.col(|ui| {
+                            fill(ui, header_bg);
                             ui.colored_label(header_fg, "#");
                         });
                         for c in columns {
                             header.col(|ui| {
+                                fill(ui, header_bg);
                                 ui.colored_label(header_fg, &c.name).on_hover_text(&c.type_name);
                             });
                         }
@@ -1318,6 +1352,14 @@ impl App {
         }
         self.export.open = open && !close;
     }
+}
+
+/// Paint a table cell's whole background. `max_rect` is the cell, and it is
+/// expanded by the table's own item spacing so the header reads as one strip
+/// rather than a row of chips with gaps between them.
+fn fill(ui: &egui::Ui, color: egui::Color32) {
+    let rect = ui.max_rect().expand2(ui.spacing().item_spacing);
+    ui.painter().rect_filled(rect, 0.0, color);
 }
 
 /// One schema node and its children. Clicking a table puts a SELECT for it in
