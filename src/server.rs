@@ -263,6 +263,7 @@ impl Server {
             "query.cell" => self.cell(params).await,
             "query.classify" => self.classify(params),
             "row.write" => self.row_write(params).await,
+            "instance.metrics" => self.metrics(params).await,
             // ── saved state (proto 2) ───────────────────────────────────────
             "store.status" => self.store_status(),
             "store.connections.list" => self.store_conn_list().await,
@@ -273,6 +274,9 @@ impl Server {
             "store.queries.get" => self.store_query_get(params).await,
             "store.queries.save" => self.store_query_save(params).await,
             "store.queries.remove" => self.store_query_remove(params).await,
+            "store.charts.list" => self.store_chart_list(params).await,
+            "store.charts.save" => self.store_chart_save(params).await,
+            "store.charts.remove" => self.store_chart_remove(params).await,
             "store.history.record" => self.store_history_record(params).await,
             "store.history.list" => self.store_history_list(params).await,
             "store.import" => self.store_import(params).await,
@@ -892,6 +896,32 @@ impl Server {
         }))
     }
 
+    /// What the server on the other end says about itself.
+    ///
+    /// Each driver asks its OWN system views — `pg_stat_*`, `SHOW STATUS`,
+    /// `INFO`, a handful of PRAGMAs — because what is available and what it is
+    /// called differ completely between engines, and a client assembling this
+    /// would be a list of driver names in a client.
+    ///
+    /// Every call is one round trip, made only when asked for. There is no timer
+    /// in here: repeating this against somebody\u{2019}s production database is a
+    /// decision for the person looking at it, not a default.
+    async fn metrics(&self, params: Json) -> anyhow::Result<Json> {
+        #[derive(Deserialize)]
+        struct P {
+            conn_id: u64,
+        }
+        let p: P = serde_json::from_value(params)?;
+        let kind = self.conn_driver(p.conn_id)?;
+        let driver = self.inner.registry.get(&kind)?;
+        if !driver.meta().caps.metrics {
+            anyhow::bail!("the {kind} driver has nothing to report about its server");
+        }
+        let conn = self.conn(p.conn_id)?;
+        let metrics = conn.lock().await.metrics().await?;
+        Ok(json!({ "metrics": metrics }))
+    }
+
     async fn cell(&self, params: Json) -> anyhow::Result<Json> {
         #[derive(Deserialize)]
         struct P {
@@ -983,6 +1013,44 @@ impl Server {
         }
         let p: P = serde_json::from_value(params)?;
         Ok(json!({ "query": self.store()?.get_query(p.conn, p.name).await? }))
+    }
+
+    // ── charts ───────────────────────────────────────────────────────────────
+
+    async fn store_chart_list(&self, params: Json) -> anyhow::Result<Json> {
+        #[derive(Deserialize)]
+        struct P {
+            conn: String,
+        }
+        let p: P = serde_json::from_value(params)?;
+        Ok(json!({ "charts": self.store()?.list_charts(p.conn).await? }))
+    }
+
+    async fn store_chart_save(&self, params: Json) -> anyhow::Result<Json> {
+        #[derive(Deserialize)]
+        struct P {
+            conn: String,
+            name: String,
+            sql: String,
+            #[serde(default)]
+            measure: String,
+        }
+        let p: P = serde_json::from_value(params)?;
+        if p.name.trim().is_empty() {
+            return Err(anyhow::anyhow!("a saved chart needs a name"));
+        }
+        self.store()?.save_chart(p.conn, p.name, p.sql, p.measure).await?;
+        Ok(json!({ "saved": true }))
+    }
+
+    async fn store_chart_remove(&self, params: Json) -> anyhow::Result<Json> {
+        #[derive(Deserialize)]
+        struct P {
+            conn: String,
+            name: String,
+        }
+        let p: P = serde_json::from_value(params)?;
+        Ok(json!({ "removed": self.store()?.remove_chart(p.conn, p.name).await? }))
     }
 
     async fn store_query_save(&self, params: Json) -> anyhow::Result<Json> {

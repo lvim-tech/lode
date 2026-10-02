@@ -114,6 +114,22 @@ impl Store {
                 ts        INTEGER
             );
             CREATE INDEX IF NOT EXISTS history_ts ON history (ts);
+            -- A saved chart is a saved QUERY plus how to read it. Kept here
+            -- rather than in a client's own file for the same reason saved
+            -- queries are: a chart somebody made is something they will want
+            -- from the editor as well, and a per-client file cannot be shared.
+            CREATE TABLE IF NOT EXISTS charts (
+                id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                conn       TEXT NOT NULL,
+                name       TEXT NOT NULL,
+                sql        TEXT NOT NULL,
+                -- The column being measured, BY NAME. An index would move the
+                -- moment the statement changed a column, and silently measure
+                -- something else.
+                measure    TEXT NOT NULL DEFAULT '',
+                updated_at INTEGER
+            );
+            CREATE UNIQUE INDEX IF NOT EXISTS charts_conn_name ON charts (conn, name);
             "#,
         )?;
         conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
@@ -263,6 +279,58 @@ impl Store {
                 params![conn_name, name, sql, now()],
             )?;
             Ok(())
+        })
+        .await
+    }
+
+    // ── charts ───────────────────────────────────────────────────────────────
+
+    pub async fn list_charts(&self, conn_name: String) -> anyhow::Result<Vec<Json>> {
+        self.with(move |c| {
+            let mut st = c.prepare(
+                "SELECT name, sql, measure, updated_at FROM charts WHERE conn = ?1 ORDER BY name",
+            )?;
+            let rows = st
+                .query_map(params![conn_name], |r| {
+                    Ok(serde_json::json!({
+                        "name": r.get::<_, String>(0)?,
+                        "sql": r.get::<_, String>(1)?,
+                        "measure": r.get::<_, String>(2)?,
+                        "updated_at": r.get::<_, Option<i64>>(3)?,
+                    }))
+                })?
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(rows)
+        })
+        .await
+    }
+
+    pub async fn save_chart(
+        &self,
+        conn_name: String,
+        name: String,
+        sql: String,
+        measure: String,
+    ) -> anyhow::Result<()> {
+        self.with(move |c| {
+            c.execute(
+                "INSERT INTO charts (conn, name, sql, measure, updated_at) VALUES (?1, ?2, ?3, ?4, ?5) \
+                 ON CONFLICT(conn, name) DO UPDATE SET sql = excluded.sql, \
+                 measure = excluded.measure, updated_at = excluded.updated_at",
+                params![conn_name, name, sql, measure, now()],
+            )?;
+            Ok(())
+        })
+        .await
+    }
+
+    pub async fn remove_chart(&self, conn_name: String, name: String) -> anyhow::Result<bool> {
+        self.with(move |c| {
+            let n = c.execute(
+                "DELETE FROM charts WHERE conn = ?1 AND name = ?2",
+                params![conn_name, name],
+            )?;
+            Ok(n > 0)
         })
         .await
     }

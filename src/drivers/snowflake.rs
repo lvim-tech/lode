@@ -85,6 +85,7 @@ const META: DriverMeta = DriverMeta {
         indexes: false,
         ddl: true, // no indexes (micro-partitions); GET_DDL — UNVERIFIED (cloud-only)
         edit: false,
+        metrics: false,
     },
     hint: "SELECT * FROM table LIMIT 100",
     browse: "SELECT {columns} FROM {qualified} {clauses} LIMIT {limit};",

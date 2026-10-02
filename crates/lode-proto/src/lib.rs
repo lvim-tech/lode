@@ -330,6 +330,9 @@ pub struct Caps {
     /// is the right answer there: it has no `row.write` to call.
     #[serde(default)]
     pub edit: bool,
+    /// The engine can report what its server is doing.
+    #[serde(default)]
+    pub metrics: bool,
     #[serde(default)]
     pub ddl: bool,
 }
@@ -363,6 +366,25 @@ pub struct TableColumn {
     /// these, and only when there is at least one.
     #[serde(default)]
     pub primary: bool,
+}
+
+/// A chart somebody saved: a statement and how to read it.
+#[derive(Debug, Clone, Deserialize)]
+pub struct SavedChart {
+    pub name: String,
+    pub sql: String,
+    /// The measured column BY NAME — an index would move the moment the
+    /// statement changed a column, and silently measure something else.
+    #[serde(default)]
+    pub measure: String,
+}
+
+/// One thing an engine says about itself.
+#[derive(Debug, Clone, Deserialize)]
+pub struct Metric {
+    pub group: String,
+    pub name: String,
+    pub value: String,
 }
 
 /// One comparison the builder offers, as the driver declared it.

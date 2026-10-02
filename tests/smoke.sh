@@ -300,6 +300,32 @@ send '{"id":35,"method":"store.queries.list","params":{"conn":"smoke"}}'
 check "its queries went with it" "$(await '.id == 35' | jq -r '.result.queries | length')" "0"
 
 # ── 9. stdin EOF shuts the engine down ───────────────────────────────────────
+# ── instance metrics and saved charts ────────────────────────────────────────
+# A fresh connection: the store section above disconnects the first one, and a
+# metric read needs a live link by definition.
+send "{\"jsonrpc\":\"2.0\",\"id\":899,\"method\":\"conn.connect\",\"params\":{\"driver\":\"sqlite\",\"params\":{\"file\":\"$DB\"}}}"
+MCID=$(await '.id == 899' | jq -r '.result.conn_id')
+send "{\"jsonrpc\":\"2.0\",\"id\":900,\"method\":\"instance.metrics\",\"params\":{\"conn_id\":$MCID}}"
+M=$(await '.id == 900')
+check "metrics came back" "$(printf '%s' "$M" | jq '.result.metrics | length > 0')" "true"
+# The size has to be a READABLE string, not a page count: a metric that needs a
+# unit and a scale from somewhere else is a metric nobody can act on.
+check "size is readable" \
+    "$(printf '%s' "$M" | jq -r '[.result.metrics[] | select(.name=="size")][0].value | test("^[0-9.]+ (B|KiB|MiB|GiB|TiB)$")')" "true"
+check "metrics are grouped" \
+    "$(printf '%s' "$M" | jq '[.result.metrics[].group] | unique | length >= 2')" "true"
+
+send '{"jsonrpc":"2.0","id":901,"method":"store.charts.save","params":{"conn":"smoke","name":"by balance","sql":"SELECT name, balance FROM t","measure":"balance"}}'
+check "chart saved" "$(await '.id == 901' | jq '.result.saved')" "true"
+send '{"jsonrpc":"2.0","id":902,"method":"store.charts.list","params":{"conn":"smoke"}}'
+C=$(await '.id == 902')
+check "chart listed" "$(printf '%s' "$C" | jq '.result.charts | length')" "1"
+# The measure is kept BY NAME. An index would move the moment the statement
+# changed a column, and the chart would silently measure something else.
+check "measure kept by name" "$(printf '%s' "$C" | jq -r '.result.charts[0].measure')" "balance"
+send '{"jsonrpc":"2.0","id":903,"method":"store.charts.remove","params":{"conn":"smoke","name":"by balance"}}'
+check "chart removed" "$(await '.id == 903' | jq '.result.removed')" "true"
+
 exec 3>&-
 i=0
 while kill -0 "$PID" 2>/dev/null && [ "$i" -lt 50 ]; do

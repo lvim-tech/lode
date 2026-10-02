@@ -12,7 +12,9 @@
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
-use lode_proto::{BuilderOp, Column, DriverMeta, Index, Node, SavedQuery, TableColumn};
+use lode_proto::{
+    BuilderOp, Column, DriverMeta, Index, Node, SavedChart, SavedQuery, TableColumn,
+};
 use serde_json::Value;
 
 /// How a result is shown.
@@ -24,6 +26,10 @@ pub enum ResultView {
     Table,
     /// The raw record.
     Json,
+    /// The same rows as bars. Not a different QUERY — a different reading of
+    /// the one that ran, which is why it sits with the views and not with the
+    /// sub-tabs.
+    Chart,
 }
 
 impl ResultView {
@@ -32,6 +38,7 @@ impl ResultView {
             ResultView::Tree => "Tree",
             ResultView::Table => "Table",
             ResultView::Json => "JSON",
+            ResultView::Chart => "Chart",
         }
     }
 
@@ -47,6 +54,85 @@ impl ResultView {
             _ => ResultView::Table,
         }
     }
+}
+
+/// What a result can be drawn as, read off the rows themselves.
+///
+/// A chart needs one column to name the bars and at least one to size them, and
+/// the second has to be a NUMBER. This decides that from the loaded rows rather
+/// than from the column types the driver declared, because a driver that
+/// declares nothing (sqlite often does) would otherwise never be chartable, and
+/// because a column declared INTEGER can still arrive holding nulls.
+#[derive(Debug)]
+pub struct ChartShape {
+    /// The column whose values name each bar.
+    pub label: usize,
+    /// The numeric columns that can be plotted, in result order.
+    pub values: Vec<usize>,
+}
+
+impl ChartShape {
+    /// Work out what can be drawn, or say why nothing can.
+    pub fn of(columns: &[Column], rows: &[Vec<Value>]) -> Result<ChartShape, String> {
+        if rows.is_empty() {
+            return Err("nothing has been loaded to draw".into());
+        }
+        let numeric: Vec<usize> = (0..columns.len())
+            .filter(|&i| {
+                // A column counts as numeric when every value in it that is not
+                // NULL is a number. One stray string means the column is not a
+                // measurement, and drawing it as one would invent a zero.
+                let seen: Vec<&Value> = rows.iter().filter_map(|r| r.get(i)).collect();
+                !seen.is_empty()
+                    && seen.iter().any(|v| v.is_number())
+                    && seen.iter().all(|v| v.is_number() || v.is_null())
+            })
+            .collect();
+        if numeric.is_empty() {
+            return Err("no column in this result holds numbers, so there is nothing to measure".into());
+        }
+        // The label is the first column that is NOT one of the measurements;
+        // failing that, the row number, which is what `label_of` falls back to.
+        let label = (0..columns.len())
+            .find(|i| !numeric.contains(i))
+            .unwrap_or(usize::MAX);
+        Ok(ChartShape { label, values: numeric })
+    }
+}
+
+/// The text under a bar: the label column, or the row number where every column
+/// turned out to be a measurement.
+pub fn bar_label(tab: &Tab, shape: &ChartShape, row: usize) -> String {
+    if shape.label == usize::MAX {
+        return (tab.from + row + 1).to_string();
+    }
+    tab.rows
+        .get(row)
+        .and_then(|r| r.get(shape.label))
+        .map(preview)
+        .unwrap_or_default()
+}
+
+/// The number a bar is drawn from, and the range to draw it against.
+///
+/// The range starts at zero unless the data goes below it. A bar chart whose
+/// axis starts somewhere else exaggerates every difference on it, which is the
+/// oldest way to mislead with a chart and is not worth the extra pixels.
+pub fn value_range(rows: &[Vec<Value>], col: usize) -> (f64, f64) {
+    let mut lo = 0.0f64;
+    let mut hi = 0.0f64;
+    for r in rows {
+        if let Some(n) = r.get(col).and_then(|v| v.as_f64()) {
+            lo = lo.min(n);
+            hi = hi.max(n);
+        }
+    }
+    if (hi - lo).abs() < f64::EPSILON {
+        // Every value the same: give the bars something to be drawn against so
+        // they are visible rather than zero-height.
+        hi = lo + 1.0;
+    }
+    (lo, hi)
 }
 
 /// The row of sub-tabs inside a result. Only `Documents` does anything yet; the
@@ -97,6 +183,7 @@ pub struct Live {
     pub tunneled: bool,
     pub nodes: Vec<Node>,
     pub queries: Vec<SavedQuery>,
+    pub charts: Vec<SavedChart>,
 }
 
 /// One tab: a query, its connection, and the result it produced.
@@ -150,6 +237,12 @@ pub struct Tab {
     pub editing: Option<(usize, usize)>,
     /// What the visual builder has been told so far.
     pub builder: Builder,
+    /// Which measurement the chart is drawing, when the result has several.
+    pub chart_col: Option<usize>,
+    /// The measurement a SAVED chart asked for, by name. Matched to a column
+    /// once the result arrives: a name survives a statement that reordered its
+    /// columns, and an index does not.
+    pub chart_measure: Option<String>,
     /// A write waiting to be confirmed: the statement the ENGINE said it would
     /// run, why it is dangerous, and the plan to repeat with `confirm`.
     pub pending_write: Option<PendingWrite>,
@@ -483,6 +576,8 @@ impl Tab {
             ddl: None,
             editing: None,
             builder: Builder::default(),
+            chart_col: None,
+            chart_measure: None,
             pending_write: None,
             rendered: String::new(),
         }
@@ -502,6 +597,8 @@ impl Tab {
         // A new result is not the old one re-ordered: its columns may differ.
         self.sort = None;
         self.detail = None;
+        // A new result may not have the column the chart was drawing.
+        self.chart_col = None;
     }
 
     /// The statement this tab would run: assembled from the engine's own
@@ -810,6 +907,57 @@ mod tests {
     /// An untouched builder has to produce the browse EXACTLY — not a
     /// differently spelled equivalent, which would make opening the Builder tab
     /// and touching nothing change what runs.
+    /// A column with one stray string in it is not a measurement. Treating it
+    /// as one would silently draw that row as zero, which is a chart that is
+    /// wrong rather than a chart that is missing.
+    #[test]
+    fn a_column_with_a_stray_string_is_not_a_measurement() {
+        let cols = vec![col("name"), col("n")];
+        let good = vec![vec![json!("a"), json!(1)], vec![json!("b"), json!(2)]];
+        let shape = ChartShape::of(&cols, &good).expect("two numbers make a measurement");
+        assert_eq!(shape.values, vec![1]);
+        assert_eq!(shape.label, 0);
+
+        let bad = vec![vec![json!("a"), json!(1)], vec![json!("b"), json!("oops")]];
+        let e = ChartShape::of(&cols, &bad).unwrap_err();
+        assert!(e.contains("no column"), "{e}");
+    }
+
+    /// A NULL among numbers does not disqualify the column — it is a missing
+    /// measurement, not a non-measurement.
+    #[test]
+    fn nulls_do_not_stop_a_column_being_numeric() {
+        let cols = vec![col("name"), col("n")];
+        let rows = vec![vec![json!("a"), json!(1)], vec![json!("b"), Value::Null]];
+        assert_eq!(ChartShape::of(&cols, &rows).unwrap().values, vec![1]);
+    }
+
+    #[test]
+    fn an_empty_result_says_so_rather_than_drawing_nothing() {
+        let e = ChartShape::of(&[col("a")], &[]).unwrap_err();
+        assert!(e.contains("nothing has been loaded"), "{e}");
+    }
+
+    /// The axis starts at zero unless the data goes below it. A bar chart that
+    /// starts its axis elsewhere exaggerates every difference on it.
+    #[test]
+    fn the_axis_includes_zero() {
+        let rows = vec![vec![json!(10)], vec![json!(12)]];
+        assert_eq!(value_range(&rows, 0), (0.0, 12.0));
+
+        let with_negatives = vec![vec![json!(-5)], vec![json!(12)]];
+        assert_eq!(value_range(&with_negatives, 0), (-5.0, 12.0));
+    }
+
+    /// All the same value still draws: a flat chart is a fact about the data,
+    /// and bars of zero height look like a broken window.
+    #[test]
+    fn a_flat_column_still_has_a_range() {
+        let rows = vec![vec![json!(7)], vec![json!(7)]];
+        let (lo, hi) = value_range(&rows, 0);
+        assert!(hi > lo);
+    }
+
     #[test]
     fn an_untouched_builder_changes_nothing() {
         let b = Builder::default();

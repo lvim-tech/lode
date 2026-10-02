@@ -83,6 +83,8 @@ const PG_META: DriverMeta = DriverMeta {
         indexes: true, // pg_index + pg_attribute
         ddl: false,    // postgres has NO server-side CREATE TABLE (pg_dump is a client) — see the trait doc
         edit: false,
+        // pg_stat_database / pg_stat_activity — reads. Unverified here.
+        metrics: true,
     },
     hint: "SELECT * FROM table LIMIT 100",
     browse: "SELECT {columns} FROM {qualified} {clauses} LIMIT {limit};",
@@ -391,6 +393,71 @@ impl Connection for PgConnection {
             }
         }
         Ok(schemas)
+    }
+
+    async fn metrics(&mut self) -> anyhow::Result<Vec<crate::spec::Metric>> {
+        use crate::spec::Metric;
+        // PostgreSQL's own statistics views. Reads, every one.
+        //
+        // UNVERIFIED: written from the documented shape of these views, not run
+        // against a server — there is none to run it against here. The queries
+        // are reads and a failure shows as an error in the panel rather than as
+        // wrong numbers, which is the one thing that must not happen.
+        let mut out = Vec::new();
+        let text = |r: &Vec<Value>, i: usize| -> String {
+            match r.get(i) {
+                Some(Value::Text(s)) => s.clone(),
+                Some(Value::Int(n)) => n.to_string(),
+                Some(Value::Float(f)) => f.to_string(),
+                Some(Value::Bool(b)) => b.to_string(),
+                _ => String::new(),
+            }
+        };
+
+        if let Ok((_, rows, _)) = self
+            .simple("SELECT pg_size_pretty(pg_database_size(current_database())), current_database(), version()")
+            .await
+        {
+            if let Some(r) = rows.first() {
+                out.push(Metric { group: "storage", name: "database size", value: text(r, 0) });
+                out.push(Metric { group: "settings", name: "database", value: text(r, 1) });
+                out.push(Metric { group: "settings", name: "version", value: text(r, 2) });
+            }
+        }
+        if let Ok((_, rows, _)) = self
+            .simple(
+                "SELECT numbackends, xact_commit, xact_rollback, blks_read, blks_hit, \
+                 deadlocks, temp_files FROM pg_stat_database WHERE datname = current_database()",
+            )
+            .await
+        {
+            if let Some(r) = rows.first() {
+                out.push(Metric { group: "activity", name: "connections", value: text(r, 0) });
+                out.push(Metric { group: "activity", name: "commits", value: text(r, 1) });
+                out.push(Metric { group: "activity", name: "rollbacks", value: text(r, 2) });
+                out.push(Metric { group: "activity", name: "blocks read", value: text(r, 3) });
+                out.push(Metric { group: "activity", name: "blocks hit", value: text(r, 4) });
+                out.push(Metric { group: "activity", name: "deadlocks", value: text(r, 5) });
+                out.push(Metric { group: "activity", name: "temp files", value: text(r, 6) });
+            }
+        }
+        if let Ok((_, rows, _)) = self
+            .simple("SELECT count(*) FROM pg_stat_activity WHERE state = 'active'")
+            .await
+        {
+            if let Some(r) = rows.first() {
+                out.push(Metric { group: "activity", name: "running queries", value: text(r, 0) });
+            }
+        }
+        if out.is_empty() {
+            // A server that answers none of this is usually a hosted one that
+            // withholds the statistics views. Saying so beats an empty panel.
+            anyhow::bail!(
+                "this server answered none of the statistics queries \u{2014} a managed service often \
+                 withholds pg_stat_*"
+            );
+        }
+        Ok(out)
     }
 
     async fn columns(&mut self, obj: &ObjRef) -> anyhow::Result<Vec<TableColumn>> {

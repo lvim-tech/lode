@@ -78,6 +78,8 @@ const META: DriverMeta = DriverMeta {
         indexes: false,
         ddl: false, // a KV store has neither indexes nor a schema to describe
         edit: false,
+        // INFO — a read. Unverified here.
+        metrics: true,
     },
     hint: "KEYS *",
     browse: "TYPE {name}",
@@ -388,6 +390,57 @@ impl Connection for RedisConnection {
     async fn columns(&mut self, _obj: &ObjRef) -> anyhow::Result<Vec<TableColumn>> {
         // A key/value store has no columns to describe, and therefore no key to address a "row" by.
         Ok(Vec::new())
+    }
+
+    async fn metrics(&mut self) -> anyhow::Result<Vec<crate::spec::Metric>> {
+        use crate::spec::Metric;
+        // Redis says everything about itself through one command, as `field:value`
+        // lines under `# Section` headings.
+        //
+        // UNVERIFIED: written from the documented shape of INFO, not run against
+        // a server — there is none here, and the one in reach is somebody's.
+        let reply = self.command(&["INFO".to_string()]).await?;
+        let text = match render(reply) {
+            (_, rows) => rows
+                .into_iter()
+                .flatten()
+                .map(|v| match v {
+                    Value::Text(s) => s,
+                    other => format!("{other:?}"),
+                })
+                .collect::<Vec<_>>()
+                .join("\n"),
+        };
+        // Only the fields worth a panel. INFO returns well over a hundred, and a
+        // panel of a hundred numbers is a panel nobody reads.
+        const WANTED: &[(&str, &str, &str)] = &[
+            ("storage", "memory used", "used_memory_human"),
+            ("storage", "memory peak", "used_memory_peak_human"),
+            ("storage", "keys", "db0"),
+            ("activity", "clients", "connected_clients"),
+            ("activity", "commands processed", "total_commands_processed"),
+            ("activity", "ops per second", "instantaneous_ops_per_sec"),
+            ("activity", "keyspace hits", "keyspace_hits"),
+            ("activity", "keyspace misses", "keyspace_misses"),
+            ("activity", "evicted keys", "evicted_keys"),
+            ("settings", "version", "redis_version"),
+            ("settings", "mode", "redis_mode"),
+            ("settings", "role", "role"),
+            ("settings", "uptime (days)", "uptime_in_days"),
+        ];
+        let mut out = Vec::new();
+        for (group, name, field) in WANTED {
+            if let Some(line) = text.lines().find(|l| l.starts_with(&format!("{field}:"))) {
+                let value = line.splitn(2, ':').nth(1).unwrap_or("").trim().to_string();
+                if !value.is_empty() {
+                    out.push(Metric { group, name, value });
+                }
+            }
+        }
+        if out.is_empty() {
+            anyhow::bail!("INFO returned nothing this panel knows how to read");
+        }
+        Ok(out)
     }
 
     async fn execute(&mut self, stmt: &str) -> anyhow::Result<Box<dyn ResultStream>> {

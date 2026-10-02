@@ -22,7 +22,7 @@ use gpui::{
 };
 use lode_proto::{
     cell_text, DriverMeta, Engine, Hello, HistoryRow, Index, Message, Node, QueryState,
-    SavedConnection, SavedQuery, TableColumn,
+    SavedChart, SavedConnection, SavedQuery, TableColumn,
 };
 use serde_json::{json, Value};
 
@@ -32,7 +32,8 @@ use crate::input::{InputColors, InputEvent, TextInput};
 use crate::session::{self, Session, SessionTab};
 use crate::theme::{self, Theme};
 use crate::workspace::{
-    column_editable, copy_as_insert, copy_as_select, fuzzy_score, row_key, Cond,
+    bar_label, column_editable, copy_as_insert, copy_as_select, fuzzy_score, row_key,
+    value_range, ChartShape, Cond,
     PendingWrite, Toast,
     fmt_duration, preview, type_badge, Live, ResultView, RunState, SubTab, Tab, Task,
 };
@@ -172,6 +173,10 @@ const BLOCKING: Duration = Duration::from_secs(15);
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Rail {
     Connections,
+    /// What the server on the other end is doing. Reading this COSTS the server
+    /// a round trip, which is why it is its own panel: it happens when it is
+    /// being looked at and not otherwise.
+    Instance,
     /// Every statement this engine has run, from either client — the history is
     /// the ENGINE's, so the editor's runs are in here too.
     History,
@@ -184,6 +189,7 @@ impl Rail {
         match self {
             // Font Awesome codepoints, carried by every Nerd Font patch.
             Rail::Connections => "\u{f1c0}",
+            Rail::Instance => "\u{f080}",
             Rail::History => "\u{f1da}",
             Rail::Tasks => "\u{f0ae}",
             Rail::Settings => "\u{f013}",
@@ -192,6 +198,7 @@ impl Rail {
     fn label(self) -> &'static str {
         match self {
             Rail::Connections => "Connections",
+            Rail::Instance => "Instance",
             Rail::History => "History",
             Rail::Tasks => "Tasks",
             Rail::Settings => "Settings",
@@ -216,7 +223,9 @@ enum Pending {
     /// A connection saved from that window.
     FormSave,
     History,
+    Metrics { conn: String },
     SavedQueries { conn: String },
+    SavedCharts { conn: String },
     /// The columns of a tab's object — where the identifying key comes from.
     Columns { tab: u64 },
     Indexes { tab: u64 },
@@ -276,6 +285,19 @@ pub struct Workspace {
     history: Vec<HistoryRow>,
     /// The history panel's own search box.
     history_filter: Entity<TextInput>,
+
+    /// What the server last said about itself, and which connection said it.
+    metrics: Vec<lode_proto::Metric>,
+    metrics_conn: Option<String>,
+    metrics_error: Option<String>,
+    /// How often to ask again, or None for "only when asked".
+    ///
+    /// None by DEFAULT. Repeating a statistics query against somebody's
+    /// production database is a decision for the person looking at it, and a
+    /// window that starts a timer on its own has made that decision for them.
+    metrics_every: Option<Duration>,
+    metrics_at: Option<Instant>,
+    metrics_inflight: bool,
 
     /// The command palette, while it is open.
     palette_open: bool,
@@ -360,6 +382,12 @@ impl Workspace {
             console_open: true,
             history: Vec::new(),
             history_filter,
+            metrics: Vec::new(),
+            metrics_conn: None,
+            metrics_error: None,
+            metrics_every: None,
+            metrics_at: None,
+            metrics_inflight: false,
             palette_open: false,
             palette_input,
             palette_sel: 0,
@@ -376,6 +404,7 @@ impl Workspace {
 
         w.rail = match w.restore.rail.as_str() {
             "history" => Rail::History,
+            "instance" => Rail::Instance,
             "tasks" => Rail::Tasks,
             "settings" => Rail::Settings,
             _ => Rail::Connections,
@@ -443,6 +472,7 @@ impl Workspace {
 
     fn pump(&mut self, cx: &mut Context<Self>) {
         let mut changed = false;
+        self.poll_metrics();
         loop {
             let Some(engine) = &self.engine else { break };
             let Some(msg) = engine.try_recv() else { break };
@@ -592,6 +622,7 @@ impl Workspace {
                     tunneled: v.get("tunneled").and_then(Value::as_bool).unwrap_or(false),
                     nodes: Vec::new(),
                     queries: Vec::new(),
+                    charts: Vec::new(),
                 });
                 self.status = format!("connected: {name}");
                 self.remember();
@@ -645,9 +676,26 @@ impl Workspace {
                     f.test_answer(stage, Ok(format!("{detail} ({ms} ms)")), cx)
                 });
             }
+            Pending::Metrics { conn } => {
+                self.metrics =
+                    serde_json::from_value(v.get("metrics").cloned().unwrap_or(json!([])))
+                        .unwrap_or_default();
+                self.metrics_conn = Some(conn);
+                self.metrics_error = None;
+                self.metrics_at = Some(Instant::now());
+                self.metrics_inflight = false;
+            }
             Pending::History => {
                 self.history =
                     serde_json::from_value(v.get("history").cloned().unwrap_or(json!([]))).unwrap_or_default();
+            }
+            Pending::SavedCharts { conn } => {
+                let cs: Vec<SavedChart> =
+                    serde_json::from_value(v.get("charts").cloned().unwrap_or(json!([])))
+                        .unwrap_or_default();
+                if let Some(c) = self.conns.iter_mut().find(|c| c.name == conn) {
+                    c.charts = cs;
+                }
             }
             Pending::SavedQueries { conn } => {
                 let qs: Vec<SavedQuery> =
@@ -745,6 +793,16 @@ impl Workspace {
             Pending::Connect { name, .. } => {
                 self.status = format!("could not connect to {name}");
                 self.toast(format!("{name}: {e}"), true);
+            }
+            Pending::Metrics { conn } => {
+                // The panel shows the refusal where the numbers would be. A
+                // managed service withholding its statistics views is a fact
+                // about that server, not a malfunction here.
+                self.metrics.clear();
+                self.metrics_conn = Some(conn);
+                self.metrics_error = Some(e);
+                self.metrics_at = Some(Instant::now());
+                self.metrics_inflight = false;
             }
             Pending::RowPlan { tab, .. } | Pending::RowApply { tab } => {
                 if let Some(t) = self.tabs.iter_mut().find(|t| t.id == tab) {
@@ -1058,6 +1116,7 @@ impl Workspace {
                     tab.view = match t.view.as_str() {
                         "tree" => ResultView::Tree,
                         "json" => ResultView::Json,
+                        "chart" => ResultView::Chart,
                         _ => ResultView::Table,
                     };
                 }
@@ -1116,6 +1175,7 @@ impl Workspace {
             theme: Some(self.theme_name.clone()),
             rail: match self.rail {
                 Rail::Connections => "connections",
+                Rail::Instance => "instance",
                 Rail::History => "history",
                 Rail::Tasks => "tasks",
                 Rail::Settings => "settings",
@@ -1480,14 +1540,14 @@ impl Workspace {
                 act: PaletteAct::GoTab(tb.id),
             });
         }
-        for v in [ResultView::Tree, ResultView::Table, ResultView::Json] {
+        for v in [ResultView::Tree, ResultView::Table, ResultView::Json, ResultView::Chart] {
             out.push(PaletteItem {
                 label: format!("View as {}", v.label()),
                 hint: "result".into(),
                 act: PaletteAct::View(v),
             });
         }
-        for r in [Rail::Connections, Rail::History, Rail::Tasks, Rail::Settings] {
+        for r in [Rail::Connections, Rail::Instance, Rail::History, Rail::Tasks, Rail::Settings] {
             out.push(PaletteItem {
                 label: format!("Show {}", r.label()),
                 hint: "panel".into(),
@@ -1619,6 +1679,98 @@ impl Workspace {
             if as_insert { "row copied as INSERT" } else { "row copied as SELECT" },
             false,
         );
+    }
+
+    // ── saved charts ────────────────────────────────────────────────────────
+
+    /// Open a saved chart: its statement in a tab, shown as a chart, measuring
+    /// the column it was saved measuring.
+    ///
+    /// The measure is matched BY NAME once the result arrives, in `on_result` —
+    /// if the statement has changed and that column is gone, the chart falls
+    /// back to the first measurement rather than drawing a different column
+    /// under the old name.
+    fn open_chart(&mut self, conn: &str, name: &str, sql: &str, measure: &str, cx: &mut Context<Self>) {
+        if self.live(conn).is_none() {
+            self.toast(format!("{conn} is not connected"), true);
+            return;
+        }
+        self.run_statement_titled(conn, name, sql, false, cx);
+        if let Some(tab) = self.tabs.last_mut() {
+            tab.view = ResultView::Chart;
+            tab.chart_measure = Some(measure.to_string());
+        }
+    }
+
+    /// Save what the chart is showing. The statement and the measured column,
+    /// under a name — kept by the ENGINE, so it is there in the editor too.
+    fn save_chart(&mut self, cx: &mut Context<Self>) {
+        let Some(tab) = self.tabs.get(self.active) else { return };
+        let (conn, name, id) = (tab.conn_name.clone(), tab.title.clone(), tab.id);
+        self.sync_tab_from_inputs(id, cx);
+        let Some(tab) = self.tabs.iter().find(|t| t.id == id) else { return };
+        if tab.sql.trim().is_empty() {
+            return;
+        }
+        let measure = tab
+            .chart_col
+            .and_then(|i| tab.columns.get(i))
+            .map(|c| c.name.clone())
+            .unwrap_or_default();
+        let (sql, conn2) = (tab.sql.clone(), conn.clone());
+        self.ask(
+            Pending::SavedCharts { conn: conn.clone() },
+            "store.charts.save",
+            json!({ "conn": conn, "name": name, "sql": sql, "measure": measure }),
+        );
+        self.ask(
+            Pending::SavedCharts { conn: conn2.clone() },
+            "store.charts.list",
+            json!({ "conn": conn2 }),
+        );
+        self.toast(format!("saved chart: {name}"), false);
+    }
+
+    // ── instance metrics ────────────────────────────────────────────────────
+
+    /// Ask the server what it is doing. One round trip, when asked.
+    fn ask_metrics(&mut self) {
+        let Some(live) = self.conns.first() else { return };
+        let (name, conn_id, driver) = (live.name.clone(), live.conn_id, live.driver.clone());
+        if !self.meta(&driver).map_or(false, |m| m.caps.metrics) {
+            self.metrics.clear();
+            self.metrics_conn = Some(name);
+            self.metrics_error =
+                Some(format!("the {driver} driver has nothing to report about its server"));
+            return;
+        }
+        self.metrics_inflight = true;
+        self.ask(
+            Pending::Metrics { conn: name },
+            "instance.metrics",
+            json!({ "conn_id": conn_id }),
+        );
+    }
+
+    /// Repeat it, but ONLY while the panel is open and only at a rate somebody
+    /// chose. Leaving the panel stops it, because this is the only place it is
+    /// called from and it checks.
+    fn poll_metrics(&mut self) {
+        if self.rail != Rail::Instance || self.metrics_inflight || self.conns.is_empty() {
+            return;
+        }
+        // The panel being open is the request. A session restored WITH it open
+        // is somebody who left it open, so it reads once — and then only again
+        // at a rate they chose.
+        if self.metrics_at.is_none() && self.metrics_error.is_none() {
+            self.ask_metrics();
+            return;
+        }
+        let Some(every) = self.metrics_every else { return };
+        let due = self.metrics_at.map_or(true, |t| t.elapsed() >= every);
+        if due {
+            self.ask_metrics();
+        }
     }
 
     // ── the builder ─────────────────────────────────────────────────────────
@@ -1881,7 +2033,7 @@ impl Workspace {
             .border_color(t.border())
             .py_2()
             .gap_1();
-        for mode in [Rail::Connections, Rail::History, Rail::Tasks, Rail::Settings] {
+        for mode in [Rail::Connections, Rail::Instance, Rail::History, Rail::Tasks, Rail::Settings] {
             let on = self.rail == mode;
             col = col.child(
                 div()
@@ -1906,6 +2058,11 @@ impl Workspace {
                         this.rail = mode;
                         if mode == Rail::History && this.history.is_empty() {
                             this.ask(Pending::History, "store.history.list", json!({ "limit": 200 }));
+                        }
+                        // Opening the panel is the request. Closing it is why
+                        // nothing asks again.
+                        if mode == Rail::Instance {
+                            this.ask_metrics();
                         }
                         this.remember();
                         cx.notify();
@@ -1935,6 +2092,86 @@ impl Workspace {
                         .text_color(t.fg())
                         .child(SharedString::from(self.theme_name.clone())),
                 );
+                return panel;
+            }
+            Rail::Instance => {
+                let who = self.metrics_conn.clone().unwrap_or_else(|| "nothing connected".into());
+                panel = panel.child(self.section(&format!("Instance \u{2014} {who}")));
+
+                // How often, said plainly and chosen explicitly. "off" is the
+                // default because repeating a statistics query against
+                // somebody else\u{2019}s production database is their decision.
+                let mut rate = div().flex().items_center().gap_1().px_2().py_1();
+                rate = rate.child(self.small("read every", t.muted()));
+                for (label, every) in [
+                    ("off", None),
+                    ("2s", Some(Duration::from_secs(2))),
+                    ("10s", Some(Duration::from_secs(10))),
+                    ("60s", Some(Duration::from_secs(60))),
+                ] {
+                    let on = self.metrics_every == every;
+                    rate = rate.child(
+                        div()
+                            .id(SharedString::from(format!("rate-{label}")))
+                            .px_1()
+                            .cursor_pointer()
+                            .text_size(px(10.0))
+                            .text_color(if on { t.inverted() } else { t.muted() })
+                            .when(on, |d| d.bg(t.accent()))
+                            .child(label)
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.metrics_every = every;
+                                cx.notify();
+                            })),
+                    );
+                }
+                rate = rate.child(
+                    div()
+                        .id("metrics-now")
+                        .px_1()
+                        .cursor_pointer()
+                        .text_size(px(10.0))
+                        .text_color(t.accent())
+                        .child("\u{f021} now")
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.ask_metrics();
+                            cx.notify();
+                        })),
+                );
+                panel = panel.child(rate);
+
+                if let Some(at) = self.metrics_at {
+                    panel = panel.child(div().px_2().child(self.small(
+                        format!("read {} ago", fmt_duration(at.elapsed())),
+                        t.muted(),
+                    )));
+                }
+                if let Some(e) = &self.metrics_error {
+                    panel = panel.child(div().px_2().child(self.small(e.clone(), t.error())));
+                }
+
+                let mut group = String::new();
+                for m in &self.metrics {
+                    if m.group != group {
+                        group = m.group.clone();
+                        panel = panel.child(self.section(&group));
+                    }
+                    panel = panel.child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .justify_between()
+                            .px_2()
+                            .py(px(1.0))
+                            .child(self.small(m.name.clone(), t.muted()))
+                            .child(
+                                div()
+                                    .text_size(px(11.0))
+                                    .text_color(t.fg())
+                                    .child(SharedString::from(m.value.clone())),
+                            ),
+                    );
+                }
                 return panel;
             }
             Rail::History => {
@@ -2131,6 +2368,38 @@ impl Workspace {
             panel = panel.child(self.section(&live.name));
             if live.nodes.is_empty() {
                 panel = panel.child(div().px_2().child(self.small("loading…", t.muted())));
+            }
+            if !live.charts.is_empty() {
+                panel = panel.child(self.section("Saved charts"));
+                for c in &live.charts {
+                    panel = panel.child(
+                        div()
+                            .id(SharedString::from(format!("sc-{}-{}", live.name, c.name)))
+                            .flex()
+                            .items_center()
+                            .gap_1()
+                            .pl(px(10.0))
+                            .pr_2()
+                            .py(px(2.0))
+                            .cursor_pointer()
+                            .hover(|d| d.bg(t.hover()))
+                            .child(div().text_size(px(10.0)).text_color(t.accent()).child("\u{f080}"))
+                            .child(
+                                div()
+                                    .text_size(px(11.0))
+                                    .text_color(t.fg())
+                                    .child(SharedString::from(c.name.clone())),
+                            )
+                            .on_click(cx.listener({
+                                let (cn, n, sql, m) =
+                                    (live.name.clone(), c.name.clone(), c.sql.clone(), c.measure.clone());
+                                move |this, _, _, cx| {
+                                    this.open_chart(&cn, &n, &sql, &m, cx);
+                                    cx.notify();
+                                }
+                            })),
+                    );
+                }
             }
             if !live.queries.is_empty() {
                 panel = panel.child(self.section("Saved queries"));
@@ -2393,7 +2662,7 @@ impl Workspace {
         // corner of the breadcrumbs: they are about the result below them.
         let mut views = div().flex().items_center().gap_2().px_3().py_1();
         views = views.child(sub_row).child(self.small("│", t.border()));
-        for v in [ResultView::Tree, ResultView::Table, ResultView::Json] {
+        for v in [ResultView::Tree, ResultView::Table, ResultView::Json, ResultView::Chart] {
             let on = tab.view == v;
             let tab_id = tab.id;
             views = views.child(
@@ -2427,6 +2696,21 @@ impl Workspace {
                     cx.notify();
                 })),
         );
+        if tab.view == ResultView::Chart {
+            views = views.child(
+                div()
+                    .id("save-chart")
+                    .px_2()
+                    .cursor_pointer()
+                    .text_size(px(11.0))
+                    .text_color(t.accent())
+                    .child("Save chart")
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.save_chart(cx);
+                        cx.notify();
+                    })),
+            );
+        }
         views = views.child(
             div()
                 .id("save-query")
@@ -2496,6 +2780,7 @@ impl Workspace {
             ResultView::Table => self.table_el(tab, cx),
             ResultView::Tree => self.tree_el(tab, cx),
             ResultView::Json => self.json_el(tab),
+            ResultView::Chart => self.chart_el(tab, cx),
         };
         // The detail panel sits BESIDE the grid, not over it: the row it is
         // showing stays visible in its place among the others, which is half of
@@ -2511,6 +2796,145 @@ impl Workspace {
             None => view,
         });
         body.into_any_element()
+    }
+
+    /// The result as bars.
+    ///
+    /// Drawn from the ROWS, not from the declared column types: a driver that
+    /// declares nothing — sqlite usually does — would otherwise never be
+    /// chartable, and a column declared INTEGER can still arrive holding text.
+    fn chart_el(&self, tab: &Tab, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let t = self.t();
+        let shape = match ChartShape::of(&tab.columns, &tab.rows) {
+            Ok(s) => s,
+            // Say WHY there is no chart. "No chart" on its own reads as a bug.
+            Err(why) => {
+                return div()
+                    .flex()
+                    .flex_col()
+                    .size_full()
+                    .items_center()
+                    .justify_center()
+                    .gap_1()
+                    .child(div().text_color(t.muted()).child(SharedString::from(why)))
+                    .child(self.small(
+                        "a chart needs one column of numbers and one to name the bars",
+                        t.muted(),
+                    ))
+                    .into_any_element();
+            }
+        };
+
+        let tab_id = tab.id;
+        // A saved chart names its measurement. Match it by NAME here, so a
+        // statement that gained or reordered a column still measures what the
+        // chart was saved measuring — and falls back visibly rather than
+        // drawing a different column under the old name.
+        let by_name = tab.chart_measure.as_ref().and_then(|m| {
+            shape
+                .values
+                .iter()
+                .copied()
+                .find(|&i| tab.columns.get(i).map(|c| &c.name) == Some(m))
+        });
+        let chosen = tab
+            .chart_col
+            .filter(|c| shape.values.contains(c))
+            .or(by_name)
+            .unwrap_or(shape.values[0]);
+
+        // Which measurement is being drawn, when there is more than one.
+        let mut picker = div().flex().items_center().gap_2().px_3().py_1();
+        if shape.values.len() > 1 {
+            picker = picker.child(self.small("measure", t.muted()));
+            for &i in &shape.values {
+                let on = i == chosen;
+                let name = tab.columns.get(i).map(|c| c.name.clone()).unwrap_or_default();
+                picker = picker.child(
+                    div()
+                        .id(SharedString::from(format!("ch-{tab_id}-{i}")))
+                        .px_1()
+                        .cursor_pointer()
+                        .text_size(px(11.0))
+                        .text_color(if on { t.inverted() } else { t.fg() })
+                        .when(on, |d| d.bg(t.accent()))
+                        .hover(|d| d.bg(t.hover()))
+                        .child(SharedString::from(name))
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            if let Some(tb) = this.tabs.iter_mut().find(|x| x.id == tab_id) {
+                                tb.chart_col = Some(i);
+                            }
+                            cx.notify();
+                        })),
+                );
+            }
+        }
+
+        let (lo, hi) = value_range(&tab.rows, chosen);
+        let span = hi - lo;
+        let mut bars = div().flex().flex_col().flex_1().overflow_hidden().px_3().py_1().gap(px(2.0));
+        // Only what fits is drawn, and the count below says how many there are:
+        // a chart of two hundred bars three pixels wide is not a chart.
+        let shown = tab.rows.len().min(40);
+        for r in 0..shown {
+            let v = tab.rows.get(r).and_then(|row| row.get(chosen)).and_then(|x| x.as_f64());
+            let frac = v.map(|n| ((n - lo) / span).clamp(0.0, 1.0)).unwrap_or(0.0);
+            let label = bar_label(tab, &shape, r);
+            bars = bars.child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .h(px(16.0))
+                    .child(
+                        div()
+                            .w(px(160.0))
+                            .text_size(px(11.0))
+                            .text_color(t.muted())
+                            .child(SharedString::from(label)),
+                    )
+                    .child(
+                        div().flex_1().h_full().child(
+                            div()
+                                .h_full()
+                                .w(gpui::relative(frac as f32))
+                                // A missing measurement is drawn as NOTHING, not
+                                // as a bar of zero: "no value" and "zero" are
+                                // different answers.
+                                .bg(if v.is_some() { t.accent() } else { t.panel() }),
+                        ),
+                    )
+                    .child(
+                        div()
+                            .w(px(110.0))
+                            .text_size(px(11.0))
+                            .text_color(if v.is_some() { t.fg() } else { t.muted() })
+                            .child(SharedString::from(match v {
+                                Some(n) => format!("{n}"),
+                                None => "NULL".into(),
+                            })),
+                    ),
+            );
+        }
+
+        let footer = self.small(
+            format!(
+                "{}\u{2013}{} of {} loaded row(s) \u{2014} axis from {lo} to {hi}",
+                if shown == 0 { 0 } else { 1 },
+                shown,
+                tab.rows.len()
+            ),
+            t.muted(),
+        );
+
+        div()
+            .flex()
+            .flex_col()
+            .size_full()
+            .child(picker)
+            .child(bars)
+            .child(div().px_3().py_1().child(footer))
+            .into_any_element()
     }
 
     /// The visual builder: choices in, a statement out.

@@ -47,6 +47,8 @@ const META: DriverMeta = DriverMeta {
         ddl: true,     // sqlite_master.sql — the ORIGINAL CREATE text, verbatim
         // sqlite binds every value and rolls back a write that was not one row.
         edit: true,
+        // PRAGMAs, all of them reads.
+        metrics: true,
     },
     hint: "SELECT * FROM table LIMIT 100",
     browse: "SELECT {columns} FROM {qualified} {clauses} LIMIT {limit};",
@@ -100,6 +102,34 @@ fn cell(v: SqlValue) -> Value {
             b64: base64::engine::general_purpose::STANDARD.encode(&b),
             len: b.len(),
         },
+    }
+}
+
+/// Bytes as a person reads them. A page count times a page size is a number
+/// nobody can hold; "4.0 MiB" is the same fact and can be acted on.
+fn human_bytes(n: i64) -> String {
+    const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
+    let mut v = n as f64;
+    let mut u = 0;
+    while v >= 1024.0 && u < UNITS.len() - 1 {
+        v /= 1024.0;
+        u += 1;
+    }
+    if u == 0 {
+        format!("{n} B")
+    } else {
+        format!("{v:.1} {}", UNITS[u])
+    }
+}
+
+fn display(v: &Value) -> String {
+    match v {
+        Value::Null => "NULL".into(),
+        Value::Bool(b) => b.to_string(),
+        Value::Int(i) => i.to_string(),
+        Value::Float(f) => f.to_string(),
+        Value::Text(s) => s.clone(),
+        other => format!("{other:?}"),
     }
 }
 
@@ -352,6 +382,62 @@ impl Connection for SqliteConnection {
             Some(Value::Text(s)) => Some(s.clone()),
             _ => None,
         }))
+    }
+
+    async fn metrics(&mut self) -> anyhow::Result<Vec<crate::spec::Metric>> {
+        use crate::spec::Metric;
+        // SQLite's system views are PRAGMAs. Every one of these is a read.
+        let mut out = Vec::new();
+        let one = |rows: Vec<Vec<Value>>| -> Option<Value> { rows.into_iter().next()?.into_iter().next() };
+        let num = |v: Option<Value>| -> Option<i64> {
+            match v {
+                Some(Value::Int(i)) => Some(i),
+                Some(Value::Float(f)) => Some(f as i64),
+                Some(Value::Text(s)) => s.parse().ok(),
+                _ => None,
+            }
+        };
+
+        let (_, r, _) = self.run("PRAGMA page_count".into()).await?;
+        let pages = num(one(r));
+        let (_, r, _) = self.run("PRAGMA page_size".into()).await?;
+        let page_size = num(one(r));
+        if let (Some(p), Some(s)) = (pages, page_size) {
+            out.push(Metric { group: "storage", name: "size", value: human_bytes(p * s) });
+            out.push(Metric { group: "storage", name: "pages", value: p.to_string() });
+            out.push(Metric { group: "storage", name: "page size", value: human_bytes(s) });
+        }
+        let (_, r, _) = self.run("PRAGMA freelist_count".into()).await?;
+        if let Some(f) = num(one(r)) {
+            // Free pages are space the file is holding and not using — the
+            // number that says whether a VACUUM would give anything back.
+            out.push(Metric { group: "storage", name: "free pages", value: f.to_string() });
+        }
+        for (pragma, name, group) in [
+            ("PRAGMA journal_mode", "journal mode", "settings"),
+            ("PRAGMA synchronous", "synchronous", "settings"),
+            ("PRAGMA encoding", "encoding", "settings"),
+            ("PRAGMA foreign_keys", "foreign keys", "settings"),
+            ("PRAGMA user_version", "user version", "settings"),
+        ] {
+            let (_, r, _) = self.run(pragma.into()).await?;
+            if let Some(v) = one(r) {
+                out.push(Metric { group, name, value: display(&v) });
+            }
+        }
+        let (_, r, _) = self
+            .run("SELECT count(*) FROM sqlite_master WHERE type='table'".into())
+            .await?;
+        if let Some(n) = num(one(r)) {
+            out.push(Metric { group: "contents", name: "tables", value: n.to_string() });
+        }
+        let (_, r, _) = self
+            .run("SELECT count(*) FROM sqlite_master WHERE type='index'".into())
+            .await?;
+        if let Some(n) = num(one(r)) {
+            out.push(Metric { group: "contents", name: "indexes", value: n.to_string() });
+        }
+        Ok(out)
     }
 
     async fn plan_row(&mut self, plan: &RowPlan) -> anyhow::Result<String> {

@@ -39,7 +39,14 @@ use serde_json::json;
 ///     cannot write anyway. Additive: an older client never calls it, and a
 ///     newer client against an older engine sees `edit: false` and offers
 ///     nothing.
-pub const PROTO: u32 = 5;
+/// 6 — added `instance.metrics` with `caps.metrics`, and `store.charts.*`.
+///     The metrics are each driver asking its OWN system views, because what a
+///     server will say about itself and what it calls it differ completely
+///     between engines. The charts are in the engine's store rather than a
+///     client's file, for the same reason saved queries are: a chart somebody
+///     made is something they will want from the editor too. Additive — the
+///     store's schema version is unchanged for the tables the Lua side knows.
+pub const PROTO: u32 = 6;
 
 /// One decoded incoming request.
 #[derive(Debug, Deserialize)]

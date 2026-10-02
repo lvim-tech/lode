@@ -132,6 +132,7 @@ const MONGO_META: DriverMeta = DriverMeta {
         // somebody's data). Turn this on in the same commit that shows the
         // mongo section of that test passing, and not before.
         edit: false,
+        metrics: false,
     },
     hint: "{\"find\": \"collection\", \"limit\": 50}",
     browse: "{\"find\": \"{name}\", \"limit\": {limit}}",

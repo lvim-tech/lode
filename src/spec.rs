@@ -35,6 +35,13 @@ pub struct Caps {
     // ONLY where its driver claims it, so no engine ever grows a row that dead-ends.
     pub indexes: bool, // can list an object's indexes (`schema.indexes`)
     pub ddl: bool,     // can return an object's CREATE statement (`schema.ddl`)
+    /// Can report what its server is doing (`instance.metrics`).
+    ///
+    /// Separate from everything else because what an engine will tell you about
+    /// itself varies more than anything: PostgreSQL has a whole statistics
+    /// collector, SQLite has a handful of PRAGMAs about a file, and a driver
+    /// speaking to someone else's hosted service may be allowed none of it.
+    pub metrics: bool,
     /// Can change ONE addressed row (`row.write`).
     ///
     /// Claimed only by a driver that can do it SAFELY — that is, one that binds
@@ -502,6 +509,20 @@ pub fn value_from_json(v: &serde_json::Value) -> Value {
         }
         J::Array(_) => Value::Json(v.clone()),
     }
+}
+
+/// One thing an engine says about itself.
+///
+/// Deliberately flat text rather than a number: "4.0 MiB", "wal", "3 of 100
+/// connections". A metric that arrives as a bare number needs a unit and a
+/// scale from somewhere, and the only place that knows both is the driver that
+/// asked for it.
+#[derive(Debug, Clone, Serialize)]
+pub struct Metric {
+    /// Which heading it belongs under — "storage", "activity", "settings".
+    pub group: &'static str,
+    pub name: &'static str,
+    pub value: String,
 }
 
 /// A change to ONE row, named by its identifying key.

@@ -252,6 +252,16 @@ pub trait Connection: Send {
         anyhow::bail!("this engine cannot edit a row from the grid")
     }
 
+    /// What this engine says about itself (`Caps::metrics`).
+    ///
+    /// Defaults to nothing, so a driver opts IN. An engine that cannot be asked
+    /// — or is not allowed to answer, which a hosted service often is not —
+    /// says nothing rather than having numbers invented for it from the client
+    /// side, where they would be guesses wearing the server's name.
+    async fn metrics(&mut self) -> anyhow::Result<Vec<crate::spec::Metric>> {
+        Ok(Vec::new())
+    }
+
     /// Execute a statement, returning a paged result stream.
     async fn execute(&mut self, stmt: &str) -> anyhow::Result<Box<dyn ResultStream>>;
 

@@ -59,6 +59,7 @@ const CAPS: Caps = Caps {
     indexes: true,
     ddl: true, // information_schema.STATISTICS / SHOW CREATE TABLE
     edit: false,
+    metrics: false,
 };
 
 const MARIADB_META: DriverMeta = DriverMeta {
