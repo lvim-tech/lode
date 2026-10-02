@@ -20,6 +20,20 @@ use crate::spec::{
     Value,
 };
 
+/// Cassandra's WHERE is NOT SQL's. It filters on key columns and indexed ones,
+/// it has no LIKE and no `IS NULL` — a row either has a value or has no cell at
+/// all. Offering the shared list here would put four choices in front of
+/// somebody that produce an error every time, so this list is the short truth.
+const CQL_BUILDER_OPS: &[crate::spec::BuilderOp] = &[
+    crate::spec::BuilderOp { label: "=", fragment: "{col} = {value}" },
+    crate::spec::BuilderOp { label: "<", fragment: "{col} < {value}" },
+    crate::spec::BuilderOp { label: "<=", fragment: "{col} <= {value}" },
+    crate::spec::BuilderOp { label: ">", fragment: "{col} > {value}" },
+    crate::spec::BuilderOp { label: ">=", fragment: "{col} >= {value}" },
+    crate::spec::BuilderOp { label: "IN", fragment: "{col} IN ({value})" },
+    crate::spec::BuilderOp { label: "CONTAINS", fragment: "{col} CONTAINS {value}" },
+];
+
 const PARAMS: &[ParamSpec] = &[
     ParamSpec {
         key: "host",
@@ -70,11 +84,12 @@ const CASSANDRA_META: DriverMeta = DriverMeta {
     auth: AUTH,
     caps: CAPS,
     hint: "SELECT * FROM table LIMIT 100",
-    browse: "SELECT * FROM {qualified} {clauses} LIMIT {limit};",
+    browse: "SELECT {columns} FROM {qualified} {clauses} LIMIT {limit};",
     browse_by_kind: &[],
     query_form: &[],
     query_template: "",
     browse_form: crate::spec::SQL_BROWSE_FORM,
+    builder_ops: CQL_BUILDER_OPS,
 };
 
 const SCYLLA_META: DriverMeta = DriverMeta {
@@ -85,11 +100,12 @@ const SCYLLA_META: DriverMeta = DriverMeta {
     auth: AUTH,
     caps: CAPS,
     hint: "SELECT * FROM table LIMIT 100",
-    browse: "SELECT * FROM {qualified} {clauses} LIMIT {limit};",
+    browse: "SELECT {columns} FROM {qualified} {clauses} LIMIT {limit};",
     browse_by_kind: &[],
     query_form: &[],
     query_template: "",
     browse_form: crate::spec::SQL_BROWSE_FORM,
+    builder_ops: CQL_BUILDER_OPS,
 };
 
 /// The CQL driver, serving both the `cassandra` and `scylla` kinds.

@@ -989,6 +989,15 @@ impl Workspace {
     }
 
     fn run_tab(&mut self, tab_id: u64) {
+        self.run_tab_confirmed(tab_id, false)
+    }
+
+    /// Run a tab, saying whether the person has already been asked.
+    ///
+    /// The `confirm` goes to the ENGINE, which is where the policy lives. This
+    /// client asks first anyway; the flag is how it reports that it did, and the
+    /// engine refuses when it did not.
+    fn run_tab_confirmed(&mut self, tab_id: u64, confirm: bool) {
         let Some(idx) = self.tabs.iter().position(|t| t.id == tab_id) else { return };
         let (conn_name, title) = (self.tabs[idx].conn_name.clone(), self.tabs[idx].title.clone());
         let Some(live) = self.live(&conn_name) else {
@@ -1016,7 +1025,7 @@ impl Workspace {
         self.ask(
             Pending::Execute { tab: tab_id, task: task_id },
             "query.execute",
-            json!({ "conn_id": conn_id, "statement": statement }),
+            json!({ "conn_id": conn_id, "statement": statement, "confirm": confirm }),
         );
     }
 
@@ -1172,12 +1181,26 @@ impl Workspace {
 
     fn run_statement(&mut self, conn: &str, statement: &str, cx: &mut Context<Self>) {
         let title: String = statement.chars().take(40).collect();
-        self.run_statement_titled(conn, &title, statement, cx);
+        self.run_statement_titled(conn, &title, statement, false, cx);
+    }
+
+    /// The same, for a statement the person has just been asked about and
+    /// approved. The flag travels to the engine, which is what actually decides.
+    fn run_statement_approved(&mut self, conn: &str, statement: &str, cx: &mut Context<Self>) {
+        let title: String = statement.chars().take(40).collect();
+        self.run_statement_titled(conn, &title, statement, true, cx);
     }
 
     /// Run a statement at a connection, as its own tab — so it gets the same
     /// grid, views, paging and task entry everything else gets.
-    fn run_statement_titled(&mut self, conn: &str, title: &str, statement: &str, cx: &mut Context<Self>) {
+    fn run_statement_titled(
+        &mut self,
+        conn: &str,
+        title: &str,
+        statement: &str,
+        confirm: bool,
+        cx: &mut Context<Self>,
+    ) {
         let Some(live) = self.live(conn) else { return };
         let driver = live.driver.clone();
         let meta = self.meta(&driver).cloned();
@@ -1317,7 +1340,7 @@ impl Workspace {
                 .push(("warn".into(), format!("{conn} is not connected")));
             return;
         }
-        self.run_statement_titled(conn, title, sql, cx);
+        self.run_statement_titled(conn, title, sql, false, cx);
     }
 
     /// Write what the grid holds. What is written is what is LOADED, and the row
@@ -3340,7 +3363,7 @@ impl Workspace {
                                         .child("Run it")
                                         .on_click(cx.listener(|this, _, _, cx| {
                                             if let Some((conn, stmt, _)) = this.confirm.take() {
-                                                this.run_statement(&conn, &stmt, cx);
+                                                this.run_statement_approved(&conn, &stmt, cx);
                                                 this.console.update(cx, |i, cx| i.set_text("", cx));
                                             }
                                             cx.notify();

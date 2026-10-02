@@ -139,6 +139,7 @@ const MONGO_META: DriverMeta = DriverMeta {
     query_form: QUERY_FORM,
     query_template: "{\"find\": \"{name}\"{fragments}}",
     browse_form: &[],
+    builder_ops: &[],
 };
 
 /// The MongoDB driver.

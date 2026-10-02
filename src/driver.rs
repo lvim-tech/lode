@@ -44,6 +44,100 @@ pub trait Driver: Send + Sync {
     fn classify(&self, statement: &str) -> Option<String> {
         default_sql_classify(statement)
     }
+
+    /// Whether this statement CHANGES anything.
+    ///
+    /// Deliberately a different question from `classify`. That one asks "is
+    /// this dangerous", and an `INSERT` is not — it is still a write, and a
+    /// connection marked read-only has to refuse it. Conflating the two would
+    /// make "read only" mean "no DROP", which is not what anybody means by it.
+    ///
+    /// Defaults to SQL, which is what most drivers are.
+    fn writes(&self, statement: &str) -> bool {
+        default_sql_writes(statement)
+    }
+}
+
+/// Does this SQL change anything? Reads the leading verb of each statement in
+/// the batch; anything it does not recognise counts as a write, because the
+/// cost of being wrong runs one way only — refusing a read somebody wanted is
+/// an annoyance, and allowing a write they forbade is the thing read-only
+/// exists to stop.
+pub fn default_sql_writes(statement: &str) -> bool {
+    let cleaned: String = statement
+        .lines()
+        .map(|l| match l.find("--") {
+            Some(i) => &l[..i],
+            None => l,
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
+    cleaned
+        .split(';')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .any(|s| {
+            let first = s.split_whitespace().next().unwrap_or("").to_ascii_lowercase();
+            // A PRAGMA that ASSIGNS changes the database; one that asks does
+            // not. `SET` is left out of the reading list entirely — `SET GLOBAL`
+            // changes a server, and telling the two apart is a parser's job.
+            if first == "pragma" {
+                return s.contains('=');
+            }
+            !matches!(
+                first.as_str(),
+                "select" | "with" | "show" | "describe" | "desc" | "explain" | "values" | "table"
+                    | "use"
+            )
+        })
+}
+
+#[cfg(test)]
+mod writes_tests {
+    use super::default_sql_writes;
+
+    #[test]
+    fn reading_is_not_writing() {
+        for s in [
+            "SELECT * FROM t",
+            "  with x as (select 1) select * from x",
+            "EXPLAIN SELECT 1",
+            "SHOW TABLES",
+            "PRAGMA table_info('t')",
+        ] {
+            assert!(!default_sql_writes(s), "{s} does not change anything");
+        }
+    }
+
+    #[test]
+    fn writing_is_writing_even_when_it_is_not_dangerous() {
+        // The point of the distinction: an INSERT is not dangerous and IS a
+        // write, and read-only has to refuse it.
+        for s in ["INSERT INTO t VALUES (1)", "CREATE TABLE t(a)", "PRAGMA journal_mode = WAL"] {
+            assert!(default_sql_writes(s), "{s} changes something");
+        }
+    }
+
+    /// A batch is a write if ANY statement in it is: hiding an UPDATE behind a
+    /// leading SELECT is the obvious way past a check that reads only the first
+    /// verb.
+    #[test]
+    fn one_write_in_a_batch_makes_the_batch_a_write() {
+        assert!(default_sql_writes("SELECT 1; UPDATE t SET a = 1"));
+    }
+
+    /// Anything unrecognised counts as a write. Being wrong costs an annoyance
+    /// one way and a forbidden write the other.
+    #[test]
+    fn an_unknown_verb_is_assumed_to_write() {
+        assert!(default_sql_writes("VACUUM"));
+        assert!(default_sql_writes("CALL do_something()"));
+    }
+
+    #[test]
+    fn a_commented_out_update_is_not_one() {
+        assert!(!default_sql_writes("SELECT 1 -- UPDATE t SET a = 1"));
+    }
 }
 
 /// The destructive-statement rule for SQL, shared by every SQL driver.

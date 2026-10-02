@@ -100,6 +100,10 @@ pub struct DriverMeta {
     /// that cannot simply offers no filter.
     #[serde(default)]
     pub browse_form: Vec<QueryFieldSpec>,
+    /// The comparisons this dialect offers. Empty on an older engine and on an
+    /// engine with no builder, which the client reads the same way: no builder.
+    #[serde(default)]
+    pub builder_ops: Vec<BuilderOp>,
 }
 
 /// One input of a structured query bar, as the engine declares it.
@@ -170,6 +174,19 @@ pub fn render_with(
     fragments: &[String],
     clauses: &[String],
 ) -> String {
+    render_full(template, name, schema, limit, fragments, clauses, "")
+}
+
+/// As `render_with`, plus the projection the builder chose.
+pub fn render_full(
+    template: &str,
+    name: &str,
+    schema: Option<&str>,
+    limit: usize,
+    fragments: &[String],
+    clauses: &[String],
+    columns: &str,
+) -> String {
     let schema = schema.filter(|s| !s.is_empty());
     let qualified = match schema {
         Some(s) => format!("{s}.{name}"),
@@ -187,6 +204,10 @@ pub fn render_with(
     // statement is shown to the person who runs it.
     let clause_text = clauses.join(" ");
     let out = template
+        // No projection chosen means every column, which is what a browse has
+        // always meant — the placeholder exists so the BUILDER can narrow it,
+        // not so a plain browse changes.
+        .replace("{columns}", if columns.is_empty() { "*" } else { columns })
         .replace("{clauses}", &clause_text)
         .replace("{qualified}", &qualified)
         .replace("{name}", name)
@@ -342,6 +363,26 @@ pub struct TableColumn {
     /// these, and only when there is at least one.
     #[serde(default)]
     pub primary: bool,
+}
+
+/// One comparison the builder offers, as the driver declared it.
+#[derive(Debug, Clone, Deserialize)]
+pub struct BuilderOp {
+    pub label: String,
+    pub fragment: String,
+}
+
+impl BuilderOp {
+    /// Whether this comparison takes a value at all. `IS NULL` does not, and
+    /// showing a box that is ignored is how an interface teaches the wrong
+    /// thing.
+    pub fn takes_value(&self) -> bool {
+        self.fragment.contains("{value}")
+    }
+
+    pub fn render(&self, col: &str, value: &str) -> String {
+        self.fragment.replace("{col}", col).replace("{value}", value)
+    }
 }
 
 /// One index on an object, as `schema.indexes` returns it.

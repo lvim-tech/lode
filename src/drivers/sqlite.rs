@@ -49,11 +49,12 @@ const META: DriverMeta = DriverMeta {
         edit: true,
     },
     hint: "SELECT * FROM table LIMIT 100",
-    browse: "SELECT * FROM {qualified} {clauses} LIMIT {limit};",
+    browse: "SELECT {columns} FROM {qualified} {clauses} LIMIT {limit};",
     browse_by_kind: &[],
     query_form: &[],
     query_template: "",
     browse_form: crate::spec::SQL_BROWSE_FORM,
+    builder_ops: crate::spec::SQL_BUILDER_OPS,
 };
 
 /// The SQLite driver.

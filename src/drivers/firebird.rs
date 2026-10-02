@@ -66,11 +66,12 @@ const META: DriverMeta = DriverMeta {
         edit: false,
     },
     hint: "SELECT FIRST 100 * FROM table",
-    browse: "SELECT FIRST {limit} * FROM {qualified} {clauses};",
+    browse: "SELECT FIRST {limit} {columns} FROM {qualified} {clauses};",
     browse_by_kind: &[],
     query_form: &[],
     query_template: "",
     browse_form: crate::spec::SQL_BROWSE_FORM,
+    builder_ops: crate::spec::SQL_BUILDER_OPS,
 };
 
 /// The Firebird driver.

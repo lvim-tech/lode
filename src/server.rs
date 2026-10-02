@@ -22,7 +22,9 @@ use crate::driver::{CancelHandle, Connection, ResultStream};
 use crate::net::NetContext;
 use crate::registry::Registry;
 use crate::rpc::{self, Request};
-use crate::spec::{AuthSpec, Column, ConnSpec, DriverMeta, ObjRef, ParamType, RowPlan, Value};
+use crate::spec::{
+    AuthSpec, Column, ConnSpec, DriverMeta, ObjRef, ParamType, Policy, RowPlan, Value,
+};
 use crate::store::Store;
 
 type Conn = Arc<AsyncMutex<Box<dyn Connection>>>;
@@ -36,6 +38,8 @@ const DIAL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 /// tunnel stays up as long as this entry lives, and is torn down on disconnect.
 struct ConnEntry {
     conn: Conn,
+    /// What this connection is allowed to do.
+    policy: Policy,
     /// Which driver this connection IS. Recorded rather than taken from a
     /// request, so a write is classified by the engine that will run it and not
     /// by whatever the caller claims it is talking to.
@@ -155,6 +159,54 @@ impl Server {
         let _ = self.inner.out.send(line);
     }
 
+    /// What a live connection is allowed to do.
+    fn conn_policy(&self, id: u64) -> anyhow::Result<Policy> {
+        self.inner
+            .conns
+            .lock()
+            .unwrap()
+            .get(&id)
+            .map(|e| e.policy)
+            .ok_or_else(|| anyhow::anyhow!("no such connection {id}"))
+    }
+
+    /// Hold a statement against the connection's policy.
+    ///
+    /// Returns the reason to refuse, or `None` to go ahead. This runs on EVERY
+    /// path that can change data — the console, a tab, the builder, a row
+    /// edit — because a check that lives on one path is a check that the next
+    /// path forgets.
+    fn allowed(
+        &self,
+        conn_id: u64,
+        driver: &dyn crate::driver::Driver,
+        statement: &str,
+        confirmed: bool,
+    ) -> anyhow::Result<()> {
+        let policy = self.conn_policy(conn_id)?;
+        if policy == Policy::Open {
+            return Ok(());
+        }
+        if !driver.writes(statement) {
+            return Ok(());
+        }
+        if policy == Policy::ReadOnly {
+            anyhow::bail!(
+                "this connection is read only \u{2014} it refuses anything that changes the \
+                 database, including statements that are not dangerous"
+            );
+        }
+        // Policy::Confirm: only what classify NAMES has to be confirmed. Asking
+        // about every INSERT would make the question a reflex, and a reflex is
+        // not a decision.
+        if let Some(reason) = driver.classify(statement) {
+            if !confirmed {
+                anyhow::bail!("needs confirming: {reason}");
+            }
+        }
+        Ok(())
+    }
+
     /// Which driver a live connection belongs to.
     fn conn_driver(&self, id: u64) -> anyhow::Result<String> {
         self.inner
@@ -258,6 +310,7 @@ impl Server {
             id,
             ConnEntry {
                 conn: Arc::new(AsyncMutex::new(conn)),
+                policy: spec.policy,
                 driver: spec.driver.clone(),
                 _net: net,
             },
@@ -525,6 +578,9 @@ impl Server {
         struct P {
             conn_id: u64,
             statement: String,
+            /// The caller has asked about this statement and been told yes.
+            #[serde(default)]
+            confirm: bool,
         }
         let p: P = match serde_json::from_value(params) {
             Ok(p) => p,
@@ -534,6 +590,17 @@ impl Server {
             Ok(c) => c,
             Err(e) => return self.send(rpc::response_err(id, &e.to_string())),
         };
+        // The policy is held HERE, not in whatever is calling. A client that
+        // skips its own confirmation dialog still cannot get a dangerous
+        // statement past this.
+        match self
+            .conn_driver(p.conn_id)
+            .and_then(|k| self.inner.registry.get(&k))
+            .and_then(|d| self.allowed(p.conn_id, d.as_ref(), &p.statement, p.confirm))
+        {
+            Ok(()) => {}
+            Err(e) => return self.send(rpc::response_err(id, &e.to_string())),
+        }
 
         let call_id = self.inner.next_call.fetch_add(1, Ordering::Relaxed);
         let call = Arc::new(AsyncMutex::new(Call::new()));
@@ -803,6 +870,9 @@ impl Server {
         }
 
         let statement = conn.lock().await.plan_row(&p.plan).await?;
+        // A read-only connection refuses here as well, and before the plan is
+        // ever offered — the same rule, reached by a different door.
+        self.allowed(p.conn_id, driver.as_ref(), &statement, p.confirm)?;
         let reason = driver.classify(&statement);
         if !p.confirm {
             return Ok(json!({

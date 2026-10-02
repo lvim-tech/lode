@@ -134,6 +134,26 @@ pub struct DriverMeta {
     /// driver still owns every word of SQL — the client contributes a value, not
     /// a syntax.
     pub browse_form: &'static [QueryFieldSpec],
+    /// The comparisons this dialect offers in the visual builder.
+    ///
+    /// A label and the fragment it produces, with `{col}` and `{value}` filled
+    /// in. Declared per driver rather than assumed, because the list is NOT the
+    /// same everywhere: `ILIKE` is PostgreSQL's, `IS NULL` is spelled the same
+    /// in all of them and `<>` is not universally preferred over `!=`. Empty
+    /// means this engine has no builder, which is the right answer for a
+    /// key/value store.
+    pub builder_ops: &'static [BuilderOp],
+}
+
+/// One comparison the builder can offer.
+#[derive(Debug, Clone, Copy, Serialize)]
+pub struct BuilderOp {
+    /// What the person picks from the list.
+    pub label: &'static str,
+    /// The condition it becomes. `{col}` is the column, `{value}` the typed
+    /// text. An op with no `{value}` (IS NULL) takes no input, and the builder
+    /// hides the box rather than showing one that is ignored.
+    pub fragment: &'static str,
 }
 
 /// One input of a STRUCTURED query bar, for engines whose statements are not a
@@ -158,6 +178,21 @@ pub struct QueryFieldSpec {
     /// How many lines the input gets. 1 is a single-line field.
     pub rows: u8,
 }
+
+/// The comparisons nearly every SQL dialect spells the same way. A driver with
+/// more of its own starts from this and adds to it.
+pub const SQL_BUILDER_OPS: &[BuilderOp] = &[
+    BuilderOp { label: "=", fragment: "{col} = {value}" },
+    BuilderOp { label: "<>", fragment: "{col} <> {value}" },
+    BuilderOp { label: "<", fragment: "{col} < {value}" },
+    BuilderOp { label: "<=", fragment: "{col} <= {value}" },
+    BuilderOp { label: ">", fragment: "{col} > {value}" },
+    BuilderOp { label: ">=", fragment: "{col} >= {value}" },
+    BuilderOp { label: "LIKE", fragment: "{col} LIKE {value}" },
+    BuilderOp { label: "IN", fragment: "{col} IN ({value})" },
+    BuilderOp { label: "IS NULL", fragment: "{col} IS NULL" },
+    BuilderOp { label: "IS NOT NULL", fragment: "{col} IS NOT NULL" },
+];
 
 /// The clauses every SQL driver offers on a browse. Identical across them
 /// because this much of SQL genuinely is: a `WHERE` and an `ORDER BY` after the
@@ -208,6 +243,42 @@ pub struct ConnSpec {
     pub tls: TlsSpec,
     #[serde(default)]
     pub tunnel: Option<TunnelSpec>,
+    /// What this connection is ALLOWED to do, enforced by the engine.
+    ///
+    /// On the connection rather than on a client, because a client is a thing
+    /// that can be rewritten, replaced or simply forget — and "the production
+    /// database is read-only from here" has to survive all three.
+    #[serde(default)]
+    pub policy: Policy,
+}
+
+/// What a connection may do.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum Policy {
+    /// Nothing that writes. Not an UPDATE, not an INSERT, not a CREATE — the
+    /// line is "does this change the database", not "does this look dangerous",
+    /// because an INSERT into the wrong table is not dangerous-looking and is
+    /// still a change somebody did not want made.
+    ReadOnly,
+    /// Writes are allowed; the ones `classify` names have to be confirmed. This
+    /// is the default: it is the behaviour somebody expects without having
+    /// configured anything, and it fails toward asking.
+    #[default]
+    Confirm,
+    /// Everything runs. For a scratch database where the asking is the nuisance
+    /// rather than the write.
+    Open,
+}
+
+impl Policy {
+    pub fn label(self) -> &'static str {
+        match self {
+            Policy::ReadOnly => "read only",
+            Policy::Confirm => "asks first",
+            Policy::Open => "unrestricted",
+        }
+    }
 }
 
 impl ConnSpec {

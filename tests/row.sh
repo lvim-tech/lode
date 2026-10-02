@@ -174,6 +174,56 @@ else
     printf '     %-42s %s\n' "duckdb not built in" "skipped"
 fi
 
+# ── the connection policy ────────────────────────────────────────────────────
+# The policy lives on the CONNECTION and is enforced by the engine, so a client
+# that skips its own confirmation dialog still cannot get past it. The three
+# settings have to differ in the right places, not merely exist.
+sqlite3 "$DB" "CREATE TABLE pol(id INTEGER PRIMARY KEY, a TEXT); INSERT INTO pol VALUES (1,'x');"
+
+connect_with() {
+    pid=$1; policy=$2
+    send "{\"jsonrpc\":\"2.0\",\"id\":$pid,\"method\":\"conn.connect\",\"params\":{\"driver\":\"sqlite\",\"params\":{\"file\":\"$DB\"},\"auth\":{\"kind\":\"none\"},\"policy\":\"$policy\"}}"
+    await ".id == $pid" | jq '.result.conn_id'
+}
+
+RO=$(connect_with 40 read_only)
+send "{\"jsonrpc\":\"2.0\",\"id\":41,\"method\":\"query.execute\",\"params\":{\"conn_id\":$RO,\"statement\":\"SELECT * FROM pol\"}}"
+L=$(await '.id == 41')
+check "read only: a SELECT runs" "$(printf '%s' "$L" | jq '.result.call_id != null')" "true"
+
+# An INSERT is not DANGEROUS and is a write. Read-only has to refuse it, or
+# "read only" would mean "no DROP", which is not what anybody means by it.
+send "{\"jsonrpc\":\"2.0\",\"id\":42,\"method\":\"query.execute\",\"params\":{\"conn_id\":$RO,\"statement\":\"INSERT INTO pol VALUES (2,'y')\",\"confirm\":true}}"
+L=$(await '.id == 42')
+mentions "read only: refuses a harmless INSERT" "$L" "read only"
+check "read only: nothing was inserted" "$(rows_of "SELECT count(*) FROM pol")" "1"
+
+send "{\"jsonrpc\":\"2.0\",\"id\":43,\"method\":\"row.write\",\"params\":{\"conn_id\":$RO,\"obj\":{\"name\":\"pol\",\"schema\":\"main\"},\"key\":[[\"id\",1]],\"set\":[[\"a\",\"z\"]],\"confirm\":true}}"
+L=$(await '.id == 43')
+mentions "read only: refuses a row edit too" "$L" "read only"
+check "read only: the row is unchanged" "$(rows_of "SELECT a FROM pol WHERE id=1")" "x"
+
+CF=$(connect_with 44 confirm)
+# Not dangerous: it runs without being asked about, because asking every time is
+# how a confirmation becomes a reflex.
+send "{\"jsonrpc\":\"2.0\",\"id\":45,\"method\":\"query.execute\",\"params\":{\"conn_id\":$CF,\"statement\":\"INSERT INTO pol VALUES (3,'c')\"}}"
+L=$(await '.id == 45')
+check "asks first: a plain INSERT runs" "$(printf '%s' "$L" | jq '.result.call_id != null')" "true"
+
+send "{\"jsonrpc\":\"2.0\",\"id\":46,\"method\":\"query.execute\",\"params\":{\"conn_id\":$CF,\"statement\":\"DELETE FROM pol\"}}"
+L=$(await '.id == 46')
+mentions "asks first: unconfirmed DELETE refused" "$L" "needs confirming"
+check "asks first: nothing was deleted" "$(rows_of "SELECT count(*) FROM pol")" "2"
+
+send "{\"jsonrpc\":\"2.0\",\"id\":47,\"method\":\"query.execute\",\"params\":{\"conn_id\":$CF,\"statement\":\"DELETE FROM pol WHERE id=3\",\"confirm\":true}}"
+L=$(await '.id == 47')
+check "asks first: confirmed DELETE runs" "$(printf '%s' "$L" | jq '.result.call_id != null')" "true"
+
+OP=$(connect_with 48 open)
+send "{\"jsonrpc\":\"2.0\",\"id\":49,\"method\":\"query.execute\",\"params\":{\"conn_id\":$OP,\"statement\":\"DELETE FROM pol WHERE id=99\"}}"
+L=$(await '.id == 49')
+check "unrestricted: runs without asking" "$(printf '%s' "$L" | jq '.result.call_id != null')" "true"
+
 # ── mongodb, when there is one to talk to ────────────────────────────────────
 # The write path for mongo is WRITTEN but `caps.edit` is false, because nothing
 # here can prove it: no mongod, no network, and the one real MongoDB in reach is

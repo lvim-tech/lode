@@ -21,6 +21,22 @@ use crate::spec::{
 
 // ── driver metadata ──────────────────────────────────────────────────────────
 
+/// PostgreSQL's list is the shared one plus the case-insensitive match it is
+/// alone in having as an operator.
+const PG_BUILDER_OPS: &[crate::spec::BuilderOp] = &[
+    crate::spec::BuilderOp { label: "=", fragment: "{col} = {value}" },
+    crate::spec::BuilderOp { label: "<>", fragment: "{col} <> {value}" },
+    crate::spec::BuilderOp { label: "<", fragment: "{col} < {value}" },
+    crate::spec::BuilderOp { label: "<=", fragment: "{col} <= {value}" },
+    crate::spec::BuilderOp { label: ">", fragment: "{col} > {value}" },
+    crate::spec::BuilderOp { label: ">=", fragment: "{col} >= {value}" },
+    crate::spec::BuilderOp { label: "LIKE", fragment: "{col} LIKE {value}" },
+    crate::spec::BuilderOp { label: "ILIKE", fragment: "{col} ILIKE {value}" },
+    crate::spec::BuilderOp { label: "IN", fragment: "{col} IN ({value})" },
+    crate::spec::BuilderOp { label: "IS NULL", fragment: "{col} IS NULL" },
+    crate::spec::BuilderOp { label: "IS NOT NULL", fragment: "{col} IS NOT NULL" },
+];
+
 const PARAMS: &[ParamSpec] = &[
     ParamSpec {
         key: "host",
@@ -69,11 +85,12 @@ const PG_META: DriverMeta = DriverMeta {
         edit: false,
     },
     hint: "SELECT * FROM table LIMIT 100",
-    browse: "SELECT * FROM {qualified} {clauses} LIMIT {limit};",
+    browse: "SELECT {columns} FROM {qualified} {clauses} LIMIT {limit};",
     browse_by_kind: &[],
     query_form: &[],
     query_template: "",
     browse_form: crate::spec::SQL_BROWSE_FORM,
+    builder_ops: PG_BUILDER_OPS,
 };
 
 #[cfg(feature = "cockroachdb")]
@@ -85,11 +102,12 @@ const CRDB_META: DriverMeta = DriverMeta {
     auth: AUTH,
     caps: PG_META.caps,
     hint: "SELECT * FROM table LIMIT 100",
-    browse: "SELECT * FROM {qualified} {clauses} LIMIT {limit};",
+    browse: "SELECT {columns} FROM {qualified} {clauses} LIMIT {limit};",
     browse_by_kind: &[],
     query_form: &[],
     query_template: "",
     browse_form: crate::spec::SQL_BROWSE_FORM,
+    builder_ops: PG_BUILDER_OPS,
 };
 
 /// The Postgres-wire driver. One impl serves both the `postgres` and
