@@ -164,6 +164,47 @@ impl Driver for MongoDriver {
         &MONGO_META
     }
 
+    /// MongoDB's destructive commands are keys of the command document, and the
+    /// dangerous shape is a `delete`/`update` whose filter is empty — which is
+    /// the mongo spelling of "no WHERE clause".
+    fn classify(&self, statement: &str) -> Option<String> {
+        let doc: serde_json::Value = serde_json::from_str(statement).ok()?;
+        let obj = doc.as_object()?;
+        let empty_filter = |k: &str| {
+            obj.get(k)
+                .and_then(|v| v.as_array())
+                .map(|a| {
+                    a.iter().any(|e| {
+                        e.get("q")
+                            .or_else(|| e.get("filter"))
+                            .map(|f| f.as_object().map(|o| o.is_empty()).unwrap_or(false))
+                            .unwrap_or(true)
+                    })
+                })
+                .unwrap_or(false)
+        };
+        if let Some(c) = obj.get("drop").and_then(|v| v.as_str()) {
+            return Some(format!("drop removes the collection and every document in it — {c}"));
+        }
+        if obj.contains_key("dropDatabase") {
+            return Some("dropDatabase removes the database and every collection in it".into());
+        }
+        if obj.contains_key("dropIndexes") {
+            return Some("dropIndexes removes indexes from the collection".into());
+        }
+        if obj.contains_key("delete") {
+            return if empty_filter("deletes") {
+                Some("delete with an empty filter removes EVERY document".into())
+            } else {
+                None
+            };
+        }
+        if obj.contains_key("update") && empty_filter("updates") {
+            return Some("update with an empty filter rewrites EVERY document".into());
+        }
+        None
+    }
+
     async fn connect(&self, spec: &ConnSpec, net: NetContext) -> anyhow::Result<Box<dyn Connection>> {
         let host = spec.param("host")?;
         let port = spec.port(27017);

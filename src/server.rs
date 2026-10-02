@@ -194,6 +194,7 @@ impl Server {
             "query.cancel" => self.cancel(params).await,
             "query.release" => self.release(params).await,
             "query.cell" => self.cell(params).await,
+            "query.classify" => self.classify(params),
             // ── saved state (proto 2) ───────────────────────────────────────
             "store.status" => self.store_status(),
             "store.connections.list" => self.store_conn_list().await,
@@ -682,6 +683,28 @@ impl Server {
         let p: P = serde_json::from_value(params)?;
         self.inner.calls.lock().unwrap().remove(&p.call_id);
         Ok(json!({}))
+    }
+
+    /// Is this statement destructive, and why?
+    ///
+    /// Asked BEFORE running one, so a client can confirm. It takes a driver
+    /// kind rather than a connection: the question is about the language, the
+    /// answer is the same whether or not anything is open, and a console should
+    /// be able to ask it before it connects.
+    ///
+    /// The reason is prose, not a flag, because "DELETE with no WHERE clause
+    /// removes EVERY row" is what makes someone stop and `dangerous: true` is
+    /// not.
+    fn classify(&self, params: Json) -> anyhow::Result<Json> {
+        #[derive(Deserialize)]
+        struct P {
+            driver: String,
+            statement: String,
+        }
+        let p: P = serde_json::from_value(params)?;
+        let driver = self.inner.registry.get(&p.driver)?;
+        let reason = driver.classify(&p.statement);
+        Ok(json!({ "dangerous": reason.is_some(), "reason": reason }))
     }
 
     async fn cell(&self, params: Json) -> anyhow::Result<Json> {

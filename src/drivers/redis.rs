@@ -100,6 +100,35 @@ impl Driver for RedisDriver {
         &META
     }
 
+    /// Redis destroys things with a verb, so the verb is the whole rule. The
+    /// SQL default would pass every one of these without a word.
+    fn classify(&self, statement: &str) -> Option<String> {
+        let mut words = statement.split_whitespace();
+        let verb = words.next()?.to_ascii_uppercase();
+        let rest: Vec<&str> = words.collect();
+        match verb.as_str() {
+            "FLUSHALL" => Some("FLUSHALL empties EVERY database on this server".into()),
+            "FLUSHDB" => Some("FLUSHDB empties the current database".into()),
+            "DEL" | "UNLINK" => Some(format!(
+                "{verb} removes {}",
+                if rest.is_empty() {
+                    "the named keys".to_string()
+                } else {
+                    format!("{} key(s): {}", rest.len(), rest.join(" "))
+                }
+            )),
+            "RENAME" => Some("RENAME overwrites the destination key if it exists".into()),
+            "CONFIG" if rest.first().map(|w| w.eq_ignore_ascii_case("set")).unwrap_or(false) => {
+                Some("CONFIG SET changes the server's configuration".into())
+            }
+            "SHUTDOWN" => Some("SHUTDOWN stops the server".into()),
+            "SCRIPT" if rest.first().map(|w| w.eq_ignore_ascii_case("flush")).unwrap_or(false) => {
+                Some("SCRIPT FLUSH discards every cached script".into())
+            }
+            _ => None,
+        }
+    }
+
     async fn connect(&self, spec: &ConnSpec, net: NetContext) -> anyhow::Result<Box<dyn Connection>> {
         let host = spec.param("host")?;
         let port = spec.port(6379);

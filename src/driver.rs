@@ -25,6 +25,75 @@ pub trait Driver: Send + Sync {
     /// Open one connection. `net` has already resolved any SSH tunnel, so the
     /// driver dials the address `net` hands it — tunnelling is transparent.
     async fn connect(&self, spec: &ConnSpec, net: NetContext) -> anyhow::Result<Box<dyn Connection>>;
+
+    /// Why this statement is destructive, or `None` when it is not.
+    ///
+    /// A client asks before running one. It cannot decide this itself: what
+    /// `DROP` means, whether a `delete` with an empty filter removes everything,
+    /// and whether `FLUSHALL` is a word at all are facts about the LANGUAGE, and
+    /// a client that knew them would be a list of driver names in a client.
+    ///
+    /// The default covers SQL, which is what most drivers are. A driver whose
+    /// statements are not SQL overrides it; one whose statements are SQL with a
+    /// dialect's own destructive verbs extends it.
+    ///
+    /// The answer is a REASON, not a flag, because "this will delete every row
+    /// in the table" is what makes someone stop and "dangerous: true" is not.
+    fn classify(&self, statement: &str) -> Option<String> {
+        default_sql_classify(statement)
+    }
+}
+
+/// The destructive-statement rule for SQL, shared by every SQL driver.
+///
+/// Deliberately conservative and deliberately dumb: it reads the leading verb
+/// and looks for a `WHERE`. A parser would be better and is a parser; what this
+/// has to do is never stay silent about `DELETE FROM t`, and never cry wolf so
+/// often that the confirmation becomes a reflex.
+pub fn default_sql_classify(statement: &str) -> Option<String> {
+    // Strip line comments before looking, so a commented-out WHERE is not read
+    // as one and a verb below a comment line is still the verb.
+    let cleaned: String = statement
+        .lines()
+        .map(|l| match l.find("--") {
+            Some(i) => &l[..i],
+            None => l,
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
+    let lower = cleaned.to_ascii_lowercase();
+    let t = lower.trim_start();
+    let first = t.split_whitespace().next().unwrap_or("");
+    let has_where = lower.contains(" where ") || lower.ends_with(" where");
+
+    match first {
+        "drop" => Some(format!(
+            "DROP removes the object and everything in it{}",
+            object_of(t, 1)
+        )),
+        "truncate" => Some(format!("TRUNCATE empties the table{}", object_of(t, 1))),
+        "delete" if !has_where => Some("DELETE with no WHERE clause removes EVERY row".into()),
+        "update" if !has_where => Some("UPDATE with no WHERE clause rewrites EVERY row".into()),
+        "alter" if lower.contains(" drop ") => {
+            Some("ALTER … DROP removes a column or constraint and its data".into())
+        }
+        "grant" | "revoke" => Some("this changes who may do what".into()),
+        _ => None,
+    }
+}
+
+/// The word after position `skip`, rendered as " (name)" — a best effort at
+/// naming what is about to go, and silent when it cannot.
+fn object_of(lowered: &str, skip: usize) -> String {
+    let words: Vec<&str> = lowered.split_whitespace().skip(skip).collect();
+    // `DROP TABLE x`, `TRUNCATE TABLE x`, `TRUNCATE x`.
+    let name = words
+        .iter()
+        .find(|w| !matches!(**w, "table" | "view" | "index" | "if" | "exists" | "database" | "schema"));
+    match name {
+        Some(n) => format!(" — {}", n.trim_end_matches(';')),
+        None => String::new(),
+    }
 }
 
 /// A live connection. Held server-side behind a mutex and addressed by a numeric
@@ -110,4 +179,59 @@ pub trait ResultStream: Send {
 
     /// Pull up to `n` more rows. `Ok(None)` once the stream is exhausted.
     async fn next_page(&mut self, n: usize) -> anyhow::Result<Option<Vec<Vec<Value>>>>;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::default_sql_classify as c;
+
+    /// The shape that matters: a statement that destroys must never pass
+    /// silently, and an ordinary one must never ask — a confirmation that fires
+    /// on everything is a reflex, not a safeguard.
+    #[test]
+    fn sql_destruction_is_named_and_reading_is_not() {
+        for (stmt, needle) in [
+            ("DROP TABLE users", "users"),
+            ("drop table if exists public.t;", "public.t"),
+            ("TRUNCATE TABLE events", "events"),
+            ("DELETE FROM t", "EVERY row"),
+            ("UPDATE t SET a = 1", "EVERY row"),
+            ("ALTER TABLE t DROP COLUMN c", "ALTER"),
+            ("GRANT ALL ON t TO bob", "who may do what"),
+        ] {
+            let r = c(stmt).unwrap_or_else(|| panic!("{stmt} must be flagged"));
+            assert!(r.contains(needle), "{stmt}: {r} should mention {needle}");
+        }
+
+        for stmt in [
+            "SELECT * FROM users",
+            "DELETE FROM t WHERE id = 1",
+            "UPDATE t SET a = 1 WHERE id = 2",
+            "INSERT INTO t VALUES (1)",
+            "  select 1  ",
+            "EXPLAIN DELETE FROM t",
+        ] {
+            assert!(c(stmt).is_none(), "{stmt} must NOT ask");
+        }
+    }
+
+    /// A WHERE hidden in a comment is not a WHERE, and a verb hidden behind one
+    /// is still the verb.
+    #[test]
+    fn comments_do_not_hide_the_verb_or_invent_a_where() {
+        assert!(c("-- cleanup
+DELETE FROM t").is_some(), "the verb survives a comment");
+        assert!(
+            c("DELETE FROM t -- WHERE id = 1").is_some(),
+            "a WHERE inside a comment must not count as one"
+        );
+        assert!(c("DELETE FROM t WHERE id = 1 -- tidy").is_none());
+    }
+
+    #[test]
+    fn an_unnameable_object_is_still_flagged() {
+        // Nothing to name, but the warning must not be lost for want of a noun.
+        assert!(c("DROP").is_some());
+        assert!(c("TRUNCATE TABLE").is_some());
+    }
 }

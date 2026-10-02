@@ -28,7 +28,11 @@ use serde_json::json;
 ///     client can show an empty editor the right LANGUAGE and turn a click on a
 ///     table into a statement that engine understands. A client that does not
 ///     read them is unaffected; one that does falls back where they are absent.
-pub const PROTO: u32 = 3;
+/// 4 — added `query.classify`: ask the ENGINE whether a statement is
+///     destructive and why, before running it. A client cannot decide this —
+///     what DROP means, whether an empty mongo filter deletes everything, and
+///     whether FLUSHALL is a word are facts about the language.
+pub const PROTO: u32 = 4;
 
 /// One decoded incoming request.
 #[derive(Debug, Deserialize)]
