@@ -30,6 +30,10 @@ pub struct Session {
     /// The theme that was chosen, so it survives a restart without an env var.
     #[serde(default)]
     pub theme: Option<String>,
+    /// Which panel the rail was showing — "connections" | "history" | "tasks" |
+    /// "settings". Lower case, so the file reads as a person would write it.
+    #[serde(default)]
+    pub rail: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -105,6 +109,7 @@ mod tests {
             }],
             active: 0,
             theme: Some("LvimBase_dark".into()),
+            rail: "history".into(),
         };
         let text = serde_json::to_string(&s).unwrap();
         let back: Session = serde_json::from_str(&text).unwrap();
@@ -113,6 +118,7 @@ mod tests {
         assert_eq!(back.tabs[0].name, "people");
         assert_eq!(back.tabs[0].schema.as_deref(), Some("main"));
         assert_eq!(back.theme.as_deref(), Some("LvimBase_dark"));
+        assert_eq!(back.rail, "history");
     }
 
     /// A tab from a version that did not record the view must still load.

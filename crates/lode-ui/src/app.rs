@@ -17,9 +17,13 @@ use gpui::{
     div, prelude::*, px, size, uniform_list, Bounds, Context, Entity, MouseButton, Rgba,
     SharedString, TitlebarOptions, WeakEntity, Window, WindowBounds, WindowHandle, WindowOptions,
 };
-use lode_proto::{cell_text, DriverMeta, Engine, Hello, Message, Node, QueryState, SavedConnection};
+use lode_proto::{
+    cell_text, DriverMeta, Engine, Hello, HistoryRow, Message, Node, QueryState, SavedConnection,
+    SavedQuery,
+};
 use serde_json::{json, Value};
 
+use crate::export::{self, Format};
 use crate::form::ConnectionForm;
 use crate::input::{InputColors, InputEvent, TextInput};
 use crate::session::{self, Session, SessionTab};
@@ -36,6 +40,9 @@ const BLOCKING: Duration = Duration::from_secs(15);
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Rail {
     Connections,
+    /// Every statement this engine has run, from either client — the history is
+    /// the ENGINE's, so the editor's runs are in here too.
+    History,
     Tasks,
     Settings,
 }
@@ -45,6 +52,7 @@ impl Rail {
         match self {
             // Font Awesome codepoints, carried by every Nerd Font patch.
             Rail::Connections => "\u{f1c0}",
+            Rail::History => "\u{f1da}",
             Rail::Tasks => "\u{f0ae}",
             Rail::Settings => "\u{f013}",
         }
@@ -52,6 +60,7 @@ impl Rail {
     fn label(self) -> &'static str {
         match self {
             Rail::Connections => "Connections",
+            Rail::History => "History",
             Rail::Tasks => "Tasks",
             Rail::Settings => "Settings",
         }
@@ -74,6 +83,8 @@ enum Pending {
     FormTest { stage: &'static str, form: WeakEntity<ConnectionForm> },
     /// A connection saved from that window.
     FormSave,
+    History,
+    SavedQueries { conn: String },
 }
 
 pub struct Workspace {
@@ -122,6 +133,11 @@ pub struct Workspace {
     /// The console: a line typed straight at a connection.
     console: Entity<TextInput>,
     console_open: bool,
+    history: Vec<HistoryRow>,
+    /// The export row, while it is open, and where it would write.
+    export_open: bool,
+    export_format: Format,
+    export_path: Entity<TextInput>,
     /// The connection window, while one is open. A WINDOW, not a layer: the
     /// window manager owns it like any other.
     form_window: Option<WindowHandle<ConnectionForm>>,
@@ -141,6 +157,7 @@ impl Workspace {
             cx.notify();
         })
         .detach();
+        let export_path = cx.new(|cx| TextInput::new(cx, "result.csv", colors));
         let console = cx.new(|cx| {
             TextInput::new(cx, "Type a command and press Enter — it runs against the open connection", colors)
         });
@@ -181,9 +198,23 @@ impl Workspace {
             inputs: HashMap::new(),
             console,
             console_open: true,
+            history: Vec::new(),
+            export_open: false,
+            export_format: Format::Csv,
+            export_path,
             form_window: None,
             confirm: None,
         };
+
+        w.rail = match w.restore.rail.as_str() {
+            "history" => Rail::History,
+            "tasks" => Rail::Tasks,
+            "settings" => Rail::Settings,
+            _ => Rail::Connections,
+        };
+        // The history panel is empty until it is asked for, and if that is the
+        // panel being restored it should not open blank.
+        let want_history = w.rail == Rail::History;
 
         match Engine::spawn(None) {
             Ok(engine) => match engine.hello(BLOCKING) {
@@ -199,6 +230,9 @@ impl Workspace {
                     w.engine = Some(engine);
                     w.ask(Pending::StoreStatus, "store.status", json!({}));
                     w.ask(Pending::Connections, "store.connections.list", json!({}));
+                    if want_history {
+                        w.ask(Pending::History, "store.history.list", json!({ "limit": 200 }));
+                    }
                 }
                 Err(e) => w.fatal = Some(e.to_string()),
             },
@@ -313,6 +347,29 @@ impl Workspace {
                         json!({ "call_id": call_id, "from": 0, "n": PAGE }),
                     );
                 }
+                // Record it HERE, once it is over, with the state it reached and
+                // the time it took. The history is the engine's, so what this
+                // client runs shows up in the editor's log as well — and writing
+                // it at launch instead would mean every row said "running".
+                if matches!(st.state.as_str(), "done" | "failed" | "cancelled") {
+                    let found = self
+                        .tabs
+                        .iter()
+                        .find(|t| t.id == tab_id)
+                        .map(|t| (t.sql.trim().to_string(), t.conn_name.clone(), t.driver.clone()));
+                    if let Some((sql, conn, driver)) = found {
+                        if !sql.is_empty() {
+                            self.ask(
+                                Pending::Ignore("history"),
+                                "store.history.record",
+                                json!({
+                                    "conn": conn, "driver": driver, "statement": sql,
+                                    "state": st.state, "ms": st.ms, "rows": st.affected
+                                }),
+                            );
+                        }
+                    }
+                }
             }
             "daemon.log" => {
                 let level = params.get("level").and_then(Value::as_str).unwrap_or("info").to_string();
@@ -419,6 +476,17 @@ impl Workspace {
                 let _ = form.update(cx, |f, cx| {
                     f.test_answer(stage, Ok(format!("{detail} ({ms} ms)")), cx)
                 });
+            }
+            Pending::History => {
+                self.history =
+                    serde_json::from_value(v.get("history").cloned().unwrap_or(json!([]))).unwrap_or_default();
+            }
+            Pending::SavedQueries { conn } => {
+                let qs: Vec<SavedQuery> =
+                    serde_json::from_value(v.get("queries").cloned().unwrap_or(json!([]))).unwrap_or_default();
+                if let Some(c) = self.conns.iter_mut().find(|c| c.name == conn) {
+                    c.queries = qs;
+                }
             }
             Pending::FormSave => {
                 self.ask(Pending::Connections, "store.connections.list", json!({}));
@@ -702,6 +770,13 @@ impl Workspace {
                 .collect(),
             active: self.active,
             theme: Some(self.theme_name.clone()),
+            rail: match self.rail {
+                Rail::Connections => "connections",
+                Rail::History => "history",
+                Rail::Tasks => "tasks",
+                Rail::Settings => "settings",
+            }
+            .into(),
         });
     }
 
@@ -761,16 +836,20 @@ impl Workspace {
         );
     }
 
-    /// Run a statement typed at a connection, as its own tab — so it gets the
-    /// same grid, views, paging and task entry everything else gets.
     fn run_statement(&mut self, conn: &str, statement: &str, cx: &mut Context<Self>) {
+        let title: String = statement.chars().take(40).collect();
+        self.run_statement_titled(conn, &title, statement, cx);
+    }
+
+    /// Run a statement at a connection, as its own tab — so it gets the same
+    /// grid, views, paging and task entry everything else gets.
+    fn run_statement_titled(&mut self, conn: &str, title: &str, statement: &str, cx: &mut Context<Self>) {
         let Some(live) = self.live(conn) else { return };
         let driver = live.driver.clone();
         let meta = self.meta(&driver).cloned();
         let id = self.next_tab;
         self.next_tab += 1;
-        let title: String = statement.chars().take(40).collect();
-        let mut tab = Tab::new(id, conn.to_string(), driver, title, meta.as_ref());
+        let mut tab = Tab::new(id, conn.to_string(), driver, title.to_string(), meta.as_ref());
         tab.sql = statement.to_string();
         self.tabs.push(tab);
         self.active = self.tabs.len() - 1;
@@ -869,6 +948,64 @@ impl Workspace {
         self.close_form(cx);
     }
 
+    /// Save the active tab's statement under its title, for this connection.
+    /// The engine owns saved queries, so one saved here appears in the editor.
+    fn save_query(&mut self, cx: &mut Context<Self>) {
+        let Some(tab) = self.tabs.get(self.active) else { return };
+        let (conn, name) = (tab.conn_name.clone(), tab.title.clone());
+        let id = tab.id;
+        self.sync_tab_from_inputs(id, cx);
+        let Some(tab) = self.tabs.iter().find(|t| t.id == id) else { return };
+        let sql = tab.sql.clone();
+        if sql.trim().is_empty() {
+            return;
+        }
+        self.ask(
+            Pending::SavedQueries { conn: conn.clone() },
+            "store.queries.save",
+            json!({ "conn": conn, "name": name, "sql": sql }),
+        );
+        // The save answers `{saved:true}`, not a list, so ask for the list.
+        self.ask(
+            Pending::SavedQueries { conn: conn.clone() },
+            "store.queries.list",
+            json!({ "conn": conn }),
+        );
+        self.status = format!("saved query: {name}");
+    }
+
+    /// Open a statement in its own tab on a connection — used by the history
+    /// list and by a saved query.
+    fn open_sql(&mut self, conn: &str, title: &str, sql: &str, cx: &mut Context<Self>) {
+        if self.live(conn).is_none() {
+            self.log
+                .push(("warn".into(), format!("{conn} is not connected")));
+            return;
+        }
+        self.run_statement_titled(conn, title, sql, cx);
+    }
+
+    /// Write what the grid holds. What is written is what is LOADED, and the row
+    /// says so — an export that quietly paged the whole table in the background
+    /// is a different feature with a different cost.
+    fn write_export(&mut self, cx: &mut Context<Self>) {
+        let path = self.export_path.read(cx).text().trim().to_string();
+        if path.is_empty() {
+            return;
+        }
+        let fmt = self.export_format;
+        let msg = match self.tabs.get(self.active) {
+            Some(t) if !t.rows.is_empty() => {
+                match export::write(std::path::Path::new(&path), &t.columns, &t.rows, fmt) {
+                    Ok(n) => format!("wrote {n} row(s) to {path}"),
+                    Err(e) => format!("could not write {path}: {e}"),
+                }
+            }
+            _ => "nothing loaded to export".to_string(),
+        };
+        self.status = msg;
+    }
+
     fn cancel_active(&mut self) {
         let Some(tab) = self.tabs.get(self.active) else { return };
         let Some(call_id) = tab.call_id else { return };
@@ -911,7 +1048,7 @@ impl Workspace {
             .border_color(t.border())
             .py_2()
             .gap_1();
-        for mode in [Rail::Connections, Rail::Tasks, Rail::Settings] {
+        for mode in [Rail::Connections, Rail::History, Rail::Tasks, Rail::Settings] {
             let on = self.rail == mode;
             col = col.child(
                 div()
@@ -928,6 +1065,10 @@ impl Workspace {
                     .child(SharedString::from(mode.glyph()))
                     .on_click(cx.listener(move |this, _, _, cx| {
                         this.rail = mode;
+                        if mode == Rail::History && this.history.is_empty() {
+                            this.ask(Pending::History, "store.history.list", json!({ "limit": 200 }));
+                        }
+                        this.remember();
                         cx.notify();
                     })),
             );
@@ -955,6 +1096,69 @@ impl Workspace {
                         .text_color(t.fg())
                         .child(SharedString::from(self.theme_name.clone())),
                 );
+                return panel;
+            }
+            Rail::History => {
+                panel = panel.child(
+                    div()
+                        .id("history-reload")
+                        .px_2()
+                        .py_1()
+                        .cursor_pointer()
+                        .hover(|d| d.bg(t.hover()))
+                        .text_size(px(11.0))
+                        .text_color(t.accent())
+                        .child("\u{f021}  Reload history")
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.ask(Pending::History, "store.history.list", json!({ "limit": 200 }));
+                            cx.notify();
+                        })),
+                );
+                panel = panel.child(self.section(&format!("History ({})", self.history.len())));
+                if self.history.is_empty() {
+                    panel = panel.child(
+                        div().px_2().child(self.small("nothing yet — press reload", t.muted())),
+                    );
+                }
+                for h in self.history.iter().take(100) {
+                    let failed = h.state.as_deref() == Some("failed");
+                    let conn = h.conn.clone().unwrap_or_default();
+                    let stmt = h.statement.clone();
+                    let one: String = stmt.replace('\n', " ").chars().take(70).collect();
+                    panel = panel.child(
+                        div()
+                            .id(SharedString::from(format!("hist-{}", h.id)))
+                            .flex()
+                            .flex_col()
+                            .px_2()
+                            .py(px(2.0))
+                            .cursor_pointer()
+                            .hover(|d| d.bg(t.hover()))
+                            .child(
+                                div()
+                                    .text_size(px(11.0))
+                                    .text_color(if failed { t.error() } else { t.fg() })
+                                    .child(SharedString::from(one)),
+                            )
+                            .child(self.small(
+                                format!(
+                                    "{} · {} ms{}",
+                                    if conn.is_empty() { "—".into() } else { conn.clone() },
+                                    h.ms.unwrap_or(0),
+                                    h.rows.map(|r| format!(" · {r} row(s)")).unwrap_or_default()
+                                ),
+                                t.muted(),
+                            ))
+                            .on_click(cx.listener({
+                                let (c, s) = (conn.clone(), stmt.clone());
+                                move |this, _, _, cx| {
+                                    let title: String = s.chars().take(40).collect();
+                                    this.open_sql(&c, &title, &s, cx);
+                                    cx.notify();
+                                }
+                            })),
+                    );
+                }
                 return panel;
             }
             Rail::Tasks => {
@@ -1066,6 +1270,38 @@ impl Workspace {
             panel = panel.child(self.section(&live.name));
             if live.nodes.is_empty() {
                 panel = panel.child(div().px_2().child(self.small("loading…", t.muted())));
+            }
+            if !live.queries.is_empty() {
+                panel = panel.child(self.section("Saved queries"));
+                for q in &live.queries {
+                    panel = panel.child(
+                        div()
+                            .id(SharedString::from(format!("sq-{}-{}", live.name, q.name)))
+                            .flex()
+                            .items_center()
+                            .gap_1()
+                            .pl(px(10.0))
+                            .pr_2()
+                            .py(px(2.0))
+                            .cursor_pointer()
+                            .hover(|d| d.bg(t.hover()))
+                            .child(div().text_size(px(10.0)).text_color(t.accent()).child("\u{f15c}"))
+                            .child(
+                                div()
+                                    .text_size(px(11.0))
+                                    .text_color(t.fg())
+                                    .child(SharedString::from(q.name.clone())),
+                            )
+                            .on_click(cx.listener({
+                                let (c, n, s) = (live.name.clone(), q.name.clone(), q.sql.clone());
+                                move |this, _, _, cx| {
+                                    this.open_sql(&c, &n, &s, cx);
+                                    cx.notify();
+                                }
+                            })),
+                    );
+                }
+                panel = panel.child(self.section("Schema"));
             }
             for node in live
                 .nodes
@@ -1328,8 +1564,38 @@ impl Workspace {
                     cx.notify();
                 })),
         );
+        views = views.child(
+            div()
+                .id("save-query")
+                .px_2()
+                .cursor_pointer()
+                .text_size(px(11.0))
+                .text_color(t.muted())
+                .child("Save query")
+                .on_click(cx.listener(|this, _, _, cx| {
+                    this.save_query(cx);
+                    cx.notify();
+                })),
+        );
+        let has_rows = !tab.rows.is_empty();
+        views = views.child(
+            div()
+                .id("export-toggle")
+                .px_2()
+                .cursor_pointer()
+                .text_size(px(11.0))
+                .text_color(if has_rows { t.muted() } else { t.border() })
+                .child("Export")
+                .on_click(cx.listener(|this, _, _, cx| {
+                    this.export_open = !this.export_open;
+                    cx.notify();
+                })),
+        );
         body = body.child(views);
         body = body.child(self.query_bar(tab, cx));
+        if self.export_open {
+            body = body.child(self.export_row(tab, cx));
+        }
 
         if let Some(err) = &tab.error {
             body = body.child(
@@ -1456,6 +1722,68 @@ impl Workspace {
                 ),
         );
         bar.into_any_element()
+    }
+
+    /// The export row. It says what it writes — the LOADED rows — because an
+    /// export that silently paged the whole table would be a different feature.
+    fn export_row(&self, tab: &Tab, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let t = self.t();
+        let mut row = div()
+            .flex()
+            .items_center()
+            .gap_2()
+            .w_full()
+            .px_3()
+            .py_1()
+            .bg(t.panel())
+            .border_b_1()
+            .border_color(t.border())
+            .child(self.small(
+                format!("Export {} loaded row(s) as", tab.rows.len()),
+                t.muted(),
+            ));
+
+        for f in [Format::Csv, Format::Tsv, Format::Json] {
+            let on = self.export_format == f;
+            row = row.child(
+                div()
+                    .id(SharedString::from(format!("fmt-{}", f.label())))
+                    .px_1()
+                    .cursor_pointer()
+                    .text_size(px(10.0))
+                    .text_color(if on { t.inverted() } else { t.muted() })
+                    .when(on, |d| d.bg(t.accent()))
+                    .child(SharedString::from(f.label()))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        // Keep the extension honest when the format changes.
+                        let old = this.export_format.extension();
+                        this.export_format = f;
+                        let path = this.export_path.read(cx).text().to_string();
+                        if path.ends_with(old) {
+                            let stem = path.trim_end_matches(old).trim_end_matches('.').to_string();
+                            let next = format!("{stem}.{}", f.extension());
+                            this.export_path.update(cx, |i, cx| i.set_text(next, cx));
+                        }
+                        cx.notify();
+                    })),
+            );
+        }
+
+        row.child(div().w(px(260.0)).child(self.export_path.clone())).child(
+            div()
+                .id("export-write")
+                .px_2()
+                .cursor_pointer()
+                .text_size(px(11.0))
+                .bg(t.accent())
+                .text_color(t.inverted())
+                .child("Write")
+                .on_click(cx.listener(|this, _, _, cx| {
+                    this.write_export(cx);
+                    cx.notify();
+                })),
+        )
+        .into_any_element()
     }
 
     fn table_el(&self, tab: &Tab, cx: &mut Context<Self>) -> gpui::AnyElement {
