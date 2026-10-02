@@ -223,7 +223,7 @@ scripts/build && tests/smoke.sh && tests/tunnel.sh
 ```
 .                     the ENGINE — `loded`, the root package
 crates/lode-proto     the protocol client: spawn the engine, speak to it
-crates/lode-gui       the desktop client — `lode`
+crates/lode-ui        the desktop client — `lode`
 ```
 
 The engine depends on neither crate, and cannot: a client is a separate process
@@ -232,12 +232,12 @@ the next client to be different.
 
 ```sh
 scripts/build                  # the engine → build/loded
-cargo build --release -p lode-gui   # the desktop client → target/release/lode
+cargo build --release -p lode-ui    # the desktop client → target/release/lode
 ```
 
 ## The desktop client
 
-`crates/lode-gui` is a client exactly like the editor plugin: it spawns `loded`,
+`crates/lode-ui` is a client exactly like the editor plugin: it spawns `loded`,
 speaks the protocol above, and holds no driver of its own. It opens no socket to
 a database and resolves no credential. If it crashes the engine's connections go
 with it and nothing else; if the engine crashes the window survives and says so.
@@ -326,7 +326,7 @@ belongs next to one.
 - **`lvim-db`** — the Neovim plugin
   (https://github.com/lvim-tech/lvim-db). Probes `$LODE_DAEMON`, `loded` on
   `$PATH`, then a sibling `lode/build/loded` checkout.
-- **`lode`** — the desktop client in `crates/lode-gui`.
+- **`lode`** — the desktop client in `crates/lode-ui`.
 
 ## License
 

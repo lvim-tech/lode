@@ -12,7 +12,7 @@
 set -e
 cd "$(dirname "$0")/.."
 
-cargo build --release -p lode-gui "$@"
+cargo build --release -p lode-ui "$@"
 
 mkdir -p build
 cp -f target/release/lode build/lode

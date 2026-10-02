@@ -170,7 +170,7 @@ send "{\"id\":43,\"method\":\"conn.test\",\"params\":{\"stage\":\"magic\",\"spec
 check "unknown stage rejected" "$(await '.id == 43' | jq -r '.ok')" "false"
 
 # The FULL spec shape a form produces — auth, tls and a tunnel block together —
-# must deserialise. This is the shape crates/lode-gui builds; a field the engine
+# must deserialise. This is the shape crates/lode-ui builds; a field the engine
 # will not accept has to fail here and not in front of a user.
 send "{\"id\":44,\"method\":\"conn.test\",\"params\":{\"stage\":\"endpoint\",\"spec\":{\"driver\":\"postgres\",\"params\":{\"host\":\"127.0.0.1\",\"port\":\"1\"},\"auth\":{\"kind\":\"password\",\"user\":\"u\",\"password\":\"{{ env \\\"NOPE\\\" }}\"},\"tls\":{\"mode\":\"verify_full\",\"ca\":\"/tmp/ca.pem\"},\"tunnel\":{\"host\":\"h\",\"port\":22,\"user\":\"u\",\"auth\":{\"kind\":\"agent\"}}}}}"
 FULL=$(await '.id == 44')
