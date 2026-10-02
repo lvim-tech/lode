@@ -116,6 +116,16 @@ pub struct DriverMeta {
     /// with `", "` when there is at least one and empty when there is none — so
     /// a skeleton can be written as valid JSON with no fields filled in.
     pub query_template: &'static str,
+    /// Fields that narrow a BROWSE — a WHERE and an ORDER BY, for the engines
+    /// that have them.
+    ///
+    /// Separate from `query_form` on purpose. `query_form` REPLACES the free
+    /// statement box, which is right for MongoDB and wrong for SQL: taking away
+    /// the box to offer two inputs would be a loss. These fields sit beside the
+    /// browse a click produced and feed `{clauses}` in the template, so the
+    /// driver still owns every word of SQL — the client contributes a value, not
+    /// a syntax.
+    pub browse_form: &'static [QueryFieldSpec],
 }
 
 /// One input of a STRUCTURED query bar, for engines whose statements are not a
@@ -140,6 +150,28 @@ pub struct QueryFieldSpec {
     /// How many lines the input gets. 1 is a single-line field.
     pub rows: u8,
 }
+
+/// The clauses every SQL driver offers on a browse. Identical across them
+/// because this much of SQL genuinely is: a `WHERE` and an `ORDER BY` after the
+/// table and before the limit.
+pub const SQL_BROWSE_FORM: &[QueryFieldSpec] = &[
+    QueryFieldSpec {
+        key: "filter",
+        label: "Where",
+        placeholder: "balance < 0",
+        fragment: "WHERE {value}",
+        default: "",
+        rows: 1,
+    },
+    QueryFieldSpec {
+        key: "order",
+        label: "Order by",
+        placeholder: "balance DESC",
+        fragment: "ORDER BY {value}",
+        default: "",
+        rows: 1,
+    },
+];
 
 impl DriverMeta {
     /// The browse template for an object of this `kind`.

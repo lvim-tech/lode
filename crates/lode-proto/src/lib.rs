@@ -95,6 +95,11 @@ pub struct DriverMeta {
     /// The skeleton `query_form`'s fragments are assembled into.
     #[serde(default)]
     pub query_template: String,
+    /// Fields that narrow a browse. Absent from an older engine, which is why it
+    /// defaults rather than failing: a client that can filter talking to one
+    /// that cannot simply offers no filter.
+    #[serde(default)]
+    pub browse_form: Vec<QueryFieldSpec>,
 }
 
 /// One input of a structured query bar, as the engine declares it.
@@ -148,6 +153,23 @@ pub fn render_template(
     limit: usize,
     fragments: &[String],
 ) -> String {
+    render_with(template, name, schema, limit, fragments, &[])
+}
+
+/// As `render_template`, plus `{clauses}` — SQL's own kind of fragment.
+///
+/// `{fragments}` is comma-joined and comma-prefixed, which is right for a JSON
+/// document and wrong for SQL: `WHERE x, ORDER BY y` is not a statement. Clauses
+/// are joined with a space and collapse to nothing when empty, so
+/// `SELECT * FROM t {clauses} LIMIT 200;` is valid with none, one or both.
+pub fn render_with(
+    template: &str,
+    name: &str,
+    schema: Option<&str>,
+    limit: usize,
+    fragments: &[String],
+    clauses: &[String],
+) -> String {
     let schema = schema.filter(|s| !s.is_empty());
     let qualified = match schema {
         Some(s) => format!("{s}.{name}"),
@@ -161,12 +183,70 @@ pub fn render_template(
     } else {
         format!(", {}", fragments.join(", "))
     };
-    template
+    // A clause list that is empty must leave NO double space behind: the
+    // statement is shown to the person who runs it.
+    let clause_text = clauses.join(" ");
+    let out = template
+        .replace("{clauses}", &clause_text)
         .replace("{qualified}", &qualified)
         .replace("{name}", name)
         .replace("{schema}", schema.unwrap_or(""))
         .replace("{limit}", &limit.to_string())
-        .replace("{fragments}", &joined)
+        .replace("{fragments}", &joined);
+    collapse_spaces(&out)
+}
+
+/// Squeeze runs of spaces, leaving a statement that reads as one written by a
+/// person. Only between tokens — never inside a quoted string.
+fn collapse_spaces(s: &str) -> String {
+    let (mut out, mut quote, mut last_space) = (String::with_capacity(s.len()), None::<char>, false);
+    for c in s.chars() {
+        match quote {
+            Some(q) => {
+                out.push(c);
+                if c == q {
+                    quote = None;
+                }
+            }
+            None => {
+                if c == '\'' || c == '"' {
+                    quote = Some(c);
+                    out.push(c);
+                    last_space = false;
+                } else if c == ' ' {
+                    if !last_space {
+                        out.push(c);
+                    }
+                    last_space = true;
+                } else {
+                    out.push(c);
+                    last_space = false;
+                }
+            }
+        }
+    }
+    out.replace(" ;", ";").trim().to_string()
+}
+
+/// Assemble the clauses a browse form produced, then render the browse.
+pub fn render_browse(
+    meta: &DriverMeta,
+    kind: &str,
+    values: &std::collections::HashMap<String, String>,
+    name: &str,
+    schema: Option<&str>,
+    limit: usize,
+) -> String {
+    let clauses: Vec<String> = meta
+        .browse_form
+        .iter()
+        .filter_map(|f| {
+            let v = values.get(&f.key).map(String::as_str).unwrap_or("").trim();
+            (!v.is_empty() && !f.fragment.is_empty())
+                .then(|| f.fragment.replace("{value}", v))
+        })
+        .collect();
+    render_with(meta.browse_for(kind), name, schema, limit, &[], &clauses)
 }
 
 /// Assemble a structured query bar's values into a statement, using only what
@@ -706,6 +786,51 @@ mod tests {
     /// The statement a click on a table produces is the ENGINE's template with
     /// values put in — not a format string in the client. These are the real
     /// templates the drivers declare.
+    /// A browse with nothing filled in must be exactly the statement it was
+    /// before this existed — no stray spaces, no clause, no change.
+    #[test]
+    fn an_empty_browse_form_leaves_the_statement_alone() {
+        let out = render_with(
+            "SELECT * FROM {qualified} {clauses} LIMIT {limit};",
+            "people",
+            Some("main"),
+            200,
+            &[],
+            &[],
+        );
+        assert_eq!(out, "SELECT * FROM main.people LIMIT 200;");
+    }
+
+    #[test]
+    fn clauses_join_with_a_space_and_land_before_the_limit() {
+        let out = render_with(
+            "SELECT * FROM {qualified} {clauses} LIMIT {limit};",
+            "people",
+            None,
+            50,
+            &[],
+            &["WHERE balance < 0".into(), "ORDER BY balance DESC".into()],
+        );
+        assert_eq!(
+            out,
+            "SELECT * FROM people WHERE balance < 0 ORDER BY balance DESC LIMIT 50;"
+        );
+    }
+
+    /// Spaces inside a quoted value are the value's, not the statement's.
+    #[test]
+    fn a_quoted_value_keeps_its_spaces() {
+        let out = render_with(
+            "SELECT * FROM {name} {clauses};",
+            "t",
+            None,
+            1,
+            &[],
+            &["WHERE note = 'two  spaces'".into()],
+        );
+        assert_eq!(out, "SELECT * FROM t WHERE note = 'two  spaces';");
+    }
+
     #[test]
     fn a_browse_statement_is_the_engines_template() {
         assert_eq!(

@@ -63,10 +63,11 @@ const META: DriverMeta = DriverMeta {
         ddl: true, // system.data_skipping_indices / SHOW CREATE TABLE
     },
     hint: "SELECT * FROM table LIMIT 100",
-    browse: "SELECT * FROM {qualified} LIMIT {limit};",
+    browse: "SELECT * FROM {qualified} {clauses} LIMIT {limit};",
     browse_by_kind: &[],
     query_form: &[],
     query_template: "",
+    browse_form: crate::spec::SQL_BROWSE_FORM,
 };
 
 /// The ClickHouse driver.

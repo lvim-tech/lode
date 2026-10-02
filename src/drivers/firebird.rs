@@ -65,10 +65,11 @@ const META: DriverMeta = DriverMeta {
         ddl: false, // RDB$INDICES; Firebird has no server-side CREATE statement
     },
     hint: "SELECT FIRST 100 * FROM table",
-    browse: "SELECT FIRST {limit} * FROM {qualified};",
+    browse: "SELECT FIRST {limit} * FROM {qualified} {clauses};",
     browse_by_kind: &[],
     query_form: &[],
     query_template: "",
+    browse_form: crate::spec::SQL_BROWSE_FORM,
 };
 
 /// The Firebird driver.

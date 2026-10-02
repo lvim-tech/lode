@@ -138,6 +138,11 @@ pub struct Tab {
     pub sort: Option<(usize, bool)>,
     /// A row opened in the detail panel beside the grid.
     pub detail: Option<usize>,
+    /// The last statement this tab's browse fields PRODUCED. Kept so a hand
+    /// edit can be told from an untouched one: if the box still holds this, the
+    /// fields may rewrite it; if it does not, somebody typed in there and their
+    /// words win.
+    pub rendered: String,
 }
 
 /// A short-lived message in the corner.
@@ -329,6 +334,7 @@ impl Tab {
             widths: HashMap::new(),
             sort: None,
             detail: None,
+            rendered: String::new(),
         }
     }
 

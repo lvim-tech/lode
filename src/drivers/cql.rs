@@ -69,10 +69,11 @@ const CASSANDRA_META: DriverMeta = DriverMeta {
     auth: AUTH,
     caps: CAPS,
     hint: "SELECT * FROM table LIMIT 100",
-    browse: "SELECT * FROM {qualified} LIMIT {limit};",
+    browse: "SELECT * FROM {qualified} {clauses} LIMIT {limit};",
     browse_by_kind: &[],
     query_form: &[],
     query_template: "",
+    browse_form: crate::spec::SQL_BROWSE_FORM,
 };
 
 const SCYLLA_META: DriverMeta = DriverMeta {
@@ -83,10 +84,11 @@ const SCYLLA_META: DriverMeta = DriverMeta {
     auth: AUTH,
     caps: CAPS,
     hint: "SELECT * FROM table LIMIT 100",
-    browse: "SELECT * FROM {qualified} LIMIT {limit};",
+    browse: "SELECT * FROM {qualified} {clauses} LIMIT {limit};",
     browse_by_kind: &[],
     query_form: &[],
     query_template: "",
+    browse_form: crate::spec::SQL_BROWSE_FORM,
 };
 
 /// The CQL driver, serving both the `cassandra` and `scylla` kinds.

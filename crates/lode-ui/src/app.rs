@@ -757,6 +757,17 @@ impl Workspace {
     ) {
         let colors = input_colors(&self.theme);
         let structured = meta.map(|m| m.is_structured()).unwrap_or(false);
+        for f in meta.map(|m| m.browse_form.clone()).unwrap_or_default() {
+            let (ph, def) = (f.placeholder.clone(), f.default.clone());
+            let input = cx.new(|cx| {
+                let mut i = TextInput::new(cx, &ph, colors);
+                if !def.is_empty() {
+                    i.set_text(def.clone(), cx);
+                }
+                i
+            });
+            self.inputs.insert((tab_id, format!("browse:{}", f.key)), input);
+        }
         if structured {
             for f in &meta.unwrap().query_form {
                 let (ph, default) = (f.placeholder.clone(), f.default.clone());
@@ -817,7 +828,40 @@ impl Workspace {
             }
             self.tabs[idx].sql = self.tabs[idx].statement(meta.as_ref(), PAGE);
         } else if let Some(i) = self.inputs.get(&(tab_id, String::new())) {
-            self.tabs[idx].sql = i.read(cx).text().to_string();
+            let typed = i.read(cx).text().to_string();
+            // A browse with narrowing fields: read them, and rewrite the box
+            // ONLY if nobody has typed in it since we last filled it.
+            let browse_keys: Vec<String> = meta
+                .as_ref()
+                .map(|m| m.browse_form.iter().map(|f| f.key.clone()).collect())
+                .unwrap_or_default();
+            let object = self.tabs[idx].object.clone();
+            if let (Some(m), Some((name, schema)), false) =
+                (meta.as_ref(), object, browse_keys.is_empty())
+            {
+                for k in &browse_keys {
+                    if let Some(f) = self.inputs.get(&(tab_id, format!("browse:{k}"))) {
+                        let v = f.read(cx).text().to_string();
+                        self.tabs[idx].fields.insert(k.clone(), v);
+                    }
+                }
+                let kind = self.tabs[idx].kind.clone();
+                let fresh = lode_proto::render_browse(
+                    m,
+                    &kind,
+                    &self.tabs[idx].fields,
+                    &name,
+                    schema.as_deref(),
+                    PAGE,
+                );
+                if typed == self.tabs[idx].rendered || typed.trim().is_empty() {
+                    self.tabs[idx].sql = fresh.clone();
+                    self.tabs[idx].rendered = fresh.clone();
+                    i.update(cx, |inp, cx| inp.set_text(fresh, cx));
+                    return;
+                }
+            }
+            self.tabs[idx].sql = typed;
         }
     }
 
@@ -2246,6 +2290,44 @@ impl Workspace {
             bar = bar.child(div().flex_1().child(input.clone()));
         }
 
+        // A browse the tree produced can be narrowed. The fields come from the
+        // DRIVER — it is the one that knows where a WHERE goes in its own
+        // dialect, and which dialects have one at all.
+        let browse = meta
+            .filter(|_| tab.object.is_some())
+            .map(|m| m.browse_form.clone())
+            .unwrap_or_default();
+        let mut narrow = div()
+            .flex()
+            .items_center()
+            .gap_2()
+            .w_full()
+            .px_3()
+            .py_1()
+            .bg(t.panel())
+            .border_b_1()
+            .border_color(t.border());
+        let has_narrow = !browse.is_empty();
+        for f in &browse {
+            let Some(input) = self.inputs.get(&(tab_id, format!("browse:{}", f.key))) else {
+                continue;
+            };
+            narrow = narrow.child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_1()
+                    .child(self.small(f.label.clone(), t.muted()))
+                    .child(div().w(px(240.0)).child(input.clone())),
+            );
+        }
+        if has_narrow {
+            narrow = narrow.child(div().flex_1()).child(self.small(
+                "the statement above is what runs — edit it and these stop rewriting it",
+                t.muted(),
+            ));
+        }
+
         // The run button says what it does in this engine's words.
         let run_label = if structured { "Find" } else { "Run" };
         bar = bar.child(
@@ -2303,6 +2385,15 @@ impl Workspace {
                         })),
                 ),
         );
+        if has_narrow {
+            return div()
+                .flex()
+                .flex_col()
+                .w_full()
+                .child(bar)
+                .child(narrow)
+                .into_any_element();
+        }
         bar.into_any_element()
     }
 

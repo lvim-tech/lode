@@ -68,10 +68,11 @@ const PG_META: DriverMeta = DriverMeta {
         ddl: false,    // postgres has NO server-side CREATE TABLE (pg_dump is a client) — see the trait doc
     },
     hint: "SELECT * FROM table LIMIT 100",
-    browse: "SELECT * FROM {qualified} LIMIT {limit};",
+    browse: "SELECT * FROM {qualified} {clauses} LIMIT {limit};",
     browse_by_kind: &[],
     query_form: &[],
     query_template: "",
+    browse_form: crate::spec::SQL_BROWSE_FORM,
 };
 
 #[cfg(feature = "cockroachdb")]
@@ -83,10 +84,11 @@ const CRDB_META: DriverMeta = DriverMeta {
     auth: AUTH,
     caps: PG_META.caps,
     hint: "SELECT * FROM table LIMIT 100",
-    browse: "SELECT * FROM {qualified} LIMIT {limit};",
+    browse: "SELECT * FROM {qualified} {clauses} LIMIT {limit};",
     browse_by_kind: &[],
     query_form: &[],
     query_template: "",
+    browse_form: crate::spec::SQL_BROWSE_FORM,
 };
 
 /// The Postgres-wire driver. One impl serves both the `postgres` and

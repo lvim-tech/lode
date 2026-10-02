@@ -83,6 +83,7 @@ const META: DriverMeta = DriverMeta {
     browse_by_kind: BROWSE_BY_KIND,
     query_form: &[],
     query_template: "",
+    browse_form: &[],
 };
 
 /// The Redis driver.
