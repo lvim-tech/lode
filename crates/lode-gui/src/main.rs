@@ -11,6 +11,7 @@
 
 mod app;
 mod export;
+mod font;
 mod theme;
 
 fn main() -> eframe::Result {

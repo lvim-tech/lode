@@ -1,6 +1,6 @@
 //! The application.
 //!
-//! One rule shapes everything here: **the UI thread never waits on a database.**
+//! One rule shapes the behaviour: **the UI thread never waits on a database.**
 //! Every request is sent with `Engine::send`, which returns an id, and the
 //! answer is picked up in a later frame from `Engine::try_recv`. A `pending`
 //! map says what each outstanding id was for. There is no spinner that is
@@ -10,6 +10,12 @@
 //! The only blocking call in the whole client is the first `rpc.hello`, in
 //! `App::new`, where there is nothing else to do yet and a failure has to be
 //! reportable before a window exists.
+//!
+//! **Every colour comes from the theme.** There is not one hex value in this
+//! file. A surface the design needs and the theme does not have is a role added
+//! to the generator in lvim-colorscheme and regenerated across the 48 palettes,
+//! not a shade mixed here — otherwise the client's idea of a theme and the
+//! generator's drift apart, and the contrast guarantees stop meaning anything.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -20,6 +26,7 @@ use lode_proto::{cell_text, Column, DriverMeta, Engine, Hello, Message, Node, Qu
 use serde_json::{json, Value};
 
 use crate::export::{self, Format};
+use crate::font::{self, Fonts, Icons};
 use crate::theme::{self, Theme};
 
 /// Rows fetched per page. The engine buffers the whole result and serves slices,
@@ -28,6 +35,16 @@ const PAGE: usize = 200;
 
 /// Timeout for the few calls that are allowed to block (the handshake).
 const BLOCKING: Duration = Duration::from_secs(15);
+
+/// The connection-test stages the engine understands, in the order a connection
+/// is actually established — which is the order the form shows them in, so a
+/// failure points at the first layer that is wrong rather than the last.
+const STAGES: [(&str, &str); 4] = [
+    ("endpoint", "Is the host (or the file) there at all?"),
+    ("tunnel", "Can the SSH forward be stood up on its own?"),
+    ("tls", "Does the link come up encrypted?"),
+    ("auth", "Are the credentials accepted?"),
+];
 
 /// What an outstanding request was for.
 enum Pending {
@@ -45,6 +62,8 @@ enum Pending {
     /// Fire and forget: nothing to update on success, but a failure is still
     /// worth a log line. Releasing a buffer, cancelling, recording history.
     Ignore(&'static str),
+    /// One `conn.test` stage from the connection form.
+    Test(&'static str),
 }
 
 #[derive(PartialEq, Eq, Clone, Copy)]
@@ -71,6 +90,8 @@ struct Tab {
     affected: Option<u64>,
     ms: u64,
     error: Option<String>,
+    /// The row the pointer last chose, as an index into `rows`.
+    selected: Option<usize>,
 }
 
 impl Tab {
@@ -89,6 +110,7 @@ impl Tab {
             affected: None,
             ms: 0,
             error: None,
+            selected: None,
         }
     }
 }
@@ -104,18 +126,157 @@ struct Live {
     queries: Vec<lode_proto::SavedQuery>,
 }
 
-/// The add/edit connection form. Built entirely from the engine's `DriverMeta`,
-/// so it has no field list of its own and grows a new database type for free.
+/// The result of one `conn.test` stage.
+#[derive(Clone)]
+enum TestState {
+    Running,
+    Ok(String, u64),
+    Failed(String),
+}
+
+/// The add/edit connection form.
+///
+/// The parameter fields are still built entirely from the engine's `DriverMeta`,
+/// so a new database type needs no change here. What is NOT in `DriverMeta` —
+/// the auth method's own fields, the TLS posture, the SSH tunnel — is the same
+/// typed shape for every driver, so it is laid out explicitly. Without it the
+/// desktop client could only use connections someone had first configured in
+/// Neovim, which rather defeats the point of two clients sharing one engine.
 struct ConnForm {
     name: String,
     driver: String,
     params: HashMap<String, String>,
+
     auth_kind: String,
     auth_user: String,
-    /// A TEMPLATE, never a password. The engine resolves it at connect time.
+    /// A TEMPLATE, never a resolved password. The engine resolves it at connect
+    /// time; nothing here ever sees the value.
     auth_secret: String,
+    auth_cert: String,
+    auth_key: String,
+    auth_key_password: String,
+    auth_provider: String,
+    auth_principal: String,
+
+    tls_mode: String,
+    tls_ca: String,
+    tls_client_cert: String,
+    tls_client_key: String,
+
+    tunnel_on: bool,
+    tunnel_host: String,
+    tunnel_port: String,
+    tunnel_user: String,
+    tunnel_auth: String,
+    tunnel_key_path: String,
+    tunnel_secret: String,
+
     editing: Option<String>,
     error: Option<String>,
+    tests: HashMap<&'static str, TestState>,
+}
+
+impl ConnForm {
+    fn blank(driver: String) -> Self {
+        ConnForm {
+            name: String::new(),
+            driver,
+            params: HashMap::new(),
+            auth_kind: "none".into(),
+            auth_user: String::new(),
+            auth_secret: String::new(),
+            auth_cert: String::new(),
+            auth_key: String::new(),
+            auth_key_password: String::new(),
+            auth_provider: String::new(),
+            auth_principal: String::new(),
+            tls_mode: "prefer".into(),
+            tls_ca: String::new(),
+            tls_client_cert: String::new(),
+            tls_client_key: String::new(),
+            tunnel_on: false,
+            tunnel_host: String::new(),
+            tunnel_port: "22".into(),
+            tunnel_user: String::new(),
+            tunnel_auth: "agent".into(),
+            tunnel_key_path: String::new(),
+            tunnel_secret: String::new(),
+            editing: None,
+            error: None,
+            tests: HashMap::new(),
+        }
+    }
+
+    /// The `ConnSpec` the engine accepts: driver, params, auth, tls, tunnel.
+    /// This is what `conn.test` and `conn.connect` both take, so the form tests
+    /// exactly what it would connect with — not an approximation of it.
+    fn spec(&self) -> Value {
+        let mut params = serde_json::Map::new();
+        for (k, v) in &self.params {
+            if !v.is_empty() {
+                params.insert(k.clone(), json!(v));
+            }
+        }
+        let auth = match self.auth_kind.as_str() {
+            "password" => json!({ "kind": "password", "user": self.auth_user, "password": self.auth_secret }),
+            "client_cert" => json!({
+                "kind": "client_cert", "cert": self.auth_cert, "key": self.auth_key,
+                "key_password": self.auth_key_password, "user": self.auth_user
+            }),
+            "provider" => json!({
+                "kind": "provider", "provider": self.auth_provider,
+                "token": self.auth_secret, "user": self.auth_user
+            }),
+            "kerberos" => json!({
+                "kind": "kerberos",
+                "principal": if self.auth_principal.is_empty() { Value::Null } else { json!(self.auth_principal) }
+            }),
+            _ => json!({ "kind": "none" }),
+        };
+        let mut tls = serde_json::Map::new();
+        tls.insert("mode".into(), json!(self.tls_mode));
+        for (k, v) in [
+            ("ca", &self.tls_ca),
+            ("client_cert", &self.tls_client_cert),
+            ("client_key", &self.tls_client_key),
+        ] {
+            if !v.is_empty() {
+                tls.insert(k.into(), json!(v));
+            }
+        }
+        let tunnel = if self.tunnel_on {
+            let auth = match self.tunnel_auth.as_str() {
+                "key" => json!({ "kind": "key", "path": self.tunnel_key_path, "passphrase": self.tunnel_secret }),
+                "password" => json!({ "kind": "password", "password": self.tunnel_secret }),
+                _ => json!({ "kind": "agent" }),
+            };
+            json!({
+                "host": self.tunnel_host,
+                "port": self.tunnel_port.trim().parse::<u16>().unwrap_or(22),
+                "user": self.tunnel_user,
+                "auth": auth
+            })
+        } else {
+            Value::Null
+        };
+        json!({
+            "driver": self.driver,
+            "params": Value::Object(params),
+            "auth": auth,
+            "tls": Value::Object(tls),
+            "tunnel": tunnel
+        })
+    }
+
+    /// What is SAVED: the spec without its driver, which the store keeps in its
+    /// own column. Secrets are still templates — see `spec`.
+    fn stored_spec(&self) -> Value {
+        let mut v = self.spec();
+        if let Some(m) = v.as_object_mut() {
+            m.remove("driver");
+        }
+        v
+    }
 }
 
 struct ExportState {
@@ -134,6 +295,9 @@ pub struct App {
     theme_name: String,
     theme: Theme,
     theme_dirty: bool,
+    scale: f32,
+    fonts: Fonts,
+    icon: Icons,
 
     store_ok: bool,
     saved: Vec<SavedConnection>,
@@ -155,12 +319,13 @@ pub struct App {
 
 impl App {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
+        let fonts = font::install(&cc.egui_ctx);
+        let icon = Icons::for_fonts(&fonts);
+        let scale = Theme::scale();
         let themes = theme::discover();
-        // A remembered choice, else the first discovered theme, else built in.
         let want = std::env::var("LODE_THEME").ok();
         let (theme_name, theme) = pick_theme(&themes, want.as_deref());
-        theme.apply(&cc.egui_ctx);
-        egui_extras::install_image_loaders(&cc.egui_ctx);
+        theme.apply(&cc.egui_ctx, scale);
 
         let mut app = App {
             engine: None,
@@ -170,6 +335,9 @@ impl App {
             theme_name,
             theme,
             theme_dirty: false,
+            scale,
+            fonts,
+            icon,
             store_ok: false,
             saved: Vec::new(),
             live: None,
@@ -324,16 +492,8 @@ impl App {
                 }
             }
             "daemon.log" => {
-                let level = params
-                    .get("level")
-                    .and_then(Value::as_str)
-                    .unwrap_or("info")
-                    .to_string();
-                let message = params
-                    .get("message")
-                    .and_then(Value::as_str)
-                    .unwrap_or("")
-                    .to_string();
+                let level = params.get("level").and_then(Value::as_str).unwrap_or("info").to_string();
+                let message = params.get("message").and_then(Value::as_str).unwrap_or("").to_string();
                 self.log.push((level, message));
                 if self.log.len() > 500 {
                     self.log.remove(0);
@@ -421,6 +581,7 @@ impl App {
                     t.has_more = page.has_more;
                     t.total = page.total;
                     t.affected = page.affected.or(t.affected);
+                    t.selected = None;
                 }
             }
             Pending::StoreWrite(_) => {
@@ -433,6 +594,13 @@ impl App {
                 }
             }
             Pending::Ignore(_) => {}
+            Pending::Test(stage) => {
+                let detail = v.get("detail").and_then(Value::as_str).unwrap_or("ok").to_string();
+                let ms = v.get("ms").and_then(Value::as_u64).unwrap_or(0);
+                if let Some(f) = &mut self.form {
+                    f.tests.insert(stage, TestState::Ok(detail, ms));
+                }
+            }
         }
     }
 
@@ -447,6 +615,14 @@ impl App {
             Pending::Connect { name, .. } => {
                 self.status = format!("could not connect to {name}");
                 self.log.push(("error".into(), format!("{name}: {e}")));
+            }
+            // A failed test belongs NEXT TO ITS BUTTON, verbatim: the engine's
+            // message names the layer and the reason, and summarising it into
+            // the status bar would throw away the only useful part.
+            Pending::Test(stage) => {
+                if let Some(f) = &mut self.form {
+                    f.tests.insert(stage, TestState::Failed(e));
+                }
             }
             other => {
                 let label = match other {
@@ -494,8 +670,6 @@ impl App {
             return;
         };
         let conn_id = live.conn_id;
-        let conn_name = live.name.clone();
-        let driver = live.driver.clone();
         let Some(tab) = self.tabs.get_mut(self.active) else { return };
         let sql = tab.sql.trim().to_string();
         if sql.is_empty() {
@@ -510,6 +684,7 @@ impl App {
         tab.from = 0;
         tab.total = None;
         tab.affected = None;
+        tab.selected = None;
 
         // Free the previous result's buffer on the engine: a browsing session
         // would otherwise grow one buffer per run for the whole process.
@@ -517,7 +692,6 @@ impl App {
             self.calls.remove(&old);
             self.ask(Pending::Ignore("release"), "query.release", json!({ "call_id": old }));
         }
-        let _ = (&conn_name, &driver); // recorded when it FINISHES, in on_notification
         self.ask(
             Pending::Execute { tab: tab_id },
             "query.execute",
@@ -554,6 +728,13 @@ impl App {
         );
     }
 
+    fn run_test(&mut self, stage: &'static str) {
+        let Some(form) = &mut self.form else { return };
+        form.tests.insert(stage, TestState::Running);
+        let spec = form.spec();
+        self.ask(Pending::Test(stage), "conn.test", json!({ "stage": stage, "spec": spec }));
+    }
+
     fn save_form(&mut self) {
         let Some(form) = &self.form else { return };
         if form.name.trim().is_empty() {
@@ -562,19 +743,8 @@ impl App {
             }
             return;
         }
-        let mut params = serde_json::Map::new();
-        for (k, v) in &form.params {
-            if !v.is_empty() {
-                params.insert(k.clone(), json!(v));
-            }
-        }
-        let auth = match form.auth_kind.as_str() {
-            "password" => json!({ "kind": "password", "user": form.auth_user, "password": form.auth_secret }),
-            "provider" => json!({ "kind": "provider", "provider": "token", "user": form.auth_user, "token": form.auth_secret }),
-            _ => json!({ "kind": "none" }),
-        };
-        let spec = json!({ "params": params, "auth": auth, "tls": { "mode": "prefer" } });
         let (name, driver) = (form.name.clone(), form.driver.clone());
+        let spec = form.stored_spec();
         let renamed_from = form.editing.clone().filter(|old| *old != name);
         self.ask(
             Pending::StoreWrite("save connection"),
@@ -599,16 +769,7 @@ impl App {
             .first()
             .map(|d| d.kind.clone())
             .unwrap_or_else(|| "sqlite".into());
-        let mut form = ConnForm {
-            name: String::new(),
-            driver: first_driver,
-            params: HashMap::new(),
-            auth_kind: "none".into(),
-            auth_user: String::new(),
-            auth_secret: String::new(),
-            editing: None,
-            error: None,
-        };
+        let mut form = ConnForm::blank(first_driver);
         if let Some(c) = edit {
             form.name = c.name.clone();
             form.driver = c.driver.clone();
@@ -620,18 +781,47 @@ impl App {
                 }
             }
             if let Some(a) = c.spec.get("auth").and_then(Value::as_object) {
-                form.auth_kind = a
-                    .get("kind")
-                    .and_then(Value::as_str)
-                    .unwrap_or("none")
-                    .to_string();
-                form.auth_user = a.get("user").and_then(Value::as_str).unwrap_or("").to_string();
+                let s = |k: &str| a.get(k).and_then(Value::as_str).unwrap_or("").to_string();
+                form.auth_kind = a.get("kind").and_then(Value::as_str).unwrap_or("none").to_string();
+                form.auth_user = s("user");
                 form.auth_secret = a
                     .get("password")
                     .or_else(|| a.get("token"))
                     .and_then(Value::as_str)
                     .unwrap_or("")
                     .to_string();
+                form.auth_cert = s("cert");
+                form.auth_key = s("key");
+                form.auth_key_password = s("key_password");
+                form.auth_provider = s("provider");
+                form.auth_principal = s("principal");
+            }
+            if let Some(t) = c.spec.get("tls").and_then(Value::as_object) {
+                let s = |k: &str| t.get(k).and_then(Value::as_str).unwrap_or("").to_string();
+                form.tls_mode = t.get("mode").and_then(Value::as_str).unwrap_or("prefer").to_string();
+                form.tls_ca = s("ca");
+                form.tls_client_cert = s("client_cert");
+                form.tls_client_key = s("client_key");
+            }
+            if let Some(t) = c.spec.get("tunnel").and_then(Value::as_object) {
+                form.tunnel_on = true;
+                form.tunnel_host = t.get("host").and_then(Value::as_str).unwrap_or("").to_string();
+                form.tunnel_port = t
+                    .get("port")
+                    .and_then(Value::as_u64)
+                    .map(|p| p.to_string())
+                    .unwrap_or_else(|| "22".into());
+                form.tunnel_user = t.get("user").and_then(Value::as_str).unwrap_or("").to_string();
+                if let Some(a) = t.get("auth").and_then(Value::as_object) {
+                    form.tunnel_auth = a.get("kind").and_then(Value::as_str).unwrap_or("agent").to_string();
+                    form.tunnel_key_path = a.get("path").and_then(Value::as_str).unwrap_or("").to_string();
+                    form.tunnel_secret = a
+                        .get("passphrase")
+                        .or_else(|| a.get("password"))
+                        .and_then(Value::as_str)
+                        .unwrap_or("")
+                        .to_string();
+                }
             }
         }
         self.form = Some(form);
@@ -677,16 +867,18 @@ enum Act {
     CloseTab(u64),
     SetTheme(String),
     ReloadThemes,
-    LoadQuery(String, String),
+    LoadQuery(String),
     SaveQuery,
     OpenExport,
     Refresh,
+    Test(&'static str),
+    SelectRow(usize),
 }
 
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         if self.theme_dirty {
-            self.theme.apply(ctx);
+            self.theme.apply(ctx, self.scale);
             self.theme_dirty = false;
         }
         let busy = self.pump() || !self.pending.is_empty();
@@ -698,28 +890,34 @@ impl eframe::App for App {
         }
 
         if let Some(fatal) = self.fatal.clone() {
-            egui::CentralPanel::default().show(ctx, |ui| {
-                ui.vertical_centered(|ui| {
-                    ui.add_space(80.0);
-                    ui.heading("No engine");
-                    ui.add_space(8.0);
-                    ui.label(fatal);
-                    ui.add_space(16.0);
-                    ui.label(
-                        "lode is the database engine this client talks to. Build it with \
-                         `scripts/build` and put `loded` on $PATH, or set $LODE_DAEMON.",
-                    );
+            let theme = self.theme.clone();
+            egui::CentralPanel::default()
+                .frame(egui::Frame::new().fill(theme.base()).inner_margin(egui::Margin::same(24)))
+                .show(ctx, |ui| {
+                    ui.vertical_centered(|ui| {
+                        ui.add_space(80.0);
+                        ui.heading(egui::RichText::new("No engine").color(theme.error()));
+                        ui.add_space(10.0);
+                        ui.label(fatal);
+                        ui.add_space(18.0);
+                        ui.label(
+                            egui::RichText::new(
+                                "lode is the database engine this client talks to. Build it with \
+                                 `scripts/build` and put `loded` on $PATH, or set $LODE_DAEMON.",
+                            )
+                            .color(theme.muted()),
+                        );
+                    });
                 });
-            });
             return;
         }
 
         let mut acts: Vec<Act> = Vec::new();
         self.top_bar(ctx, &mut acts);
-        self.left_panel(ctx, &mut acts);
         self.bottom_bar(ctx);
+        self.left_panel(ctx, &mut acts);
         self.central(ctx, &mut acts);
-        self.form_window(ctx);
+        self.form_window(ctx, &mut acts);
         self.export_window(ctx);
 
         for a in acts {
@@ -739,6 +937,12 @@ impl eframe::App for App {
                 Act::Run => self.run_active(),
                 Act::Cancel => self.cancel_active(),
                 Act::Page(d) => self.page_by(d),
+                Act::Test(stage) => self.run_test(stage),
+                Act::SelectRow(i) => {
+                    if let Some(t) = self.tabs.get_mut(self.active) {
+                        t.selected = Some(i);
+                    }
+                }
                 Act::NewTab => {
                     let id = self.next_tab;
                     self.next_tab += 1;
@@ -777,7 +981,7 @@ impl eframe::App for App {
                     self.themes = theme::discover();
                     self.status = format!("{} theme(s) found", self.themes.len());
                 }
-                Act::LoadQuery(_conn, sql) => {
+                Act::LoadQuery(sql) => {
                     if let Some(tab) = self.tabs.get_mut(self.active) {
                         tab.sql = sql;
                     }
@@ -818,46 +1022,87 @@ impl eframe::App for App {
 }
 
 impl App {
+    /// A toolbar button: the glyph and the word together when there is a glyph
+    /// set, the word alone otherwise — never a mystery glyph on its own.
+    fn tool(&self, ui: &mut egui::Ui, icon: &str, label: &str, enabled: bool) -> egui::Response {
+        let text = if self.fonts.nerd {
+            format!("{icon}  {label}")
+        } else {
+            label.to_string()
+        };
+        ui.add_enabled(enabled, egui::Button::new(text))
+    }
+
+    /// The one button in a group that is the obvious thing to press.
+    fn primary(&self, ui: &mut egui::Ui, icon: &str, label: &str, enabled: bool) -> egui::Response {
+        let text = if self.fonts.nerd {
+            format!("{icon}  {label}")
+        } else {
+            label.to_string()
+        };
+        ui.add_enabled(
+            enabled,
+            egui::Button::new(egui::RichText::new(text).color(self.theme.inverted()))
+                .fill(self.theme.accent()),
+        )
+    }
+
     fn top_bar(&mut self, ctx: &egui::Context, acts: &mut Vec<Act>) {
-        egui::TopBottomPanel::top("top").show(ctx, |ui| {
+        let theme = self.theme.clone();
+        let frame = egui::Frame::new()
+            .fill(theme.panel())
+            .inner_margin(egui::Margin::symmetric(12, 8))
+            .stroke(egui::Stroke::new(1.0_f32, theme.border()));
+        egui::TopBottomPanel::top("top").frame(frame).show(ctx, |ui| {
             ui.horizontal(|ui| {
-                ui.strong("lode");
-                ui.separator();
-                if ui.button("Run  (Ctrl+Enter)").clicked() {
-                    acts.push(Act::Run);
-                }
+                let connected = self.live.is_some();
                 let running = self
                     .tabs
                     .get(self.active)
                     .map(|t| t.state == RunState::Running)
                     .unwrap_or(false);
-                if ui.add_enabled(running, egui::Button::new("Cancel")).clicked() {
+
+                // ── execution ───────────────────────────────────────────────
+                if self.primary(ui, self.icon.run, "Run", connected && !running).clicked() {
+                    acts.push(Act::Run);
+                }
+                if self.tool(ui, self.icon.cancel, "Cancel", running).clicked() {
                     acts.push(Act::Cancel);
                 }
                 ui.separator();
-                if ui.button("New tab").clicked() {
+
+                // ── tabs ────────────────────────────────────────────────────
+                if self.tool(ui, self.icon.new_tab, "New tab", true).clicked() {
                     acts.push(Act::NewTab);
                 }
-                if ui
-                    .add_enabled(self.live.is_some(), egui::Button::new("Save query"))
-                    .clicked()
-                {
+                if self.tool(ui, self.icon.save, "Save query", connected).clicked() {
                     acts.push(Act::SaveQuery);
                 }
-                if ui.button("Export…").clicked() {
+                ui.separator();
+
+                // ── output ──────────────────────────────────────────────────
+                let has_rows = self.tabs.get(self.active).map(|t| !t.rows.is_empty()).unwrap_or(false);
+                if self.tool(ui, self.icon.export, "Export", has_rows).clicked() {
                     acts.push(Act::OpenExport);
                 }
                 ui.separator();
-                if ui.button("Refresh").clicked() {
+
+                // ── refresh ─────────────────────────────────────────────────
+                if self.tool(ui, self.icon.refresh, "Refresh", true).clicked() {
                     acts.push(Act::Refresh);
                 }
 
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui.small_button("⟳").on_hover_text("rescan theme files").clicked() {
+                    if ui
+                        .add(egui::Button::new(self.icon.refresh).small())
+                        .on_hover_text("rescan the theme directories")
+                        .clicked()
+                    {
                         acts.push(Act::ReloadThemes);
                     }
                     let mut chosen = self.theme_name.clone();
                     egui::ComboBox::from_id_salt("theme")
+                        .width(190.0)
                         .selected_text(&chosen)
                         .show_ui(ui, |ui| {
                             for name in self.themes.keys() {
@@ -866,10 +1111,10 @@ impl App {
                                 }
                             }
                             if self.themes.is_empty() {
-                                ui.label("no theme files found");
+                                ui.label(egui::RichText::new("no theme files found").color(theme.muted()));
                             }
                         });
-                    ui.label("Theme");
+                    ui.label(egui::RichText::new("Theme").color(theme.muted()));
                 });
             });
         });
@@ -882,120 +1127,193 @@ impl App {
     }
 
     fn left_panel(&mut self, ctx: &egui::Context, acts: &mut Vec<Act>) {
+        let theme = self.theme.clone();
+        let icon = self.icon;
+        let frame = egui::Frame::new()
+            .fill(theme.panel())
+            .inner_margin(egui::Margin::symmetric(10, 10));
         egui::SidePanel::left("side")
+            .frame(frame)
             .resizable(true)
-            .default_width(280.0)
+            .default_width(290.0)
+            .width_range(210.0..=460.0)
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
-                    ui.strong("Connections");
+                    section(ui, &theme, "Connections");
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui.small_button("+").on_hover_text("add a connection").clicked() {
+                        if ui
+                            .add(egui::Button::new(icon.add).small())
+                            .on_hover_text("add a connection")
+                            .clicked()
+                        {
                             acts.push(Act::New);
                         }
                     });
                 });
                 if !self.store_ok {
-                    ui.colored_label(
-                        self.theme.c(&self.theme.accent.warning, egui::Color32::YELLOW),
-                        "the engine has no saved state — connections cannot be stored",
+                    ui.label(
+                        egui::RichText::new("the engine has no saved state — connections cannot be stored")
+                            .small()
+                            .color(theme.warning()),
                     );
                 }
-                ui.separator();
+                ui.add_space(4.0);
 
                 egui::ScrollArea::vertical()
                     .id_salt("conns")
-                    .max_height(220.0)
+                    .max_height(200.0)
                     .show(ui, |ui| {
                         if self.saved.is_empty() {
-                            ui.label("none saved yet");
+                            ui.label(egui::RichText::new("none saved yet").color(theme.muted()));
                         }
                         for c in &self.saved {
                             let is_live = self.live.as_ref().is_some_and(|l| l.name == c.name);
                             ui.horizontal(|ui| {
-                                let label = if is_live {
-                                    format!("● {}", c.name)
-                                } else {
-                                    format!("○ {}", c.name)
-                                };
-                                if ui
-                                    .selectable_label(is_live, label)
-                                    .on_hover_text(format!("{} — double-click to connect", c.driver))
-                                    .double_clicked()
-                                {
-                                    acts.push(Act::Connect(c.name.clone()));
-                                }
+                                let dot = if is_live { icon.connected } else { icon.offline };
+                                let colour = if is_live { theme.fg() } else { theme.muted() };
+                                // The BUTTONS are laid out first, from the right,
+                                // and the name takes what is left. Drawing the
+                                // name first gives it the whole row and the
+                                // right-aligned buttons are then painted ON TOP
+                                // of a long one — which is exactly what happened
+                                // to "prod (postgres, tunnelled)".
                                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                    if ui.small_button("✕").on_hover_text("delete").clicked() {
+                                    if ui
+                                        .add(egui::Button::new(icon.delete).small())
+                                        .on_hover_text("delete this saved connection")
+                                        .clicked()
+                                    {
                                         acts.push(Act::Delete(c.name.clone()));
                                     }
-                                    if ui.small_button("✎").on_hover_text("edit").clicked() {
+                                    if ui
+                                        .add(egui::Button::new(icon.edit).small())
+                                        .on_hover_text("edit — driver, auth, TLS, SSH tunnel")
+                                        .clicked()
+                                    {
                                         acts.push(Act::Edit(c.name.clone()));
                                     }
-                                    if !is_live && ui.small_button("▶").on_hover_text("connect").clicked() {
+                                    if !is_live
+                                        && ui
+                                            .add(egui::Button::new(icon.connect).small())
+                                            .on_hover_text("connect")
+                                            .clicked()
+                                    {
                                         acts.push(Act::Connect(c.name.clone()));
                                     }
+                                    ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                                        if ui
+                                            .add(egui::Button::selectable(
+                                                is_live,
+                                                egui::RichText::new(format!("{dot}  {}", c.name))
+                                                    .color(colour),
+                                            ))
+                                            .on_hover_text(format!(
+                                                "{} — double-click here, or press the link button, to connect",
+                                                c.driver
+                                            ))
+                                            .double_clicked()
+                                        {
+                                            acts.push(Act::Connect(c.name.clone()));
+                                        }
+                                    });
                                 });
                             });
                         }
                     });
 
-                ui.separator();
+                ui.add_space(10.0);
                 if let Some(live) = &self.live {
+                    section(ui, &theme, &live.name);
                     ui.horizontal(|ui| {
-                        ui.strong(&live.name);
-                        if ui.small_button("disconnect").clicked() {
-                            acts.push(Act::Disconnect);
-                        }
-                    });
-                    let lock = if live.encrypted {
-                        if live.tunneled {
-                            "🔒 encrypted (SSH tunnel)"
+                        let (glyph, text, colour) = if live.encrypted {
+                            (
+                                icon.locked,
+                                if live.tunneled { "encrypted (SSH tunnel)" } else { "encrypted (TLS)" },
+                                theme.success(),
+                            )
                         } else {
-                            "🔒 encrypted (TLS)"
-                        }
-                    } else {
-                        "⚠ PLAINTEXT"
-                    };
-                    ui.small(lock);
-                    ui.separator();
-
-                    if !live.queries.is_empty() {
-                        ui.collapsing("Saved queries", |ui| {
-                            for q in &live.queries {
-                                if ui.selectable_label(false, &q.name).clicked() {
-                                    acts.push(Act::LoadQuery(live.name.clone(), q.sql.clone()));
-                                }
+                            (icon.unlocked, "PLAINTEXT", theme.error())
+                        };
+                        ui.label(
+                            egui::RichText::new(format!("{glyph}  {text}"))
+                                .small()
+                                .color(colour),
+                        );
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if ui
+                                .add(egui::Button::new(icon.disconnect).small())
+                                .on_hover_text("disconnect")
+                                .clicked()
+                            {
+                                acts.push(Act::Disconnect);
                             }
                         });
+                    });
+
+                    if !live.queries.is_empty() {
+                        ui.add_space(6.0);
+                        egui::CollapsingHeader::new(format!("{}  Saved queries", icon.query))
+                            .default_open(false)
+                            .show(ui, |ui| {
+                                for q in &live.queries {
+                                    if ui.selectable_label(false, &q.name).clicked() {
+                                        acts.push(Act::LoadQuery(q.sql.clone()));
+                                    }
+                                }
+                            });
                     }
 
-                    ui.strong("Schema");
+                    ui.add_space(10.0);
+                    section(ui, &theme, "Schema");
+                    ui.add_space(2.0);
                     egui::ScrollArea::vertical().id_salt("tree").show(ui, |ui| {
                         if live.nodes.is_empty() {
-                            ui.label("…");
+                            ui.label(egui::RichText::new("loading…").color(theme.muted()));
                         }
                         for n in &live.nodes {
-                            draw_node(ui, n, &mut |sql| acts.push(Act::LoadQuery(String::new(), sql)));
+                            draw_node(ui, n, &icon, &mut |sql| acts.push(Act::LoadQuery(sql)));
                         }
                     });
                 } else {
-                    ui.label("not connected");
+                    ui.label(egui::RichText::new("not connected").color(theme.muted()));
                 }
             });
     }
 
     fn bottom_bar(&mut self, ctx: &egui::Context) {
-        egui::TopBottomPanel::bottom("status").show(ctx, |ui| {
+        let theme = self.theme.clone();
+        let icon = self.icon;
+        let frame = egui::Frame::new()
+            .fill(theme.status())
+            .inner_margin(egui::Margin::symmetric(12, 5))
+            .stroke(egui::Stroke::new(1.0_f32, theme.border()));
+        egui::TopBottomPanel::bottom("status").frame(frame).show(ctx, |ui| {
             ui.horizontal(|ui| {
-                ui.small(&self.status);
+                let name = |p: &Option<std::path::PathBuf>| {
+                    p.as_ref()
+                        .and_then(|p| p.file_stem().and_then(|s| s.to_str()))
+                        .unwrap_or("egui built-in")
+                        .to_string()
+                };
+                ui.label(egui::RichText::new(&self.status).small().color(theme.muted()))
+                    .on_hover_text(format!(
+                        "monospace: {}\nproportional: {}\nicons: {}\n\nOverride with                          $LODE_FONT_MONO, $LODE_FONT_UI, $LODE_FONT_SIZE.",
+                        name(&self.fonts.mono),
+                        name(&self.fonts.ui),
+                        if self.fonts.nerd { "Nerd Font glyphs" } else { "words (no Nerd Font found)" },
+                    ));
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if let Some(last) = self.log.last() {
-                        let col = match last.0.as_str() {
-                            "error" => self.theme.c(&self.theme.accent.error, egui::Color32::RED),
-                            "warn" => self.theme.c(&self.theme.accent.warning, egui::Color32::YELLOW),
-                            _ => self.theme.c(&self.theme.text.muted, egui::Color32::GRAY),
+                        let (col, glyph) = match last.0.as_str() {
+                            "error" => (theme.error(), icon.fail),
+                            "warn" => (theme.warning(), icon.fail),
+                            _ => (theme.muted(), icon.ok),
                         };
-                        ui.colored_label(col, &last.1);
+                        ui.label(
+                            egui::RichText::new(format!("{glyph}  {}", last.1))
+                                .small()
+                                .color(col),
+                        );
                     }
                 });
             });
@@ -1003,16 +1321,27 @@ impl App {
     }
 
     fn central(&mut self, ctx: &egui::Context, acts: &mut Vec<Act>) {
-        egui::CentralPanel::default().show(ctx, |ui| {
+        let theme = self.theme.clone();
+        let icon = self.icon;
+        let scale = self.scale;
+        let frame = egui::Frame::new()
+            .fill(theme.base())
+            .inner_margin(egui::Margin::symmetric(12, 10));
+        egui::CentralPanel::default().frame(frame).show(ctx, |ui| {
             // tab strip
             ui.horizontal(|ui| {
                 let mut select = None;
                 for (i, t) in self.tabs.iter().enumerate() {
                     let on = i == self.active;
-                    if ui.selectable_label(on, &t.title).clicked() {
+                    let dot = match t.state {
+                        RunState::Running => icon.run,
+                        RunState::Failed => icon.fail,
+                        _ => icon.query,
+                    };
+                    if ui.selectable_label(on, format!("{dot}  {}", t.title)).clicked() {
                         select = Some(i);
                     }
-                    if on && self.tabs.len() > 1 && ui.small_button("✕").clicked() {
+                    if on && self.tabs.len() > 1 && ui.add(egui::Button::new(icon.close).small()).clicked() {
                         acts.push(Act::CloseTab(t.id));
                     }
                 }
@@ -1020,125 +1349,174 @@ impl App {
                     self.active = i;
                 }
             });
-            ui.separator();
+            ui.add_space(8.0);
 
-            let muted = self.theme.c(&self.theme.text.muted, egui::Color32::GRAY);
-            let null_fg = self.theme.c(&self.theme.grid.null_fg, muted);
-            let header_fg = self.theme.c(&self.theme.grid.header_fg, egui::Color32::WHITE);
-            let header_bg = self.theme.c(&self.theme.grid.header_bg, muted);
-            let err_col = self.theme.c(&self.theme.accent.error, egui::Color32::RED);
+            let muted = theme.muted();
+            let null_fg = theme.null_fg();
+            let header_fg = theme.header_fg();
+            let header_bg = theme.header_bg();
+            let err_col = theme.error();
+            let base = theme.base();
+            let border = theme.border();
+            let row_h = Theme::row_height(scale);
 
-            let Some(tab) = self.tabs.get_mut(self.active) else { return };
+            let active = self.active;
+            let Some(tab) = self.tabs.get_mut(active) else { return };
 
-            // editor
-            let editor_h = (ui.available_height() * 0.35).max(90.0);
-            egui::ScrollArea::vertical()
-                .id_salt("editor")
-                .max_height(editor_h)
+            // ── the editor ──────────────────────────────────────────────────
+            let editor_h = (ui.available_height() * 0.32).clamp(80.0, 320.0);
+            egui::Frame::new()
+                .fill(base)
+                .stroke(egui::Stroke::new(1.0_f32, border))
+                .corner_radius(egui::CornerRadius::same(4))
+                .inner_margin(egui::Margin::same(8))
                 .show(ui, |ui| {
-                    ui.add(
-                        egui::TextEdit::multiline(&mut tab.sql)
-                            .code_editor()
-                            .desired_rows(6)
-                            .desired_width(f32::INFINITY)
-                            .hint_text("SELECT …    (Ctrl+Enter runs)"),
-                    );
+                    egui::ScrollArea::vertical()
+                        .id_salt("editor")
+                        .max_height(editor_h)
+                        .show(ui, |ui| {
+                            ui.add(
+                                egui::TextEdit::multiline(&mut tab.sql)
+                                    .code_editor()
+                                    .frame(false)
+                                    .desired_rows(5)
+                                    .desired_width(f32::INFINITY)
+                                    .hint_text("SELECT …        Ctrl+Enter runs"),
+                            );
+                        });
                 });
 
-            ui.separator();
+            ui.add_space(10.0);
 
-            // result header
+            // ── the result header ───────────────────────────────────────────
             ui.horizontal(|ui| {
                 match tab.state {
-                    RunState::Idle => ui.small("no result yet"),
-                    RunState::Running => ui.small("running…"),
-                    RunState::Cancelled => ui.small("cancelled"),
-                    RunState::Failed => ui.colored_label(err_col, "failed"),
+                    RunState::Idle => ui.label(egui::RichText::new("no result yet").small().color(muted)),
+                    RunState::Running => ui.label(egui::RichText::new("running…").small().color(muted)),
+                    RunState::Cancelled => ui.label(egui::RichText::new("cancelled").small().color(muted)),
+                    RunState::Failed => ui.label(egui::RichText::new("failed").small().color(err_col)),
                     RunState::Done => {
                         let shown = tab.rows.len();
                         let text = match (tab.total, tab.affected) {
                             (_, Some(a)) if tab.columns.is_empty() => format!("{a} row(s) affected"),
-                            (Some(t), _) => format!("{}–{} / {t}", tab.from + 1, tab.from + shown),
-                            (None, _) => format!("{}–{} / ?", tab.from + 1, tab.from + shown),
+                            (Some(t), _) => format!("{}–{} of {t}", tab.from + 1, tab.from + shown),
+                            (None, _) => format!("{}–{} of ?", tab.from + 1, tab.from + shown),
                         };
-                        ui.small(format!("{text}   ·   {} ms", tab.ms))
+                        ui.label(
+                            egui::RichText::new(format!("{text}        {} ms", tab.ms))
+                                .small()
+                                .color(muted),
+                        )
                     }
                 };
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     let can_next = tab.state == RunState::Done && tab.has_more;
                     let can_prev = tab.state == RunState::Done && tab.from > 0;
-                    if ui.add_enabled(can_next, egui::Button::new("next ▶")).clicked() {
+                    if ui.add_enabled(can_next, egui::Button::new("Next  ▶")).clicked() {
                         acts.push(Act::Page(1));
                     }
-                    if ui.add_enabled(can_prev, egui::Button::new("◀ prev")).clicked() {
+                    if ui.add_enabled(can_prev, egui::Button::new("◀  Prev")).clicked() {
                         acts.push(Act::Page(-1));
                     }
                 });
             });
 
             if let Some(e) = &tab.error {
-                ui.colored_label(err_col, e);
+                ui.add_space(6.0);
+                egui::Frame::new()
+                    .fill(base)
+                    .stroke(egui::Stroke::new(1.0_f32, err_col))
+                    .corner_radius(egui::CornerRadius::same(4))
+                    .inner_margin(egui::Margin::same(8))
+                    .show(ui, |ui| {
+                        ui.colored_label(err_col, e);
+                    });
             }
 
-            // the grid
+            // ── the grid ────────────────────────────────────────────────────
             if tab.columns.is_empty() || tab.rows.is_empty() {
                 return;
             }
+            ui.add_space(8.0);
             let ncols = tab.columns.len();
             let rows = &tab.rows;
             let columns = &tab.columns;
             let first_row = tab.from;
+            let selected = tab.selected;
 
             egui::ScrollArea::horizontal().id_salt("grid").show(ui, |ui| {
                 let mut builder = TableBuilder::new(ui)
                     .striped(true)
                     .resizable(true)
+                    .sense(egui::Sense::click())
                     .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
                     .column(TCol::auto());
                 for _ in 0..ncols {
-                    builder = builder.column(TCol::initial(150.0).at_least(40.0).clip(true));
+                    builder = builder.column(TCol::initial(160.0).at_least(48.0).clip(true));
                 }
                 builder
-                    .header(22.0, |mut header| {
+                    .header(row_h + 6.0, |mut header| {
                         // The header strip is painted with the theme's own
-                        // header surface, not left on the panel fill: the
-                        // column names have to read as a HEADER over the rows,
-                        // and `header_fg` is the one ink the generator floored
-                        // against `header_bg` rather than against the page.
+                        // header surface: the column names have to read as a
+                        // HEADER over the rows, and `header_fg` is the one ink
+                        // the generator floored against `header_bg` rather than
+                        // against the page.
                         header.col(|ui| {
                             fill(ui, header_bg);
-                            ui.colored_label(header_fg, "#");
+                            pad(ui, false, |ui| {
+                                ui.label(egui::RichText::new("#").small().color(header_fg));
+                            });
                         });
                         for c in columns {
                             header.col(|ui| {
                                 fill(ui, header_bg);
-                                ui.colored_label(header_fg, &c.name).on_hover_text(&c.type_name);
+                                pad(ui, false, |ui| {
+                                    ui.label(egui::RichText::new(&c.name).color(header_fg).strong())
+                                        .on_hover_text(&c.type_name);
+                                });
                             });
                         }
                     })
                     .body(|body| {
                         // Virtualised: egui_extras asks only for the rows on
                         // screen, so the loop cost does not grow with the page.
-                        body.rows(18.0, rows.len(), |mut row| {
+                        body.rows(row_h, rows.len(), |mut row| {
                             let i = row.index();
+                            row.set_selected(selected == Some(i));
                             row.col(|ui| {
-                                ui.colored_label(muted, (first_row + i + 1).to_string());
+                                pad(ui, true, |ui| {
+                                    ui.label(
+                                        egui::RichText::new((first_row + i + 1).to_string())
+                                            .small()
+                                            .color(muted),
+                                    );
+                                });
                             });
                             for ci in 0..ncols {
                                 row.col(|ui| {
-                                    match rows[i].get(ci).and_then(cell_text) {
+                                    let v = rows[i].get(ci);
+                                    // Numbers right, text left: a column of
+                                    // figures is read by its last digit, and a
+                                    // left-ragged column of numbers cannot be
+                                    // compared down the page at all.
+                                    let numeric = matches!(v, Some(Value::Number(_)));
+                                    pad(ui, numeric, |ui| match v.and_then(cell_text) {
                                         // A NULL is drawn differently from the
                                         // text "NULL", because they are
                                         // different values.
                                         None => {
-                                            ui.colored_label(null_fg, "NULL");
+                                            ui.label(egui::RichText::new("NULL").italics().color(null_fg));
                                         }
                                         Some(s) => {
                                             let one_line = s.replace('\n', "⏎");
-                                            ui.label(one_line).on_hover_text(s);
+                                            ui.label(egui::RichText::new(one_line).monospace())
+                                                .on_hover_text(s);
                                         }
-                                    };
+                                    });
                                 });
+                            }
+                            if row.response().clicked() {
+                                acts.push(Act::SelectRow(i));
                             }
                         });
                     });
@@ -1146,119 +1524,294 @@ impl App {
         });
     }
 
-    fn form_window(&mut self, ctx: &egui::Context) {
-        let Some(form) = &mut self.form else { return };
-        let mut open = true;
-        let mut save = false;
-        let mut cancel = false;
+    fn form_window(&mut self, ctx: &egui::Context, acts: &mut Vec<Act>) {
+        if self.form.is_none() {
+            return;
+        }
+        let theme = self.theme.clone();
+        let icon = self.icon;
+        let nerd = self.fonts.nerd;
         let drivers: Vec<(String, String)> = self
             .hello
             .as_ref()
             .map(|h| h.drivers.iter().map(|d| (d.kind.clone(), d.display.clone())).collect())
             .unwrap_or_default();
-        let meta = self
-            .hello
-            .as_ref()
-            .and_then(|h| h.drivers.iter().find(|d| d.kind == form.driver))
-            .cloned();
+        let meta = self.hello.as_ref().and_then(|h| {
+            let kind = self.form.as_ref().map(|f| f.driver.clone())?;
+            h.drivers.iter().find(|d| d.kind == kind).cloned()
+        });
 
-        egui::Window::new(if form.editing.is_some() {
+        let Some(form) = &mut self.form else { return };
+        let mut open = true;
+        let mut save = false;
+        let mut cancel = false;
+
+        let title = if form.editing.is_some() {
             "Edit connection"
         } else {
             "New connection"
-        })
-        .open(&mut open)
-        .resizable(true)
-        .default_width(420.0)
-        .show(ctx, |ui| {
-            egui::Grid::new("form").num_columns(2).show(ui, |ui| {
-                ui.label("Name");
-                ui.text_edit_singleline(&mut form.name);
-                ui.end_row();
+        };
+        egui::Window::new(title)
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(true)
+            .default_width(580.0)
+            .frame(
+                egui::Frame::new()
+                    .fill(theme.overlay())
+                    .stroke(egui::Stroke::new(1.0_f32, theme.border()))
+                    .corner_radius(egui::CornerRadius::same(6))
+                    .inner_margin(egui::Margin::same(14)),
+            )
+            .show(ctx, |ui| {
+                egui::ScrollArea::vertical()
+                    .id_salt("formscroll")
+                    .max_height(520.0)
+                    .show(ui, |ui| {
+                        // ── identity + the driver's own parameters ──────────
+                        section(ui, &theme, "Connection");
+                        egui::Grid::new("ident").num_columns(2).spacing([12.0, 6.0]).show(ui, |ui| {
+                            ui.label("Name");
+                            ui.text_edit_singleline(&mut form.name);
+                            ui.end_row();
+                            ui.label("Driver");
+                            egui::ComboBox::from_id_salt("driver")
+                                .selected_text(
+                                    drivers
+                                        .iter()
+                                        .find(|(k, _)| *k == form.driver)
+                                        .map(|(_, d)| d.clone())
+                                        .unwrap_or_else(|| form.driver.clone()),
+                                )
+                                .show_ui(ui, |ui| {
+                                    for (kind, display) in &drivers {
+                                        ui.selectable_value(&mut form.driver, kind.clone(), display);
+                                    }
+                                });
+                            ui.end_row();
 
-                ui.label("Driver");
-                egui::ComboBox::from_id_salt("driver")
-                    .selected_text(
-                        drivers
-                            .iter()
-                            .find(|(k, _)| *k == form.driver)
-                            .map(|(_, d)| d.clone())
-                            .unwrap_or_else(|| form.driver.clone()),
-                    )
-                    .show_ui(ui, |ui| {
-                        for (kind, display) in &drivers {
-                            ui.selectable_value(&mut form.driver, kind.clone(), display);
-                        }
-                    });
-                ui.end_row();
-
-                // The fields come from the ENGINE's DriverMeta, not from a list
-                // here: that is what makes a new database type need no client
-                // change at all.
-                if let Some(m) = &meta {
-                    for p in &m.params {
-                        let label = if p.required {
-                            format!("{} *", p.label)
-                        } else {
-                            p.label.clone()
-                        };
-                        ui.label(label);
-                        let entry = form
-                            .params
-                            .entry(p.key.clone())
-                            .or_insert_with(|| p.default.clone().unwrap_or_default());
-                        if p.kind == "bool" {
-                            let mut on = entry == "true";
-                            if ui.checkbox(&mut on, "").changed() {
-                                *entry = on.to_string();
-                            }
-                        } else {
-                            ui.text_edit_singleline(entry);
-                        }
-                        ui.end_row();
-                    }
-
-                    ui.label("Auth");
-                    egui::ComboBox::from_id_salt("auth")
-                        .selected_text(&form.auth_kind)
-                        .show_ui(ui, |ui| {
-                            for a in &m.auth {
-                                ui.selectable_value(&mut form.auth_kind, a.clone(), a);
+                            // The parameter fields come from the ENGINE's
+                            // DriverMeta, not from a list here: that is what
+                            // makes a new database type need no client change.
+                            if let Some(m) = &meta {
+                                for p in &m.params {
+                                    let label = if p.required {
+                                        format!("{} *", p.label)
+                                    } else {
+                                        p.label.clone()
+                                    };
+                                    ui.label(label);
+                                    let entry = form
+                                        .params
+                                        .entry(p.key.clone())
+                                        .or_insert_with(|| p.default.clone().unwrap_or_default());
+                                    if p.kind == "bool" {
+                                        let mut on = entry == "true";
+                                        if ui.checkbox(&mut on, "").changed() {
+                                            *entry = on.to_string();
+                                        }
+                                    } else {
+                                        ui.text_edit_singleline(entry);
+                                    }
+                                    ui.end_row();
+                                }
                             }
                         });
-                    ui.end_row();
+                        stage_row(ui, &theme, icon, nerd, form, "endpoint", acts);
 
-                    if form.auth_kind != "none" {
-                        ui.label("User");
-                        ui.text_edit_singleline(&mut form.auth_user);
-                        ui.end_row();
-                        ui.label("Secret");
-                        ui.text_edit_singleline(&mut form.auth_secret);
-                        ui.end_row();
+                        // ── auth ────────────────────────────────────────────
+                        ui.add_space(10.0);
+                        section(ui, &theme, "Authentication");
+                        let auth_kinds: Vec<String> = meta
+                            .as_ref()
+                            .map(|m| m.auth.clone())
+                            .filter(|v| !v.is_empty())
+                            .unwrap_or_else(|| vec!["none".into(), "password".into()]);
+                        egui::Grid::new("auth").num_columns(2).spacing([12.0, 6.0]).show(ui, |ui| {
+                            ui.label("Method");
+                            egui::ComboBox::from_id_salt("authkind")
+                                .selected_text(&form.auth_kind)
+                                .show_ui(ui, |ui| {
+                                    for a in &auth_kinds {
+                                        ui.selectable_value(&mut form.auth_kind, a.clone(), a);
+                                    }
+                                });
+                            ui.end_row();
+                            match form.auth_kind.as_str() {
+                                "password" => {
+                                    ui.label("User");
+                                    ui.text_edit_singleline(&mut form.auth_user);
+                                    ui.end_row();
+                                    ui.label("Password");
+                                    ui.text_edit_singleline(&mut form.auth_secret);
+                                    ui.end_row();
+                                }
+                                "client_cert" => {
+                                    ui.label("User");
+                                    ui.text_edit_singleline(&mut form.auth_user);
+                                    ui.end_row();
+                                    ui.label("Certificate");
+                                    ui.text_edit_singleline(&mut form.auth_cert);
+                                    ui.end_row();
+                                    ui.label("Private key");
+                                    ui.text_edit_singleline(&mut form.auth_key);
+                                    ui.end_row();
+                                    ui.label("Key password");
+                                    ui.text_edit_singleline(&mut form.auth_key_password);
+                                    ui.end_row();
+                                }
+                                "provider" => {
+                                    ui.label("Provider");
+                                    ui.text_edit_singleline(&mut form.auth_provider)
+                                        .on_hover_text("aws | oauth | oidc — interpreted per driver");
+                                    ui.end_row();
+                                    ui.label("User");
+                                    ui.text_edit_singleline(&mut form.auth_user);
+                                    ui.end_row();
+                                    ui.label("Token");
+                                    ui.text_edit_singleline(&mut form.auth_secret);
+                                    ui.end_row();
+                                }
+                                "kerberos" => {
+                                    ui.label("Principal");
+                                    ui.text_edit_singleline(&mut form.auth_principal);
+                                    ui.end_row();
+                                }
+                                _ => {}
+                            }
+                        });
+                        if form.auth_kind != "none" {
+                            secret_note(ui, &theme);
+                        }
+                        stage_row(ui, &theme, icon, nerd, form, "auth", acts);
+
+                        // ── tls ─────────────────────────────────────────────
+                        ui.add_space(10.0);
+                        section(ui, &theme, "TLS");
+                        egui::Grid::new("tls").num_columns(2).spacing([12.0, 6.0]).show(ui, |ui| {
+                            ui.label("Mode");
+                            egui::ComboBox::from_id_salt("tlsmode")
+                                .selected_text(&form.tls_mode)
+                                .show_ui(ui, |ui| {
+                                    for (m, help) in [
+                                        ("disable", "no encryption attempted — the only plaintext path"),
+                                        ("prefer", "use TLS when the server offers it (the safe default)"),
+                                        ("require", "encryption mandatory, certificate unverified"),
+                                        ("verify_ca", "mandatory + the chain is verified"),
+                                        ("verify_full", "mandatory + chain AND hostname verified"),
+                                    ] {
+                                        ui.selectable_value(&mut form.tls_mode, m.to_string(), m)
+                                            .on_hover_text(help);
+                                    }
+                                });
+                            ui.end_row();
+                            ui.label("CA bundle");
+                            ui.text_edit_singleline(&mut form.tls_ca);
+                            ui.end_row();
+                            ui.label("Client certificate");
+                            ui.text_edit_singleline(&mut form.tls_client_cert);
+                            ui.end_row();
+                            ui.label("Client key");
+                            ui.text_edit_singleline(&mut form.tls_client_key);
+                            ui.end_row();
+                        });
+                        if form.tls_mode == "disable" {
+                            ui.label(
+                                egui::RichText::new(
+                                    "the link will be PLAINTEXT — the engine warns on every connect",
+                                )
+                                .small()
+                                .color(theme.warning()),
+                            );
+                        }
+                        stage_row(ui, &theme, icon, nerd, form, "tls", acts);
+
+                        // ── ssh tunnel ──────────────────────────────────────
+                        ui.add_space(10.0);
+                        section(ui, &theme, "SSH tunnel");
+                        ui.checkbox(&mut form.tunnel_on, "Front this connection with an SSH tunnel")
+                            .on_hover_text(
+                                "The engine forwards the database's TCP endpoint through an SSH \
+                                 direct-tcpip channel, so it works for drivers that have no TLS of \
+                                 their own.",
+                            );
+                        if form.tunnel_on {
+                            egui::Grid::new("tunnel").num_columns(2).spacing([12.0, 6.0]).show(ui, |ui| {
+                                ui.label("SSH host");
+                                ui.text_edit_singleline(&mut form.tunnel_host);
+                                ui.end_row();
+                                ui.label("SSH port");
+                                ui.text_edit_singleline(&mut form.tunnel_port);
+                                ui.end_row();
+                                ui.label("SSH user");
+                                ui.text_edit_singleline(&mut form.tunnel_user);
+                                ui.end_row();
+                                ui.label("Method");
+                                egui::ComboBox::from_id_salt("tunnelauth")
+                                    .selected_text(&form.tunnel_auth)
+                                    .show_ui(ui, |ui| {
+                                        for (m, help) in [
+                                            ("agent", "the running ssh-agent"),
+                                            ("key", "a private key file"),
+                                            ("password", "a password"),
+                                        ] {
+                                            ui.selectable_value(&mut form.tunnel_auth, m.to_string(), m)
+                                                .on_hover_text(help);
+                                        }
+                                    });
+                                ui.end_row();
+                                match form.tunnel_auth.as_str() {
+                                    "key" => {
+                                        ui.label("Key file");
+                                        ui.text_edit_singleline(&mut form.tunnel_key_path);
+                                        ui.end_row();
+                                        ui.label("Passphrase");
+                                        ui.text_edit_singleline(&mut form.tunnel_secret);
+                                        ui.end_row();
+                                    }
+                                    "password" => {
+                                        ui.label("Password");
+                                        ui.text_edit_singleline(&mut form.tunnel_secret);
+                                        ui.end_row();
+                                    }
+                                    _ => {}
+                                }
+                            });
+                            if form.tunnel_auth != "agent" {
+                                secret_note(ui, &theme);
+                            }
+                            stage_row(ui, &theme, icon, nerd, form, "tunnel", acts);
+                        }
+                    });
+
+                if let Some(e) = &form.error {
+                    ui.add_space(6.0);
+                    ui.colored_label(theme.error(), e);
+                }
+
+                ui.add_space(10.0);
+                ui.separator();
+                ui.add_space(6.0);
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    let label = if nerd {
+                        format!("{}  Save", icon.save)
+                    } else {
+                        "Save".to_string()
+                    };
+                    if ui
+                        .add(
+                            egui::Button::new(egui::RichText::new(label).color(theme.inverted()))
+                                .fill(theme.accent()),
+                        )
+                        .clicked()
+                    {
+                        save = true;
                     }
-                }
+                    if ui.button("Cancel").clicked() {
+                        cancel = true;
+                    }
+                });
             });
-
-            if form.auth_kind != "none" {
-                ui.small(
-                    "The secret is stored as a TEMPLATE and resolved by the engine at connect time: \
-                     {{ env \"PGPASSWORD\" }}, {{ vault \"prod/db\" }}, {{ cmd \"…\" }}. A literal \
-                     value here is saved as typed.",
-                );
-            }
-            if let Some(e) = &form.error {
-                ui.colored_label(egui::Color32::from_rgb(0xd7, 0x5e, 0x52), e);
-            }
-            ui.separator();
-            ui.horizontal(|ui| {
-                if ui.button("Save").clicked() {
-                    save = true;
-                }
-                if ui.button("Cancel").clicked() {
-                    cancel = true;
-                }
-            });
-        });
 
         if save {
             self.save_form();
@@ -1271,6 +1824,9 @@ impl App {
         if !self.export.open {
             return;
         }
+        let theme = self.theme.clone();
+        let nerd = self.fonts.nerd;
+        let icon = self.icon;
         let mut open = true;
         let mut write = false;
         let mut close = false;
@@ -1282,51 +1838,74 @@ impl App {
 
         egui::Window::new("Export the loaded rows")
             .open(&mut open)
-            .default_width(460.0)
+            .collapsible(false)
+            .default_width(500.0)
+            .frame(
+                egui::Frame::new()
+                    .fill(theme.overlay())
+                    .stroke(egui::Stroke::new(1.0_f32, theme.border()))
+                    .corner_radius(egui::CornerRadius::same(6))
+                    .inner_margin(egui::Margin::same(14)),
+            )
             .show(ctx, |ui| {
                 ui.label(format!("{nrows} row(s), {ncols} column(s) — what the grid holds."));
-                ui.small(
-                    "Only the LOADED page is written. Paging further and exporting again appends \
-                     nothing — it writes that page instead.",
+                ui.label(
+                    egui::RichText::new(
+                        "Only the LOADED page is written. Paging further and exporting again writes \
+                         that page instead — it does not append.",
+                    )
+                    .small()
+                    .color(theme.muted()),
                 );
-                ui.separator();
-                ui.horizontal(|ui| {
+                ui.add_space(10.0);
+                egui::Grid::new("exportgrid").num_columns(2).spacing([12.0, 8.0]).show(ui, |ui| {
                     ui.label("Format");
-                    for f in [Format::Csv, Format::Tsv, Format::Json] {
-                        if ui
-                            .selectable_label(self.export.format == f, f.label())
-                            .clicked()
-                        {
-                            // Keep the extension honest when the format changes.
-                            let old = self.export.format.extension();
-                            self.export.format = f;
-                            if self.export.path.ends_with(old) {
-                                let stem = self
-                                    .export
-                                    .path
-                                    .trim_end_matches(old)
-                                    .trim_end_matches('.')
-                                    .to_string();
-                                self.export.path = format!("{stem}.{}", f.extension());
+                    ui.horizontal(|ui| {
+                        for f in [Format::Csv, Format::Tsv, Format::Json] {
+                            if ui.selectable_label(self.export.format == f, f.label()).clicked() {
+                                // Keep the extension honest when the format changes.
+                                let old = self.export.format.extension();
+                                self.export.format = f;
+                                if self.export.path.ends_with(old) {
+                                    let stem = self
+                                        .export
+                                        .path
+                                        .trim_end_matches(old)
+                                        .trim_end_matches('.')
+                                        .to_string();
+                                    self.export.path = format!("{stem}.{}", f.extension());
+                                }
                             }
                         }
-                    }
-                });
-                ui.horizontal(|ui| {
+                    });
+                    ui.end_row();
                     ui.label("Path");
                     ui.add(
                         egui::TextEdit::singleline(&mut self.export.path)
-                            .desired_width(300.0)
+                            .desired_width(330.0)
                             .hint_text("result.csv"),
                     );
+                    ui.end_row();
                 });
                 if let Some(m) = &self.export.message {
-                    ui.label(m);
+                    ui.add_space(6.0);
+                    ui.label(egui::RichText::new(m).small().color(theme.muted()));
                 }
+                ui.add_space(10.0);
                 ui.separator();
-                ui.horizontal(|ui| {
+                ui.add_space(6.0);
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    let label = if nerd {
+                        format!("{}  Write", icon.export)
+                    } else {
+                        "Write".to_string()
+                    };
                     if ui
-                        .add_enabled(nrows > 0 && !self.export.path.is_empty(), egui::Button::new("Write"))
+                        .add_enabled(
+                            nrows > 0 && !self.export.path.is_empty(),
+                            egui::Button::new(egui::RichText::new(label).color(theme.inverted()))
+                                .fill(theme.accent()),
+                        )
                         .clicked()
                     {
                         write = true;
@@ -1354,22 +1933,121 @@ impl App {
     }
 }
 
-/// Paint a table cell's whole background. `max_rect` is the cell, and it is
-/// expanded by the table's own item spacing so the header reads as one strip
-/// rather than a row of chips with gaps between them.
+// ── small shared pieces ────────────────────────────────────────────────────────
+
+/// A section heading: quiet, small, and the only thing that tells a panel's
+/// regions apart once they all carry the same ink.
+fn section(ui: &mut egui::Ui, theme: &Theme, text: &str) {
+    ui.label(
+        egui::RichText::new(text.to_uppercase())
+            .small()
+            .strong()
+            .color(theme.muted()),
+    );
+}
+
+/// The one line that has to be said wherever a credential is typed.
+fn secret_note(ui: &mut egui::Ui, theme: &Theme) {
+    ui.label(
+        egui::RichText::new(
+            "Stored as a TEMPLATE and resolved by the engine at connect time — {{ env \"PGPASSWORD\" }}, \
+             {{ vault \"prod/db\" }}, {{ cmd \"…\" }}. A literal value is saved exactly as typed.",
+        )
+        .small()
+        .color(theme.muted()),
+    );
+}
+
+/// One stage's Test button and its last answer.
+///
+/// The engine dry-runs ONE layer per stage, which is the whole value of it: a
+/// failure here names the layer that is wrong instead of handing back whatever
+/// error the deepest layer happened to raise. The engine's message is shown
+/// verbatim, because summarising it would throw away the only useful part.
+fn stage_row(
+    ui: &mut egui::Ui,
+    theme: &Theme,
+    icon: Icons,
+    nerd: bool,
+    form: &ConnForm,
+    stage: &'static str,
+    acts: &mut Vec<Act>,
+) {
+    let help = STAGES.iter().find(|(s, _)| *s == stage).map(|(_, h)| *h).unwrap_or("");
+    ui.add_space(6.0);
+    ui.horizontal_wrapped(|ui| {
+        let label = if nerd {
+            format!("{}  Test", icon.test)
+        } else {
+            "Test".to_string()
+        };
+        if ui.button(label).on_hover_text(help).clicked() {
+            acts.push(Act::Test(stage));
+        }
+        match form.tests.get(stage) {
+            Some(TestState::Running) => {
+                ui.label(egui::RichText::new("testing…").small().color(theme.muted()));
+            }
+            Some(TestState::Ok(detail, ms)) => {
+                ui.label(
+                    egui::RichText::new(format!("{}  {detail}  ({ms} ms)", icon.ok))
+                        .small()
+                        .color(theme.success()),
+                );
+            }
+            Some(TestState::Failed(e)) => {
+                ui.label(
+                    egui::RichText::new(format!("{}  {e}", icon.fail))
+                        .small()
+                        .color(theme.error()),
+                );
+            }
+            None => {
+                ui.label(egui::RichText::new(help).small().color(theme.muted()));
+            }
+        }
+    });
+}
+
+/// Paint a table cell's whole background. `max_rect` is the cell, expanded by
+/// the table's item spacing so a header reads as one strip rather than a row of
+/// chips with gaps between them.
 fn fill(ui: &egui::Ui, color: egui::Color32) {
     let rect = ui.max_rect().expand2(ui.spacing().item_spacing);
     ui.painter().rect_filled(rect, 0.0, color);
 }
 
+/// Cell contents with breathing room, left or right aligned.
+fn pad<R>(ui: &mut egui::Ui, right: bool, add: impl FnOnce(&mut egui::Ui) -> R) {
+    let layout = if right {
+        egui::Layout::right_to_left(egui::Align::Center)
+    } else {
+        egui::Layout::left_to_right(egui::Align::Center)
+    };
+    ui.with_layout(layout, |ui| {
+        ui.add_space(6.0);
+        add(ui);
+    });
+}
+
 /// One schema node and its children. Clicking a table puts a SELECT for it in
 /// the editor — the fastest honest thing a tree click can do, and it leaves the
-/// statement visible and editable instead of running something the user did not
-/// read.
-fn draw_node(ui: &mut egui::Ui, n: &Node, on_pick: &mut impl FnMut(String)) {
+/// statement visible and editable instead of running something nobody read.
+fn draw_node(ui: &mut egui::Ui, n: &Node, icon: &Icons, on_pick: &mut impl FnMut(String)) {
+    let glyph = match n.kind.as_str() {
+        "database" => icon.database,
+        "schema" => icon.schema,
+        "table" => icon.table,
+        "view" => icon.view,
+        "column" => icon.column,
+        _ => icon.table,
+    };
     if n.children.is_empty() {
-        let label = format!("{}  ", n.name);
-        if ui.selectable_label(false, label).on_hover_text(&n.kind).clicked() {
+        if ui
+            .selectable_label(false, format!("{glyph}  {}", n.name))
+            .on_hover_text(&n.kind)
+            .clicked()
+        {
             let qualified = match &n.schema {
                 Some(s) if !s.is_empty() => format!("{s}.{}", n.name),
                 _ => n.name.clone(),
@@ -1377,12 +2055,140 @@ fn draw_node(ui: &mut egui::Ui, n: &Node, on_pick: &mut impl FnMut(String)) {
             on_pick(format!("SELECT * FROM {qualified} LIMIT 200;"));
         }
     } else {
-        egui::CollapsingHeader::new(&n.name)
+        egui::CollapsingHeader::new(format!("{glyph}  {}", n.name))
             .id_salt(format!("{}-{}", n.kind, n.name))
             .show(ui, |ui| {
                 for c in &n.children {
-                    draw_node(ui, c, on_pick);
+                    draw_node(ui, c, icon, on_pick);
                 }
             });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn filled_form() -> ConnForm {
+        let mut f = ConnForm::blank("postgres".into());
+        f.name = "prod".into();
+        f.params.insert("host".into(), "db.example".into());
+        f.params.insert("port".into(), "5432".into());
+        f.params.insert("empty".into(), String::new());
+        f.auth_kind = "password".into();
+        f.auth_user = "app".into();
+        f.auth_secret = "{{ vault \"prod/db\" }}".into();
+        f.tls_mode = "verify_full".into();
+        f.tls_ca = "/etc/ssl/ca.pem".into();
+        f.tunnel_on = true;
+        f.tunnel_host = "bastion.example".into();
+        f.tunnel_port = "2222".into();
+        f.tunnel_user = "jump".into();
+        f.tunnel_auth = "key".into();
+        f.tunnel_key_path = "~/.ssh/id_ed25519".into();
+        f.tunnel_secret = "{{ env \"KEYPASS\" }}".into();
+        f
+    }
+
+    /// The form must produce exactly the ConnSpec the engine deserialises —
+    /// this is the shape `conn.test` and `conn.connect` both take.
+    #[test]
+    fn the_form_builds_the_engines_connspec() {
+        let s = filled_form().spec();
+        assert_eq!(s["driver"], "postgres");
+        assert_eq!(s["params"]["host"], "db.example");
+        assert!(s["params"].get("empty").is_none(), "empty params are left out");
+        assert_eq!(s["auth"]["kind"], "password");
+        assert_eq!(s["auth"]["user"], "app");
+        assert_eq!(s["tls"]["mode"], "verify_full");
+        assert_eq!(s["tls"]["ca"], "/etc/ssl/ca.pem");
+        assert!(s["tls"].get("client_cert").is_none());
+        assert_eq!(s["tunnel"]["host"], "bastion.example");
+        assert_eq!(s["tunnel"]["port"], 2222);
+        assert_eq!(s["tunnel"]["auth"]["kind"], "key");
+        assert_eq!(s["tunnel"]["auth"]["path"], "~/.ssh/id_ed25519");
+    }
+
+    /// A secret typed into the form is stored as the TEMPLATE it was typed as.
+    /// Nothing in the client resolves one, and nothing may rewrite one.
+    #[test]
+    fn secrets_stay_templates() {
+        let s = filled_form().spec();
+        assert_eq!(s["auth"]["password"], "{{ vault \"prod/db\" }}");
+        assert_eq!(s["tunnel"]["auth"]["passphrase"], "{{ env \"KEYPASS\" }}");
+    }
+
+    #[test]
+    fn no_tunnel_means_null_not_an_empty_object() {
+        // TunnelSpec has required fields; an empty object would be a
+        // deserialisation error on the engine, where `null` is "no tunnel".
+        let mut f = filled_form();
+        f.tunnel_on = false;
+        assert_eq!(f.spec()["tunnel"], Value::Null);
+    }
+
+    #[test]
+    fn the_stored_spec_drops_the_driver_but_keeps_everything_else() {
+        // The store keeps the driver in its own column; `connect` puts it back.
+        let f = filled_form();
+        let stored = f.stored_spec();
+        assert!(stored.get("driver").is_none());
+        assert_eq!(stored["auth"]["user"], "app");
+        assert_eq!(stored["tunnel"]["user"], "jump");
+    }
+
+    /// A round trip through what the store would hold: save the form, read it
+    /// back into a form, and the spec must be identical. A field the editor
+    /// writes and the loader drops is how a tunnel quietly disappears.
+    #[test]
+    fn a_saved_connection_reopens_identically() {
+        let original = filled_form();
+        let saved = SavedConnection {
+            id: 1,
+            name: original.name.clone(),
+            driver: original.driver.clone(),
+            spec: original.stored_spec(),
+            created: None,
+        };
+
+        let mut reopened = ConnForm::blank("sqlite".into());
+        // Mirrors App::open_form; kept in step by this test failing if it is not.
+        reopened.name = saved.name.clone();
+        reopened.driver = saved.driver.clone();
+        if let Some(p) = saved.spec.get("params").and_then(Value::as_object) {
+            for (k, v) in p {
+                reopened
+                    .params
+                    .insert(k.clone(), v.as_str().map(str::to_string).unwrap_or_default());
+            }
+        }
+        let a = saved.spec.get("auth").and_then(Value::as_object).unwrap();
+        reopened.auth_kind = a["kind"].as_str().unwrap().into();
+        reopened.auth_user = a["user"].as_str().unwrap().into();
+        reopened.auth_secret = a["password"].as_str().unwrap().into();
+        let t = saved.spec.get("tls").and_then(Value::as_object).unwrap();
+        reopened.tls_mode = t["mode"].as_str().unwrap().into();
+        reopened.tls_ca = t["ca"].as_str().unwrap().into();
+        let n = saved.spec.get("tunnel").and_then(Value::as_object).unwrap();
+        reopened.tunnel_on = true;
+        reopened.tunnel_host = n["host"].as_str().unwrap().into();
+        reopened.tunnel_port = n["port"].as_u64().unwrap().to_string();
+        reopened.tunnel_user = n["user"].as_str().unwrap().into();
+        let na = n["auth"].as_object().unwrap();
+        reopened.tunnel_auth = na["kind"].as_str().unwrap().into();
+        reopened.tunnel_key_path = na["path"].as_str().unwrap().into();
+        reopened.tunnel_secret = na["passphrase"].as_str().unwrap().into();
+
+        assert_eq!(original.spec(), reopened.spec());
+    }
+
+    #[test]
+    fn every_stage_the_form_offers_is_one_the_engine_knows() {
+        // The engine rejects an unknown stage; these four are its whole set.
+        let names: Vec<&str> = STAGES.iter().map(|(s, _)| *s).collect();
+        assert_eq!(names, vec!["endpoint", "tunnel", "tls", "auth"]);
+        for (_, help) in STAGES {
+            assert!(!help.is_empty(), "a stage with no explanation is a mystery button");
+        }
     }
 }

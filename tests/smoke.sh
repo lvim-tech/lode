@@ -139,6 +139,47 @@ if [ "$SEEDED" = no ]; then
     await ".method == \"query.state\" and .params.call_id == $SEEDCALL" >/dev/null
 fi
 
+# ── 2b. conn.test, one stage at a time ───────────────────────────────────────
+# This is what a client's connection form calls per section. The value of it is
+# ATTRIBUTION: a failure names the layer that is wrong instead of handing back
+# whatever error the deepest layer happened to raise, so each stage is checked
+# for answering about ITS layer and nothing else.
+send "{\"id\":40,\"method\":\"conn.test\",\"params\":{\"stage\":\"endpoint\",\"spec\":{\"driver\":\"sqlite\",\"params\":{\"file\":\"$DB\"}}}}"
+T=$(await '.id == 40')
+check "test endpoint ok" "$(printf '%s' "$T" | jq -r '.result.ok')" "true"
+report "its detail" "$(printf '%s' "$T" | jq -r '.result.detail')"
+
+# A file that is not there must fail THE ENDPOINT STAGE, with the path in the
+# message — not a generic "could not connect".
+send "{\"id\":41,\"method\":\"conn.test\",\"params\":{\"stage\":\"endpoint\",\"spec\":{\"driver\":\"sqlite\",\"params\":{\"file\":\"$WORK/nope.sqlite\"}}}}"
+BADEP=$(await '.id == 41')
+check "missing file fails endpoint" "$(printf '%s' "$BADEP" | jq -r '.ok')" "false"
+check "and names the path" \
+    "$(printf '%s' "$BADEP" | jq -r '.error | test("nope.sqlite")')" "true"
+
+# A tunnel stage on a spec with no tunnel must say exactly that, rather than
+# silently passing — a green tunnel light on a connection with no tunnel is the
+# worst answer available.
+send "{\"id\":42,\"method\":\"conn.test\",\"params\":{\"stage\":\"tunnel\",\"spec\":{\"driver\":\"sqlite\",\"params\":{\"file\":\"$DB\"}}}}"
+NOTUN=$(await '.id == 42')
+check "tunnel stage without a tunnel fails" "$(printf '%s' "$NOTUN" | jq -r '.ok')" "false"
+report "its error" "$(printf '%s' "$NOTUN" | jq -r '.error')"
+
+# An unknown stage is rejected, so a client cannot invent one.
+send "{\"id\":43,\"method\":\"conn.test\",\"params\":{\"stage\":\"magic\",\"spec\":{\"driver\":\"sqlite\",\"params\":{\"file\":\"$DB\"}}}}"
+check "unknown stage rejected" "$(await '.id == 43' | jq -r '.ok')" "false"
+
+# The FULL spec shape a form produces — auth, tls and a tunnel block together —
+# must deserialise. This is the shape crates/lode-gui builds; a field the engine
+# will not accept has to fail here and not in front of a user.
+send "{\"id\":44,\"method\":\"conn.test\",\"params\":{\"stage\":\"endpoint\",\"spec\":{\"driver\":\"postgres\",\"params\":{\"host\":\"127.0.0.1\",\"port\":\"1\"},\"auth\":{\"kind\":\"password\",\"user\":\"u\",\"password\":\"{{ env \\\"NOPE\\\" }}\"},\"tls\":{\"mode\":\"verify_full\",\"ca\":\"/tmp/ca.pem\"},\"tunnel\":{\"host\":\"h\",\"port\":22,\"user\":\"u\",\"auth\":{\"kind\":\"agent\"}}}}}"
+FULL=$(await '.id == 44')
+# It will NOT succeed (nothing is listening, and there is no ssh host), but the
+# failure must be about reaching the host — proving the spec itself parsed.
+check "full spec parses" \
+    "$(printf '%s' "$FULL" | jq -r '.error // "" | test("missing|unknown|invalid|expected") | not')" "true"
+report "full spec answer" "$(printf '%s' "$FULL" | jq -r '.error // .result.detail' | cut -c1-90)"
+
 # ── 3. the schema tree ───────────────────────────────────────────────────────
 send "{\"id\":3,\"method\":\"schema.structure\",\"params\":{\"conn_id\":$CID}}"
 STRUCT=$(await '.id == 3')

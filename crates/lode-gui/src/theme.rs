@@ -59,6 +59,13 @@ pub struct Surface {
     pub raised: String,
     /// Popups and dialogs.
     pub overlay: String,
+    /// The strip along the bottom edge. Deeper than `panel`, so it reads as the
+    /// window's edge rather than as one more panel.
+    #[serde(default)]
+    pub status: String,
+    /// The row under the pointer: between the grid's stripe and a card.
+    #[serde(default)]
+    pub hover: String,
     pub border: String,
 }
 
@@ -136,23 +143,86 @@ impl Theme {
         hex(s, fallback)
     }
 
-    /// Paint this theme onto an egui context.
+    /// The named surfaces, resolved. Every one falls back to a surface that is
+    /// certainly there, so a theme missing a role is dimmer, never broken.
+    pub fn base(&self) -> egui::Color32 {
+        self.c(&self.surface.base, egui::Color32::from_rgb(0x20, 0x27, 0x2b))
+    }
+    pub fn panel(&self) -> egui::Color32 {
+        self.c(&self.surface.panel, self.base())
+    }
+    pub fn raised(&self) -> egui::Color32 {
+        self.c(&self.surface.raised, self.base())
+    }
+    pub fn overlay(&self) -> egui::Color32 {
+        self.c(&self.surface.overlay, self.panel())
+    }
+    /// The status strip. A theme generated before this role existed has no
+    /// `status`, and the panel is the honest stand-in.
+    pub fn status(&self) -> egui::Color32 {
+        self.c(&self.surface.status, self.panel())
+    }
+    pub fn hover(&self) -> egui::Color32 {
+        self.c(&self.surface.hover, self.raised())
+    }
+    pub fn border(&self) -> egui::Color32 {
+        self.c(&self.surface.border, egui::Color32::GRAY)
+    }
+    pub fn fg(&self) -> egui::Color32 {
+        self.c(&self.text.primary, egui::Color32::WHITE)
+    }
+    pub fn muted(&self) -> egui::Color32 {
+        self.c(&self.text.muted, egui::Color32::GRAY)
+    }
+    pub fn inverted(&self) -> egui::Color32 {
+        self.c(&self.text.inverted, egui::Color32::BLACK)
+    }
+    pub fn accent(&self) -> egui::Color32 {
+        self.c(&self.accent.primary, egui::Color32::LIGHT_BLUE)
+    }
+    pub fn warning(&self) -> egui::Color32 {
+        self.c(&self.accent.warning, egui::Color32::YELLOW)
+    }
+    pub fn error(&self) -> egui::Color32 {
+        self.c(&self.accent.error, egui::Color32::RED)
+    }
+    pub fn success(&self) -> egui::Color32 {
+        self.c(&self.accent.success, self.accent())
+    }
+    pub fn header_bg(&self) -> egui::Color32 {
+        self.c(&self.grid.header_bg, self.raised())
+    }
+    pub fn header_fg(&self) -> egui::Color32 {
+        self.c(&self.grid.header_fg, self.fg())
+    }
+    pub fn null_fg(&self) -> egui::Color32 {
+        self.c(&self.grid.null_fg, self.muted())
+    }
+
+    /// Paint this theme onto an egui context: colours, AND the metrics.
     ///
-    /// Only colours and strokes are set. Corner radii, spacing and font sizes
-    /// are deliberately left to egui's own defaults: they are not in the theme
-    /// file, they are not what a palette is for, and a theme that silently
-    /// changed the metrics of the application would make switching palettes a
-    /// layout change.
-    pub fn apply(&self, ctx: &egui::Context) {
-        let base = self.c(&self.surface.base, egui::Color32::from_rgb(0x20, 0x27, 0x2b));
-        let panel = self.c(&self.surface.panel, base);
-        let raised = self.c(&self.surface.raised, base);
-        let overlay = self.c(&self.surface.overlay, panel);
-        let border = self.c(&self.surface.border, egui::Color32::GRAY);
-        let fg = self.c(&self.text.primary, egui::Color32::WHITE);
-        let muted = self.c(&self.text.muted, egui::Color32::GRAY);
-        let primary = self.c(&self.accent.primary, egui::Color32::LIGHT_BLUE);
-        let inverted = self.c(&self.text.inverted, egui::Color32::BLACK);
+    /// The metrics used to be left at egui's defaults, on the argument that a
+    /// palette is not a layout. That argument was right about the FILE and wrong
+    /// about the application: nothing in the theme file describes spacing, and
+    /// the result was a correct palette poured into a toolkit demo — controls
+    /// touching each other, no margins, one text size for everything. The
+    /// metrics belong to the application, so they are set here, once, and are
+    /// the same whichever of the 48 palettes is loaded. Switching a theme still
+    /// changes no measurement.
+    ///
+    /// `scale` is the base text size, from `$LODE_FONT_SIZE`; everything else is
+    /// derived from it so one number moves the whole interface.
+    pub fn apply(&self, ctx: &egui::Context, scale: f32) {
+        let base = self.base();
+        let panel = self.panel();
+        let raised = self.raised();
+        let overlay = self.overlay();
+        let border = self.border();
+        let fg = self.fg();
+        let muted = self.muted();
+        let primary = self.accent();
+        let inverted = self.inverted();
+        let hover = self.hover();
 
         let mut v = if self.dark {
             egui::Visuals::dark()
@@ -203,7 +273,93 @@ impl Theme {
         v.widgets.open.bg_stroke = egui::Stroke::new(1.0_f32, border);
         v.widgets.open.fg_stroke = egui::Stroke::new(1.0_f32, fg);
 
+        // A list entry or a tree row under the pointer. egui draws that with
+        // `hovered.weak_bg_fill`, which is why the theme's hover surface is a
+        // role and not a shade computed here.
+        v.widgets.hovered.weak_bg_fill = hover;
+
+        // ── shape ───────────────────────────────────────────────────────────
+        // Small radii, not none and not pills: a data application wants its
+        // edges soft enough to group things and sharp enough that a cell still
+        // looks like a cell.
+        let r = egui::CornerRadius::same(4);
+        for w in [
+            &mut v.widgets.noninteractive,
+            &mut v.widgets.inactive,
+            &mut v.widgets.hovered,
+            &mut v.widgets.active,
+            &mut v.widgets.open,
+        ] {
+            w.corner_radius = r;
+            w.expansion = 0.0;
+        }
+        v.window_corner_radius = egui::CornerRadius::same(6);
+        v.menu_corner_radius = egui::CornerRadius::same(6);
+        v.window_shadow = egui::epaint::Shadow {
+            offset: [0, 4],
+            blur: 16,
+            spread: 0,
+            color: egui::Color32::from_black_alpha(if self.dark { 110 } else { 48 }),
+        };
+        v.popup_shadow = v.window_shadow;
+
         ctx.set_visuals(v);
+
+        // ── metrics ─────────────────────────────────────────────────────────
+        let mut style = (*ctx.style()).clone();
+        let sp = &mut style.spacing;
+        // The single worst thing about the first version: everything was
+        // touching. Horizontal space between controls is bigger than vertical,
+        // because a toolbar reads along its length and a form reads down it.
+        sp.item_spacing = egui::vec2(8.0, 6.0);
+        sp.button_padding = egui::vec2(10.0, 5.0);
+        sp.window_margin = egui::Margin::same(12);
+        sp.menu_margin = egui::Margin::same(6);
+        sp.indent = 18.0;
+        sp.interact_size = egui::vec2(40.0, scale + 12.0);
+        sp.combo_width = 150.0;
+        sp.text_edit_width = 220.0;
+        sp.icon_width = scale + 3.0;
+        sp.icon_width_inner = scale - 3.0;
+        sp.scroll = egui::style::ScrollStyle {
+            bar_width: 9.0,
+            handle_min_length: 24.0,
+            bar_inner_margin: 3.0,
+            bar_outer_margin: 0.0,
+            floating: false,
+            ..egui::style::ScrollStyle::solid()
+        };
+
+        // Four sizes, not one. `Small` carries the counters and hints, `Body`
+        // the chrome, `Monospace` the data and the SQL (at the same size as the
+        // body so a grid and a label line up), `Heading` the section titles.
+        use egui::{FontFamily, FontId, TextStyle};
+        style.text_styles = [
+            (TextStyle::Small, FontId::new(scale - 2.0, FontFamily::Proportional)),
+            (TextStyle::Body, FontId::new(scale, FontFamily::Proportional)),
+            (TextStyle::Button, FontId::new(scale, FontFamily::Proportional)),
+            (TextStyle::Monospace, FontId::new(scale, FontFamily::Monospace)),
+            (TextStyle::Heading, FontId::new(scale + 3.0, FontFamily::Proportional)),
+        ]
+        .into();
+        ctx.set_style(style);
+    }
+
+    /// The row height the grid uses: the monospace line plus breathing room, so
+    /// a cell is not a line of text wedged between two others.
+    pub fn row_height(scale: f32) -> f32 {
+        scale + 10.0
+    }
+
+    /// The base text size. `$LODE_FONT_SIZE` overrides it; the default is a
+    /// little above a terminal's, because a window is read further away than a
+    /// terminal pane and has no cell grid to help the eye.
+    pub fn scale() -> f32 {
+        std::env::var("LODE_FONT_SIZE")
+            .ok()
+            .and_then(|s| s.trim().parse::<f32>().ok())
+            .filter(|v| (8.0..=32.0).contains(v))
+            .unwrap_or(13.0)
     }
 
     /// The theme used when no file is found: the lvim "base dark" palette,
@@ -218,6 +374,8 @@ impl Theme {
                 panel: "#1b2125".into(),
                 raised: "#2a3237".into(),
                 overlay: "#242b30".into(),
+                status: "#161b1e".into(),
+                hover: "#262e33".into(),
                 border: "#3a444a".into(),
             },
             text: Text {

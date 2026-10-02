@@ -228,16 +228,51 @@ speaks the protocol above, and holds no driver of its own. It opens no socket to
 a database and resolves no credential. If it crashes the engine's connections go
 with it and nothing else; if the engine crashes the window survives and says so.
 
-What the first version does: saved connections (a form built from the engine's
-own `DriverMeta`, so a new database type needs no change here), the schema tree,
-a multi-tab query editor, a virtualised result grid with paging and cancel,
-saved queries, shared history, and export to CSV / TSV / JSON. **The UI thread
-never waits on a database** — every request is sent and collected in a later
-frame, so a slow query leaves the rest of the window usable.
+What it does: saved connections, the schema tree, a multi-tab query editor, a
+virtualised result grid with forward and backward paging and cancel, saved
+queries, shared history, and export to CSV / TSV / JSON. **The UI thread never
+waits on a database** — every request is sent and collected in a later frame, so
+a slow query leaves the rest of the window usable.
 
-What it does not do yet: charts, dashboards, a visual query builder, in-grid row
-editing, a connection test UI, scripting and an MCP server. They are the next
-steps, not hidden ones.
+### The connection form
+
+Four sections, and between them they are the whole `ConnSpec` the engine takes:
+
+- **Connection** — built from the engine's own `DriverMeta`: the field set, the
+  types, the defaults. A new database type in the engine needs no change here.
+- **Authentication** — the methods the driver declares (`none`, `password`,
+  `client_cert`, `provider`, `kerberos`) with each method's own fields.
+- **TLS** — `disable` / `prefer` / `require` / `verify_ca` / `verify_full`, plus
+  a CA bundle and a client certificate and key.
+- **SSH tunnel** — host, port, user, and `agent` / key file / password.
+
+Each section has a **Test** button wired to `conn.test` with its own stage
+(`endpoint`, `auth`, `tls`, `tunnel`). The engine dry-runs that ONE layer, which
+is the point of it: a failure names the layer that is wrong instead of handing
+back whatever error the deepest layer happened to raise. The answer, success or
+failure, is shown verbatim beside the button.
+
+Secrets are typed as **templates** — `{{ env "PGPASSWORD" }}`,
+`{{ vault "prod/db" }}`, `{{ cmd "…" }}` — and stored as typed. The client never
+resolves one and never sees a resolved value.
+
+### Fonts
+
+The grid and the editor use a monospace face and the chrome a proportional one.
+Each is looked for in order: `$LODE_FONT_MONO` / `$LODE_FONT_UI`, then well-known
+names under the standard font roots, then a bounded search of those roots. With
+nothing found, egui's built-in font is used and the application is plain but
+correct. `$LODE_FONT_SIZE` sets the base text size (default 13) and everything
+else is derived from it.
+
+Icon glyphs appear only when the monospace face is a **Nerd Font**; otherwise the
+buttons carry words. A glyph from a font that is not installed is an empty box,
+and an empty box is worse than the word it replaced.
+
+### What it does not do yet
+
+Charts, dashboards, a visual query builder, in-grid row editing, scripting and an
+MCP server. They are the next steps, not hidden ones.
 
 ### Themes
 
@@ -255,7 +290,14 @@ built-in palette applies, so a fresh build is usable immediately.
 
 A theme file is already contrast-grounded by its generator; the client copies it
 and corrects nothing, because a client that "improved" a theme would make the 48
-themes disagree with the same 48 themes in every other lvim tool.
+themes disagree with the same 48 themes in every other lvim tool. The file names
+the surfaces (`base`, `panel`, `raised`, `overlay`, `status`, `hover`, `border`),
+the inks, the accents, the editor's syntax colours and the grid's own set; there
+is not one colour value in the client's source.
+
+The METRICS are not in the theme file and never will be. Spacing, corner radii
+and text sizes belong to the application: they are the same whichever of the 48
+palettes is loaded, so switching a theme changes no measurement.
 
 ## Clients
 
