@@ -12,7 +12,7 @@
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
-use lode_proto::{Column, DriverMeta, Node, SavedQuery};
+use lode_proto::{Column, DriverMeta, Index, Node, SavedQuery, TableColumn};
 use serde_json::Value;
 
 /// How a result is shown.
@@ -75,7 +75,7 @@ impl SubTab {
     }
 
     pub fn implemented(self) -> bool {
-        matches!(self, SubTab::Documents)
+        matches!(self, SubTab::Documents | SubTab::Schema)
     }
 }
 
@@ -138,6 +138,19 @@ pub struct Tab {
     pub sort: Option<(usize, bool)>,
     /// A row opened in the detail panel beside the grid.
     pub detail: Option<usize>,
+    /// What the object's columns ARE, as the engine described them — the only
+    /// place the identifying key is known. Empty until `schema.columns` answers,
+    /// and empty FOREVER for a tab that is a typed statement rather than an
+    /// object, which is also why such a tab is not editable: there is no one
+    /// table behind a join to write back to.
+    pub meta_columns: Vec<TableColumn>,
+    pub indexes: Vec<Index>,
+    pub ddl: Option<String>,
+    /// A cell being edited: which row, which column.
+    pub editing: Option<(usize, usize)>,
+    /// A write waiting to be confirmed: the statement the ENGINE said it would
+    /// run, why it is dangerous, and the plan to repeat with `confirm`.
+    pub pending_write: Option<PendingWrite>,
     /// The last statement this tab's browse fields PRODUCED. Kept so a hand
     /// edit can be told from an untouched one: if the box still holds this, the
     /// fields may rewrite it; if it does not, somebody typed in there and their
@@ -252,6 +265,73 @@ fn sql_literal(v: &Value) -> String {
     }
 }
 
+/// A write the engine has described but not done.
+///
+/// It holds the ENGINE's statement, not a guess at one: the whole reason the
+/// unconfirmed call exists is that what a client thinks the driver will build
+/// and what the driver builds are two different strings, and the reassuring one
+/// is the client's.
+#[derive(Debug, Clone)]
+pub struct PendingWrite {
+    pub statement: String,
+    pub reason: Option<String>,
+    pub key: Vec<(String, Value)>,
+    pub set: Vec<(String, Value)>,
+    pub delete: bool,
+    pub row: usize,
+}
+
+/// The key that addresses one loaded row, or why there is none.
+///
+/// `Err` carries the sentence shown to the person. It is deliberately not an
+/// Option: "this is not editable" with no reason is how a user concludes the
+/// program is broken.
+pub fn row_key(tab: &Tab, row: usize) -> Result<Vec<(String, Value)>, String> {
+    if tab.object.is_none() {
+        return Err("this tab is a statement, not a table — there is no single object to write back to"
+            .into());
+    }
+    if tab.meta_columns.is_empty() {
+        return Err("the engine has not described this object's columns yet".into());
+    }
+    let key: Vec<&TableColumn> = tab.meta_columns.iter().filter(|c| c.primary).collect();
+    if key.is_empty() {
+        return Err(format!(
+            "{} has no primary key, so a row in it cannot be addressed exactly — \
+             matching on the other columns would be a guess",
+            tab.object.as_ref().map(|(n, _)| n.as_str()).unwrap_or("this object")
+        ));
+    }
+    let Some(values) = tab.rows.get(row) else {
+        return Err("that row is not loaded".into());
+    };
+    let mut out = Vec::new();
+    for k in key {
+        // The key column has to be IN the result. `SELECT name FROM t` can be
+        // read and cannot be written back, and saying so is better than
+        // addressing the row by whatever did come back.
+        let Some(i) = tab.columns.iter().position(|c| c.name == k.name) else {
+            return Err(format!(
+                "{} is part of the key but is not in this result, so the row cannot be addressed",
+                k.name
+            ));
+        };
+        out.push((k.name.clone(), values.get(i).cloned().unwrap_or(Value::Null)));
+    }
+    Ok(out)
+}
+
+/// Whether one column may be changed: not part of the key, and known to the
+/// engine. A column the engine never mentioned is one this result invented —
+/// an expression, a count — and there is nothing to write it to.
+pub fn column_editable(tab: &Tab, col: usize) -> bool {
+    let Some(c) = tab.columns.get(col) else { return false };
+    tab.meta_columns
+        .iter()
+        .find(|m| m.name == c.name)
+        .map_or(false, |m| !m.primary)
+}
+
 /// Order the loaded rows by one column.
 ///
 /// This sorts the PAGE, not the result — the client does not rewrite the
@@ -334,6 +414,11 @@ impl Tab {
             widths: HashMap::new(),
             sort: None,
             detail: None,
+            meta_columns: Vec::new(),
+            indexes: Vec::new(),
+            ddl: None,
+            editing: None,
+            pending_write: None,
             rendered: String::new(),
         }
     }
@@ -636,6 +721,72 @@ mod tests {
 
     /// Numbers compare as numbers and NULL goes last, both ways — a NULL is not
     /// a small value and sorting it to the top would say it was.
+    fn tabcol(name: &str, primary: bool) -> TableColumn {
+        TableColumn { name: name.into(), type_name: String::new(), primary }
+    }
+
+    fn table_tab() -> Tab {
+        let m = meta("sqlite", true, false);
+        let mut t = Tab::new(1, "c".into(), "sqlite".into(), "people".into(), Some(&m));
+        t.object = Some(("people".into(), Some("main".into())));
+        t.columns = vec![col("id"), col("name")];
+        t.rows = vec![vec![json!(7), json!("Ada")]];
+        t.meta_columns = vec![tabcol("id", true), tabcol("name", false)];
+        t
+    }
+
+    #[test]
+    fn a_row_is_addressed_by_its_key_and_nothing_else() {
+        let t = table_tab();
+        let k = row_key(&t, 0).expect("a keyed table addresses its row");
+        assert_eq!(k.len(), 1, "only the key, not every column");
+        assert_eq!(k[0].0, "id");
+        assert_eq!(k[0].1, json!(7));
+    }
+
+    /// Every refusal carries a sentence. "Not editable" with no reason is how
+    /// somebody decides the program is broken.
+    #[test]
+    fn a_table_with_no_key_says_why_it_cannot_be_edited() {
+        let mut t = table_tab();
+        t.meta_columns = vec![tabcol("id", false), tabcol("name", false)];
+        let e = row_key(&t, 0).unwrap_err();
+        assert!(e.contains("no primary key"), "{e}");
+        assert!(e.contains("guess"), "it has to say what the alternative would be: {e}");
+    }
+
+    /// A key column missing from the RESULT is just as unaddressable as a table
+    /// with no key — `SELECT name FROM people` is readable and not writable.
+    #[test]
+    fn a_key_column_left_out_of_the_result_cannot_be_written_back() {
+        let mut t = table_tab();
+        t.columns = vec![col("name")];
+        t.rows = vec![vec![json!("Ada")]];
+        let e = row_key(&t, 0).unwrap_err();
+        assert!(e.contains("id"), "{e}");
+        assert!(e.contains("cannot be addressed"), "{e}");
+    }
+
+    #[test]
+    fn a_typed_tab_is_not_a_table() {
+        let m = meta("sqlite", true, false);
+        let t = Tab::new(1, "c".into(), "sqlite".into(), "x".into(), Some(&m));
+        let e = row_key(&t, 0).unwrap_err();
+        assert!(e.contains("statement, not a table"), "{e}");
+    }
+
+    #[test]
+    fn the_key_column_is_not_editable_and_an_invented_one_is_not_either() {
+        let mut t = table_tab();
+        assert!(!column_editable(&t, 0), "the key addresses the row; changing it moves it");
+        assert!(column_editable(&t, 1));
+        t.columns.push(col("row_number"));
+        assert!(
+            !column_editable(&t, 2),
+            "a column the engine never mentioned has nothing behind it to write to"
+        );
+    }
+
     #[test]
     fn letters_in_order_find_a_thing_and_a_tighter_run_wins() {
         assert!(fuzzy_score("Export as CSV", "ecsv").is_some());
@@ -794,11 +945,17 @@ mod tests {
         assert!(!ok.open);
     }
 
+    /// The row shows every sub-tab and marks the ones that do nothing yet. The
+    /// test exists so that a sub-tab cannot quietly start LOOKING available
+    /// before it is: a tab that is drawn the same as a working one and does
+    /// nothing on a click is worse than one that is visibly not ready.
     #[test]
-    fn only_documents_is_implemented_but_the_row_holds_the_rest() {
+    fn the_row_says_which_sub_tabs_actually_do_something() {
         assert_eq!(SubTab::all().len(), 4);
-        assert!(SubTab::Documents.implemented());
-        for s in [SubTab::Schema, SubTab::Aggregate, SubTab::Builder] {
+        for s in [SubTab::Documents, SubTab::Schema] {
+            assert!(s.implemented(), "{} is built", s.label());
+        }
+        for s in [SubTab::Aggregate, SubTab::Builder] {
             assert!(!s.implemented(), "{} is laid out, not built", s.label());
         }
     }

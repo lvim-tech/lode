@@ -21,8 +21,8 @@ use gpui::{
     Window, WindowBounds, WindowHandle, WindowOptions,
 };
 use lode_proto::{
-    cell_text, DriverMeta, Engine, Hello, HistoryRow, Message, Node, QueryState, SavedConnection,
-    SavedQuery,
+    cell_text, DriverMeta, Engine, Hello, HistoryRow, Index, Message, Node, QueryState,
+    SavedConnection, SavedQuery, TableColumn,
 };
 use serde_json::{json, Value};
 
@@ -32,7 +32,7 @@ use crate::input::{InputColors, InputEvent, TextInput};
 use crate::session::{self, Session, SessionTab};
 use crate::theme::{self, Theme};
 use crate::workspace::{
-    copy_as_insert, copy_as_select, fuzzy_score, Toast,
+    column_editable, copy_as_insert, copy_as_select, fuzzy_score, row_key, PendingWrite, Toast,
     fmt_duration, preview, type_badge, Live, ResultView, RunState, SubTab, Tab, Task,
 };
 
@@ -123,6 +123,37 @@ pub enum PaletteAct {
     NewConnection,
 }
 
+/// Read a typed cell back into a JSON value.
+///
+/// `null` is the empty word for "no value", and it has to be typed exactly —
+/// otherwise a column holding the TEXT "null" could never be written. The rest
+/// follows what the cell held before: a number stays a number, and everything
+/// else is text, because guessing that "007" is seven is how a product code
+/// becomes an integer.
+fn parse_cell(typed: &str, was: Option<&Value>) -> Value {
+    if typed == "null" {
+        return Value::Null;
+    }
+    match was {
+        Some(Value::Number(_)) => match typed.parse::<i64>() {
+            Ok(i) => json!(i),
+            Err(_) => match typed.parse::<f64>() {
+                Ok(f) => json!(f),
+                // It was a number and this is not one. Send the text and let
+                // the database refuse it — which it will, clearly, in its own
+                // words, rather than this silently storing a zero.
+                Err(_) => json!(typed),
+            },
+        },
+        Some(Value::Bool(_)) => match typed {
+            "true" => json!(true),
+            "false" => json!(false),
+            other => json!(other),
+        },
+        _ => json!(typed),
+    }
+}
+
 /// Rows fetched per page.
 const PAGE: usize = 200;
 
@@ -185,6 +216,14 @@ enum Pending {
     FormSave,
     History,
     SavedQueries { conn: String },
+    /// The columns of a tab's object — where the identifying key comes from.
+    Columns { tab: u64 },
+    Indexes { tab: u64 },
+    Ddl { tab: u64 },
+    /// A write the engine has been asked to DESCRIBE, not to do.
+    RowPlan { tab: u64, row: usize, key: Vec<(String, Value)>, set: Vec<(String, Value)>, delete: bool },
+    /// The same write, confirmed.
+    RowApply { tab: u64 },
 }
 
 pub struct Workspace {
@@ -616,6 +655,54 @@ impl Workspace {
                     c.queries = qs;
                 }
             }
+            Pending::Columns { tab } => {
+                let cols: Vec<TableColumn> =
+                    serde_json::from_value(v.get("columns").cloned().unwrap_or(json!([])))
+                        .unwrap_or_default();
+                if let Some(t) = self.tabs.iter_mut().find(|t| t.id == tab) {
+                    t.meta_columns = cols;
+                }
+            }
+            Pending::Indexes { tab } => {
+                let idx: Vec<Index> =
+                    serde_json::from_value(v.get("indexes").cloned().unwrap_or(json!([])))
+                        .unwrap_or_default();
+                if let Some(t) = self.tabs.iter_mut().find(|t| t.id == tab) {
+                    t.indexes = idx;
+                }
+            }
+            Pending::Ddl { tab } => {
+                let ddl = v.get("ddl").and_then(|d| d.as_str()).map(str::to_string);
+                if let Some(t) = self.tabs.iter_mut().find(|t| t.id == tab) {
+                    t.ddl = ddl;
+                }
+            }
+            Pending::RowPlan { tab, row, key, set, delete } => {
+                // The statement held here is the ENGINE's. A client that showed
+                // its own guess and then sent something else would be asking
+                // about one thing and doing another.
+                let statement = v
+                    .get("statement")
+                    .and_then(|s| s.as_str())
+                    .unwrap_or_default()
+                    .to_string();
+                let reason = v.get("reason").and_then(|r| r.as_str()).map(str::to_string);
+                if let Some(t) = self.tabs.iter_mut().find(|t| t.id == tab) {
+                    t.pending_write = Some(PendingWrite { statement, reason, key, set, delete, row });
+                    t.editing = None;
+                }
+            }
+            Pending::RowApply { tab } => {
+                let n = v.get("affected").and_then(|a| a.as_u64()).unwrap_or(0);
+                self.toast(format!("{n} row(s) written"), false);
+                if let Some(t) = self.tabs.iter_mut().find(|t| t.id == tab) {
+                    t.pending_write = None;
+                }
+                // Read it back rather than patching the grid from what we sent:
+                // a column with a default, a trigger or a type coercion means
+                // the stored row is not always the row that was asked for.
+                self.run_tab(tab);
+            }
             Pending::FormSave => {
                 self.ask(Pending::Connections, "store.connections.list", json!({}));
             }
@@ -657,6 +744,16 @@ impl Workspace {
             Pending::Connect { name, .. } => {
                 self.status = format!("could not connect to {name}");
                 self.toast(format!("{name}: {e}"), true);
+            }
+            Pending::RowPlan { tab, .. } | Pending::RowApply { tab } => {
+                if let Some(t) = self.tabs.iter_mut().find(|t| t.id == tab) {
+                    t.pending_write = None;
+                    t.editing = None;
+                }
+                // A refused write is the most important thing on the screen: it
+                // is both the reason nothing happened and, usually, the reason
+                // it should not have.
+                self.toast(e, true);
             }
             // A failed stage is the engine naming the layer that is wrong, so it
             // goes back to the window beside the button that asked.
@@ -741,6 +838,32 @@ impl Workspace {
         self.tabs.push(tab);
         self.active = self.tabs.len() - 1;
         self.make_inputs(id, meta.as_ref(), &statement, cx);
+        // What the object IS, asked once per tab. The identifying key comes
+        // from here and nowhere else — without it a row cannot be addressed,
+        // and a client that guessed a key from the columns it happened to get
+        // back is a client that writes the wrong row.
+        let objref = json!({ "name": name, "schema": schema });
+        if let Some(conn_id) = self.live(conn_name).map(|l| l.conn_id) {
+            self.ask(
+                Pending::Columns { tab: id },
+                "schema.columns",
+                json!({ "conn_id": conn_id, "object": objref }),
+            );
+            if meta.as_ref().map_or(false, |m| m.caps.indexes) {
+                self.ask(
+                    Pending::Indexes { tab: id },
+                    "schema.indexes",
+                    json!({ "conn_id": conn_id, "object": objref }),
+                );
+            }
+            if meta.as_ref().map_or(false, |m| m.caps.ddl) {
+                self.ask(
+                    Pending::Ddl { tab: id },
+                    "schema.ddl",
+                    json!({ "conn_id": conn_id, "object": objref }),
+                );
+            }
+        }
         self.run_tab(id);
         self.remember();
     }
@@ -920,12 +1043,21 @@ impl Workspace {
                 continue;
             }
             self.open_object(&t.conn, &t.name, t.schema.as_deref(), &t.kind, cx);
-            if let (Some(tab), false) = (self.tabs.last_mut(), t.view.is_empty()) {
-                tab.view = match t.view.as_str() {
-                    "tree" => ResultView::Tree,
-                    "json" => ResultView::Json,
-                    _ => ResultView::Table,
+            if let Some(tab) = self.tabs.last_mut() {
+                if !t.view.is_empty() {
+                    tab.view = match t.view.as_str() {
+                        "tree" => ResultView::Tree,
+                        "json" => ResultView::Json,
+                        _ => ResultView::Table,
+                    };
+                }
+                tab.sub = match t.sub.as_str() {
+                    "schema" => SubTab::Schema,
+                    "aggregate" => SubTab::Aggregate,
+                    "builder" => SubTab::Builder,
+                    _ => SubTab::Documents,
                 };
+                tab.detail = t.detail;
             }
         }
         if self.restore.active < self.tabs.len() {
@@ -965,6 +1097,8 @@ impl Workspace {
                         view: t.view.label().to_lowercase(),
                         title: t.title.clone(),
                         draft: t.sql.clone(),
+                        sub: t.sub.label().to_lowercase(),
+                        detail: t.detail,
                     }
                 })
                 .collect(),
@@ -1458,6 +1592,131 @@ impl Workspace {
             if as_insert { "row copied as INSERT" } else { "row copied as SELECT" },
             false,
         );
+    }
+
+    // ── writing a row ───────────────────────────────────────────────────────
+
+    /// Ask the ENGINE what a change would do. Nothing is written by this.
+    fn propose_write(
+        &mut self,
+        tab_id: u64,
+        row: usize,
+        set: Vec<(String, Value)>,
+        delete: bool,
+        _cx: &mut Context<Self>,
+    ) {
+        let Some(idx) = self.tabs.iter().position(|t| t.id == tab_id) else { return };
+        let tab = &self.tabs[idx];
+        if !self.meta(&tab.driver).map_or(false, |m| m.caps.edit) {
+            self.toast(
+                format!("the {} driver does not edit rows", tab.driver),
+                true,
+            );
+            return;
+        }
+        let key = match row_key(tab, row) {
+            Ok(k) => k,
+            Err(why) => {
+                // The refusal IS the message. Not a disabled button with no
+                // explanation, which teaches nothing.
+                self.toast(why, true);
+                return;
+            }
+        };
+        let Some(conn_id) = self.live(&tab.conn_name).map(|l| l.conn_id) else {
+            self.toast(format!("{} is not connected", tab.conn_name), true);
+            return;
+        };
+        let Some((name, schema)) = tab.object.clone() else { return };
+        let params = json!({
+            "conn_id": conn_id,
+            "obj": { "name": name, "schema": schema },
+            "key": key,
+            "set": set,
+            "delete": delete,
+        });
+        self.ask(
+            Pending::RowPlan { tab: tab_id, row, key, set, delete },
+            "row.write",
+            params,
+        );
+    }
+
+    /// Repeat the write the engine described, with `confirm`.
+    fn apply_write(&mut self, tab_id: u64, _cx: &mut Context<Self>) {
+        let Some(idx) = self.tabs.iter().position(|t| t.id == tab_id) else { return };
+        let Some(p) = self.tabs[idx].pending_write.clone() else { return };
+        let tab = &self.tabs[idx];
+        let Some(conn_id) = self.live(&tab.conn_name).map(|l| l.conn_id) else { return };
+        let Some((name, schema)) = tab.object.clone() else { return };
+        self.ask(
+            Pending::RowApply { tab: tab_id },
+            "row.write",
+            json!({
+                "conn_id": conn_id,
+                "obj": { "name": name, "schema": schema },
+                "key": p.key,
+                "set": p.set,
+                "delete": p.delete,
+                "confirm": true,
+            }),
+        );
+    }
+
+    /// Start editing one cell, loading the input with what is there now.
+    fn begin_edit(&mut self, tab_id: u64, row: usize, col: usize, cx: &mut Context<Self>) {
+        let Some(idx) = self.tabs.iter().position(|t| t.id == tab_id) else { return };
+        if !column_editable(&self.tabs[idx], col) {
+            let why = match self.tabs[idx].columns.get(col) {
+                Some(c) if self.tabs[idx].meta_columns.iter().any(|m| m.name == c.name) => {
+                    format!("{} is part of the key — changing it would move the row", c.name)
+                }
+                Some(c) => format!("{} is not a column of the table, so there is nothing to write it to", c.name),
+                None => "no such column".into(),
+            };
+            self.toast(why, true);
+            return;
+        }
+        if let Err(why) = row_key(&self.tabs[idx], row) {
+            self.toast(why, true);
+            return;
+        }
+        let now = self.tabs[idx]
+            .rows
+            .get(row)
+            .and_then(|r| r.get(col))
+            .map(|v| cell_text(v).unwrap_or_default())
+            .unwrap_or_default();
+        let colors = input_colors(&self.theme);
+        let input = cx.new(|cx| {
+            let mut i = TextInput::new(cx, "", colors);
+            i.set_text(now, cx);
+            i
+        });
+        self.inputs.insert((tab_id, "edit".into()), input);
+        self.tabs[idx].editing = Some((row, col));
+        // Focus is taken on the next frame, once the field exists in the tree.
+        cx.defer(move |cx| {
+            cx.refresh_windows();
+        });
+    }
+
+    /// Take what was typed and ask about it. A value is sent as TEXT unless it
+    /// parses as a number or is literally `null` — the engine binds whatever it
+    /// gets, so what matters here is not inventing a type the person did not.
+    fn commit_edit(&mut self, tab_id: u64, cx: &mut Context<Self>) {
+        let Some(idx) = self.tabs.iter().position(|t| t.id == tab_id) else { return };
+        let Some((row, col)) = self.tabs[idx].editing else { return };
+        let Some(input) = self.inputs.get(&(tab_id, "edit".into())) else { return };
+        let typed = input.read(cx).text().to_string();
+        let Some(name) = self.tabs[idx].columns.get(col).map(|c| c.name.clone()) else { return };
+        let was = self.tabs[idx].rows.get(row).and_then(|r| r.get(col)).cloned();
+        let value = parse_cell(&typed, was.as_ref());
+        if Some(&value) == was.as_ref() {
+            self.tabs[idx].editing = None;
+            return;
+        }
+        self.propose_write(tab_id, row, vec![(name, value)], false, cx);
     }
 
     fn cancel_active(&mut self) {
@@ -2104,6 +2363,12 @@ impl Workspace {
             return body.into_any_element();
         }
 
+        // The Schema sub-tab describes the OBJECT, so the view switch and the
+        // paging do not apply to it: it is not a different rendering of the
+        // rows, it is a different subject.
+        if tab.sub == SubTab::Schema {
+            return body.child(self.schema_el(tab)).into_any_element();
+        }
         let view = match tab.view {
             ResultView::Table => self.table_el(tab, cx),
             ResultView::Tree => self.tree_el(tab, cx),
@@ -2122,6 +2387,92 @@ impl Workspace {
                 .into_any_element(),
             None => view,
         });
+        body.into_any_element()
+    }
+
+    /// What the object IS: its columns, which of them identify a row, its
+    /// indexes, and the engine's own CREATE statement where it has one.
+    ///
+    /// Every part of this comes from the engine; none of it is reconstructed
+    /// here. A CREATE assembled from column metadata reads as authoritative and
+    /// quietly drops constraints, defaults and storage clauses — so a driver
+    /// that cannot ask its server for one says so instead.
+    fn schema_el(&self, tab: &Tab) -> gpui::AnyElement {
+        let t = self.t();
+        let mut body = div().flex().flex_col().flex_1().overflow_hidden().p_3().gap_2();
+
+        if tab.object.is_none() {
+            return body
+                .child(self.small(
+                    "this tab is a statement, not an object — there is nothing to describe",
+                    t.muted(),
+                ))
+                .into_any_element();
+        }
+
+        body = body.child(self.section(&format!("Columns ({})", tab.meta_columns.len())));
+        if tab.meta_columns.is_empty() {
+            body = body.child(self.small("the engine has not answered yet", t.muted()));
+        }
+        for c in &tab.meta_columns {
+            body = body.child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .child(div().w(px(220.0)).text_size(px(12.0)).text_color(t.fg()).child(
+                        SharedString::from(c.name.clone()),
+                    ))
+                    .child(div().w(px(160.0)).child(self.small(c.type_name.clone(), t.muted())))
+                    .when(c.primary, |d| d.child(self.small("key", t.accent()))),
+            );
+        }
+
+        let keyed = tab.meta_columns.iter().any(|c| c.primary);
+        body = body.child(self.small(
+            if keyed {
+                "a row here can be addressed exactly, so it can be edited".to_string()
+            } else {
+                "no key: a row here cannot be addressed exactly, so it is not editable".to_string()
+            },
+            if keyed { t.muted() } else { t.error() },
+        ));
+
+        if !tab.indexes.is_empty() {
+            body = body.child(self.section(&format!("Indexes ({})", tab.indexes.len())));
+            for i in &tab.indexes {
+                let mut tags = Vec::new();
+                if i.primary {
+                    tags.push("primary");
+                }
+                if i.unique {
+                    tags.push("unique");
+                }
+                body = body.child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .child(div().w(px(220.0)).text_size(px(12.0)).text_color(t.fg()).child(
+                            SharedString::from(i.name.clone()),
+                        ))
+                        .child(div().w(px(260.0)).child(self.small(i.columns.join(", "), t.muted())))
+                        .child(self.small(tags.join(" · "), t.accent())),
+                );
+            }
+        }
+
+        if let Some(ddl) = &tab.ddl {
+            body = body.child(self.section("CREATE"));
+            body = body.child(
+                div()
+                    .flex_1()
+                    .overflow_hidden()
+                    .text_size(px(11.0))
+                    .text_color(t.fg())
+                    .child(SharedString::from(ddl.clone())),
+            );
+        }
         body.into_any_element()
     }
 
@@ -2173,38 +2524,153 @@ impl Workspace {
                 ),
         );
 
+        let tab_id = tab.id;
+        let editable = self.meta(&tab.driver).map_or(false, |m| m.caps.edit);
         let mut fields = div().flex().flex_col().flex_1().overflow_hidden().py_1();
         for (ci, c) in tab.columns.iter().enumerate() {
             let v = row.get(ci).unwrap_or(&serde_json::Value::Null);
             let null = v.is_null();
-            fields = fields.child(
+            let key_col = tab.meta_columns.iter().any(|m| m.name == c.name && m.primary);
+            let editing_this = tab.editing == Some((i, ci));
+            let can = editable && column_editable(tab, ci) && tab.pending_write.is_none();
+
+            let label = div()
+                .flex()
+                .items_center()
+                .gap_2()
+                .child(self.small(c.name.clone(), t.header_fg()))
+                .child(self.small(
+                    crate::workspace::type_badge(v, Some(&c.type_name)),
+                    t.muted(),
+                ))
+                // A key column says so. It is why it cannot be edited, and
+                // saying it here is cheaper than a refusal later.
+                .when(key_col, |d| d.child(self.small("key", t.accent())));
+
+            let value: gpui::AnyElement = if editing_this {
+                match self.inputs.get(&(tab_id, "edit".to_string())) {
+                    Some(input) => div()
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .child(div().flex_1().child(input.clone()))
+                        .child(
+                            div()
+                                .id("edit-ok")
+                                .px_1()
+                                .cursor_pointer()
+                                .text_size(px(11.0))
+                                .text_color(t.accent())
+                                .child("\u{f00c}")
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.commit_edit(tab_id, cx);
+                                    cx.notify();
+                                })),
+                        )
+                        .child(
+                            div()
+                                .id("edit-no")
+                                .px_1()
+                                .cursor_pointer()
+                                .text_size(px(11.0))
+                                .text_color(t.muted())
+                                .child("\u{f00d}")
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    if let Some(tb) =
+                                        this.tabs.iter_mut().find(|x| x.id == tab_id)
+                                    {
+                                        tb.editing = None;
+                                    }
+                                    cx.notify();
+                                })),
+                        )
+                        .into_any_element(),
+                    None => div().into_any_element(),
+                }
+            } else {
                 div()
-                    .flex()
-                    .flex_col()
-                    .px_3()
-                    .py(px(2.0))
-                    .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .gap_2()
-                            .child(self.small(c.name.clone(), t.header_fg()))
-                            .child(self.small(
-                                crate::workspace::type_badge(v, Some(&c.type_name)),
-                                t.muted(),
-                            )),
-                    )
-                    .child(
-                        div()
-                            .text_size(px(12.0))
-                            .text_color(if null { t.muted() } else { t.fg() })
-                            .child(SharedString::from(
-                                cell_text(v).unwrap_or_else(|| "NULL".to_string()),
-                            )),
-                    ),
+                    .id(SharedString::from(format!("val-{tab_id}-{ci}")))
+                    .text_size(px(12.0))
+                    .text_color(if null { t.muted() } else { t.fg() })
+                    .when(can, |d| d.cursor_pointer().hover(|h| h.bg(t.hover())))
+                    .child(SharedString::from(
+                        cell_text(v).unwrap_or_else(|| "NULL".to_string()),
+                    ))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.begin_edit(tab_id, i, ci, cx);
+                        cx.notify();
+                    }))
+                    .into_any_element()
+            };
+
+            fields = fields.child(
+                div().flex().flex_col().px_3().py(px(2.0)).child(label).child(value),
             );
         }
         panel = panel.child(fields);
+
+        // A write the engine has described but not done.
+        if let Some(p) = &tab.pending_write {
+            let mut ask = div()
+                .flex()
+                .flex_col()
+                .gap_1()
+                .px_3()
+                .py_1()
+                .bg(t.panel())
+                .border_t_1()
+                .border_color(t.error())
+                .child(self.small(
+                    p.reason.clone().unwrap_or_else(|| {
+                        "this changes stored data".to_string()
+                    }),
+                    t.error(),
+                ))
+                // The statement is the ENGINE's, shown verbatim. A client that
+                // displayed its own version and sent another would be asking
+                // about one thing and doing a different one.
+                .child(
+                    div()
+                        .text_size(px(11.0))
+                        .text_color(t.fg())
+                        .child(SharedString::from(p.statement.clone())),
+                );
+            ask = ask.child(
+                div()
+                    .flex()
+                    .gap_2()
+                    .child(
+                        div()
+                            .id("write-yes")
+                            .px_2()
+                            .cursor_pointer()
+                            .text_size(px(11.0))
+                            .bg(t.error())
+                            .text_color(t.inverted())
+                            .child(if p.delete { "Delete it" } else { "Write it" })
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.apply_write(tab_id, cx);
+                                cx.notify();
+                            })),
+                    )
+                    .child(
+                        div()
+                            .id("write-no")
+                            .px_2()
+                            .cursor_pointer()
+                            .text_size(px(11.0))
+                            .text_color(t.muted())
+                            .child("Leave it")
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                if let Some(tb) = this.tabs.iter_mut().find(|x| x.id == tab_id) {
+                                    tb.pending_write = None;
+                                }
+                                cx.notify();
+                            })),
+                    ),
+            );
+            panel = panel.child(ask);
+        }
 
         // Copy as Query. See `copy_as_select` for why the client is allowed to
         // write SQL here: this goes to a person, not to a database.
@@ -2247,6 +2713,21 @@ impl Workspace {
                 );
         } else {
             foot = foot.child(self.small("this driver does not speak SQL", t.muted()));
+        }
+        if editable && tab.pending_write.is_none() {
+            foot = foot.child(div().flex_1()).child(
+                div()
+                    .id("row-delete")
+                    .px_2()
+                    .cursor_pointer()
+                    .text_size(px(11.0))
+                    .text_color(t.error())
+                    .child("Delete row")
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.propose_write(tab_id, i, Vec::new(), true, cx);
+                        cx.notify();
+                    })),
+            );
         }
         Some(panel.child(foot).into_any_element())
     }

@@ -59,6 +59,14 @@ pub struct SessionTab {
     /// The statement in the box, run or not.
     #[serde(default)]
     pub draft: String,
+    /// Which sub-tab was showing — "documents" | "schema" | …
+    #[serde(default)]
+    pub sub: String,
+    /// The row that was open in the detail panel. Coming back to a table and
+    /// having to find your row again is the kind of small loss that makes a
+    /// restart feel expensive.
+    #[serde(default)]
+    pub detail: Option<usize>,
 }
 
 /// Where the session lives: beside the engine's data, but its own file.
@@ -119,6 +127,8 @@ mod tests {
                 view: "table".into(),
                 title: String::new(),
                 draft: String::new(),
+                sub: "schema".into(),
+                detail: Some(2),
             }],
             active: 0,
             theme: Some("LvimBase_dark".into()),
@@ -132,6 +142,8 @@ mod tests {
         assert_eq!(back.tabs[0].schema.as_deref(), Some("main"));
         assert_eq!(back.theme.as_deref(), Some("LvimBase_dark"));
         assert_eq!(back.rail, "history");
+        assert_eq!(back.tabs[0].sub, "schema");
+        assert_eq!(back.tabs[0].detail, Some(2));
 
         // A tab with no object is a typed one, and its words come back.
         let typed = Session {
@@ -144,6 +156,8 @@ mod tests {
                 view: "table".into(),
                 title: "Draft".into(),
                 draft: "SELECT 1 WHERE".into(),
+                sub: String::new(),
+                detail: None,
             }],
             active: 0,
             theme: None,

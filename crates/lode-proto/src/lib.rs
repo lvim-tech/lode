@@ -305,6 +305,10 @@ pub struct Caps {
     pub kv: bool,
     #[serde(default)]
     pub indexes: bool,
+    /// The engine can change ONE addressed row. False on an older engine, which
+    /// is the right answer there: it has no `row.write` to call.
+    #[serde(default)]
+    pub edit: bool,
     #[serde(default)]
     pub ddl: bool,
 }
@@ -326,6 +330,30 @@ pub struct Column {
     pub name: String,
     #[serde(rename = "type", default)]
     pub type_name: String,
+}
+
+/// One column of an object, as `schema.columns` returns it.
+#[derive(Debug, Clone, Deserialize)]
+pub struct TableColumn {
+    pub name: String,
+    #[serde(rename = "type", default)]
+    pub type_name: String,
+    /// Part of the identifying key. A row can be addressed exactly only by
+    /// these, and only when there is at least one.
+    #[serde(default)]
+    pub primary: bool,
+}
+
+/// One index on an object, as `schema.indexes` returns it.
+#[derive(Debug, Clone, Deserialize)]
+pub struct Index {
+    pub name: String,
+    #[serde(default)]
+    pub columns: Vec<String>,
+    #[serde(default)]
+    pub unique: bool,
+    #[serde(default)]
+    pub primary: bool,
 }
 
 /// One page of a result, as `query.page` returns it.
