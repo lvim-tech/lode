@@ -294,12 +294,19 @@ impl Server {
         }))
     }
 
-    /// Endpoint stage — is the thing we would dial actually there? A file-backed
+    /// Endpoint stage — is the thing we would dial actually THERE? A file-backed
     /// driver (its meta declares a `File` param) checks the path; a TCP driver
-    /// opens a socket to host:port, THROUGH the tunnel when one is configured (so
-    /// a green endpoint on a tunnelled spec means the whole path is up). A driver
-    /// with neither (an HTTPS API like Snowflake) has nothing to probe short of a
-    /// real connect, and says so.
+    /// asks `NetContext::probe`, which dials the server directly when there is no
+    /// tunnel and asks the SSH server to reach it when there is. A driver with
+    /// neither (an HTTPS API like Snowflake) has nothing to probe short of a real
+    /// connect, and says so.
+    ///
+    /// This used to call `net.resolve` and connect to what came back. On a
+    /// tunnelled spec that is the LOCAL forward's listener, so it answered yes as
+    /// soon as the SSH session was up and the far side had not been asked at all:
+    /// a MongoDB connection to 127.0.0.1:9042 with nothing listening passed in
+    /// 251 ms. The probe now goes to the far end, which is what this stage claims
+    /// to be about.
     async fn test_endpoint(spec: &ConnSpec, meta: &'static DriverMeta) -> anyhow::Result<String> {
         if let Some(fp) = meta.params.iter().find(|p| matches!(p.kind, ParamType::File)) {
             let raw = spec.param(fp.key)?;
@@ -323,16 +330,7 @@ impl Server {
             return Err(anyhow::anyhow!("no port set and '{}' declares no default", meta.kind));
         }
         let net = NetContext::new(spec.tunnel.clone());
-        let addr = net.resolve(host, port).await?;
-        tokio::time::timeout(DIAL_TIMEOUT, tokio::net::TcpStream::connect(&addr))
-            .await
-            .map_err(|_| anyhow::anyhow!("timed out dialling {host}:{port} after {}s", DIAL_TIMEOUT.as_secs()))?
-            .map_err(|e| anyhow::anyhow!("cannot reach {host}:{port}: {e}"))?;
-        Ok(if net.tunneled() {
-            format!("{host}:{port} reachable through the SSH tunnel (local {addr})")
-        } else {
-            format!("{host}:{port} reachable (plain TCP)")
-        })
+        net.probe(host, port, DIAL_TIMEOUT).await
     }
 
     /// Tunnel stage — stand the SSH session + local forward up on their own, so a

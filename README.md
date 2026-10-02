@@ -112,9 +112,15 @@ map keyed by the driver's own `ParamSpec` keys; `auth` is one of `none`,
 templates, never values.
 
 `conn.test` dry-runs ONE layer so a failure is attributed to the layer that
-caused it: `endpoint` (stat the file, or dial the socket — through the tunnel
-when one is configured), `tunnel` (stand the SSH forward up alone), `tls` and
-`auth` (a real connect, closed again).
+caused it: `endpoint` (stat the file, or reach the server), `tunnel` (stand the
+SSH forward up alone), `tls` and `auth` (a real connect, closed again).
+
+On a TUNNELLED spec the endpoint stage asks the SSH server to open a
+`direct-tcpip` channel to the endpoint and reports what it said. It deliberately
+does not dial the local forwarded port: that listener belongs to this process, so
+connecting to it proves only that the SSH session came up — which is how a
+MongoDB connection aimed at a port with nothing on it once reported `reachable
+through the SSH tunnel` in 251 ms.
 
 An **unencrypted** link is never silent: `conn.connect` emits a `daemon.log`
 warning and returns `encrypted: false`.
@@ -198,10 +204,18 @@ printf '%s\n' '{"id":1,"method":"rpc.hello","params":{}}' | build/loded
 
 `tests/smoke.sh` is the same thing done properly: it spawns `loded`, shakes
 hands, connects to a throwaway SQLite database, runs a statement, pages the
-result and disconnects. It needs no network and no database server.
+result, exercises every `store.*` method and the migration, and checks that each
+`conn.test` stage answers about its own layer. It needs no network and no
+database server.
+
+`tests/tunnel.sh` covers what only a real SSH server can: it stands up its OWN
+sshd — own host key, own `authorized_keys`, own config, own port, all inside a
+mktemp directory, touching nothing in `~` or `/etc` — and checks that the
+endpoint stage tells the truth THROUGH a tunnel. It skips cleanly when sshd is
+not installed.
 
 ```sh
-scripts/build && tests/smoke.sh
+scripts/build && tests/smoke.sh && tests/tunnel.sh
 ```
 
 ## The repository
