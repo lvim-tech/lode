@@ -1,0 +1,23 @@
+#!/bin/sh
+# Build the lode desktop client into build/lode.
+#
+# Separate from `scripts/build` on purpose: that one builds the ENGINE and
+# installs `build/loded`, which is the path every client probes, and nothing
+# should be able to make an engine build depend on a GUI toolchain. Someone who
+# only wants the Neovim client never runs this.
+#
+#   scripts/build-gui
+#
+# Any further argument is forwarded to cargo.
+set -e
+cd "$(dirname "$0")/.."
+
+cargo build --release -p lode-gui "$@"
+
+mkdir -p build
+cp -f target/release/lode build/lode
+echo "installed build/lode"
+echo
+echo "It needs an engine. Build one with scripts/build, then either put"
+echo "build/loded on \$PATH or point \$LODE_DAEMON at it."
+echo "Themes: cp <lvim-colorscheme>/extras/lode/*.toml ~/.config/lode/themes/"

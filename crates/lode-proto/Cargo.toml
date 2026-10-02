@@ -1,0 +1,16 @@
+[package]
+name = "lode-proto"
+version = "0.1.0"
+edition = "2021"
+license = "BSD-3-Clause"
+description = "Client side of the lode protocol: spawn the engine and speak newline-delimited JSON-RPC to it"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"
+
+# Deliberately NO tokio. The engine needs an async runtime because it is the one
+# doing the database I/O; a client does not. One reader thread and a mutex over
+# the pipe is the whole transport, and it drops into any event loop — a GUI
+# frame, a CLI, a test — without that event loop having to be async.

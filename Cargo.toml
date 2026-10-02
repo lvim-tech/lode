@@ -1,3 +1,16 @@
+# The repository is a workspace: the ENGINE is this root package (so its paths,
+# its build script and every client that probes `build/loded` stay exactly where
+# they were), and the client side lives under crates/ —
+#
+#   crates/lode-proto   the protocol client: spawn the engine, speak to it
+#   crates/lode-gui     the desktop application, a client like any other
+#
+# The engine does not depend on either. It cannot: its whole point is that a
+# client is a separate process, and the moment the engine knew about a client
+# there would be a reason for the next client to be different.
+[workspace]
+members = ["crates/lode-proto", "crates/lode-gui"]
+
 [package]
 name = "lode"
 version = "0.1.0"
