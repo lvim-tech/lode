@@ -68,6 +68,11 @@ const CASSANDRA_META: DriverMeta = DriverMeta {
     params: PARAMS,
     auth: AUTH,
     caps: CAPS,
+    hint: "SELECT * FROM table LIMIT 100",
+    browse: "SELECT * FROM {qualified} LIMIT {limit};",
+    browse_by_kind: &[],
+    query_form: &[],
+    query_template: "",
 };
 
 const SCYLLA_META: DriverMeta = DriverMeta {
@@ -77,6 +82,11 @@ const SCYLLA_META: DriverMeta = DriverMeta {
     params: PARAMS,
     auth: AUTH,
     caps: CAPS,
+    hint: "SELECT * FROM table LIMIT 100",
+    browse: "SELECT * FROM {qualified} LIMIT {limit};",
+    browse_by_kind: &[],
+    query_form: &[],
+    query_template: "",
 };
 
 /// The CQL driver, serving both the `cassandra` and `scylla` kinds.

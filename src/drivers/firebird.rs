@@ -64,6 +64,11 @@ const META: DriverMeta = DriverMeta {
         indexes: true,
         ddl: false, // RDB$INDICES; Firebird has no server-side CREATE statement
     },
+    hint: "SELECT FIRST 100 * FROM table",
+    browse: "SELECT FIRST {limit} * FROM {qualified};",
+    browse_by_kind: &[],
+    query_form: &[],
+    query_template: "",
 };
 
 /// The Firebird driver.

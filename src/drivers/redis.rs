@@ -45,6 +45,22 @@ const PARAMS: &[ParamSpec] = &[
     },
 ];
 
+/// Reading a Redis key is a different command for every type of key, and the
+/// type is exactly what `structure` already labels each node with. So the map is
+/// keyed by that label: a client looks the node's kind up and gets the command,
+/// without knowing a thing about Redis.
+///
+/// `browse` itself is `TYPE`, which is the honest answer for a kind not listed
+/// here — it says what the key is, and the next command is then obvious.
+const BROWSE_BY_KIND: &[(&str, &str)] = &[
+    ("string", "GET {name}"),
+    ("list", "LRANGE {name} 0 {limit}"),
+    ("hash", "HGETALL {name}"),
+    ("set", "SMEMBERS {name}"),
+    ("zset", "ZRANGE {name} 0 {limit} WITHSCORES"),
+    ("stream", "XRANGE {name} - + COUNT {limit}"),
+];
+
 const META: DriverMeta = DriverMeta {
     kind: "redis",
     display: "Redis",
@@ -62,6 +78,11 @@ const META: DriverMeta = DriverMeta {
         indexes: false,
         ddl: false, // a KV store has neither indexes nor a schema to describe
     },
+    hint: "KEYS *",
+    browse: "TYPE {name}",
+    browse_by_kind: BROWSE_BY_KIND,
+    query_form: &[],
+    query_template: "",
 };
 
 /// The Redis driver.
@@ -339,7 +360,19 @@ impl Connection for RedisConnection {
 
     async fn execute(&mut self, stmt: &str) -> anyhow::Result<Box<dyn ResultStream>> {
         let tokens = tokenize(stmt);
-        let reply = self.command(&tokens).await?;
+        // Redis has no parse stage of its own — the server answers — so a
+        // statement in the wrong language comes back as the server's complaint.
+        // "unknown command" is the server saying exactly that, and it is the one
+        // case worth answering with what this driver does take. Any other error
+        // is a real Redis error and is passed through untouched.
+        let reply = self.command(&tokens).await.map_err(|e| {
+            let msg = e.to_string();
+            if msg.to_ascii_lowercase().contains("unknown command") {
+                anyhow::anyhow!("{msg}\nRedis takes a command, for example: {}", META.hint)
+            } else {
+                e
+            }
+        })?;
         let (columns, rows) = render(reply);
         Ok(Box::new(super::buffered::BufferedStream::new(columns, rows, None)))
     }

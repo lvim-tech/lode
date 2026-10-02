@@ -67,6 +67,11 @@ const PG_META: DriverMeta = DriverMeta {
         indexes: true, // pg_index + pg_attribute
         ddl: false,    // postgres has NO server-side CREATE TABLE (pg_dump is a client) — see the trait doc
     },
+    hint: "SELECT * FROM table LIMIT 100",
+    browse: "SELECT * FROM {qualified} LIMIT {limit};",
+    browse_by_kind: &[],
+    query_form: &[],
+    query_template: "",
 };
 
 #[cfg(feature = "cockroachdb")]
@@ -77,6 +82,11 @@ const CRDB_META: DriverMeta = DriverMeta {
     params: PARAMS,
     auth: AUTH,
     caps: PG_META.caps,
+    hint: "SELECT * FROM table LIMIT 100",
+    browse: "SELECT * FROM {qualified} LIMIT {limit};",
+    browse_by_kind: &[],
+    query_form: &[],
+    query_template: "",
 };
 
 /// The Postgres-wire driver. One impl serves both the `postgres` and

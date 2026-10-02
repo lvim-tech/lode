@@ -83,6 +83,73 @@ pub struct DriverMeta {
     pub params: &'static [ParamSpec],
     pub auth: &'static [AuthKind],
     pub caps: Caps,
+    /// What an empty editor should suggest — IN THIS ENGINE'S LANGUAGE.
+    ///
+    /// A client showed `SELECT …` for every driver, so a MongoDB connection
+    /// invited SQL and answered `statement must be a JSON document: expected
+    /// value at line 1 column 1`. The engine is the only side that knows what
+    /// each driver speaks, and a client that knew would be a list of driver
+    /// names in a client — the thing `params` and `auth` exist to avoid.
+    pub hint: &'static str,
+    /// How to read the first rows of ONE object, as a template.
+    ///
+    /// The client substitutes `{qualified}` (the schema-qualified name, or the
+    /// bare name where there is no schema), `{name}`, `{schema}` and `{limit}`.
+    /// A template rather than an RPC: the client already holds every value, and
+    /// a round trip to format a string is a round trip to format a string.
+    pub browse: &'static str,
+    /// Overrides of `browse` for particular node kinds, as `schema.structure`
+    /// labels them.
+    ///
+    /// Most engines need none: a table is a table. Redis needs five, because
+    /// reading a key depends on what the key IS — a string is `GET`, a hash is
+    /// `HGETALL`, a sorted set is `ZRANGE`. Expressing that as a map keyed by
+    /// the node kind keeps the knowledge here, where the driver already decides
+    /// what to call each node, instead of in a client matching on driver names.
+    pub browse_by_kind: &'static [(&'static str, &'static str)],
+    /// The fields of a structured query bar. EMPTY means this engine is typed
+    /// as free text in an editor, which is what every SQL driver wants.
+    pub query_form: &'static [QueryFieldSpec],
+    /// The statement those fields are assembled into. `{name}`, `{qualified}`,
+    /// `{schema}` and `{limit}` are substituted as in `browse`; `{fragments}`
+    /// becomes the non-empty fields' fragments joined with `", "`, prefixed
+    /// with `", "` when there is at least one and empty when there is none — so
+    /// a skeleton can be written as valid JSON with no fields filled in.
+    pub query_template: &'static str,
+}
+
+/// One input of a STRUCTURED query bar, for engines whose statements are not a
+/// language a person wants to type by hand.
+///
+/// MongoDB is the case that forced it: "write a command document" is a true
+/// instruction and a bad interface, and every other client of it shows filter /
+/// projection / sort / limit as four fields. Which fields exist, what they are
+/// called and how each one contributes to the statement are all facts about the
+/// driver, so they live here rather than in a client matching on driver names.
+#[derive(Debug, Clone, Copy, Serialize)]
+pub struct QueryFieldSpec {
+    pub key: &'static str,
+    pub label: &'static str,
+    /// Shown in the empty input — a real example, not a restatement of the label.
+    pub placeholder: &'static str,
+    /// What this field adds to the statement when it is NOT empty. `{value}` is
+    /// substituted with what was typed.
+    pub fragment: &'static str,
+    /// What the field starts as.
+    pub default: &'static str,
+    /// How many lines the input gets. 1 is a single-line field.
+    pub rows: u8,
+}
+
+impl DriverMeta {
+    /// The browse template for an object of this `kind`.
+    pub fn browse_for(&self, kind: &str) -> &'static str {
+        self.browse_by_kind
+            .iter()
+            .find(|(k, _)| *k == kind)
+            .map(|(_, t)| *t)
+            .unwrap_or(self.browse)
+    }
 }
 
 // ── the incoming connection spec (built by the Lua form) ─────────────────────

@@ -20,8 +20,8 @@ use mongodb::{Client, Cursor};
 use crate::driver::{Connection, Driver, ResultStream};
 use crate::net::NetContext;
 use crate::spec::{
-    AuthKind, AuthSpec, Caps, Column, ConnSpec, DriverMeta, Index, Node, ObjRef, ParamSpec, ParamType, TableColumn,
-    Value,
+    AuthKind, AuthSpec, Caps, Column, ConnSpec, DriverMeta, Index, Node, ObjRef, ParamSpec, ParamType,
+    QueryFieldSpec, TableColumn, Value,
 };
 
 const PARAMS: &[ParamSpec] = &[
@@ -66,6 +66,48 @@ const AUTH: &[AuthKind] = &[
     AuthKind::Provider,
 ];
 
+/// The structured query bar for a `find`.
+///
+/// "Write a command document" is a true instruction and a bad interface — it is
+/// what answered a user who typed SQL with `expected value at line 1 column 1`.
+/// These are the four inputs every other MongoDB client shows, and each one
+/// carries the JSON it contributes, so a client assembles the statement without
+/// knowing any MongoDB.
+const QUERY_FORM: &[QueryFieldSpec] = &[
+    QueryFieldSpec {
+        key: "filter",
+        label: "Filter",
+        placeholder: "{\"name\": {\"$regex\": \"test\"}}",
+        fragment: "\"filter\": {value}",
+        default: "",
+        rows: 2,
+    },
+    QueryFieldSpec {
+        key: "projection",
+        label: "Project",
+        placeholder: "{\"_id\": 0, \"name\": 1}",
+        fragment: "\"projection\": {value}",
+        default: "",
+        rows: 1,
+    },
+    QueryFieldSpec {
+        key: "sort",
+        label: "Sort",
+        placeholder: "{\"created\": -1}",
+        fragment: "\"sort\": {value}",
+        default: "",
+        rows: 1,
+    },
+    QueryFieldSpec {
+        key: "limit",
+        label: "Limit",
+        placeholder: "50",
+        fragment: "\"limit\": {value}",
+        default: "50",
+        rows: 1,
+    },
+];
+
 const MONGO_META: DriverMeta = DriverMeta {
     kind: "mongodb",
     display: "MongoDB",
@@ -83,6 +125,11 @@ const MONGO_META: DriverMeta = DriverMeta {
         indexes: true, // listIndexes
         ddl: false,    // a document store has no CREATE statement to show
     },
+    hint: "{\"find\": \"collection\", \"limit\": 50}",
+    browse: "{\"find\": \"{name}\", \"limit\": {limit}}",
+    browse_by_kind: &[],
+    query_form: QUERY_FORM,
+    query_template: "{\"find\": \"{name}\"{fragments}}",
 };
 
 /// The MongoDB driver.
@@ -284,8 +331,17 @@ impl MongoConnection {
         // the extended-JSON forms (`$oid`, `$date`, `$numberLong`, …) into their real BSON types — which is
         // both what every other mongo client speaks and the only way a caller can name an ObjectId in a
         // filter. That is what makes an addressed update possible (see `Value::Oid`).
-        let json: serde_json::Value =
-            serde_json::from_str(stmt).map_err(|e| anyhow::anyhow!("statement must be a JSON document: {e}"))?;
+        // The message a person actually meets when they type SQL here. It used
+        // to be `statement must be a JSON document: expected value at line 1
+        // column 1`, which is true, is about serde, and teaches nothing. The
+        // driver knows what it expected, so it says so — and says it with the
+        // same example the empty editor offers, so the two cannot drift.
+        let json: serde_json::Value = serde_json::from_str(stmt).map_err(|e| {
+            anyhow::anyhow!(
+                "MongoDB takes a command document, not SQL — for example: {}\n({e})",
+                MONGO_META.hint
+            )
+        })?;
         let doc: Document = match Bson::try_from(json) {
             Ok(Bson::Document(d)) => d,
             Ok(_) => anyhow::bail!("statement must be a JSON object"),

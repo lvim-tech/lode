@@ -67,6 +67,11 @@ const MARIADB_META: DriverMeta = DriverMeta {
     params: PARAMS,
     auth: AUTH,
     caps: CAPS,
+    hint: "SELECT * FROM table LIMIT 100",
+    browse: "SELECT * FROM {qualified} LIMIT {limit};",
+    browse_by_kind: &[],
+    query_form: &[],
+    query_template: "",
 };
 
 const MYSQL_META: DriverMeta = DriverMeta {
@@ -76,6 +81,11 @@ const MYSQL_META: DriverMeta = DriverMeta {
     params: PARAMS,
     auth: AUTH,
     caps: CAPS,
+    hint: "SELECT * FROM table LIMIT 100",
+    browse: "SELECT * FROM {qualified} LIMIT {limit};",
+    browse_by_kind: &[],
+    query_form: &[],
+    query_template: "",
 };
 
 /// The MySQL-wire driver, serving both the `mariadb` and `mysql` kinds.

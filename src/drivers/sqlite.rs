@@ -45,6 +45,11 @@ const META: DriverMeta = DriverMeta {
         indexes: true, // PRAGMA index_list / index_info
         ddl: true,     // sqlite_master.sql — the ORIGINAL CREATE text, verbatim
     },
+    hint: "SELECT * FROM table LIMIT 100",
+    browse: "SELECT * FROM {qualified} LIMIT {limit};",
+    browse_by_kind: &[],
+    query_form: &[],
+    query_template: "",
 };
 
 /// The SQLite driver.

@@ -85,6 +85,11 @@ const META: DriverMeta = DriverMeta {
         indexes: false,
         ddl: true, // no indexes (micro-partitions); GET_DDL — UNVERIFIED (cloud-only)
     },
+    hint: "SELECT * FROM table LIMIT 100",
+    browse: "SELECT * FROM {qualified} LIMIT {limit};",
+    browse_by_kind: &[],
+    query_form: &[],
+    query_template: "",
 };
 
 /// The Snowflake driver.

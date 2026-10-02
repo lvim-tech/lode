@@ -78,6 +78,119 @@ pub struct DriverMeta {
     pub auth: Vec<String>,
     #[serde(default)]
     pub caps: Caps,
+    /// What an empty editor should suggest, in this engine's language.
+    /// Absent on an engine older than protocol 3.
+    #[serde(default)]
+    pub hint: String,
+    /// How to read the first rows of one object. See [`render_template`].
+    #[serde(default)]
+    pub browse: String,
+    /// Per-node-kind overrides of `browse`.
+    #[serde(default)]
+    pub browse_by_kind: Vec<(String, String)>,
+    /// The inputs of a structured query bar. EMPTY means this engine is typed
+    /// as free text.
+    #[serde(default)]
+    pub query_form: Vec<QueryFieldSpec>,
+    /// The skeleton `query_form`'s fragments are assembled into.
+    #[serde(default)]
+    pub query_template: String,
+}
+
+/// One input of a structured query bar, as the engine declares it.
+#[derive(Debug, Clone, Deserialize)]
+pub struct QueryFieldSpec {
+    pub key: String,
+    pub label: String,
+    #[serde(default)]
+    pub placeholder: String,
+    /// What this field adds to the statement when non-empty; `{value}` is the
+    /// typed text.
+    #[serde(default)]
+    pub fragment: String,
+    #[serde(default)]
+    pub default: String,
+    #[serde(default = "one")]
+    pub rows: u8,
+}
+
+fn one() -> u8 {
+    1
+}
+
+impl DriverMeta {
+    /// The browse template for an object of this `kind`, falling back to the
+    /// general one.
+    pub fn browse_for(&self, kind: &str) -> &str {
+        self.browse_by_kind
+            .iter()
+            .find(|(k, _)| k == kind)
+            .map(|(_, t)| t.as_str())
+            .unwrap_or(&self.browse)
+    }
+
+    /// Whether this engine wants a structured bar rather than a free editor.
+    pub fn is_structured(&self) -> bool {
+        !self.query_form.is_empty() && !self.query_template.is_empty()
+    }
+}
+
+/// Substitute an engine-supplied statement template.
+///
+/// `{qualified}`, `{name}`, `{schema}`, `{limit}` and `{fragments}`. The client
+/// holds every one of these values, so the substitution happens here rather than
+/// over a round trip — but the TEMPLATE is the engine's, which is the point: no
+/// client decides what SQL or what command document a driver wants.
+pub fn render_template(
+    template: &str,
+    name: &str,
+    schema: Option<&str>,
+    limit: usize,
+    fragments: &[String],
+) -> String {
+    let schema = schema.filter(|s| !s.is_empty());
+    let qualified = match schema {
+        Some(s) => format!("{s}.{name}"),
+        None => name.to_string(),
+    };
+    // Empty means the skeleton stands alone and must still be valid, so there is
+    // no separator either; one or more are joined and prefixed, so a skeleton is
+    // written as `{"find": "{name}"{fragments}}` and works both ways.
+    let joined = if fragments.is_empty() {
+        String::new()
+    } else {
+        format!(", {}", fragments.join(", "))
+    };
+    template
+        .replace("{qualified}", &qualified)
+        .replace("{name}", name)
+        .replace("{schema}", schema.unwrap_or(""))
+        .replace("{limit}", &limit.to_string())
+        .replace("{fragments}", &joined)
+}
+
+/// Assemble a structured query bar's values into a statement, using only what
+/// the engine declared.
+pub fn render_query(
+    meta: &DriverMeta,
+    values: &std::collections::HashMap<String, String>,
+    name: &str,
+    schema: Option<&str>,
+    limit: usize,
+) -> String {
+    let fragments: Vec<String> = meta
+        .query_form
+        .iter()
+        .filter_map(|f| {
+            let v = values.get(&f.key).map(String::as_str).unwrap_or("").trim();
+            if v.is_empty() || f.fragment.is_empty() {
+                None
+            } else {
+                Some(f.fragment.replace("{value}", v))
+            }
+        })
+        .collect();
+    render_template(&meta.query_template, name, schema, limit, &fragments)
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -585,6 +698,91 @@ pub fn cell_text(v: &Value) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn meta_from(json: Value) -> DriverMeta {
+        serde_json::from_value(json).unwrap()
+    }
+
+    /// The statement a click on a table produces is the ENGINE's template with
+    /// values put in — not a format string in the client. These are the real
+    /// templates the drivers declare.
+    #[test]
+    fn a_browse_statement_is_the_engines_template() {
+        assert_eq!(
+            render_template("SELECT * FROM {qualified} LIMIT {limit};", "ratings", Some("public"), 200, &[]),
+            "SELECT * FROM public.ratings LIMIT 200;"
+        );
+        // No schema: the qualified name is the bare one, with no stray dot.
+        assert_eq!(
+            render_template("SELECT * FROM {qualified} LIMIT {limit};", "t", None, 50, &[]),
+            "SELECT * FROM t LIMIT 50;"
+        );
+        assert_eq!(
+            render_template("SELECT * FROM {qualified} LIMIT {limit};", "t", Some(""), 50, &[]),
+            "SELECT * FROM t LIMIT 50;",
+            "an empty schema is no schema"
+        );
+        // T-SQL says it differently, which is exactly why this is per driver.
+        assert_eq!(
+            render_template("SELECT TOP {limit} * FROM {qualified};", "t", Some("dbo"), 100, &[]),
+            "SELECT TOP 100 * FROM dbo.t;"
+        );
+        // MongoDB is not SQL at all.
+        assert_eq!(
+            render_template("{\"find\": \"{name}\", \"limit\": {limit}}", "ratings", Some("schoolexams"), 200, &[]),
+            "{\"find\": \"ratings\", \"limit\": 200}"
+        );
+        // Redis: the command depends on what the key IS.
+        let redis = meta_from(json!({
+            "kind": "redis", "display": "Redis",
+            "browse": "TYPE {name}",
+            "browse_by_kind": [["string", "GET {name}"], ["hash", "HGETALL {name}"]],
+        }));
+        assert_eq!(redis.browse_for("string"), "GET {name}");
+        assert_eq!(redis.browse_for("hash"), "HGETALL {name}");
+        assert_eq!(redis.browse_for("zset"), "TYPE {name}", "an unlisted kind falls back");
+    }
+
+    /// The structured bar assembles a statement out of the engine's own
+    /// fragments, and must produce something valid with nothing filled in.
+    #[test]
+    fn a_structured_query_is_assembled_from_declared_fragments() {
+        let mongo = meta_from(json!({
+            "kind": "mongodb", "display": "MongoDB",
+            "query_template": "{\"find\": \"{name}\"{fragments}}",
+            "query_form": [
+                { "key": "filter", "label": "Filter", "fragment": "\"filter\": {value}" },
+                { "key": "sort", "label": "Sort", "fragment": "\"sort\": {value}" },
+                { "key": "limit", "label": "Limit", "fragment": "\"limit\": {value}", "default": "50" }
+            ]
+        }));
+        assert!(mongo.is_structured());
+
+        let mut v = std::collections::HashMap::new();
+        // Nothing filled in: the skeleton alone has to be valid JSON.
+        let empty = render_query(&mongo, &v, "ratings", Some("schoolexams"), 200);
+        assert_eq!(empty, "{\"find\": \"ratings\"}");
+        serde_json::from_str::<Value>(&empty).expect("a bare skeleton must still parse");
+
+        v.insert("limit".into(), "50".into());
+        v.insert("filter".into(), "{\"name\": 1}".into());
+        v.insert("sort".into(), "   ".into()); // whitespace is empty
+        let out = render_query(&mongo, &v, "ratings", None, 200);
+        assert_eq!(out, "{\"find\": \"ratings\", \"filter\": {\"name\": 1}, \"limit\": 50}");
+        serde_json::from_str::<Value>(&out).expect("a filled form must parse too");
+        assert!(!out.contains("sort"), "a blank field contributes nothing");
+    }
+
+    /// An engine older than protocol 3 sends none of this, and the client has to
+    /// cope rather than show an empty hint and a broken click.
+    #[test]
+    fn a_pre_protocol_3_driver_meta_still_parses() {
+        let old = meta_from(json!({ "kind": "postgres", "display": "PostgreSQL" }));
+        assert!(old.hint.is_empty());
+        assert!(old.browse.is_empty());
+        assert!(!old.is_structured(), "no form declared means the free editor");
+        assert_eq!(old.browse_for("table"), "");
+    }
 
     #[test]
     fn cell_text_separates_null_from_the_word() {

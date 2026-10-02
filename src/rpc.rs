@@ -24,7 +24,11 @@ use serde_json::json;
 ///     history that used to live inside the client, moved into the engine so
 ///     two clients share one set. Nothing from 1 changed shape, so a client
 ///     written against 1 keeps working against a 2 engine.
-pub const PROTO: u32 = 2;
+/// 3 — added `hint`, `browse` and `browse_by_kind` to each `DriverMeta`, so a
+///     client can show an empty editor the right LANGUAGE and turn a click on a
+///     table into a statement that engine understands. A client that does not
+///     read them is unaffected; one that does falls back where they are absent.
+pub const PROTO: u32 = 3;
 
 /// One decoded incoming request.
 #[derive(Debug, Deserialize)]

@@ -64,6 +64,11 @@ const META: DriverMeta = DriverMeta {
         indexes: true,
         ddl: false, // sys.indexes; SQL Server scripts CREATE client-side (SSMS), no server command
     },
+    hint: "SELECT TOP 100 * FROM table",
+    browse: "SELECT TOP {limit} * FROM {qualified};",
+    browse_by_kind: &[],
+    query_form: &[],
+    query_template: "",
 };
 
 /// The SQL Server driver.
