@@ -209,6 +209,21 @@ impl Metrics {
         self.panel_w() - 16.0
     }
 
+    /// The label column in a form, where labels stand to the left of fields.
+    ///
+    /// One definition rather than a number repeated at every row: the labels
+    /// have to line up with each other, and six copies of `120.0` line up only
+    /// until somebody changes five of them. Wide enough for a translated label,
+    /// which is longer than the English it replaced.
+    pub fn label_w(self) -> f32 {
+        (self.base * 9.0).round()
+    }
+
+    /// A form field, which holds a host name or a path and so wants room.
+    pub fn field_w(self) -> f32 {
+        (self.base * 16.0).round()
+    }
+
     /// The outcome column of an audit row — "disconnected" is the longest word
     /// that goes in it.
     pub fn outcome_w(self) -> f32 {
@@ -308,6 +323,23 @@ mod tests {
     fn the_rail_is_wider_than_it_was() {
         // It used to be `base * 3.1` — 43 pixels at the default text size.
         assert!(Metrics::default().rail_w() >= 52.0, "{}", Metrics::default().rail_w());
+    }
+
+    /// A form's labels line up because they come from ONE number, and the
+    /// column is wide enough for a label in either language.
+    #[test]
+    fn a_form_label_column_fits_its_labels() {
+        let mut b = MIN_BASE;
+        while b <= MAX_BASE {
+            let m = Metrics::new(b);
+            // The longest label either catalogue carries, at the size labels
+            // are drawn (`small`), at a typical advance for that size.
+            let longest = "Удостоверяване".chars().count() as f32;
+            let w = longest * f32::from(m.small()) * 0.55;
+            assert!(m.label_w() >= w, "base {b}: {} vs {w}", m.label_w());
+            assert!(m.field_w() > m.label_w(), "base {b}: a field wants more room than its label");
+            b += 1.0;
+        }
     }
 
     #[test]

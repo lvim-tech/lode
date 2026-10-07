@@ -2992,6 +2992,22 @@ impl Workspace {
             .child(self.ic(glyph))
     }
 
+    /// A field, at the size of whatever it stands among.
+    ///
+    /// A field had no size of its own, so it inherited the window's root size
+    /// and came out the same everywhere — which in a narrow panel is bigger
+    /// than the rows beside it. The placeholder is drawn at the field's size,
+    /// the same as the value, so what a field says before anything is typed is
+    /// the size of what it will say after. The placeholder is the LESS
+    /// important of the two, not the more; the difference between them is
+    /// carried by the colour.
+    ///
+    /// The height follows too — the element asks for one line box — so a field
+    /// in a panel is a panel-sized field.
+    fn field<E: IntoElement>(&self, size: gpui::Pixels, el: E) -> gpui::Div {
+        div().text_size(size).child(el)
+    }
+
     /// One phrase of the interface, in the chosen language.
     fn tr(&self, key: &str) -> SharedString {
         SharedString::from(self.lang.tr(key))
@@ -3520,7 +3536,7 @@ impl Workspace {
                             cx.notify();
                         })),
                 );
-                panel = panel.child(div().px_2().py_1().child(self.history_filter.clone()));
+                panel = panel.child(div().px_2().py_1().child(self.field(ms.small(), self.history_filter.clone())));
                 let needle = self.history_filter.read(cx).text().to_string();
                 let shown: Vec<&HistoryRow> = self
                     .history
@@ -3608,7 +3624,7 @@ impl Workspace {
                             cx.notify();
                         })),
                 );
-                panel = panel.child(div().px_2().py_1().child(self.audit_filter.clone()));
+                panel = panel.child(div().px_2().py_1().child(self.field(ms.small(), self.audit_filter.clone())));
                 let needle = self.audit_filter.read(cx).text().to_string();
                 let shown: Vec<&AuditRow> = self
                     .audit
@@ -3795,7 +3811,7 @@ impl Workspace {
             Rail::Connections => {}
         }
 
-        panel = panel.child(div().px_2().py_1().child(self.filter.clone()));
+        panel = panel.child(div().px_2().py_1().child(self.field(ms.small(), self.filter.clone())));
         panel = panel.child(
             div()
                 .id("new-conn")
@@ -4412,7 +4428,7 @@ impl Workspace {
         // not only while arranging.
         if editing || b.name.is_empty() {
             top = top
-                .child(div().w(px(ms.base() * 12.0)).child(self.board_name.clone()))
+                .child(div().w(px(ms.base() * 12.0)).child(self.field(ms.small(), self.board_name.clone())))
                 .child(
                     div()
                         .id("board-rename")
@@ -4527,11 +4543,11 @@ impl Workspace {
             .child(self.small("time", t.muted()))
             // Real widths: a text field with none collapses to nothing, and the
             // three of them drew on top of one another.
-            .child(div().w(px(ms.base() * 9.0)).flex_none().child(self.board_time_col.clone()))
+            .child(div().w(px(ms.base() * 9.0)).flex_none().child(self.field(ms.small(), self.board_time_col.clone())))
             .child(self.small("from", t.muted()))
-            .child(div().w(px(ms.base() * 9.0)).flex_none().child(self.board_time_from.clone()))
+            .child(div().w(px(ms.base() * 9.0)).flex_none().child(self.field(ms.small(), self.board_time_from.clone())))
             .child(self.small("to", t.muted()))
-            .child(div().w(px(ms.base() * 9.0)).flex_none().child(self.board_time_to.clone()))
+            .child(div().w(px(ms.base() * 9.0)).flex_none().child(self.field(ms.small(), self.board_time_to.clone())))
             .child(
                 div()
                     .id("board-time-apply")
@@ -4610,7 +4626,7 @@ impl Workspace {
                         ));
                     if tile.kind != TileKind::Divider {
                         row = row
-                            .child(div().w(px(ms.base() * 16.0)).child(self.tile_text.clone()))
+                            .child(div().w(px(ms.base() * 16.0)).child(self.field(ms.small(), self.tile_text.clone())))
                             .child(
                                 div()
                                     .id("tile-set-text")
@@ -5190,7 +5206,7 @@ impl Workspace {
             // value, only where the operator takes one
             if ops.get(cond.op).map_or(true, |o| o.takes_value()) {
                 if let Some(input) = self.inputs.get(&(tab_id, format!("b:{i}"))) {
-                    row = row.child(div().w(px(240.0)).child(input.clone()));
+                    row = row.child(div().w(px(ms.base() * 17.0)).child(self.field(ms.small(), input.clone())));
                 }
             } else {
                 row = row.child(div().w(px(240.0)).child(self.small("takes no value", t.muted())));
@@ -5434,7 +5450,7 @@ impl Workspace {
                         .flex()
                         .items_center()
                         .gap_2()
-                        .child(div().flex_1().child(input.clone()))
+                        .child(div().flex_1().child(self.field(ms.small(), input.clone())))
                         .child(
                             div()
                                 .id("edit-ok")
@@ -5646,11 +5662,11 @@ impl Workspace {
                         .gap_1()
                         .child(self.small(f.label.clone(), t.muted()))
                         // A limit box does not need the width a filter does.
-                        .child(div().w(px(if f.key == "limit" { 60.0 } else { 220.0 })).child(input.clone())),
+                        .child(div().w(px(ms.base() * if f.key == "limit" { 4.5 } else { 15.5 })).child(self.field(ms.small(), input.clone()))),
                 );
             }
         } else if let Some(input) = self.inputs.get(&(tab_id, String::new())) {
-            bar = bar.child(div().flex_1().child(input.clone()));
+            bar = bar.child(div().flex_1().child(self.field(ms.small(), input.clone())));
         }
 
         // A browse the tree produced can be narrowed. The fields come from the
@@ -5681,7 +5697,7 @@ impl Workspace {
                     .items_center()
                     .gap_1()
                     .child(self.small(f.label.clone(), t.muted()))
-                    .child(div().w(px(240.0)).child(input.clone())),
+                    .child(div().w(px(ms.base() * 17.0)).child(self.field(ms.small(), input.clone()))),
             );
         }
         if has_narrow {
@@ -5806,7 +5822,7 @@ impl Workspace {
             );
         }
 
-        row.child(div().w(px(260.0)).child(self.export_path.clone())).child(
+        row.child(div().w(px(ms.base() * 18.0)).child(self.field(ms.small(), self.export_path.clone()))).child(
             div()
                 .id("export-write")
                 .px_2()
@@ -6343,7 +6359,7 @@ impl Workspace {
                     .px_3()
                     .pb_1()
                     .child(self.small(format!("{target}>"), t.accent()))
-                    .child(div().flex_1().child(self.console.clone())),
+                    .child(div().flex_1().child(self.field(ms.small(), self.console.clone()))),
             );
 
             // The confirmation. The REASON is the sentence, not a title bar.
@@ -6559,7 +6575,7 @@ impl Workspace {
                         .border_color(t.accent())
                         .flex()
                         .flex_col()
-                        .child(div().px_2().py_1().child(self.palette_input.clone()))
+                        .child(div().px_2().py_1().child(self.field(ms.body(), self.palette_input.clone())))
                         .child(div().h(px(1.0)).w_full().bg(t.border()))
                         .child(list)
                         .child(

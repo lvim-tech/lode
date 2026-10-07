@@ -424,7 +424,7 @@ impl ConnectionForm {
             .items_center()
             .gap_2()
             .py(px(2.0))
-            .child(div().w(px(120.0)).child(self.small(label.to_string(), t.muted())));
+            .child(div().w(px(ms.label_w())).child(self.small(label.to_string(), t.muted())));
 
         if field.secret {
             let mut picker = div().flex().gap_1();
@@ -448,7 +448,10 @@ impl ConnectionForm {
             }
             row = row.child(picker);
         }
-        row.child(div().flex_1().child(field.input.clone()))
+        // The field carries the form's body size, and so does its
+        // placeholder: what a field says before anything is typed is the size
+        // of what it will say after.
+        row.child(div().flex_1().text_size(ms.body()).child(field.input.clone()))
     }
 
     fn set_source(&mut self, key: &str, s: Source) {
@@ -526,7 +529,7 @@ impl Render for ConnectionForm {
                 .items_center()
                 .gap_2()
                 .child(self.small("Name", t.muted()))
-                .child(div().w(px(220.0)).child(self.name.clone())),
+                .child(div().w(px(ms.field_w())).child(self.name.clone())),
         );
 
         let mut tabs = div()
@@ -618,7 +621,7 @@ impl Render for ConnectionForm {
 
                 let auths: Vec<String> = self.meta().map(|m| m.auth.clone()).unwrap_or_default();
                 let mut auth_picker = div().flex().items_center().gap_2().py_1().child(
-                    div().w(px(120.0)).child(self.small("Authentication", t.muted())),
+                    div().w(px(ms.label_w())).child(self.small("Authentication", t.muted())),
                 );
                 for a in auths {
                     let on = a == self.auth_kind;
@@ -645,7 +648,7 @@ impl Render for ConnectionForm {
                             .items_center()
                             .gap_2()
                             .py(px(2.0))
-                            .child(div().w(px(120.0)).child(self.small("User", t.muted())))
+                            .child(div().w(px(ms.label_w())).child(self.small("User", t.muted())))
                             .child(div().flex_1().child(self.auth_user.clone())),
                     );
                     let f = Field {
@@ -665,7 +668,7 @@ impl Render for ConnectionForm {
             }
             FormTab::Access => {
                 let mut tls = div().flex().items_center().gap_2().py_1().child(
-                    div().w(px(120.0)).child(self.small("SSL mode", t.muted())),
+                    div().w(px(ms.label_w())).child(self.small("SSL mode", t.muted())),
                 );
                 for m in ["disable", "prefer", "require", "verify_ca", "verify_full"] {
                     let on = self.tls_mode == m;
@@ -728,12 +731,12 @@ impl Render for ConnectionForm {
                                 .items_center()
                                 .gap_2()
                                 .py(px(2.0))
-                                .child(div().w(px(120.0)).child(self.small(label, t.muted())))
+                                .child(div().w(px(ms.label_w())).child(self.small(label, t.muted())))
                                 .child(div().flex_1().child(input)),
                         );
                     }
                     let mut m = div().flex().items_center().gap_2().py_1().child(
-                        div().w(px(120.0)).child(self.small("Method", t.muted())),
+                        div().w(px(ms.label_w())).child(self.small("Method", t.muted())),
                     );
                     for a in ["agent", "key", "password"] {
                         let on = self.tunnel_auth == a;
