@@ -43,6 +43,12 @@ pub struct Session {
     /// How many spaces the JSON view indents by. `None` is the default.
     #[serde(default)]
     pub json_indent: Option<u8>,
+    /// Which settings groups were left open.
+    ///
+    /// By NAME, not by index: a group inserted in the middle of the list would
+    /// otherwise silently open somebody else's groups.
+    #[serde(default)]
+    pub settings_open: Option<Vec<String>>,
     /// The icon rail's size, when somebody has set one. Its OWN setting: the
     /// rail is navigation and the text is content, and enlarging one is not
     /// asking for the other.
@@ -125,6 +131,26 @@ pub fn save(s: &Session) {
 mod tests {
     use super::*;
 
+    /// Which groups were left open survives a round trip, BY NAME. An index
+    /// would re-open somebody else's groups the moment one is added in the
+    /// middle of the list.
+    #[test]
+    fn the_open_settings_groups_round_trip_by_name() {
+        let mut s = Session::default();
+        s.settings_open = Some(vec!["theme".into(), "language".into()]);
+        let text = serde_json::to_string(&s).expect("writes");
+        let back: Session = serde_json::from_str(&text).expect("reads");
+        assert_eq!(
+            back.settings_open.as_deref(),
+            Some(&["theme".to_string(), "language".to_string()][..])
+        );
+
+        // A session written before groups existed opens the default one rather
+        // than none: a settings panel with everything shut looks broken.
+        let old: Session = serde_json::from_str("{}").expect("an empty session reads");
+        assert_eq!(old.settings_open, None, "absent, so the caller picks the default");
+    }
+
     #[test]
     fn a_missing_or_broken_session_is_simply_empty() {
         // The application must open on a machine that has never run it, and on
@@ -158,6 +184,7 @@ mod tests {
             json_indent: Some(4),
             lang: Some("bg".into()),
             icon_size: Some(24.0),
+            settings_open: Some(vec!["theme".into()]),
         };
         let text = serde_json::to_string(&s).unwrap();
         let back: Session = serde_json::from_str(&text).unwrap();
@@ -173,6 +200,7 @@ mod tests {
         assert_eq!(back.json_indent, Some(4));
         assert_eq!(back.lang.as_deref(), Some("bg"));
         assert_eq!(back.icon_size, Some(24.0));
+        assert_eq!(back.settings_open.as_deref(), Some(&["theme".to_string()][..]));
 
         // A tab with no object is a typed one, and its words come back.
         let typed = Session {
@@ -195,6 +223,7 @@ mod tests {
             json_indent: None,
             lang: None,
             icon_size: None,
+            settings_open: None,
         };
         let round: Session = serde_json::from_str(&serde_json::to_string(&typed).unwrap()).unwrap();
         assert_eq!(round.tabs[0].draft, "SELECT 1 WHERE", "half a statement is still someone's work");

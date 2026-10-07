@@ -338,6 +338,55 @@ pub fn report_icons(cx: &gpui::App) {
     );
 }
 
+/// A foldable group of settings.
+///
+/// The theme list is 48 rows. Left open beside everything else it pushes the
+/// rest of the settings off the bottom, and a setting somebody cannot see is a
+/// setting they do not know exists. Groups hold a growing number of things in a
+/// fixed amount of room — the same move as the result's sub-tabs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SettingsGroup {
+    Theme,
+    Type,
+    View,
+    Language,
+    Profiles,
+}
+
+impl SettingsGroup {
+    pub fn all() -> [SettingsGroup; 5] {
+        [
+            SettingsGroup::Theme,
+            SettingsGroup::Type,
+            SettingsGroup::View,
+            SettingsGroup::Language,
+            SettingsGroup::Profiles,
+        ]
+    }
+
+    /// The word that goes in the session. Not the index: a group inserted in
+    /// the middle would silently re-open somebody else's groups.
+    pub fn id(self) -> &'static str {
+        match self {
+            SettingsGroup::Theme => "theme",
+            SettingsGroup::Type => "type",
+            SettingsGroup::View => "view",
+            SettingsGroup::Language => "language",
+            SettingsGroup::Profiles => "profiles",
+        }
+    }
+
+    fn key(self) -> &'static str {
+        match self {
+            SettingsGroup::Theme => "settings.theme",
+            SettingsGroup::Type => "settings.group_type",
+            SettingsGroup::View => "settings.group_view",
+            SettingsGroup::Language => "settings.language",
+            SettingsGroup::Profiles => "settings.group_profiles",
+        }
+    }
+}
+
 /// One line in the command palette.
 pub struct PaletteItem {
     pub label: String,
@@ -648,6 +697,11 @@ pub struct Workspace {
     /// argument about which is right is older than this program, so it is a
     /// setting rather than a decision.
     json_indent: u8,
+    /// Which settings groups are open. Remembered, like everything else here.
+    open_groups: std::collections::BTreeSet<String>,
+    /// The filter over the theme list, because there are 48 of them and their
+    /// names are long.
+    theme_filter: Entity<TextInput>,
     /// The glyphs the ICON font does not have, worked out once at startup.
     missing_glyphs: std::collections::HashSet<char>,
     /// The font the icons are drawn in — not the font the text is drawn in.
@@ -699,6 +753,7 @@ impl Workspace {
         let export_path = cx.new(|cx| TextInput::new(cx, "result.csv", colors));
         let history_filter = cx.new(|cx| TextInput::new(cx, "Search history…", colors));
         let audit_filter = cx.new(|cx| TextInput::new(cx, "Search the audit log…", colors));
+        let theme_filter = cx.new(|cx| TextInput::new(cx, "Filter themes…", colors));
         let board_name = cx.new(|cx| TextInput::new(cx, "name this dashboard", colors));
         let tile_text = cx.new(|cx| TextInput::new(cx, "heading for this tile", colors));
         let board_time_col = cx.new(|cx| TextInput::new(cx, "column", colors));
@@ -784,6 +839,16 @@ impl Workspace {
                 .unwrap_or_default(),
             json_indent: restore.json_indent.unwrap_or(4).clamp(2, 4),
             themes: theme::discover(),
+            // Open by default: the one somebody actually comes here for. Its
+            // list is capped and scrolls, so being open costs a fixed amount of
+            // room rather than 48 rows.
+            open_groups: restore
+                .settings_open
+                .clone()
+                .unwrap_or_else(|| vec![SettingsGroup::Theme.id().to_string()])
+                .into_iter()
+                .collect(),
+            theme_filter,
             missing_glyphs: missing_in(cx, &icon_family),
             icon_family,
             font_family,
@@ -1799,6 +1864,7 @@ impl Workspace {
             lang: Some(self.lang.tag().into()),
             font_size: Some(self.scale.base()),
             icon_size: Some(self.scale.icon_size()),
+            settings_open: Some(self.open_groups.iter().cloned().collect()),
             rail: match self.rail {
                 Rail::Connections => "connections",
                 Rail::Instance => "instance",
@@ -3154,6 +3220,63 @@ impl Workspace {
             .child(SharedString::from(text.to_uppercase()))
     }
 
+    fn group_open(&self, g: SettingsGroup) -> bool {
+        self.open_groups.contains(g.id())
+    }
+
+    /// A group's heading: its name, what it is set to, and whether it is open.
+    ///
+    /// The VALUE is on the row, so a closed group still answers the question it
+    /// exists for — which theme, what size, which language — without being
+    /// opened. A group that has to be opened to be read is a group somebody
+    /// opens every time, and then it may as well not fold.
+    fn group_header(
+        &self,
+        g: SettingsGroup,
+        value: impl Into<SharedString>,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let (t, ms) = (self.t(), self.scale);
+        let open = self.group_open(g);
+        div()
+            .id(SharedString::from(format!("group-{}", g.id())))
+            .flex()
+            .items_center()
+            .gap_1()
+            .w_full()
+            .px_2()
+            .py_1()
+            .cursor_pointer()
+            .bg(t.status())
+            .hover(|d| d.bg(t.hover()))
+            .child(self.icon_inline(
+                if open { "\u{f0d7}" } else { "\u{f0da}" },
+                t.muted(),
+            ))
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .text_size(ms.tiny())
+                    .text_color(t.title())
+                    .child(SharedString::from(self.lang.tr(g.key()).to_uppercase())),
+            )
+            .child(
+                div()
+                    .flex_none()
+                    .text_size(ms.tiny())
+                    .text_color(t.muted())
+                    .child(value.into()),
+            )
+            .on_click(cx.listener(move |this, _, _, cx| {
+                if !this.open_groups.remove(g.id()) {
+                    this.open_groups.insert(g.id().to_string());
+                }
+                this.remember();
+                cx.notify();
+            }))
+    }
+
     fn rail_el(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let t = self.t();
         let ms = self.scale;
@@ -3246,7 +3369,21 @@ impl Workspace {
         match self.rail {
             Rail::Settings => {
                 let mut list = self.panel_list("settings-list");
-                list = list.child(self.section(&format!("{} ({})", self.lang.tr("settings.theme"), self.themes.len())));
+                let g_theme = self.group_open(SettingsGroup::Theme);
+                list = list.child(self.group_header(
+                    SettingsGroup::Theme,
+                    self.theme_name.clone(),
+                    cx,
+                ));
+                if g_theme {
+                // 48 names, most of them long: a filter is the only way to get
+                // to one without reading the lot.
+                list = list.child(
+                    div()
+                        .px_2()
+                        .py_1()
+                        .child(self.field(ms.small(), self.theme_filter.clone())),
+                );
                 list = list.child(
                     div()
                         .id("theme-rescan")
@@ -3282,10 +3419,26 @@ impl Workspace {
                         t.muted(),
                     )));
                 }
+                // The list is CAPPED and scrolls inside itself. Open, it costs a
+                // fixed amount of room instead of pushing everything below it off
+                // the bottom — which is what it did, and is why nobody found the
+                // settings under it.
+                let filter = self.theme_filter.read(cx).text().trim().to_lowercase();
+                let mut themes = div()
+                    .id("theme-list")
+                    .flex()
+                    .flex_col()
+                    .max_h(px(ms.base() * 16.0))
+                    .overflow_y_scroll();
+                let mut shown = 0usize;
                 for name in self.themes.keys() {
+                    if !filter.is_empty() && !name.to_lowercase().contains(&filter) {
+                        continue;
+                    }
+                    shown += 1;
                     let on = *name == self.theme_name;
                     let pick = name.clone();
-                    list = list.child(
+                    themes = themes.child(
                         div()
                             .id(SharedString::from(format!("theme-{name}")))
                             .flex()
@@ -3315,7 +3468,24 @@ impl Workspace {
                             })),
                     );
                 }
+                list = list.child(themes);
+                // A filter that matches nothing says so, rather than showing an
+                // empty space that looks like a missing list.
+                if shown == 0 && !self.themes.is_empty() {
+                    list = list.child(div().px_2().child(self.small(
+                        format!("no theme matches \"{}\"", self.theme_filter.read(cx).text().trim()),
+                        t.muted(),
+                    )));
+                }
+                }
 
+                let g_view = self.group_open(SettingsGroup::View);
+                list = list.child(self.group_header(
+                    SettingsGroup::View,
+                    format!("{} spaces", self.json_indent),
+                    cx,
+                ));
+                if g_view {
                 list = list.child(self.section(self.lang.tr("settings.json_indent")));
                 let mut row = div().flex().items_center().gap_2().px_2().py_1();
                 for n in [2u8, 3, 4] {
@@ -3339,6 +3509,15 @@ impl Workspace {
                 }
                 list = list.child(row);
 
+                }
+
+                let g_lang = self.group_open(SettingsGroup::Language);
+                list = list.child(self.group_header(
+                    SettingsGroup::Language,
+                    self.lang.label(),
+                    cx,
+                ));
+                if g_lang {
                 list = list.child(self.section(self.lang.tr("settings.language")));
                 let mut langs = div().flex().items_center().gap_2().px_2().py_1();
                 for l in Lang::ALL.iter().copied() {
@@ -3372,6 +3551,15 @@ impl Workspace {
                     "the engine's refusals and the audit log stay in English — they are the record, not the interface",
                     t.muted(),
                 )));
+                }
+
+                let g_type = self.group_open(SettingsGroup::Type);
+                list = list.child(self.group_header(
+                    SettingsGroup::Type,
+                    format!("{} / {} px", self.scale.base(), self.scale.icon_size()),
+                    cx,
+                ));
+                if g_type {
                 list = list.child(self.section(self.lang.tr("settings.text")));
                 list = list.child(div().px_2().child(self.line(
                     format!("text: {} · icons: {}", self.font_family, self.icon_family),
@@ -3431,8 +3619,7 @@ impl Workspace {
                     ms.line_w(),
                 )));
 
-                panel = panel.child(list);
-                panel = panel.child(self.section(self.lang.tr("settings.text_size")));
+                list = list.child(self.section(self.lang.tr("settings.text_size")));
                 // One number, and it moves everything: the steps, the grid row
                 // height, the rail. Here rather than only in an environment
                 // variable because "a bit bigger" is a thing somebody adjusts
@@ -3457,7 +3644,7 @@ impl Workspace {
                             cx.notify();
                         }))
                 };
-                panel = panel.child(
+                list = list.child(
                     div()
                         .flex()
                         .items_center()
@@ -3489,7 +3676,7 @@ impl Workspace {
                                 })),
                         ),
                 );
-                panel = panel.child(div().px_2().child(self.line(
+                list = list.child(div().px_2().child(self.line(
                     format!(
                         "every size comes off this one — headings {}, body {}, small {}, a grid row {}",
                         f32::from(ms.heading()),
@@ -3502,6 +3689,8 @@ impl Workspace {
                     ms.line_w(),
                 )));
                 return panel;
+                }
+                panel = panel.child(list);
             }
             Rail::Instance => {
                 let who = self.metrics_conn.clone().unwrap_or_else(|| "nothing connected".into());
