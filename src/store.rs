@@ -820,7 +820,10 @@ impl Store {
         let field = match kind.as_str() {
             "tunnel" => "tunnel_profile",
             "proxy" => "proxy_profile",
-            other => anyhow::bail!("unknown profile kind '{other}'"),
+            // Only these two are referenced BY a connection. An access or a
+            // driver profile is used elsewhere, so nothing is using it "from a
+            // connection" and the honest answer is an empty list.
+            _ => return Ok(Vec::new()),
         };
         self.with(move |c| {
             let mut st = c.prepare("SELECT name, spec FROM connections")?;

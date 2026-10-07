@@ -115,7 +115,20 @@ use serde_json::json;
 ///      is filed for a person, who answers in their own client. An approval is
 ///      spent on one statement, and a denial STANDS — otherwise "no" would mean
 ///      "not this second". Additive.
-pub const PROTO: u32 = 12;
+/// 13 — added EXTERNAL DRIVERS: a program that speaks a small protocol on its
+///      stdio becomes a driver. It is registered as a `driver` profile holding
+///      a command line, asked to describe itself once at startup, and then
+///      appears in `rpc.hello` like any other — its own fields, its own hint,
+///      its own form. `hello` also carries `external`: what became of each
+///      registered program, so one that failed to describe itself has a reason
+///      attached rather than being quietly absent.
+///
+///      It is believed about SHAPE and not about SAFETY. `classify` and
+///      `writes` stay the engine's: a child can make nothing safe, cannot claim
+///      `edit` (a promise about binding values that the engine cannot check),
+///      cannot take a built-in driver's name, and is not handed the
+///      credentials. Additive.
+pub const PROTO: u32 = 13;
 
 /// One decoded incoming request.
 #[derive(Debug, Deserialize)]

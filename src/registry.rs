@@ -71,6 +71,33 @@ impl Registry {
         self.drivers.insert(driver.meta().kind, driver);
     }
 
+    /// Add a driver that is somebody else's program.
+    ///
+    /// A built-in driver WINS a clash, and is not replaced. An external driver
+    /// called `postgres` would otherwise take over every saved postgres
+    /// connection in the store the moment somebody registered it — a thing
+    /// nobody asked for and which would look like the real driver breaking.
+    /// The refusal names both, because the fix is to rename one.
+    pub fn add_external(&mut self, driver: Arc<dyn Driver>, built_in: &[&str]) -> anyhow::Result<()> {
+        let kind = driver.meta().kind;
+        if built_in.contains(&kind) {
+            anyhow::bail!(
+                "the driver program calls itself '{kind}', which is a driver this engine already \
+                 has built in — give it another name"
+            );
+        }
+        if self.drivers.contains_key(kind) {
+            anyhow::bail!("two driver programs both call themselves '{kind}'");
+        }
+        self.drivers.insert(kind, driver);
+        Ok(())
+    }
+
+    /// The kinds registered right now.
+    pub fn kinds(&self) -> Vec<&'static str> {
+        self.drivers.keys().copied().collect()
+    }
+
     /// The metadata of every registered driver (for `rpc.hello`).
     pub fn metas(&self) -> Vec<&'static DriverMeta> {
         self.drivers.values().map(|d| d.meta()).collect()

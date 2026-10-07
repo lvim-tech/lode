@@ -82,7 +82,7 @@ notification   {"method":"…","params":{…}}
 
 `proto` grows **additively**: a client accepts any engine reporting
 `proto >= its minimum`, so a newer engine keeps working with an older client.
-The current protocol is **12**. What each version added is listed in
+The current protocol is **13**. What each version added is listed in
 `src/rpc.rs` beside the constant.
 
 ### Handshake
@@ -193,6 +193,65 @@ time. The source file is only read.
 
 The database lives at `$LODE_DATA_DIR/lode.db`, else
 `$XDG_DATA_HOME/lode/lode.db`, else `~/.local/share/lode/lode.db`.
+
+### External drivers (`proto >= 13`)
+
+A program that speaks a small protocol on its stdio **is** a driver. It appears
+in `rpc.hello`, builds its own connection form from its own metadata, its objects
+appear in the tree, and both clients use it without knowing it is not built in —
+the same principle the clients already follow (nothing knows a driver by name),
+one level further out.
+
+Register one as a `driver` profile whose spec is a command line:
+
+```json
+{"kind":"driver","name":"toy","spec":{"command":"python3 /path/to/toy.py"}}
+```
+
+It is asked to describe itself once at startup, with a short ceiling. A program
+that cannot is **reported and skipped** — `hello.external` carries what became of
+each one, so a driver that is installed and missing from the list always has a
+message attached.
+
+The protocol is newline JSON, one request at a time, on the child's stdio:
+
+| method | params | result |
+|---|---|---|
+| `meta` | — | the driver's metadata |
+| `connect` | `{ spec }` | `{ conn }` — any handle it likes |
+| `structure` | `{ conn }` | `{ nodes }` |
+| `columns` / `indexes` | `{ conn, object }` | `{ columns }` / `{ indexes }` |
+| `execute` | `{ conn, statement }` | `{ columns, rows, affected? }` |
+| `databases` / `switch_database` | `{ conn, … }` | optional |
+| `close` | `{ conn }` | — |
+
+Whole results, not streams: paging over a child's stdio with backpressure is a
+lot of machinery for the long tail, and the engine already buffers pages for
+everybody. A driver that returns a million rows returns a million rows — a thing
+to know rather than to pretend about.
+
+#### What it is not believed about
+
+It is believed about **shape** — what its fields are called, what its statements
+look like. Shape is harmless to be wrong about; a bad form is a bad form.
+
+It is **not** believed about safety:
+
+* `classify` and `writes` remain the engine's. A child cannot make a `DROP` safe,
+  and a child answering "nothing writes" cannot turn a read-only connection into
+  an open one.
+* It cannot claim `caps.edit`. That is a promise that every value is bound as a
+  parameter and that a write which hit more than one row can be undone — the
+  engine cannot check it, so it will not repeat it. Nor `cancel` or `metrics`,
+  which this transport does not have.
+* It cannot take a built-in driver's name. One calling itself `postgres` would
+  otherwise capture every saved postgres connection the moment it was registered.
+* It is **not handed the credentials**. What crosses is the form's `params`, built
+  explicitly rather than by serializing `ConnSpec`, so a field added there does
+  not silently start being sent to every external driver.
+
+A driver is a program somebody installed, and a program somebody installed is not
+a reason to stop checking. The same shape as the MCP role: a floor, not a key.
 
 ### More than one language
 

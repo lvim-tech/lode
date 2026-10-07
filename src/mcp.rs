@@ -331,13 +331,13 @@ mod tests {
     /// SOMETHING — and `data_dir` refuses to pick the real one under test (see
     /// store.rs). This sets the variable as well, so the intent is visible here
     /// and not only in the guard.
-    fn test_server() -> Server {
+    async fn test_server() -> Server {
         let dir = std::env::temp_dir().join(format!("lode-mcp-test-{}", std::process::id()));
         std::env::set_var("LODE_DATA_DIR", &dir);
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
         // The receiver is dropped, so sends fail silently — which is what these
         // tests want: they are about the replies, not the notifications.
-        Server::new(tx)
+        Server::new(tx).await
     }
 
     /// Everything a model is told about a tool, checked for the two things that
@@ -370,7 +370,7 @@ mod tests {
     /// protocol error, and the client that receives it is entitled to complain.
     #[tokio::test]
     async fn a_notification_is_not_answered() {
-        let m = Mcp::new(test_server(), AgentRole::Reader);
+        let m = Mcp::new(test_server().await, AgentRole::Reader);
         assert!(m
             .handle(r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#)
             .await
@@ -382,7 +382,7 @@ mod tests {
     /// what it can do before it tries something and is told no.
     #[tokio::test]
     async fn the_handshake_states_the_role() {
-        let m = Mcp::new(test_server(), AgentRole::Reader);
+        let m = Mcp::new(test_server().await, AgentRole::Reader);
         let out = m
             .handle(r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#)
             .await
@@ -397,7 +397,7 @@ mod tests {
     /// the server is broken rather than that it was told no.
     #[tokio::test]
     async fn a_refused_tool_is_a_result_not_a_protocol_error() {
-        let m = Mcp::new(test_server(), AgentRole::Reader);
+        let m = Mcp::new(test_server().await, AgentRole::Reader);
         let out = m
             .handle(r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"nope","arguments":{}}}"#)
             .await
@@ -410,7 +410,7 @@ mod tests {
 
     #[tokio::test]
     async fn an_unknown_method_is_a_protocol_error() {
-        let m = Mcp::new(test_server(), AgentRole::Reader);
+        let m = Mcp::new(test_server().await, AgentRole::Reader);
         let out = m.handle(r#"{"jsonrpc":"2.0","id":3,"method":"resources/list"}"#).await.unwrap();
         let v: Json = serde_json::from_str(&out).unwrap();
         assert_eq!(v["error"]["code"], -32601, "{out}");

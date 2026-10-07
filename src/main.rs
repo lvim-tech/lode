@@ -17,6 +17,7 @@ mod audit;
 mod dashboard;
 mod driver;
 mod drivers;
+mod external;
 mod mcp;
 mod net;
 mod proxy;
@@ -59,7 +60,9 @@ async fn main() {
         }
     });
 
-    let server = Server::new(tx);
+    // Awaited: building the server asks every registered driver PROGRAM to
+    // describe itself, so the registry is complete before anything is served.
+    let server = Server::new(tx).await;
 
     // `loded --mcp` speaks the Model Context Protocol on this same stdio
     // instead of lode's own. The SAME `Server` underneath — same drivers, same

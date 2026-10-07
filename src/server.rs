@@ -88,6 +88,62 @@ fn agent_cell(v: &Value) -> String {
     }
 }
 
+/// Ask every registered driver PROGRAM to describe itself, and register the
+/// ones that can.
+///
+/// Once, before the engine serves anything, with a short ceiling each. A
+/// program that cannot describe itself is RECORDED and skipped: it does not
+/// stop the engine, because the other fourteen drivers have nothing to do with
+/// it, and it is not silently dropped either — `rpc.hello` carries the reason,
+/// so an installed driver missing from the list always has a message attached.
+async fn load_external_drivers(
+    store: &Result<Store, String>,
+    registry: &mut Registry,
+    out: &UnboundedSender<String>,
+) -> Vec<Json> {
+    let mut notes = Vec::new();
+    let Ok(store) = store.as_ref() else { return notes };
+    let profiles = match store.list_profiles("driver".into()).await {
+        Ok(p) => p,
+        Err(_) => return notes,
+    };
+    // Taken BEFORE any of them is asked: a program calling itself `postgres`
+    // must lose to the built-in one, not race it.
+    let built_in: Vec<&'static str> = registry.kinds();
+    for p in profiles {
+        let name = p.get("name").and_then(|x| x.as_str()).unwrap_or("").to_string();
+        let command = p
+            .get("spec")
+            .and_then(|x| x.get("command"))
+            .and_then(|x| x.as_str())
+            .unwrap_or("")
+            .to_string();
+        let (kind, error) = if command.trim().is_empty() {
+            (None, Some("it has no command to run".to_string()))
+        } else {
+            match crate::external::probe(&command).await {
+                Ok(meta) => {
+                    let kind = meta.kind;
+                    let driver = Arc::new(crate::external::ExternalDriver::new(meta, command));
+                    match registry.add_external(driver, &built_in) {
+                        Ok(()) => (Some(kind), None),
+                        Err(e) => (Some(kind), Some(e.to_string())),
+                    }
+                }
+                Err(e) => (None, Some(e.to_string())),
+            }
+        };
+        if let Some(e) = &error {
+            let _ = out.send(rpc::notification(
+                "daemon.log",
+                json!({ "level": "warn", "message": format!("driver program '{name}': {e}") }),
+            ));
+        }
+        notes.push(json!({ "name": name, "kind": kind, "ok": error.is_none(), "error": error }));
+    }
+    notes
+}
+
 /// What an MCP session may do, on top of the connection's own policy.
 ///
 /// A floor, never a key: the most restrictive of the role and the connection
@@ -124,9 +180,9 @@ impl AgentRole {
 /// typo makes an empty list instead of a silent new namespace nobody can find.
 fn check_profile_kind(kind: &str) -> anyhow::Result<()> {
     match kind {
-        "tunnel" | "proxy" | "access" => Ok(()),
+        "tunnel" | "proxy" | "access" | "driver" => Ok(()),
         other => Err(anyhow::anyhow!(
-            "unknown profile kind '{other}' — there are 'tunnel', 'proxy' and 'access'"
+            "unknown profile kind '{other}' — there are 'tunnel', 'proxy', 'access' and 'driver'"
         )),
     }
 }
@@ -187,6 +243,14 @@ pub struct Server {
 
 struct Inner {
     registry: Registry,
+    /// What became of each registered driver PROGRAM, by profile name: the kind
+    /// it claims, or why it did not become a driver. Reported by `rpc.hello`,
+    /// because a driver that is installed and absent from the list is otherwise
+    /// a mystery with no message attached to it.
+    ///
+    /// Plain, not behind a lock, because it is filled before the `Server`
+    /// exists — see `Server::new`.
+    external: Vec<Json>,
     conns: Mutex<HashMap<u64, ConnEntry>>,
     calls: Mutex<HashMap<u64, Arc<AsyncMutex<Call>>>>,
     next_conn: AtomicU64,
@@ -215,8 +279,19 @@ struct Inner {
 }
 
 impl Server {
-    pub fn new(out: UnboundedSender<String>) -> Self {
+    /// Build the engine.
+    ///
+    /// ASYNC because the registry is finished here: every registered driver
+    /// PROGRAM is asked to describe itself before the `Server` exists at all.
+    /// That is the whole reason this is not a method — a registry that could be
+    /// added to after requests start being served would need a lock around
+    /// every `get`, and the first version of this reached for a raw pointer to
+    /// avoid one. Building it first makes "the registry never changes" a fact
+    /// about the type rather than a claim in a comment.
+    pub async fn new(out: UnboundedSender<String>) -> Self {
         let store = Store::open().map_err(|e| e.to_string());
+        let mut registry = Registry::new();
+        let external = load_external_drivers(&store, &mut registry, &out).await;
         if let Err(e) = &store {
             let _ = out.send(rpc::notification(
                 "daemon.log",
@@ -228,13 +303,14 @@ impl Server {
         }
         Server {
             inner: Arc::new(Inner {
-                registry: Registry::new(),
+                registry,
                 conns: Mutex::new(HashMap::new()),
                 calls: Mutex::new(HashMap::new()),
                 next_conn: AtomicU64::new(1),
                 next_call: AtomicU64::new(1),
                 out,
                 store,
+                external,
                 audit_mode: audit::Mode::from_env(),
                 next_run: AtomicU64::new(1),
                 runs: Mutex::new(HashMap::new()),
@@ -679,6 +755,10 @@ impl Server {
             "version": env!("CARGO_PKG_VERSION"),
             "proto": rpc::PROTO,
             "drivers": self.inner.registry.metas(),
+            // Which driver PROGRAMS were found and what became of each. A
+            // driver that is installed and not in `drivers` has its reason
+            // here; without it, an absent driver is a mystery.
+            "external": self.inner.external,
         }))
     }
 
@@ -2267,7 +2347,10 @@ impl Server {
             // the thing it refers to lives in the AWS files. There is no
             // struct to parse it into here, and inventing one would be a second
             // model of somebody else's format.
-            "access" => serde_json::to_string(&p.spec)?,
+            // An access profile is a REFERENCE and a driver profile is a
+            // command line. Neither has a struct here to parse into, and
+            // inventing one would be a second model of somebody else's format.
+            "access" | "driver" => serde_json::to_string(&p.spec)?,
             "tunnel" => {
                 let t: crate::spec::TunnelSpec = serde_json::from_value(p.spec)
                     .map_err(|e| anyhow::anyhow!("that is not a tunnel: {e}"))?;

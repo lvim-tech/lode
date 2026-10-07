@@ -55,7 +55,7 @@ pub struct Caps {
 /// The kinds of auth a driver can accept. A driver lists the subset it supports
 /// in `DriverMeta.auth`; the connection form then renders only those methods'
 /// fields for the chosen driver — no hardcoded field set anywhere.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AuthKind {
     None,
@@ -78,7 +78,7 @@ pub struct ParamSpec {
     pub default: Option<&'static str>,
 }
 
-#[derive(Debug, Clone, Copy, Serialize)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ParamType {
     String,
@@ -676,10 +676,17 @@ pub enum TunnelAuth {
 // ── result model (uniform across every driver) ───────────────────────────────
 
 /// One result column.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Column {
     pub name: String,
-    #[serde(rename = "type")]
+    /// What the engine calls this column's type, or empty when it does not say.
+    ///
+    /// Optional on the way IN — which only an external driver uses — because a
+    /// driver that does not know a column's type should say nothing rather than
+    /// invent a word. The grid already treats an unknown type as unknown:
+    /// SQLite usually declares nothing either, and what can be charted is
+    /// decided from the VALUES rather than from this.
+    #[serde(rename = "type", default)]
     pub type_name: String,
 }
 
@@ -695,7 +702,7 @@ pub struct Column {
 /// It must come from the COLUMNS and not from the primary INDEX, because the two disagree — sqlite makes no
 /// index at all for `id INTEGER PRIMARY KEY` (that column is the rowid alias), so an index-derived key calls
 /// an obviously-keyed table unaddressable.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TableColumn {
     pub name: String,
     #[serde(rename = "type")]
@@ -785,7 +792,7 @@ pub struct RowOutcome {
 }
 
 /// A schema-tree node (schema → table/view/collection). `kind` drives the icon.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Node {
     pub name: String,
     pub kind: String, // "schema" | "table" | "view" | "collection" | "column" | …
@@ -798,7 +805,7 @@ pub struct Node {
 /// name, the columns it covers, and the unique/primary distinction — everything past that (method, partial
 /// predicates, collation, storage options) is per-engine and belongs in the DDL, not in a lowest-common
 /// struct that would be mostly `None`.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Index {
     pub name: String,
     pub columns: Vec<String>,
@@ -807,7 +814,7 @@ pub struct Index {
 }
 
 /// A reference to a browsable object (for `schema.columns` / `schema.indexes` / `schema.ddl`).
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ObjRef {
     pub name: String,
     #[serde(default)]
@@ -863,6 +870,65 @@ pub fn expand_tilde(path: &str) -> String {
             Err(_) => path.to_string(),
         },
         _ => path.to_string(),
+    }
+}
+
+/// The inverse of the serializer above, for values coming IN — from an external
+/// driver, which is the only thing that sends them.
+///
+/// Symmetric on purpose: the tagged forms this engine emits (`__oid`, `__ext`,
+/// `__int`, `__bytes`) are read back as the types they stand for, so a driver
+/// that echoes a row it was given returns the same row and not a row of
+/// strings. Everything else maps the plain JSON way, which is what a driver
+/// writing rows for the first time will send without reading any of this.
+impl<'de> Deserialize<'de> for Value {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Value, D::Error> {
+        let j = serde_json::Value::deserialize(d)?;
+        Ok(Value::from_json(j))
+    }
+}
+
+impl Value {
+    /// Plain JSON, and the engine's own tags, read as the types they mean.
+    pub fn from_json(j: serde_json::Value) -> Value {
+        match j {
+            serde_json::Value::Null => Value::Null,
+            serde_json::Value::Bool(b) => Value::Bool(b),
+            serde_json::Value::Number(n) => {
+                if let Some(i) = n.as_i64() {
+                    Value::Int(i)
+                } else {
+                    Value::Float(n.as_f64().unwrap_or(0.0))
+                }
+            }
+            serde_json::Value::String(t) => Value::Text(t),
+            serde_json::Value::Object(ref m) => {
+                if let Some(h) = m.get("__oid").and_then(|x| x.as_str()) {
+                    return Value::Oid(h.to_string());
+                }
+                if let Some(d) = m.get("__int").and_then(|x| x.as_str()) {
+                    // A big integer came across as digits so it would not go
+                    // through a double. Putting it back through one here would
+                    // undo the whole point of the tag.
+                    if let Ok(i) = d.parse::<i64>() {
+                        return Value::Int(i);
+                    }
+                    return Value::Text(d.to_string());
+                }
+                if let Some(b) = m.get("__bytes").and_then(|x| x.as_str()) {
+                    let len = m.get("len").and_then(|x| x.as_u64()).unwrap_or(0) as usize;
+                    return Value::Bytes { b64: b.to_string(), len };
+                }
+                if let (Some(k), Some(t)) = (
+                    m.get("__ext").and_then(|x| x.as_str()),
+                    m.get("v").and_then(|x| x.as_str()),
+                ) {
+                    return Value::Ext { text: t.to_string(), key: k.to_string() };
+                }
+                Value::Json(j)
+            }
+            other => Value::Json(other),
+        }
     }
 }
 
