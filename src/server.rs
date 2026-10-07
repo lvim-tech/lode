@@ -796,9 +796,18 @@ impl Server {
                 // holds nothing a mode is there to withhold.
                 r.statement = target.clone();
                 r.ms = Some(started.elapsed().as_millis() as i64);
+                // The spec's own credential values come out of the message
+                // before it is written OR returned. A driver's failure is
+                // assembled by somebody else — an SSH library, a database — and
+                // quotes back whatever it choked on.
+                let guard = spec.sensitive();
+                r.guarding(guard.clone());
                 r.because(e.to_string());
                 self.audit(r).await;
-                return Err(e);
+                // The CLIENT is told the same scrubbed thing. A log that is
+                // clean while the window shows the value in a toast is not
+                // clean; it is one place fixed out of two.
+                return Err(anyhow::anyhow!("{}", audit::scrub(&e.to_string(), &guard)));
             }
         };
         // Encryption status: native TLS negotiated OR the link rides an SSH tunnel.
@@ -873,12 +882,21 @@ impl Server {
             .ok_or_else(|| anyhow::anyhow!("unknown driver '{}'", p.spec.driver))?;
 
         let started = Instant::now();
-        let detail = match p.stage.as_str() {
-            "proxy" => Self::test_proxy(&p.spec).await?,
-            "endpoint" => Self::test_endpoint(&p.spec, meta).await?,
-            "tunnel" => Self::test_tunnel(&p.spec, meta).await?,
-            "tls" | "auth" => self.test_connect(&p.spec, &p.stage).await?,
-            other => return Err(anyhow::anyhow!("unknown test stage '{other}'")),
+        // Every stage goes through one place that takes the spec's own
+        // credential values out of whatever comes back. A test dials the same
+        // things a connect does and fails in the same words — including an SSH
+        // library quoting the key path it could not open.
+        let guard = p.spec.sensitive();
+        let outcome = match p.stage.as_str() {
+            "proxy" => Self::test_proxy(&p.spec).await,
+            "endpoint" => Self::test_endpoint(&p.spec, meta).await,
+            "tunnel" => Self::test_tunnel(&p.spec, meta).await,
+            "tls" | "auth" => self.test_connect(&p.spec, &p.stage).await,
+            other => Err(anyhow::anyhow!("unknown test stage '{other}'")),
+        };
+        let detail = match outcome {
+            Ok(d) => audit::scrub(&d, &guard),
+            Err(e) => return Err(anyhow::anyhow!("{}", audit::scrub(&e.to_string(), &guard))),
         };
         Ok(json!({
             "ok": true,

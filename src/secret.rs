@@ -47,6 +47,18 @@ impl Secret {
         self.0.is_empty()
     }
 
+    /// The raw text this holds, for building a redaction list and NOTHING else.
+    ///
+    /// A `Secret` is a template, and a template is often the credential itself:
+    /// somebody who types a password into the form stores it literally. That
+    /// literal is a value the engine read from a secret field, so it is a value
+    /// that must never appear in a message — and to take it out of a message,
+    /// something has to be able to read it. Deliberately not `Display`, not
+    /// `Serialize`, and not called anywhere that prints.
+    pub fn exposed(&self) -> &str {
+        &self.0
+    }
+
     /// Resolve the template to its actual secret value. Async because `{{ cmd }}`
     /// spawns a process.
     pub async fn resolve(&self) -> anyhow::Result<String> {

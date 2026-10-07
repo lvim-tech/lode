@@ -350,6 +350,8 @@ pub enum PaletteAct {
     SaveQuery,
     ToggleConsole,
     NewConnection,
+    /// Open a SAVED connection's settings, by name.
+    EditConnection(String),
     /// A column's width sideways, signed.
     ScrollGrid(f32),
 }
@@ -2163,6 +2165,15 @@ impl Workspace {
         out.push(PaletteItem { label: "Save this query".into(), hint: "result".into(), act: PaletteAct::SaveQuery });
         out.push(PaletteItem { label: "Toggle console".into(), hint: "window".into(), act: PaletteAct::ToggleConsole });
         out.push(PaletteItem { label: "New connection".into(), hint: "window".into(), act: PaletteAct::NewConnection });
+        // One per saved connection, so the settings can be reached by typing
+        // the connection's name — the pencil in the list is easy to miss.
+        for c in &self.saved {
+            out.push(PaletteItem {
+                label: format!("Edit connection: {}", c.name),
+                hint: "window".into(),
+                act: PaletteAct::EditConnection(c.name.clone()),
+            });
+        }
         out
     }
 
@@ -2257,6 +2268,16 @@ impl Workspace {
             PaletteAct::SaveQuery => self.save_query(cx),
             PaletteAct::ToggleConsole => self.console_open = !self.console_open,
             PaletteAct::NewConnection => self.open_form(None, cx),
+            PaletteAct::EditConnection(name) => {
+                let found = self
+                    .saved
+                    .iter()
+                    .find(|c| c.name == name)
+                    .map(|c| (c.name.clone(), c.driver.clone(), c.spec.clone()));
+                if let Some(found) = found {
+                    self.open_form(Some(found), cx);
+                }
+            }
         }
     }
 
@@ -3881,9 +3902,15 @@ impl Workspace {
                     .child(
                         div()
                             .id(SharedString::from(format!("edit-{}", c.name)))
-                            .text_size(ms.tiny())
-                            .text_color(t.muted())
-                            .child("\u{f044}")
+                            .flex_none()
+                            .cursor_pointer()
+                            // It was `tiny` and `muted` at the far edge, and
+                            // went unfound: somebody who cannot see how to edit
+                            // a connection concludes it cannot be edited. Now it
+                            // is at the icon size, in the accent, and it lights
+                            // up under the pointer.
+                            .hover(|d| d.bg(t.hover()))
+                            .child(self.icon_inline("\u{f044}", t.accent()))
                             .on_click(cx.listener({
                                 let (n, d, sp) = (c.name.clone(), c.driver.clone(), c.spec.clone());
                                 move |this, _, _, cx| {
@@ -3892,7 +3919,21 @@ impl Workspace {
                                 }
                             })),
                     )
-                    .on_click(cx.listener(move |this, _, _, cx| {
+                    .on_click(cx.listener(move |this, ev: &gpui::ClickEvent, _, cx| {
+                        // Twice opens the connection's settings. The pencil is
+                        // the visible way; this is the one people try first.
+                        if ev.click_count() >= 2 {
+                            let found = this
+                                .saved
+                                .iter()
+                                .find(|c| c.name == name)
+                                .map(|c| (c.name.clone(), c.driver.clone(), c.spec.clone()));
+                            if let Some(found) = found {
+                                this.open_form(Some(found), cx);
+                                cx.notify();
+                            }
+                            return;
+                        }
                         if this.conns.iter().any(|l| l.name == name) {
                             this.disconnect(&name);
                         } else {
@@ -5020,7 +5061,7 @@ impl Workspace {
                     .h(px(16.0))
                     .child(
                         div()
-                            .w(px(160.0))
+                            .w(px(ms.base() * 11.5))
                             .text_size(ms.small())
                             .text_color(t.muted())
                             .child(SharedString::from(label)),
@@ -5038,7 +5079,7 @@ impl Workspace {
                     )
                     .child(
                         div()
-                            .w(px(110.0))
+                            .w(px(ms.base() * 8.0))
                             .text_size(ms.small())
                             .text_color(if v.is_some() { t.fg() } else { t.muted() })
                             .child(SharedString::from(match v {
@@ -5157,7 +5198,7 @@ impl Workspace {
             row = row.child(
                 div()
                     .id(SharedString::from(format!("b-cc-{i}")))
-                    .w(px(160.0))
+                    .w(px(ms.base() * 11.5))
                     .px_1()
                     .cursor_pointer()
                     .text_size(ms.small())
@@ -5180,7 +5221,7 @@ impl Workspace {
             row = row.child(
                 div()
                     .id(SharedString::from(format!("b-op-{i}")))
-                    .w(px(110.0))
+                    .w(px(ms.base() * 8.0))
                     .px_1()
                     .cursor_pointer()
                     .text_size(ms.small())
@@ -5209,7 +5250,7 @@ impl Workspace {
                     row = row.child(div().w(px(ms.base() * 17.0)).child(self.field(ms.small(), input.clone())));
                 }
             } else {
-                row = row.child(div().w(px(240.0)).child(self.small("takes no value", t.muted())));
+                row = row.child(div().w(px(ms.base() * 17.0)).child(self.small("takes no value", t.muted())));
             }
             row = row.child(
                 div()
@@ -5254,7 +5295,7 @@ impl Workspace {
         body = body.child(
             div()
                 .id("b-order")
-                .w(px(300.0))
+                .w(px(ms.base() * 21.5))
                 .px_1()
                 .cursor_pointer()
                 .text_size(ms.small())
@@ -5308,10 +5349,10 @@ impl Workspace {
                     .flex()
                     .items_center()
                     .gap_2()
-                    .child(div().w(px(220.0)).text_size(ms.body()).text_color(t.fg()).child(
+                    .child(div().w(px(ms.base() * 15.5)).text_size(ms.body()).text_color(t.fg()).child(
                         SharedString::from(c.name.clone()),
                     ))
-                    .child(div().w(px(160.0)).child(self.small(c.type_name.clone(), t.muted())))
+                    .child(div().w(px(ms.base() * 11.5)).child(self.small(c.type_name.clone(), t.muted())))
                     .when(c.primary, |d| d.child(self.small("key", t.accent()))),
             );
         }
@@ -5341,10 +5382,10 @@ impl Workspace {
                         .flex()
                         .items_center()
                         .gap_2()
-                        .child(div().w(px(220.0)).text_size(ms.body()).text_color(t.fg()).child(
+                        .child(div().w(px(ms.base() * 15.5)).text_size(ms.body()).text_color(t.fg()).child(
                             SharedString::from(i.name.clone()),
                         ))
-                        .child(div().w(px(260.0)).child(self.small(i.columns.join(", "), t.muted())))
+                        .child(div().w(px(ms.base() * 18.5)).child(self.small(i.columns.join(", "), t.muted())))
                         .child(self.small(tags.join(" · "), t.accent())),
                 );
             }
@@ -5383,7 +5424,7 @@ impl Workspace {
         let mut panel = div()
             .flex()
             .flex_col()
-            .w(px(380.0))
+            .w(px(ms.base() * 27.0))
             .h_full()
             .bg(t.panel())
             .border_l_1()
@@ -6569,7 +6610,7 @@ impl Workspace {
                 .child(
                     div()
                         .key_context("Palette")
-                        .w(px(680.0))
+                        .w(px(ms.base() * 48.5))
                         .bg(t.panel())
                         .border_1()
                         .border_color(t.accent())

@@ -156,6 +156,16 @@ impl Record {
         self.secrets = secrets;
     }
 
+    /// Values that must be scrubbed from this record's text, from somewhere
+    /// other than a statement.
+    ///
+    /// A connect has no statement, so `about()` never runs and the secret list
+    /// stays empty — which is how an unscrubbed `because()` wrote an SSH key
+    /// path, holding what looked like a passphrase, into the log in full.
+    pub fn guarding(&mut self, values: Vec<String>) {
+        self.secrets.extend(values);
+    }
+
     /// Why this was refused or why it failed, with the statement's credentials
     /// taken out of the message.
     ///

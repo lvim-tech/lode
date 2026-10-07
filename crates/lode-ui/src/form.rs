@@ -145,7 +145,20 @@ pub struct ConnectionForm {
     tunnel_port: Entity<TextInput>,
     tunnel_user: Entity<TextInput>,
     tunnel_auth: String,
-    tunnel_secret: Field,
+    /// The key FILE's path. A path, not a credential — so it is a plain field
+    /// with no source picker, and it is its own field.
+    ///
+    /// One field used to back both this and the password, and the method
+    /// decided which it meant. That is how a passphrase became a key path: the
+    /// form loaded the passphrase into the shared field (dropping the path
+    /// entirely), and saving wrote whatever was in that field back out as
+    /// `path`. Opening a working connection and pressing save was enough to
+    /// break it. Separate fields cannot do that to each other.
+    tunnel_key_path: Entity<TextInput>,
+    /// The key's passphrase, which used to be written out as a hardcoded `""` —
+    /// so a passphrase-protected key could not be used at all.
+    tunnel_passphrase: Field,
+    tunnel_password: Field,
 
     /// The last answer from each `conn.test` stage.
     tests: HashMap<&'static str, Result<String, String>>,
@@ -198,18 +211,10 @@ impl ConnectionForm {
             }
         };
         let (secret_src, secret_arg) = Source::unwrap(&stored_secret);
-        let tunnel_stored = if tunnel.is_null() {
-            String::new()
-        } else {
-            let a = tunnel.get("auth").cloned().unwrap_or(json!({}));
-            let p = get(&a, "passphrase");
-            if p.is_empty() {
-                get(&a, "password")
-            } else {
-                p
-            }
-        };
-        let (tsrc, targ) = Source::unwrap(&tunnel_stored);
+        let tunnel_auth_v = tunnel.get("auth").cloned().unwrap_or(json!({}));
+        let (pass_src, pass_arg) = Source::unwrap(&get(&tunnel_auth_v, "passphrase"));
+        let (pw_src, pw_arg) = Source::unwrap(&get(&tunnel_auth_v, "password"));
+        let key_path = get(&tunnel_auth_v, "path");
 
         let mut form = ConnectionForm {
             workspace,
@@ -261,9 +266,15 @@ impl ConnectionForm {
                 .and_then(Value::as_str)
                 .unwrap_or("agent")
                 .to_string(),
-            tunnel_secret: Field {
-                input: mk(cx, "", &targ),
-                source: tsrc,
+            tunnel_key_path: mk(cx, "~/.ssh/id_ed25519", &key_path),
+            tunnel_passphrase: Field {
+                input: mk(cx, "", &pass_arg),
+                source: pass_src,
+                secret: true,
+            },
+            tunnel_password: Field {
+                input: mk(cx, "", &pw_arg),
+                source: pw_src,
                 secret: true,
             },
             tests: HashMap::new(),
@@ -336,10 +347,23 @@ impl ConnectionForm {
             _ => json!({ "kind": "none" }),
         };
         let tunnel = if self.tunnel_on {
-            let tsecret = self.tunnel_secret.source.wrap(self.tunnel_secret.input.read(cx).text());
             let tauth = match self.tunnel_auth.as_str() {
-                "key" => json!({ "kind": "key", "path": self.tunnel_secret.input.read(cx).text(), "passphrase": "" }),
-                "password" => json!({ "kind": "password", "password": tsecret }),
+                "key" => json!({
+                    "kind": "key",
+                    "path": self.tunnel_key_path.read(cx).text(),
+                    // Carried, not blanked. It used to be written out as a
+                    // literal empty string, which quietly made every
+                    // passphrase-protected key unusable.
+                    "passphrase": self.tunnel_passphrase.source.wrap(
+                        self.tunnel_passphrase.input.read(cx).text()
+                    ),
+                }),
+                "password" => json!({
+                    "kind": "password",
+                    "password": self.tunnel_password.source.wrap(
+                        self.tunnel_password.input.read(cx).text()
+                    ),
+                }),
                 _ => json!({ "kind": "agent" }),
             };
             json!({
@@ -379,6 +403,15 @@ impl ConnectionForm {
         let name = self.name.read(cx).text().trim().to_string();
         if name.is_empty() {
             self.error = Some("a connection needs a name".into());
+            cx.notify();
+            return;
+        }
+        // Refused here rather than at dial time. The connection that broke was
+        // broken by a save, and a save is the last moment anybody is looking at
+        // the field that is wrong.
+        if let Some(why) = self.key_path_problem(cx) {
+            self.error = Some(format!("SSH key: {why}"));
+            self.tab = FormTab::Access;
             cx.notify();
             return;
         }
@@ -457,31 +490,123 @@ impl ConnectionForm {
     fn set_source(&mut self, key: &str, s: Source) {
         if key == "auth-secret" {
             self.auth_secret.source = s;
-        } else if key == "tunnel-secret" {
-            self.tunnel_secret.source = s;
+        } else if key == "tunnel-passphrase" {
+            self.tunnel_passphrase.source = s;
+        } else if key == "tunnel-password" {
+            self.tunnel_password.source = s;
         } else if let Some(f) = self.params.get_mut(key) {
             f.source = s;
         }
     }
 
+    /// Why this key path cannot be right, said before anything is saved.
+    ///
+    /// A refusal with a reason beats a connection that fails at dial time with
+    /// the value quoted back at it. And it is the shape of the mistake that was
+    /// actually made: a passphrase typed where a path goes looks nothing like a
+    /// path, and a path that is not there is not a key.
+    fn key_path_problem(&self, cx: &Context<Self>) -> Option<String> {
+        if self.tunnel_auth != "key" || !self.tunnel_on {
+            return None;
+        }
+        let raw = self.tunnel_key_path.read(cx).text();
+        let path = raw.trim();
+        if path.is_empty() {
+            return Some("a key file is needed, or choose another method".into());
+        }
+        // A path has separators and no whitespace. Whitespace and punctuation
+        // with no separator at all is somebody's passphrase in the wrong field,
+        // which is the mistake this exists to catch.
+        if !path.starts_with('/') && !path.starts_with('~') && !path.starts_with('.') {
+            return Some("that is not a path — a key file starts with / or ~".into());
+        }
+        if path.chars().any(char::is_whitespace) {
+            return Some("a key file path has no spaces in it".into());
+        }
+        let expanded = match path.strip_prefix('~') {
+            Some(rest) => match std::env::var("HOME") {
+                Ok(home) => format!("{home}{rest}"),
+                Err(_) => path.to_string(),
+            },
+            None => path.to_string(),
+        };
+        if !std::path::Path::new(&expanded).is_file() {
+            return Some(format!("there is no file at {path}"));
+        }
+        None
+    }
+
+    /// A drawn checkbox: a box, with a tick in it when it is on.
+    fn tick(&self, on: bool) -> gpui::Div {
+        let (t, ms) = (&self.theme, self.scale);
+        let side = (ms.base() * 1.1).round();
+        div()
+            .flex()
+            .items_center()
+            .justify_center()
+            .flex_none()
+            .w(px(side))
+            .h(px(side))
+            .line_height(px(side))
+            .border_1()
+            .border_color(if on { t.accent() } else { t.border() })
+            .when(on, |d| d.bg(t.accent()))
+            .text_size(ms.tiny())
+            .text_color(t.inverted())
+            .child(if on { "\u{f00c}" } else { "" })
+    }
+
+    /// What stops this test from being worth running, and WHERE to fix it.
+    ///
+    /// Pressing "Test tls" and being told `missing required parameter
+    /// 'database'` is an answer about a field on another tab, and it does not
+    /// say that it is on another tab, or which field it means. The form already
+    /// knows the engine's required parameters, so it can say so before sending
+    /// anything — and the button that cannot succeed is not offered as though
+    /// it could.
+    fn blocking(&self, cx: &Context<Self>) -> Option<String> {
+        if self.name.read(cx).text().trim().is_empty() {
+            return Some("needs a name — the field at the top of this window".into());
+        }
+        let meta = self.meta()?;
+        for p in meta.params.iter().filter(|p| p.required) {
+            let empty = self
+                .params
+                .get(&p.key)
+                .map_or(true, |f| f.input.read(cx).text().trim().is_empty());
+            if empty {
+                return Some(format!("needs {} — the Main tab", p.label));
+            }
+        }
+        None
+    }
+
     fn stage_row(&self, stage: &'static str, cx: &mut Context<Self>) -> impl IntoElement {
         let t = &self.theme;
         let ms = self.scale;
+        // A test that cannot succeed is not offered as though it could: the
+        // button goes quiet and the reason stands beside it, naming the field
+        // and the tab it is on.
+        let blocked = self.blocking(cx);
         let mut row = div().flex().items_center().gap_2().py_1().child(
             div()
                 .id(SharedString::from(format!("test-{stage}")))
                 .px_2()
-                .cursor_pointer()
                 .text_size(ms.small())
                 .border_1()
-                .border_color(t.border())
-                .text_color(t.fg())
-                .child(SharedString::from(format!("Test {stage}")))
-                .on_click(cx.listener(move |this, _, _, cx| {
-                    this.run_test(stage, cx);
-                    cx.notify();
-                })),
+                .border_color(if blocked.is_some() { t.border() } else { t.accent() })
+                .text_color(if blocked.is_some() { t.muted() } else { t.fg() })
+                .when(blocked.is_none(), |d| {
+                    d.cursor_pointer().on_click(cx.listener(move |this, _, _, cx| {
+                        this.run_test(stage, cx);
+                        cx.notify();
+                    }))
+                })
+                .child(SharedString::from(format!("Test {stage}"))),
         );
+        if let Some(why) = blocked {
+            return row.child(self.small(why, t.muted()));
+        }
         // The engine's answer, verbatim: it names the layer, and summarising it
         // would throw away the only useful part.
         row = match self.tests.get(stage) {
@@ -558,9 +683,22 @@ impl Render for ConnectionForm {
                     })),
             );
         }
-        // The tunnel is worth seeing from the outside of its tab.
+        // The tunnel is worth seeing from outside its tab — but as a BADGE,
+        // not as a fourth tab. Set in the same row at the same size and colour
+        // as the three tabs, it was read as one, and reported as "an error with
+        // ssh": somebody clicked what looked like a tab and nothing happened.
+        // Pushed to the far edge, filled, and smaller, it is a state and not a
+        // destination.
         if self.tunnel_on {
-            tabs = tabs.child(self.small("SSH", t.accent()));
+            tabs = tabs.child(
+                div()
+                    .ml_auto()
+                    .px_1()
+                    .bg(t.accent())
+                    .text_size(ms.tiny())
+                    .text_color(t.inverted())
+                    .child("SSH"),
+            );
         }
 
         let mut body = div().flex().flex_col().flex_1().p_3().gap_1().overflow_hidden();
@@ -667,6 +805,19 @@ impl Render for ConnectionForm {
                 body = body.child(self.stage_row("auth", cx));
             }
             FormTab::Access => {
+                // What the ENGINE says this driver can do. The client offers
+                // nothing else: a row of five SSL modes and a "Test tls" button
+                // on a driver that declares `tls: false` is the client promising
+                // something the engine will refuse.
+                let has_tls = self.meta().map_or(false, |m| m.caps.tls);
+                let has_tunnel = self.meta().map_or(false, |m| m.caps.tunnel);
+                if !has_tls {
+                    body = body.child(self.small(
+                        format!("{display} does not offer TLS, so there is nothing to configure here."),
+                        t.muted(),
+                    ));
+                }
+                if has_tls {
                 let mut tls = div().flex().items_center().gap_2().py_1().child(
                     div().w(px(ms.label_w())).child(self.small("SSL mode", t.muted())),
                 );
@@ -695,7 +846,15 @@ impl Render for ConnectionForm {
                     ));
                 }
                 body = body.child(self.stage_row("tls", cx));
+                }
 
+                if !has_tunnel {
+                    body = body.child(self.small(
+                        format!("{display} cannot be reached through an SSH tunnel."),
+                        t.muted(),
+                    ));
+                }
+                if has_tunnel {
                 body = body.child(
                     div()
                         .id("tunnel-toggle")
@@ -704,15 +863,15 @@ impl Render for ConnectionForm {
                         .gap_2()
                         .py_1()
                         .cursor_pointer()
+                        // A drawn box with a tick in it, like every other
+                        // checkbox in this window. `[x]` was the shape of a
+                        // checkbox typed out rather than a checkbox.
+                        .child(self.tick(self.tunnel_on))
                         .child(
                             div()
                                 .text_size(ms.small())
-                                .text_color(if self.tunnel_on { t.accent() } else { t.muted() })
-                                .child(SharedString::from(if self.tunnel_on {
-                                    "[x] SSH tunnel"
-                                } else {
-                                    "[ ] SSH tunnel"
-                                })),
+                                .text_color(if self.tunnel_on { t.fg() } else { t.muted() })
+                                .child("SSH tunnel"),
                         )
                         .on_click(cx.listener(|this, _, _, cx| {
                             this.tunnel_on = !this.tunnel_on;
@@ -756,16 +915,56 @@ impl Render for ConnectionForm {
                         );
                     }
                     body = body.child(m);
-                    if self.tunnel_auth != "agent" {
+                    // Each method shows ITS OWN fields. Nothing a method writes
+                    // is read back by another one.
+                    if self.tunnel_auth == "key" {
+                        body = body.child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap_2()
+                                .py(px(2.0))
+                                .child(
+                                    div()
+                                        .w(px(ms.label_w()))
+                                        .child(self.small("Key file", t.muted())),
+                                )
+                                .child(
+                                    div()
+                                        .flex_1()
+                                        .text_size(ms.body())
+                                        .child(self.tunnel_key_path.clone()),
+                                ),
+                        );
+                        if let Some(why) = self.key_path_problem(cx) {
+                            body = body.child(self.small(why, t.error()));
+                        }
                         let f = Field {
-                            input: self.tunnel_secret.input.clone(),
-                            source: self.tunnel_secret.source,
+                            input: self.tunnel_passphrase.input.clone(),
+                            source: self.tunnel_passphrase.source,
                             secret: true,
                         };
-                        let label = if self.tunnel_auth == "key" { "Key file" } else { "Password" };
-                        body = body.child(self.row(label, &f, "tunnel-secret".into(), cx));
+                        body = body.child(self.row(
+                            "Passphrase",
+                            &f,
+                            "tunnel-passphrase".into(),
+                            cx,
+                        ));
+                        body = body.child(self.small(
+                            "Leave the passphrase empty for a key that has none.",
+                            t.muted(),
+                        ));
+                    }
+                    if self.tunnel_auth == "password" {
+                        let f = Field {
+                            input: self.tunnel_password.input.clone(),
+                            source: self.tunnel_password.source,
+                            secret: true,
+                        };
+                        body = body.child(self.row("Password", &f, "tunnel-password".into(), cx));
                     }
                     body = body.child(self.stage_row("tunnel", cx));
+                }
                 }
             }
             FormTab::Settings => {
@@ -908,6 +1107,58 @@ impl Render for ConnectionForm {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The reported corruption, as a test on the shapes that caused it.
+    ///
+    /// A `key` tunnel's three values live in three different places in the
+    /// spec, and the form used ONE field for them. Loading read `passphrase`
+    /// (falling back to `password`) and ignored `path`; saving wrote that one
+    /// field out AS `path` and hardcoded `passphrase` to `""`. So opening a
+    /// working connection and pressing save moved the passphrase into the path
+    /// and threw the real path away — which is exactly what happened.
+    ///
+    /// This asserts the reading and writing agree, key by key.
+    #[test]
+    fn a_key_tunnel_keeps_its_path_and_its_passphrase_apart() {
+        let saved = json!({
+            "host": "bastion.example",
+            "port": 22u16,
+            "user": "me",
+            "auth": {
+                "kind": "key",
+                "path": "/home/me/.ssh/id_ed25519",
+                "passphrase": "s3cret-phrase-with-punctuation!"
+            }
+        });
+        let auth = saved.get("auth").cloned().unwrap();
+
+        // What the form reads for each of its three fields.
+        let path = auth.get("path").and_then(Value::as_str).unwrap_or_default();
+        let passphrase = auth.get("passphrase").and_then(Value::as_str).unwrap_or_default();
+        let password = auth.get("password").and_then(Value::as_str).unwrap_or_default();
+
+        assert_eq!(path, "/home/me/.ssh/id_ed25519", "the path is read from `path`");
+        assert_eq!(
+            passphrase, "s3cret-phrase-with-punctuation!",
+            "the passphrase is read from `passphrase`"
+        );
+        assert!(password.is_empty(), "a key tunnel has no password field to read");
+
+        // The old code's single field: passphrase-or-password, never the path.
+        let what_the_old_form_loaded = if passphrase.is_empty() { password } else { passphrase };
+        assert_ne!(
+            what_the_old_form_loaded, path,
+            "the one-field form loaded the passphrase and would write it back as the path"
+        );
+
+        // And what a save produces now: each value back where it came from.
+        let written = json!({
+            "kind": "key",
+            "path": path,
+            "passphrase": passphrase,
+        });
+        assert_eq!(written, auth, "a load followed by a save changes nothing");
+    }
 
     /// A value's source becomes the template the engine resolves — and comes
     /// back out of it unchanged when the connection is edited again.

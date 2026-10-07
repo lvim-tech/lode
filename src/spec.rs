@@ -378,6 +378,56 @@ impl ConnSpec {
     /// keys nobody has looked at is how something nobody meant to keep ends up
     /// kept. Deliberately not `auth` either — those fields are `Secret`, and the
     /// honest way to keep a credential out of a log is to never read it.
+    /// Every value in this spec that must never appear in a message.
+    ///
+    /// `target()` keeps credentials OUT of the text the engine writes. This is
+    /// the other half: taking them out of text the engine did not write. A
+    /// driver's failure, an SSH library's failure and a database's own error
+    /// are all assembled elsewhere and routinely quote back the value they
+    /// choked on — that is how a passphrase typed into the key-path field
+    /// reached an audit log in full, inside `cannot load ssh key '…'`.
+    ///
+    /// So: the path counts. Not because a path is secret, but because the
+    /// engine cannot tell a path from a passphrase typed where a path goes, and
+    /// the one time it is wrong is the one time it matters. A field that holds
+    /// a credential when somebody makes a mistake is a credential field.
+    ///
+    /// Literal values only. A credential that arrives through `{{ env }}`,
+    /// `{{ cmd }}` or the keyring is resolved deep inside a driver, and this
+    /// never sees it — see the note on `Secret::resolve`.
+    pub fn sensitive(&self) -> Vec<String> {
+        let mut out: Vec<String> = Vec::new();
+        let mut add = |s: &str| {
+            let s = s.trim();
+            // Below four characters a replacement does more damage to the
+            // sentence than the value did, and "ab" is not a credential.
+            if s.len() >= 4 {
+                out.push(s.to_string());
+            }
+        };
+        match &self.auth {
+            AuthSpec::Password { password, .. } => add(password.exposed()),
+            AuthSpec::ClientCert { cert, key, key_password, .. } => {
+                add(cert);
+                add(key);
+                add(key_password.exposed());
+            }
+            AuthSpec::Provider { token, .. } => add(token.exposed()),
+            AuthSpec::None | AuthSpec::Kerberos { .. } => {}
+        }
+        if let Some(t) = &self.tunnel {
+            match &t.auth {
+                TunnelAuth::Key { path, passphrase } => {
+                    add(path);
+                    add(passphrase.exposed());
+                }
+                TunnelAuth::Password { password } => add(password.exposed()),
+                TunnelAuth::Agent => {}
+            }
+        }
+        out
+    }
+
     pub fn target(&self, meta: &DriverMeta) -> String {
         let mut out = String::from(&self.driver);
         if let Some(fp) = meta.params.iter().find(|p| matches!(p.kind, ParamType::File)) {
@@ -978,6 +1028,66 @@ impl Serialize for Value {
 
 #[cfg(test)]
 mod tests {
+
+    /// The reported leak, as a test.
+    ///
+    /// Somebody typed a passphrase into the key-PATH field. The SSH layer could
+    /// not open a file by that name and said so, quoting it, and the sentence
+    /// went into the audit log in full. The assertion is not that the message
+    /// is pretty — it is that the value is in NO field of the record.
+    #[test]
+    fn a_value_from_a_secret_field_reaches_no_field_of_the_record() {
+        let passphrase = "correct-horse!battery#staple$42";
+        let spec: ConnSpec = serde_json::from_value(serde_json::json!({
+            "driver": "mongodb",
+            "name": "neterra-mongo",
+            "params": { "host": "db.example", "database": "app" },
+            "auth": { "kind": "password", "user": "u", "password": "hunter2-and-then-some" },
+            "tunnel": {
+                "host": "bastion.example",
+                "user": "me",
+                "auth": { "kind": "key", "path": passphrase, "passphrase": "" }
+            }
+        }))
+        .expect("the spec parses");
+
+        let guard = spec.sensitive();
+        assert!(guard.iter().any(|v| v == passphrase), "the path is a guarded value");
+
+        // The message an SSH library actually produces, with the value in it.
+        let said = format!("cannot load ssh key '{passphrase}': No such file or directory");
+        let mut r = crate::audit::Record::new("conn.connect", "failed");
+        r.conn = spec.name.clone();
+        r.driver = Some(spec.driver.clone());
+        // `target()` needs a driver's metadata; the registry has it, and the
+        // question here is about the message rather than about the driver.
+        let reg = crate::registry::Registry::new();
+        let meta = reg
+            .metas()
+            .into_iter()
+            .find(|m| m.kind == "mongodb")
+            .expect("mongodb is registered");
+        r.statement = spec.target(meta);
+        r.guarding(guard.clone());
+        r.because(said);
+
+        for (field, text) in [
+            ("reason", r.reason.clone().unwrap_or_default()),
+            ("statement", r.statement.clone()),
+            ("conn", r.conn.clone().unwrap_or_default()),
+            ("driver", r.driver.clone().unwrap_or_default()),
+            ("outcome", r.outcome.clone()),
+        ] {
+            assert!(!text.contains(passphrase), "{field} still holds the value: {text}");
+            assert!(
+                !text.contains("hunter2-and-then-some"),
+                "{field} still holds the password: {text}"
+            );
+        }
+        // And it still says something: a record scrubbed to nothing is no
+        // better than no record.
+        assert!(r.reason.as_deref().unwrap_or("").contains("cannot load ssh key"));
+    }
     use super::*;
 
     #[test]
