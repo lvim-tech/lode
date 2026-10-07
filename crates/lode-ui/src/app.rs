@@ -3573,7 +3573,13 @@ impl Workspace {
     }
 
     fn group_open(&self, g: SettingsGroup) -> bool {
-        self.open_groups.contains(g.id())
+        // Through the same function the test counts, so the panel and the thing
+        // asserting about the panel cannot come to disagree.
+        crate::workspace::settings_rows(&self.open_groups)
+            .into_iter()
+            .find(|r| r.id == g.id())
+            .map(|r| r.open)
+            .unwrap_or(false)
     }
 
     /// A group's heading: its name, what it is set to, and whether it is open.
@@ -3605,14 +3611,18 @@ impl Workspace {
                 if open { "\u{f0d7}" } else { "\u{f0da}" },
                 t.muted(),
             ))
-            .child(
-                div()
-                    .flex_1()
-                    .min_w_0()
-                    .text_size(ms.tiny())
-                    .text_color(t.title())
-                    .child(SharedString::from(self.lang.tr(g.key()).to_uppercase())),
-            )
+            // NOT `min_w_0` on the text itself. A leaf with `min_w_0` is free
+            // to size itself to nothing, and GPUI takes the offer: the heading
+            // collapses to zero width and the group reads as absent. This trap
+            // has been walked into here before, which is why `line_in` exists —
+            // it wraps the text in a block with a DEFINITE width, which is also
+            // the only way truncation ever draws an ellipsis.
+            .child(self.line_in(
+                self.lang.tr(g.key()).to_uppercase(),
+                ms.tiny(),
+                t.title(),
+                ms.line_w() - ms.base() * 6.0,
+            ))
             .child(
                 div()
                     .flex_none()

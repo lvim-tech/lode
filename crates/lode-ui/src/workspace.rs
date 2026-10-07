@@ -295,6 +295,47 @@ impl Toast {
     }
 }
 
+/// The settings panel's groups, as DATA.
+///
+/// Pulled out of the drawing so it can be counted without a screen. The panel
+/// came back empty once and nothing could say whether the builder had produced
+/// nothing or the drawing had swallowed it; this answers that question in a
+/// test. (It was the drawing: `min_w_0` on a leaf heading, which GPUI is free
+/// to collapse to zero width, and did.)
+///
+/// Always FIVE. A stored open-state is a hint about which are expanded and can
+/// never remove a group — a name nobody recognises is ignored, and a stored
+/// state with no recognisable name at all falls back to the default rather than
+/// to a panel with everything shut, which looks broken.
+pub const SETTINGS_GROUPS: [&str; 5] = ["theme", "type", "view", "language", "profiles"];
+
+/// Which group is open by default: the one people come here for.
+pub const SETTINGS_DEFAULT_OPEN: &str = "theme";
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GroupRow {
+    pub id: &'static str,
+    pub open: bool,
+}
+
+pub fn settings_rows(stored: &std::collections::BTreeSet<String>) -> Vec<GroupRow> {
+    // Does the stored state mean anything at all? A set holding only names this
+    // version does not know is a set from a different version, and honouring it
+    // would shut everything.
+    let usable = stored.iter().any(|n| SETTINGS_GROUPS.contains(&n.as_str()));
+    SETTINGS_GROUPS
+        .iter()
+        .map(|id| GroupRow {
+            id,
+            open: if usable {
+                stored.contains(*id)
+            } else {
+                *id == SETTINGS_DEFAULT_OPEN
+            },
+        })
+        .collect()
+}
+
 /// Where the grid should sit when the bar is dragged to window position `x`.
 ///
 /// The offset GPUI wants is NEGATIVE — it is how far the content has been moved
@@ -849,6 +890,59 @@ pub fn node_matches(node: &Node, filter: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+
+    /// The settings panel has five groups, whatever the session says.
+    ///
+    /// It came back EMPTY once — not one group, not one heading — and nothing
+    /// could say whether the builder had produced nothing or the drawing had
+    /// lost it. This settles that half without a screen.
+    #[test]
+    fn the_settings_panel_always_has_its_five_groups() {
+        use std::collections::BTreeSet;
+
+        // Nothing stored: five groups, and the one people come for is open.
+        let rows = settings_rows(&BTreeSet::new());
+        assert_eq!(rows.len(), 5);
+        assert_eq!(
+            rows.iter().filter(|r| r.open).map(|r| r.id).collect::<Vec<_>>(),
+            vec![SETTINGS_DEFAULT_OPEN]
+        );
+
+        // A sensible stored state is honoured exactly.
+        let stored: BTreeSet<String> = ["language", "view"].iter().map(|s| s.to_string()).collect();
+        let rows = settings_rows(&stored);
+        assert_eq!(rows.len(), 5);
+        let open: Vec<&str> = rows.iter().filter(|r| r.open).map(|r| r.id).collect();
+        assert_eq!(open, vec!["view", "language"]);
+
+        // RUBBISH, and a state from a version that named things differently:
+        // still five groups, and the default open rather than everything shut.
+        for junk in [
+            vec!["nonsense"],
+            vec!["0", "1", "2"],
+            vec![""],
+        ] {
+            let stored: BTreeSet<String> = junk.iter().map(|s| s.to_string()).collect();
+            let rows = settings_rows(&stored);
+            assert_eq!(rows.len(), 5, "junk {junk:?} lost a group");
+            assert_eq!(
+                rows.iter().filter(|r| r.open).map(|r| r.id).collect::<Vec<_>>(),
+                vec![SETTINGS_DEFAULT_OPEN],
+                "junk {junk:?} should fall back to the default, not shut everything"
+            );
+        }
+
+        // One recognisable name among junk IS meaningful: it is honoured, and
+        // the unknown names are ignored rather than treated as groups.
+        let stored: BTreeSet<String> =
+            ["profiles", "who-knows"].iter().map(|s| s.to_string()).collect();
+        let rows = settings_rows(&stored);
+        assert_eq!(rows.len(), 5);
+        assert_eq!(
+            rows.iter().filter(|r| r.open).map(|r| r.id).collect::<Vec<_>>(),
+            vec!["profiles"]
+        );
+    }
 
     /// Dragging the bar lands somewhere sensible and never past the ends.
     ///
