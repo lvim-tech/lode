@@ -62,6 +62,64 @@ struct ConnEntry {
     _net: NetContext,
 }
 
+/// One cell, as a line of a table a language model reads.
+///
+/// Tabs and newlines are flattened because the row separator is a newline and
+/// the cell separator is a tab: a value containing either would silently become
+/// two rows or two columns, and a model would read the shifted table as the
+/// truth. NULL is spelled out rather than left blank, because an empty cell and
+/// a missing value are different answers and the blank reads as the first.
+fn agent_cell(v: &Value) -> String {
+    match v {
+        Value::Null => "NULL".to_string(),
+        Value::Text(s) => s.replace(['\t', '\n'], " "),
+        Value::Bool(b) => b.to_string(),
+        Value::Int(i) => i.to_string(),
+        Value::Float(f) => f.to_string(),
+        // Not the base64: a model given a megabyte of it would spend its whole
+        // context on bytes it cannot read. The length is the useful fact.
+        Value::Bytes { len, .. } => format!("<{len} bytes>"),
+        Value::Json(j) => j.to_string().replace(['\t', '\n'], " "),
+        Value::Timestamp(t) => t.clone(),
+        Value::Oid(o) => o.clone(),
+        // The readable form, which is what it displays as everywhere else. The
+        // extended-JSON key is for writing back, and nothing here writes back.
+        Value::Ext { text, .. } => text.replace(['\t', '\n'], " "),
+    }
+}
+
+/// What an MCP session may do, on top of the connection's own policy.
+///
+/// A floor, never a key: the most restrictive of the role and the connection
+/// wins, and a role cannot grant what a connection refuses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AgentRole {
+    /// Nothing that changes the database. The default, because the default for
+    /// something that is not a person should be the one that cannot do harm.
+    Reader,
+    /// Writes, subject to the connection's policy — and every dangerous one
+    /// still needs a person.
+    Writer,
+}
+
+impl AgentRole {
+    /// `$LODE_MCP_ROLE`. Anything unrecognised is `Reader`: a typo in a
+    /// variable must not quietly hand an agent a pen.
+    pub fn from_env() -> AgentRole {
+        match std::env::var("LODE_MCP_ROLE").as_deref().map(str::trim) {
+            Ok("writer") => AgentRole::Writer,
+            _ => AgentRole::Reader,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            AgentRole::Reader => "reader",
+            AgentRole::Writer => "writer",
+        }
+    }
+}
+
 /// The two namespaces of profile there are. Checked rather than accepted, so a
 /// typo makes an empty list instead of a silent new namespace nobody can find.
 fn check_profile_kind(kind: &str) -> anyhow::Result<()> {
@@ -196,6 +254,13 @@ impl Server {
         let _ = self.inner.out.send(line);
     }
 
+    /// Put one line on the output channel from outside. The MCP transport uses
+    /// it, so both protocols leave through the same single writer and cannot
+    /// interleave.
+    pub fn send_line(&self, line: String) {
+        self.send(line);
+    }
+
     /// What a live connection is allowed to do.
     fn conn_policy(&self, id: u64) -> anyhow::Result<Policy> {
         self.inner
@@ -301,6 +366,53 @@ impl Server {
         Ok(())
     }
 
+    /// Hold a statement against the policy for a caller that is NOT A PERSON.
+    ///
+    /// The same `classify`, the same `writes`, the same connection policy —
+    /// this calls `allowed` and then takes things AWAY. There is no second,
+    /// softer path, because a second path is the one that gets used.
+    ///
+    /// Two differences, and both only ever restrict:
+    ///
+    /// 1. A `reader` role refuses every write, whatever the connection allows.
+    ///    The role is a floor, not a key.
+    /// 2. `Policy::Open` is treated as `Confirm`. "Unrestricted" is a decision
+    ///    a person made ABOUT THEMSELVES — it means "stop asking me", not "let
+    ///    anything that can speak JSON-RPC drop a table". A permission granted
+    ///    to a person is not inherited by a machine acting in their name.
+    ///
+    /// `confirmed` is never true because an agent said so. It is true only when
+    /// a person decided it, out of band, and the approval was spent.
+    fn allowed_for_agent(
+        &self,
+        conn_id: u64,
+        driver: &dyn crate::driver::Driver,
+        statement: &str,
+        role: AgentRole,
+        confirmed: bool,
+    ) -> anyhow::Result<()> {
+        let writes = driver.writes(statement);
+        if role == AgentRole::Reader && writes {
+            anyhow::bail!(
+                "this MCP session is a reader \u{2014} it refuses anything that changes the \
+                 database, whatever the connection itself allows"
+            );
+        }
+        // The connection's own rule first, so a read-only connection refuses in
+        // its own words rather than in the agent's.
+        self.allowed(conn_id, driver, statement, confirmed)?;
+        // And then the part `allowed` lets through for a person: on an
+        // unrestricted connection it returns Ok before classify is ever called.
+        if writes && self.conn_policy(conn_id)? == Policy::Open {
+            if let Some(reason) = driver.classify(statement) {
+                if !confirmed {
+                    anyhow::bail!("needs confirming: {reason}");
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Which driver a live connection belongs to.
     fn conn_driver(&self, id: u64) -> anyhow::Result<String> {
         self.inner
@@ -337,6 +449,164 @@ impl Server {
             Err(e) => rpc::response_err(id, &e.to_string()),
         };
         self.send(line);
+    }
+
+    /// Reach the ordinary dispatch from another transport.
+    ///
+    /// The MCP server uses this, which is the point: it goes through the SAME
+    /// methods a client uses, so there is nothing for a second implementation
+    /// to get wrong or to be given more of. `query.execute` is deliberately NOT
+    /// reachable this way — see `agent_query`.
+    pub async fn dispatch_public(&self, method: &str, params: Json) -> anyhow::Result<Json> {
+        self.dispatch(method, params).await
+    }
+
+    /// Run a statement for something that is NOT A PERSON, and wait for it.
+    ///
+    /// Synchronous, unlike `query.execute`: a language model has no event loop
+    /// to be told later in, and an answer that arrives as a notification is an
+    /// answer it will never read.
+    ///
+    /// The whole approval dance lives here:
+    ///
+    ///   * `allowed_for_agent` holds it against the role AND the connection.
+    ///   * A refusal that is not "needs confirming" is final, and said.
+    ///   * "Needs confirming" FILES an approval for a person and returns what
+    ///     was filed. It does not run. Asking again before they answer files
+    ///     nothing new — an agent retrying in a loop must not fill somebody's
+    ///     queue with one question.
+    ///   * Once a person has approved it, the next attempt SPENDS that approval
+    ///     and runs. Spent, because they said yes to a DELETE, not to every
+    ///     DELETE from now on.
+    pub async fn agent_query(
+        &self,
+        conn_id: u64,
+        statement: &str,
+        role: AgentRole,
+        limit: usize,
+    ) -> anyhow::Result<String> {
+        let kind = self.conn_driver(conn_id)?;
+        let driver = self.inner.registry.get(&kind)?;
+        let conn_name = self
+            .inner
+            .conns
+            .lock()
+            .unwrap()
+            .get(&conn_id)
+            .and_then(|e| e.name.clone());
+
+        // Is there already a person's YES for exactly this?
+        let approved = match self.store() {
+            Ok(store) => {
+                let pending = store.list_approvals(Some("approved".into()), 200).await.unwrap_or_default();
+                pending.iter().find_map(|a| {
+                    let same = a.get("statement").and_then(|x| x.as_str()) == Some(statement)
+                        && a.get("conn").and_then(|x| x.as_str()) == conn_name.as_deref();
+                    if same { a.get("id").and_then(|x| x.as_i64()) } else { None }
+                })
+            }
+            Err(_) => None,
+        };
+
+        match self.allowed_for_agent(conn_id, driver.as_ref(), statement, role, approved.is_some()) {
+            Ok(()) => {}
+            Err(e) => {
+                let why = e.to_string();
+                let mut r = self.audit_for(conn_id, "mcp.query", statement, false, "refused");
+                r.because(&why);
+                self.audit(r).await;
+                if let Some(reason) = why.strip_prefix("needs confirming: ") {
+                    // Filed, not run. The agent is told exactly what is waiting
+                    // on whom.
+                    let store = self.store()?;
+                    let (id, state) = store
+                        .ask_approval(
+                            "mcp".into(),
+                            conn_name.clone(),
+                            statement.to_string(),
+                            audit::fingerprint(statement),
+                            Some(reason.to_string()),
+                        )
+                        .await?;
+                    if state == "denied" {
+                        // A denial STANDS. Filing a fresh ask after one would
+                        // mean "no" lasted until the next attempt, and the
+                        // person would answer the same question for ever.
+                        anyhow::bail!(
+                            "NOT RUN. {reason}\n\nA person has already refused this exact \
+                             statement (approval #{id}). Asking again will not change that. \
+                             If it should be allowed, they have to say so themselves."
+                        );
+                    }
+                    anyhow::bail!(
+                        "NOT RUN. {reason}\n\nThis needs a person. It has been filed as approval \
+                         #{id} ({state}) and is waiting in their client. Asking again before they \
+                         answer files nothing new. If they approve it, run exactly the same \
+                         statement again and it will go through once."
+                    );
+                }
+                return Err(e);
+            }
+        }
+
+        // Spend the approval BEFORE running. If the run then fails, the
+        // approval is still gone — which is right: they approved an attempt,
+        // and a second attempt is a second decision.
+        if let Some(id) = approved {
+            let store = self.store()?;
+            if !store.spend_approval(id, conn_name.clone(), statement.to_string()).await? {
+                anyhow::bail!("that approval is no longer valid — ask again");
+            }
+        }
+
+        let conn = self.conn(conn_id)?;
+        let started = Instant::now();
+        let mut guard = conn.lock().await;
+        let outcome = guard.execute(statement).await;
+        drop(guard);
+        let ms = started.elapsed().as_millis() as i64;
+
+        let writes = driver.writes(statement);
+        match outcome {
+            Err(e) => {
+                if writes {
+                    let mut r = self.audit_for(conn_id, "mcp.query", statement, approved.is_some(), "failed");
+                    r.ms = Some(ms);
+                    r.because(e.to_string());
+                    self.audit(r).await;
+                }
+                Err(e)
+            }
+            Ok(mut stream) => {
+                let cols: Vec<String> = stream.columns().iter().map(|c| c.name.clone()).collect();
+                let rows: Vec<Vec<Value>> = stream.next_page(limit).await.ok().flatten().unwrap_or_default();
+                let affected = stream.affected();
+                if writes {
+                    let mut r = self.audit_for(conn_id, "mcp.query", statement, approved.is_some(), "applied");
+                    r.ms = Some(ms);
+                    r.affected = affected.map(|a| a as i64);
+                    self.audit(r).await;
+                }
+                // Tab-separated, with a count. A model reads this; JSON of the
+                // same thing is twice the tokens for the same table.
+                let mut out = String::new();
+                if !cols.is_empty() {
+                    out.push_str(&cols.join("\t"));
+                    out.push('\n');
+                }
+                for row in &rows {
+                    let cells: Vec<String> = row.iter().map(agent_cell).collect();
+                    out.push_str(&cells.join("\t"));
+                    out.push('\n');
+                }
+                out.push_str(&format!(
+                    "\n({} row(s) shown{}, {ms} ms)",
+                    rows.len(),
+                    affected.map(|a| format!(", {a} affected")).unwrap_or_default()
+                ));
+                Ok(out)
+            }
+        }
     }
 
     async fn dispatch(&self, method: &str, params: Json) -> anyhow::Result<Json> {
@@ -380,6 +650,8 @@ impl Server {
             "store.profiles.get" => self.store_profile_get(params).await,
             "store.profiles.save" => self.store_profile_save(params).await,
             "store.profiles.remove" => self.store_profile_remove(params).await,
+            "approvals.list" => self.approval_list(params).await,
+            "approvals.decide" => self.approval_decide(params).await,
             "access.list" => self.access_list(params).await,
             "access.test" => self.access_test(params).await,
             "access.import" => self.access_import(params).await,
@@ -1378,6 +1650,65 @@ impl Server {
         }
         self.store()?.save_chart(p.conn, p.name, p.sql, p.measure).await?;
         Ok(json!({ "saved": true }))
+    }
+
+    // ── approvals ────────────────────────────────────────────────────────────
+
+    /// What something that is not a person has asked a person to allow.
+    ///
+    /// The human-facing half of the MCP approval flow: the agent files, the
+    /// person reads this in their own client and answers.
+    async fn approval_list(&self, params: Json) -> anyhow::Result<Json> {
+        #[derive(Deserialize)]
+        struct P {
+            #[serde(default)]
+            state: Option<String>,
+            #[serde(default)]
+            limit: Option<i64>,
+        }
+        let p: P = serde_json::from_value(params)?;
+        Ok(json!({
+            "approvals": self.store()?.list_approvals(p.state, p.limit.unwrap_or(100)).await?
+        }))
+    }
+
+    /// A person's answer, and it goes in the audit log.
+    ///
+    /// The decision is as much a fact about what happened as the statement is:
+    /// "who let this through" is the question asked immediately after "what
+    /// ran", and a log that holds the second without the first answers half.
+    async fn approval_decide(&self, params: Json) -> anyhow::Result<Json> {
+        #[derive(Deserialize)]
+        struct P {
+            id: i64,
+            approve: bool,
+        }
+        let p: P = serde_json::from_value(params)?;
+        let store = self.store()?;
+        let before = store.list_approvals(None, 500).await?;
+        let row = before
+            .iter()
+            .find(|a| a.get("id").and_then(|x| x.as_i64()) == Some(p.id))
+            .ok_or_else(|| anyhow::anyhow!("there is no approval #{}", p.id))?
+            .clone();
+        let decided = store.decide_approval(p.id, p.approve).await?;
+        if decided {
+            let mut r = audit::Record::new("approval", if p.approve { "approved" } else { "denied" });
+            r.conn = row.get("conn").and_then(|x| x.as_str()).map(str::to_string);
+            r.confirmed = p.approve;
+            r.about(
+                self.inner.audit_mode,
+                row.get("statement").and_then(|x| x.as_str()).unwrap_or(""),
+            );
+            r.because(format!(
+                "a person {} approval #{} asked for by {}",
+                if p.approve { "allowed" } else { "refused" },
+                p.id,
+                row.get("asker").and_then(|x| x.as_str()).unwrap_or("something")
+            ));
+            self.audit(r).await;
+        }
+        Ok(json!({ "decided": decided }))
     }
 
     // ── access providers ─────────────────────────────────────────────────────

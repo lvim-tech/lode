@@ -82,7 +82,7 @@ notification   {"method":"…","params":{…}}
 
 `proto` grows **additively**: a client accepts any engine reporting
 `proto >= its minimum`, so a newer engine keeps working with an older client.
-The current protocol is **11**. What each version added is listed in
+The current protocol is **12**. What each version added is listed in
 `src/rpc.rs` beside the constant.
 
 ### Handshake
@@ -193,6 +193,55 @@ time. The source file is only read.
 
 The database lives at `$LODE_DATA_DIR/lode.db`, else
 `$XDG_DATA_HOME/lode/lode.db`, else `~/.local/share/lode/lode.db`.
+
+### The MCP server (`proto >= 12`)
+
+```
+loded --mcp                  a reader: it cannot change anything
+LODE_MCP_ROLE=writer loded --mcp
+```
+
+`loded --mcp` speaks the Model Context Protocol on stdio instead of lode's own.
+It is the **same engine** underneath — same drivers, same store, same
+`Driver::classify`, same connection policy, same audit log. There is no second,
+softer path through any of it, because a second path is the one that gets used.
+
+What differs only ever **restricts**, and there are three things:
+
+1. **A role.** `reader` by default, and a reader refuses every write whatever the
+   connection allows. The role is a floor, not a key; an unrecognised value in
+   `$LODE_MCP_ROLE` is a reader, because a typo must not hand an agent a pen.
+2. **`Policy::Open` is read as `Confirm`.** "Unrestricted" is a decision a person
+   made about *themselves* — it means "stop asking me", not "let anything that
+   can speak JSON-RPC drop a table". A permission granted to a person is not
+   inherited by a machine acting in their name.
+3. **The agent cannot confirm.** When `classify` names a statement it is NOT
+   run: it is filed as an approval and the tool says so, in full, including why.
+
+| method | params | result |
+|---|---|---|
+| `approvals.list` | `{ state?, limit? }` | `{ approvals }` |
+| `approvals.decide` | `{ id, approve }` | `{ decided }` |
+
+The queue is in the **store**, not in memory, because the two sides are
+different processes: `loded --mcp` and whatever window the person has open. A
+queue in memory would be one only the asker can see.
+
+Asking twice files nothing new — an agent retrying in a loop is one question,
+and one question is what a person has to answer. **A denial stands**: asking
+again after a "no" does not file a fresh ask, or "no" would mean "not this
+second" and the same question would come back for ever. An approval is **spent**
+when it is used: they said yes to a DELETE, not to every DELETE from now on.
+
+Every tool call is audited under `mcp.query`, refusals included. So is the
+person's decision, under `approval` — "who let this through" is the question
+asked straight after "what ran", and a log with the second and not the first
+answers half of it.
+
+The tools are `list_connections` (names and drivers only — never a host, never a
+credential), `open`, `list_objects`, `describe`, `query` and `session`. Results
+come back as tab-separated text with a row count: a model reads this, and JSON of
+the same table is twice the tokens for the same information.
 
 ### Access providers (`proto >= 11`)
 

@@ -104,7 +104,18 @@ use serde_json::json;
 ///      because they need to talk to AWS and this engine does not. An import
 ///      stores the profile's NAME, never its key: the credential stays where
 ///      the AWS tools rotate it. Additive.
-pub const PROTO: u32 = 11;
+/// 12 — added the MCP SERVER and the APPROVAL QUEUE: `loded --mcp` speaks the
+///      Model Context Protocol on stdio, and `approvals.{list,decide}` is the
+///      human half. It is the SAME engine — same drivers, same store, same
+///      `classify`, same connection policy, same audit log — and what differs
+///      only ever restricts: a ROLE (`reader` by default) that cannot grant
+///      what a connection refuses, `Policy::Open` read as `Confirm` because
+///      "unrestricted" is a decision a person made about themselves, and an
+///      agent that CANNOT confirm. A statement `classify` names is not run: it
+///      is filed for a person, who answers in their own client. An approval is
+///      spent on one statement, and a denial STANDS — otherwise "no" would mean
+///      "not this second". Additive.
+pub const PROTO: u32 = 12;
 
 /// One decoded incoming request.
 #[derive(Debug, Deserialize)]

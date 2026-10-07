@@ -425,17 +425,33 @@ mod tests {
     /// A proxy that is not there names the proxy, not the database: the two
     /// failures look identical from a driver and send somebody to the wrong
     /// machine.
+    /// A proxy that is not there names the PROXY, not the database: the two
+    /// failures look identical from a driver and send somebody to the wrong
+    /// machine.
+    ///
+    /// Retried on a FRESH port each time. Binding a port and dropping it leaves
+    /// a port that is free for a moment, and the kernel will happily hand it to
+    /// one of the other proxy tests running alongside — which makes the dial
+    /// succeed and this fail with "connection reset" instead. Repeating until
+    /// the port really is empty fails only on a machine where no port is ever
+    /// free, which is not a flaky test but an impossible question. (The tunnel
+    /// probe test learned the same thing.)
     #[tokio::test]
     async fn an_absent_proxy_names_the_proxy() {
-        // Bind and drop, so the port is almost certainly free.
-        let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = l.local_addr().unwrap().port();
-        drop(l);
-        let e = dial(&spec(ProxyKind::Socks5, port, None), "db.internal", 5432)
-            .await
-            .unwrap_err()
-            .to_string();
-        assert!(e.contains("cannot reach the proxy at 127.0.0.1"), "{e}");
-        assert!(!e.contains("db.internal"), "the database is not what failed: {e}");
+        let mut last = String::new();
+        for _ in 0..8 {
+            let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let port = l.local_addr().unwrap().port();
+            drop(l);
+            last = dial(&spec(ProxyKind::Socks5, port, None), "db.internal", 5432)
+                .await
+                .unwrap_err()
+                .to_string();
+            if last.contains("cannot reach the proxy at 127.0.0.1") {
+                assert!(!last.contains("db.internal"), "the database is not what failed: {last}");
+                return;
+            }
+        }
+        panic!("no free port in eight tries; last answer was: {last}");
     }
 }

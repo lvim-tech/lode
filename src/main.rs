@@ -17,6 +17,7 @@ mod audit;
 mod dashboard;
 mod driver;
 mod drivers;
+mod mcp;
 mod net;
 mod proxy;
 mod registry;
@@ -59,6 +60,35 @@ async fn main() {
     });
 
     let server = Server::new(tx);
+
+    // `loded --mcp` speaks the Model Context Protocol on this same stdio
+    // instead of lode's own. The SAME `Server` underneath — same drivers, same
+    // store, same classify, same policy, same audit log — because an MCP server
+    // with its own path to the database is an MCP server with its own bugs and
+    // its own permissions.
+    if std::env::args().any(|a| a == "--mcp") {
+        let role = server::AgentRole::from_env();
+        // On stderr, which is not the protocol channel: whoever started this
+        // should be able to see what it was started AS without parsing JSON.
+        eprintln!("lode MCP server — role: {}", role.label());
+        let mcp = mcp::Mcp::new(server.clone(), role);
+        let mut lines = BufReader::new(tokio::io::stdin()).lines();
+        while let Ok(Some(line)) = lines.next_line().await {
+            let line = line.trim();
+            if line.is_empty() {
+                continue;
+            }
+            // One at a time, in order. An MCP client may pipeline, but a
+            // language model's tools are a conversation: answering the second
+            // before the first would let it read a table it has not opened yet.
+            if let Some(reply) = mcp.handle(line).await {
+                server.send_line(reply);
+            }
+        }
+        drop(server);
+        let _ = writer.await;
+        return;
+    }
 
     let mut lines = BufReader::new(tokio::io::stdin()).lines();
     while let Ok(Some(line)) = lines.next_line().await {

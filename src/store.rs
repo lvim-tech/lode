@@ -42,6 +42,20 @@ fn data_dir() -> anyhow::Result<PathBuf> {
     if let Some(dir) = std::env::var_os("LODE_DATA_DIR") {
         return Ok(PathBuf::from(dir));
     }
+    // UNDER TEST, never the real one. A unit test that constructs a `Server`
+    // opens a store, and without this it opens the PERSON'S store: it does not
+    // delete anything, but it creates their file if it is missing and adds
+    // whatever tables this build knows about. That happened — the mcp tests
+    // construct a Server and touched a real `~/.local/share/lode/lode.db`.
+    //
+    // A rule here rather than a reminder in each test, because the next test
+    // that constructs a Server will be written by somebody who has not read
+    // this comment.
+    #[cfg(test)]
+    {
+        return Ok(std::env::temp_dir().join(format!("lode-test-store-{}", std::process::id())));
+    }
+    #[cfg(not(test))]
     if let Some(xdg) = std::env::var_os("XDG_DATA_HOME") {
         let xdg = PathBuf::from(xdg);
         if xdg.is_absolute() {
@@ -190,6 +204,33 @@ impl Store {
                 updated_at INTEGER
             );
             CREATE UNIQUE INDEX IF NOT EXISTS scripts_conn_name ON scripts (conn, name);
+            -- A statement something that is NOT A PERSON asked to run, waiting
+            -- for a person to say yes or no.
+            --
+            -- In the STORE rather than in memory because the two sides are
+            -- different processes: the MCP server is its own `loded --mcp`, and
+            -- the human approves in their editor or their window. A queue in
+            -- memory would be a queue only the asker can see.
+            --
+            -- `fingerprint` is the statement's shape (audit::fingerprint). An
+            -- approval is spent on ONE statement and matched by its exact text;
+            -- the shape is here so a person can see that this is the same thing
+            -- they refused twice already.
+            CREATE TABLE IF NOT EXISTS approvals (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                created     INTEGER,
+                -- Who asked. "mcp" today; another door tomorrow.
+                asker       TEXT NOT NULL,
+                conn        TEXT,
+                statement   TEXT NOT NULL,
+                fingerprint TEXT,
+                -- Why it needed asking: what `classify` named.
+                reason      TEXT,
+                -- "pending" | "approved" | "denied" | "spent"
+                state       TEXT NOT NULL DEFAULT 'pending',
+                decided     INTEGER
+            );
+            CREATE INDEX IF NOT EXISTS approvals_state ON approvals (state);
             -- Every attempt to CHANGE something, and every connection opened or
             -- closed — including the attempts that were REFUSED. A log of what
             -- succeeded answers "what happened"; a log that also holds what was
@@ -513,6 +554,123 @@ impl Store {
                 .query_map(params![conn_name], |r| r.get::<_, String>(0))?
                 .collect::<Result<Vec<_>, _>>()?;
             Ok(rows)
+        })
+        .await
+    }
+
+    // ── approvals ────────────────────────────────────────────────────────────
+
+    /// Ask for one, or find the ask that is already there.
+    ///
+    /// Asking twice for the same statement on the same connection does NOT make
+    /// a second row: an agent that retries in a loop would otherwise fill a
+    /// person's approval queue with one question, and the one question is what
+    /// they have to answer.
+    ///
+    /// A DENIED ask counts as already there, and that is the half that matters.
+    /// Without it, "no" means "not this second": the agent asks again, a fresh
+    /// pending row appears, and the person is answering the same question for
+    /// ever. A denial stands for that exact statement until they remove it.
+    /// Found by the test that denies one and then asks again.
+    pub async fn ask_approval(
+        &self,
+        asker: String,
+        conn: Option<String>,
+        statement: String,
+        fingerprint: String,
+        reason: Option<String>,
+    ) -> anyhow::Result<(i64, String)> {
+        self.with(move |c| {
+            let existing: Option<(i64, String)> = c
+                .query_row(
+                    "SELECT id, state FROM approvals WHERE statement = ?1 \
+                     AND ifnull(conn,'') = ifnull(?2,'') AND state IN ('pending','approved','denied') \
+                     ORDER BY id DESC LIMIT 1",
+                    params![statement, conn],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .optional()?;
+            if let Some(found) = existing {
+                return Ok(found);
+            }
+            c.execute(
+                "INSERT INTO approvals (created, asker, conn, statement, fingerprint, reason, state) \
+                 VALUES (?1,?2,?3,?4,?5,?6,'pending')",
+                params![now(), asker, conn, statement, fingerprint, reason],
+            )?;
+            Ok((c.last_insert_rowid(), "pending".to_string()))
+        })
+        .await
+    }
+
+    /// Spend an approval: it must be APPROVED and for exactly this statement,
+    /// and it is used up.
+    ///
+    /// Used up, because an approval is for a thing that happens once. An
+    /// approval that stayed valid would be a standing permission nobody granted
+    /// — they said yes to a DELETE, not to every DELETE from now on.
+    pub async fn spend_approval(
+        &self,
+        id: i64,
+        conn: Option<String>,
+        statement: String,
+    ) -> anyhow::Result<bool> {
+        self.with(move |c| {
+            let n = c.execute(
+                "UPDATE approvals SET state = 'spent', decided = ?1 WHERE id = ?2 \
+                 AND state = 'approved' AND statement = ?3 AND ifnull(conn,'') = ifnull(?4,'')",
+                params![now(), id, statement, conn],
+            )?;
+            Ok(n > 0)
+        })
+        .await
+    }
+
+    pub async fn list_approvals(&self, state: Option<String>, limit: i64) -> anyhow::Result<Vec<Json>> {
+        self.with(move |c| {
+            let cols = "id, created, asker, conn, statement, fingerprint, reason, state, decided";
+            let read = |r: &rusqlite::Row| -> rusqlite::Result<Json> {
+                Ok(serde_json::json!({
+                    "id": r.get::<_, i64>(0)?,
+                    "created": r.get::<_, Option<i64>>(1)?,
+                    "asker": r.get::<_, String>(2)?,
+                    "conn": r.get::<_, Option<String>>(3)?,
+                    "statement": r.get::<_, String>(4)?,
+                    "fingerprint": r.get::<_, Option<String>>(5)?,
+                    "reason": r.get::<_, Option<String>>(6)?,
+                    "state": r.get::<_, String>(7)?,
+                    "decided": r.get::<_, Option<i64>>(8)?,
+                }))
+            };
+            let rows = match state {
+                Some(st) => {
+                    let sql = format!("SELECT {cols} FROM approvals WHERE state = ?1 ORDER BY id DESC LIMIT ?2");
+                    let mut s = c.prepare(&sql)?;
+                    let out = s.query_map(params![st, limit], read)?.collect::<Result<Vec<_>, _>>()?;
+                    out
+                }
+                None => {
+                    let sql = format!("SELECT {cols} FROM approvals ORDER BY id DESC LIMIT ?1");
+                    let mut s = c.prepare(&sql)?;
+                    let out = s.query_map(params![limit], read)?.collect::<Result<Vec<_>, _>>()?;
+                    out
+                }
+            };
+            Ok(rows)
+        })
+        .await
+    }
+
+    /// A person's answer. Only a PENDING ask can be decided — deciding one
+    /// twice, or un-denying one, would make the record of what was allowed
+    /// depend on who looked last.
+    pub async fn decide_approval(&self, id: i64, approve: bool) -> anyhow::Result<bool> {
+        self.with(move |c| {
+            let n = c.execute(
+                "UPDATE approvals SET state = ?1, decided = ?2 WHERE id = ?3 AND state = 'pending'",
+                params![if approve { "approved" } else { "denied" }, now(), id],
+            )?;
+            Ok(n > 0)
         })
         .await
     }
