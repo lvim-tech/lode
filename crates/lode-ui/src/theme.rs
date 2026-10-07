@@ -125,16 +125,50 @@ pub struct Grid {
     pub line_nr: String,
 }
 
-/// Parse `#rrggbb`. One unreadable value costs one colour, never the theme.
-pub fn hex(s: &str, fallback: Rgba) -> Rgba {
+/// Parse `#rrggbb`, or `None` when it is not one.
+pub fn parse_hex(s: &str) -> Option<Rgba> {
     let t = s.trim().trim_start_matches('#');
     if t.len() != 6 {
-        return fallback;
+        return None;
     }
-    match u32::from_str_radix(t, 16) {
-        Ok(v) => rgb(v),
-        Err(_) => fallback,
-    }
+    u32::from_str_radix(t, 16).ok().map(rgb)
+}
+
+/// Parse `#rrggbb`. One unreadable value costs one colour, never the theme.
+pub fn hex(s: &str, fallback: Rgba) -> Rgba {
+    parse_hex(s).unwrap_or(fallback)
+}
+
+/// The two roots of the fallback chain, read from the BUILT-IN theme rather
+/// than written as literals here.
+///
+/// Every other role falls back to another role; these two had nowhere left to
+/// fall, and were a hard-coded `#20272b` and `#ffffff` in the working code.
+/// A number in the source is a colour that did not come from the theme, which
+/// is the one rule this client has about colour. The built-in theme is the
+/// generated `LvimBase_dark` byte for byte, so it is guaranteed complete and
+/// valid — meaning a default has somewhere to come from without a literal.
+///
+/// Resolved once: `builtin()` parses a TOML document, and doing that per call
+/// of `base()` would parse it thousands of times a frame.
+/// Both `expect` rather than falling back again, and that is the point: there
+/// is no fourth place for a colour to come from, so inventing one would mean
+/// writing the literal this removed. The built-in theme is checked in, parsed by
+/// `builtin()` (which already panics on a malformed document) and asserted
+/// against the editor's own groups by a test — a build in which these fail is a
+/// build whose theme file is broken, and that should stop, not dim.
+fn root_bg() -> Rgba {
+    static ROOT: std::sync::OnceLock<Rgba> = std::sync::OnceLock::new();
+    *ROOT.get_or_init(|| {
+        parse_hex(&Theme::builtin().surface.base).expect("the built-in theme's surface.base must be #rrggbb")
+    })
+}
+
+fn root_fg() -> Rgba {
+    static ROOT: std::sync::OnceLock<Rgba> = std::sync::OnceLock::new();
+    *ROOT.get_or_init(|| {
+        parse_hex(&Theme::builtin().text.primary).expect("the built-in theme's text.primary must be #rrggbb")
+    })
 }
 
 impl Theme {
@@ -142,7 +176,7 @@ impl Theme {
     // missing one is dimmer, never broken. Written out rather than generated:
     // the fallback CHAIN is the interesting part and a macro hides it.
     pub fn base(&self) -> Rgba {
-        hex(&self.surface.base, rgb(0x20272b))
+        hex(&self.surface.base, root_bg())
     }
     pub fn panel(&self) -> Rgba {
         hex(&self.surface.panel, self.base())
@@ -166,7 +200,7 @@ impl Theme {
         hex(&self.surface.border, self.raised())
     }
     pub fn fg(&self) -> Rgba {
-        hex(&self.text.primary, rgb(0xffffff))
+        hex(&self.text.primary, root_fg())
     }
     pub fn muted(&self) -> Rgba {
         hex(&self.text.muted, self.fg())
@@ -316,6 +350,59 @@ mod tests {
         assert_eq!(t.grid.selection_bg, "#22292d", "Visual.bg");
         assert_eq!(t.grid.selection_fg, t.text.primary, "Visual sets no fg");
         assert_eq!(t.grid.line_nr, "#2a373d", "LineNr.fg");
+        // `surface.border` is the one deliberate departure from a literal
+        // source group: `WinSeparator` equals its own background on all 48
+        // styles (the editor draws no line between windows), and this client
+        // puts a tree, a result, a console and a task list in ONE frame, where
+        // no outline at all reads as one surface. It takes `LineNr` — the
+        // quietest ink the editor really paints.
+        assert_eq!(t.surface.border, "#2a373d", "LineNr.fg, used as the border");
+    }
+
+    /// The embedded copy must BE the generated file.
+    ///
+    /// It is a copy, not a symlink, because a crate has to build without the
+    /// colorscheme checkout beside it. A copy can go stale, and it did: the
+    /// generator moved `surface.border` from `WinSeparator` to `LineNr` and the
+    /// embedded theme kept the old `#1e2529` for five days. This test is the
+    /// thing that would have said so — it compares byte for byte when the
+    /// checkout is there, and skips when it is not.
+    #[test]
+    fn the_embedded_theme_is_byte_for_byte_the_generated_one() {
+        let Some(dir) = std::env::var_os("LODE_THEME_DIR") else {
+            eprintln!("skipped: set LODE_THEME_DIR to compare against the generated themes");
+            return;
+        };
+        let generated = std::path::PathBuf::from(dir).join("LvimBase_dark.toml");
+        let Ok(text) = std::fs::read_to_string(&generated) else {
+            eprintln!("skipped: no {} to compare against", generated.display());
+            return;
+        };
+        assert_eq!(
+            text,
+            include_str!("builtin_theme.toml"),
+            "crates/lode-ui/src/builtin_theme.toml is stale — copy {} over it",
+            generated.display()
+        );
+    }
+
+    /// The last two colours in the working code came from a literal; now they
+    /// come from the built-in theme. The test says exactly that, so putting a
+    /// number back would fail here rather than be noticed by eye.
+    #[test]
+    fn the_root_fallbacks_come_from_the_builtin_theme() {
+        let b = Theme::builtin();
+        assert_eq!(root_bg(), parse_hex(&b.surface.base).unwrap());
+        assert_eq!(root_fg(), parse_hex(&b.text.primary).unwrap());
+        // And a theme whose two roots are MISSING falls back to exactly those,
+        // rather than to white on black. Built by blanking the built-in theme
+        // rather than by hand-writing a skeleton: a skeleton drifts the moment a
+        // role is added, and then this test fails for the wrong reason.
+        let mut empty = Theme::builtin();
+        empty.surface.base = String::new();
+        empty.text.primary = String::new();
+        assert_eq!(empty.base(), parse_hex(&b.surface.base).unwrap());
+        assert_eq!(empty.fg(), parse_hex(&b.text.primary).unwrap());
     }
 
     /// Every real generated theme must load through the ported reader too.

@@ -30,10 +30,18 @@ pub struct Session {
     /// The theme that was chosen, so it survives a restart without an env var.
     #[serde(default)]
     pub theme: Option<String>,
-    /// Which panel the rail was showing — "connections" | "history" | "tasks" |
-    /// "settings". Lower case, so the file reads as a person would write it.
+    /// Which panel the rail was showing — "connections" | "instance" |
+    /// "history" | "audit" | "tasks" | "settings". Lower case, so the file
+    /// reads as a person would write it.
     #[serde(default)]
     pub rail: String,
+    /// The base of the type scale, in pixels, when somebody has set one.
+    ///
+    /// `None` means "whatever the application's default is", so raising the
+    /// default later reaches everyone who never touched it — which a number
+    /// written out on first run would not.
+    #[serde(default)]
+    pub font_size: Option<f32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -133,6 +141,7 @@ mod tests {
             active: 0,
             theme: Some("LvimBase_dark".into()),
             rail: "history".into(),
+            font_size: Some(16.0),
         };
         let text = serde_json::to_string(&s).unwrap();
         let back: Session = serde_json::from_str(&text).unwrap();
@@ -144,6 +153,7 @@ mod tests {
         assert_eq!(back.rail, "history");
         assert_eq!(back.tabs[0].sub, "schema");
         assert_eq!(back.tabs[0].detail, Some(2));
+        assert_eq!(back.font_size, Some(16.0), "a chosen text size comes back");
 
         // A tab with no object is a typed one, and its words come back.
         let typed = Session {
@@ -162,9 +172,13 @@ mod tests {
             active: 0,
             theme: None,
             rail: String::new(),
+            font_size: None,
         };
         let round: Session = serde_json::from_str(&serde_json::to_string(&typed).unwrap()).unwrap();
         assert_eq!(round.tabs[0].draft, "SELECT 1 WHERE", "half a statement is still someone's work");
+        // Unset stays unset, so raising the default later reaches everyone who
+        // never chose a size — which a number written out on first run would not.
+        assert!(round.font_size.is_none(), "a size nobody chose must not be written as a choice");
         assert!(round.tabs[0].name.is_empty());
     }
 

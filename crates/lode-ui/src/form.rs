@@ -27,6 +27,7 @@ use serde_json::{json, Value};
 
 use crate::app::Workspace;
 use crate::input::{InputColors, TextInput};
+use crate::metrics::Metrics;
 use crate::theme::Theme;
 
 /// Where a value comes from. The engine's `secret.rs` resolves exactly these,
@@ -119,6 +120,10 @@ struct Field {
 pub struct ConnectionForm {
     workspace: WeakEntity<Workspace>,
     theme: Theme,
+    /// The same type scale as the workspace, handed over when the window opens:
+    /// a dialog in its own OS window is still the same application, and a form
+    /// at a different size from the panel behind it reads as a different one.
+    scale: Metrics,
     tab: FormTab,
     editing: Option<String>,
     driver: String,
@@ -151,6 +156,7 @@ impl ConnectionForm {
     pub fn new(
         workspace: WeakEntity<Workspace>,
         theme: Theme,
+        scale: Metrics,
         drivers: Vec<DriverMeta>,
         existing: Option<(String, String, Value)>,
         cx: &mut Context<Self>,
@@ -263,6 +269,7 @@ impl ConnectionForm {
             tests: HashMap::new(),
             error: None,
             theme,
+            scale,
         };
         let stored_params = spec.get("params").cloned().unwrap_or(json!({}));
         form.rebuild_params(&stored_params, cx);
@@ -399,7 +406,7 @@ fn colors_of(t: &Theme) -> InputColors {
 
 impl ConnectionForm {
     fn small(&self, text: impl Into<SharedString>, c: gpui::Rgba) -> impl IntoElement {
-        div().text_size(px(11.0)).text_color(c).child(text.into())
+        div().text_size(self.scale.small()).text_color(c).child(text.into())
     }
 
     /// A labelled row: label, source chooser where one applies, field.
@@ -411,6 +418,7 @@ impl ConnectionForm {
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let t = &self.theme;
+        let ms = self.scale;
         let mut row = div()
             .flex()
             .items_center()
@@ -428,7 +436,7 @@ impl ConnectionForm {
                         .id(SharedString::from(format!("src-{k}-{}", s.label())))
                         .px_1()
                         .cursor_pointer()
-                        .text_size(px(10.0))
+                        .text_size(ms.tiny())
                         .text_color(if on { t.inverted() } else { t.muted() })
                         .when(on, |d| d.bg(t.accent()))
                         .child(SharedString::from(s.label()))
@@ -455,12 +463,13 @@ impl ConnectionForm {
 
     fn stage_row(&self, stage: &'static str, cx: &mut Context<Self>) -> impl IntoElement {
         let t = &self.theme;
+        let ms = self.scale;
         let mut row = div().flex().items_center().gap_2().py_1().child(
             div()
                 .id(SharedString::from(format!("test-{stage}")))
                 .px_2()
                 .cursor_pointer()
-                .text_size(px(11.0))
+                .text_size(ms.small())
                 .border_1()
                 .border_color(t.border())
                 .text_color(t.fg())
@@ -484,6 +493,7 @@ impl ConnectionForm {
 impl Render for ConnectionForm {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let t = self.theme.clone();
+        let ms = self.scale;
         let display = self
             .meta()
             .map(|m| m.display.clone())
@@ -535,7 +545,7 @@ impl Render for ConnectionForm {
                     .id(SharedString::from(ft.label()))
                     .px_1()
                     .cursor_pointer()
-                    .text_size(px(12.0))
+                    .text_size(ms.body())
                     .text_color(if on { t.fg() } else { t.muted() })
                     .when(on, |d| d.border_b_1().border_color(t.accent()))
                     .child(SharedString::from(ft.label()))
@@ -582,7 +592,7 @@ impl Render for ConnectionForm {
                             .id(SharedString::from(format!("drv-{kind}")))
                             .px_1()
                             .cursor_pointer()
-                            .text_size(px(10.0))
+                            .text_size(ms.tiny())
                             .text_color(if on { t.inverted() } else { t.muted() })
                             .when(on, |d| d.bg(t.accent()))
                             .child(SharedString::from(disp))
@@ -617,7 +627,7 @@ impl Render for ConnectionForm {
                             .id(SharedString::from(format!("auth-{a}")))
                             .px_1()
                             .cursor_pointer()
-                            .text_size(px(10.0))
+                            .text_size(ms.tiny())
                             .text_color(if on { t.inverted() } else { t.muted() })
                             .when(on, |d| d.bg(t.accent()))
                             .child(SharedString::from(a.clone()))
@@ -664,7 +674,7 @@ impl Render for ConnectionForm {
                             .id(SharedString::from(format!("tls-{m}")))
                             .px_1()
                             .cursor_pointer()
-                            .text_size(px(10.0))
+                            .text_size(ms.tiny())
                             .text_color(if on { t.inverted() } else { t.muted() })
                             .when(on, |d| d.bg(t.accent()))
                             .child(SharedString::from(m))
@@ -693,7 +703,7 @@ impl Render for ConnectionForm {
                         .cursor_pointer()
                         .child(
                             div()
-                                .text_size(px(11.0))
+                                .text_size(ms.small())
                                 .text_color(if self.tunnel_on { t.accent() } else { t.muted() })
                                 .child(SharedString::from(if self.tunnel_on {
                                     "[x] SSH tunnel"
@@ -732,7 +742,7 @@ impl Render for ConnectionForm {
                                 .id(SharedString::from(format!("tauth-{a}")))
                                 .px_1()
                                 .cursor_pointer()
-                                .text_size(px(10.0))
+                                .text_size(ms.tiny())
                                 .text_color(if on { t.inverted() } else { t.muted() })
                                 .when(on, |d| d.bg(t.accent()))
                                 .child(SharedString::from(a))
@@ -759,7 +769,7 @@ impl Render for ConnectionForm {
                 body = body.child(
                     div()
                         .pt_1()
-                        .text_size(px(10.0))
+                        .text_size(ms.tiny())
                         .text_color(t.header_fg())
                         .child("WHAT THIS CONNECTION MAY DO"),
                 );
@@ -799,7 +809,7 @@ impl Render for ConnectionForm {
                             .hover(|d| d.bg(t.hover()))
                             .child(
                                 div()
-                                    .text_size(px(12.0))
+                                    .text_size(ms.body())
                                     .text_color(if on { t.accent() } else { t.fg() })
                                     .child(label),
                             )
@@ -834,7 +844,7 @@ impl Render for ConnectionForm {
                     .id("test-all")
                     .px_2()
                     .cursor_pointer()
-                    .text_size(px(11.0))
+                    .text_size(ms.small())
                     .border_1()
                     .border_color(t.border())
                     .text_color(t.fg())
@@ -854,7 +864,7 @@ impl Render for ConnectionForm {
                             .id("form-cancel")
                             .px_2()
                             .cursor_pointer()
-                            .text_size(px(11.0))
+                            .text_size(ms.small())
                             .text_color(t.muted())
                             .child("Cancel")
                             .on_click(cx.listener(|this, _, _, cx| {
@@ -866,7 +876,7 @@ impl Render for ConnectionForm {
                             .id("form-save")
                             .px_2()
                             .cursor_pointer()
-                            .text_size(px(11.0))
+                            .text_size(ms.small())
                             .bg(t.accent())
                             .text_color(t.inverted())
                             .child("Save")
@@ -884,7 +894,7 @@ impl Render for ConnectionForm {
             .bg(t.base())
             .text_color(t.fg())
             .font_family("CodeNerdFont")
-            .text_size(px(12.0))
+            .text_size(ms.body())
             .child(head)
             .child(tabs)
             .child(body)

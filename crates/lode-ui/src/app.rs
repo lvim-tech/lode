@@ -21,7 +21,7 @@ use gpui::{
     Window, WindowBounds, WindowHandle, WindowOptions,
 };
 use lode_proto::{
-    cell_text, DriverMeta, Engine, Hello, HistoryRow, Index, Message, Node, QueryState,
+    cell_text, AuditRow, DriverMeta, Engine, Hello, HistoryRow, Index, Message, Node, QueryState,
     SavedChart, SavedConnection, SavedQuery, TableColumn,
 };
 use serde_json::{json, Value};
@@ -29,6 +29,7 @@ use serde_json::{json, Value};
 use crate::export::{self, Format};
 use crate::form::ConnectionForm;
 use crate::input::{InputColors, InputEvent, TextInput};
+use crate::metrics::Metrics;
 use crate::session::{self, Session, SessionTab};
 use crate::theme::{self, Theme};
 use crate::workspace::{
@@ -164,8 +165,9 @@ const PAGE: usize = 200;
 /// side padding fits a third again as many rows on a screen and still leaves a
 /// line of space between them; 150px is a column that shows a short value whole
 /// without wasting half a screen on an id.
-const ROW_H: f32 = 20.0;
-const COL_W: f32 = 150.0;
+// Was `const ROW_H: f32 = 20.0; const COL_W: f32 = 150.0;`. Both now come from
+// the type scale: a row that does not grow with the text in it pinches, and the
+// pinch is invisible in a screenshot taken at the old size. See `metrics.rs`.
 const NUM_W: f32 = 44.0;
 const BLOCKING: Duration = Duration::from_secs(15);
 
@@ -180,6 +182,10 @@ pub enum Rail {
     /// Every statement this engine has run, from either client — the history is
     /// the ENGINE's, so the editor's runs are in here too.
     History,
+    /// What CHANGED, and what was stopped from changing. Different panel from
+    /// History on purpose: history is every statement, most of them reads, and
+    /// a refusal buried in a thousand SELECTs is a refusal nobody finds.
+    Audit,
     Tasks,
     Settings,
 }
@@ -191,6 +197,7 @@ impl Rail {
             Rail::Connections => "\u{f1c0}",
             Rail::Instance => "\u{f080}",
             Rail::History => "\u{f1da}",
+            Rail::Audit => "\u{f132}",
             Rail::Tasks => "\u{f0ae}",
             Rail::Settings => "\u{f013}",
         }
@@ -200,6 +207,7 @@ impl Rail {
             Rail::Connections => "Connections",
             Rail::Instance => "Instance",
             Rail::History => "History",
+            Rail::Audit => "Audit",
             Rail::Tasks => "Tasks",
             Rail::Settings => "Settings",
         }
@@ -223,6 +231,7 @@ enum Pending {
     /// A connection saved from that window.
     FormSave,
     History,
+    Audit,
     Metrics { conn: String },
     SavedQueries { conn: String },
     SavedCharts { conn: String },
@@ -285,6 +294,19 @@ pub struct Workspace {
     history: Vec<HistoryRow>,
     /// The history panel's own search box.
     history_filter: Entity<TextInput>,
+    /// The engine's audit log, and how much of a statement it is keeping.
+    ///
+    /// `audit_mode` is shown to the reader: a blank statement column with no
+    /// explanation reads as a broken client, and it is a setting on the engine.
+    audit: Vec<AuditRow>,
+    audit_mode: String,
+    audit_filter: Entity<TextInput>,
+    /// The type scale. One number; every size in the window comes off it.
+    scale: Metrics,
+    /// Which row's full reason is open. One at a time: a refusal's reason is a
+    /// sentence, and a list where every row is three lines tall is a list
+    /// nobody scans.
+    audit_open: Option<i64>,
 
     /// What the server last said about itself, and which connection said it.
     metrics: Vec<lode_proto::Metric>,
@@ -337,8 +359,11 @@ impl Workspace {
             cx.notify();
         })
         .detach();
+        // Read ONCE: the window's fields and the type scale both come out of it.
+        let restore = session::load();
         let export_path = cx.new(|cx| TextInput::new(cx, "result.csv", colors));
         let history_filter = cx.new(|cx| TextInput::new(cx, "Search history…", colors));
+        let audit_filter = cx.new(|cx| TextInput::new(cx, "Search the audit log…", colors));
         let palette_input = cx.new(|cx| TextInput::new(cx, "Type to find a command…", colors));
         let console = cx.new(|cx| {
             TextInput::new(cx, "Type a command and press Enter — it runs against the open connection", colors)
@@ -375,13 +400,18 @@ impl Workspace {
             rail: Rail::Connections,
             status: "starting the engine…".into(),
             log: Vec::new(),
-            restore: session::load(),
+            restore: restore.clone(),
             filter,
             inputs: HashMap::new(),
             console,
             console_open: true,
             history: Vec::new(),
             history_filter,
+            audit: Vec::new(),
+            audit_mode: "full".into(),
+            audit_filter,
+            audit_open: None,
+            scale: Metrics::new(restore.font_size.unwrap_or(crate::metrics::DEFAULT_BASE)),
             metrics: Vec::new(),
             metrics_conn: None,
             metrics_error: None,
@@ -404,6 +434,7 @@ impl Workspace {
 
         w.rail = match w.restore.rail.as_str() {
             "history" => Rail::History,
+            "audit" => Rail::Audit,
             "instance" => Rail::Instance,
             "tasks" => Rail::Tasks,
             "settings" => Rail::Settings,
@@ -412,6 +443,7 @@ impl Workspace {
         // The history panel is empty until it is asked for, and if that is the
         // panel being restored it should not open blank.
         let want_history = w.rail == Rail::History;
+        let want_audit = w.rail == Rail::Audit;
 
         match Engine::spawn(None) {
             Ok(engine) => match engine.hello(BLOCKING) {
@@ -429,6 +461,9 @@ impl Workspace {
                     w.ask(Pending::Connections, "store.connections.list", json!({}));
                     if want_history {
                         w.ask(Pending::History, "store.history.list", json!({ "limit": 200 }));
+                    }
+                    if want_audit {
+                        w.ask(Pending::Audit, "store.audit.list", json!({ "limit": 300 }));
                     }
                 }
                 Err(e) => w.fatal = Some(e.to_string()),
@@ -689,6 +724,17 @@ impl Workspace {
                 self.history =
                     serde_json::from_value(v.get("history").cloned().unwrap_or(json!([]))).unwrap_or_default();
             }
+            Pending::Audit => {
+                self.audit =
+                    serde_json::from_value(v.get("audit").cloned().unwrap_or(json!([]))).unwrap_or_default();
+                // An engine from before the audit log answers without a mode,
+                // and the honest reading of that is that nothing is withheld.
+                self.audit_mode = v
+                    .get("mode")
+                    .and_then(|m| m.as_str())
+                    .unwrap_or("full")
+                    .to_string();
+            }
             Pending::SavedCharts { conn } => {
                 let cs: Vec<SavedChart> =
                     serde_json::from_value(v.get("charts").cloned().unwrap_or(json!([])))
@@ -838,6 +884,11 @@ impl Workspace {
             _ => serde_json::Map::new(),
         };
         spec.insert("driver".into(), json!(c.driver.clone()));
+        // The SAVED name goes with the spec so the engine's audit log can say
+        // which connection a statement ran on. The engine does not use it to
+        // connect; without it the log names the driver and leaves the name
+        // empty, which reads as a gap rather than as a wrong answer.
+        spec.insert("name".into(), json!(c.name.clone()));
         self.status = format!("connecting to {name}…");
         self.ask(
             Pending::Connect { name: c.name.clone(), driver: c.driver.clone() },
@@ -1173,10 +1224,12 @@ impl Workspace {
                 .collect(),
             active: self.active,
             theme: Some(self.theme_name.clone()),
+            font_size: Some(self.scale.base()),
             rail: match self.rail {
                 Rail::Connections => "connections",
                 Rail::Instance => "instance",
                 Rail::History => "history",
+                Rail::Audit => "audit",
                 Rail::Tasks => "tasks",
                 Rail::Settings => "settings",
             }
@@ -1313,7 +1366,7 @@ impl Workspace {
                 }),
                 ..Default::default()
             },
-            |_window, cx| cx.new(|cx| ConnectionForm::new(me, theme, drivers, existing, cx)),
+            |_window, cx| cx.new(|cx| ConnectionForm::new(me, theme, self.scale, drivers, existing, cx)),
         );
         match opened {
             Ok(h) => self.form_window = Some(h),
@@ -1547,7 +1600,7 @@ impl Workspace {
                 act: PaletteAct::View(v),
             });
         }
-        for r in [Rail::Connections, Rail::Instance, Rail::History, Rail::Tasks, Rail::Settings] {
+        for r in [Rail::Connections, Rail::Instance, Rail::History, Rail::Audit, Rail::Tasks, Rail::Settings] {
             out.push(PaletteItem {
                 label: format!("Show {}", r.label()),
                 hint: "panel".into(),
@@ -1609,6 +1662,9 @@ impl Workspace {
                 self.rail = r;
                 if r == Rail::History && self.history.is_empty() {
                     self.ask(Pending::History, "store.history.list", json!({ "limit": 200 }));
+                }
+                if r == Rail::Audit && self.audit.is_empty() {
+                    self.ask(Pending::Audit, "store.audit.list", json!({ "limit": 300 }));
                 }
                 self.remember();
             }
@@ -2009,31 +2065,96 @@ impl Workspace {
 
     /// A label in the muted ink, which is most of the chrome.
     fn small(&self, text: impl Into<SharedString>, colour: Rgba) -> impl IntoElement {
-        div().text_size(px(11.0)).text_color(colour).child(text.into())
+        div().text_size(self.scale.small()).text_color(colour).child(text.into())
+    }
+
+    /// The scrolling part of a panel: everything above it (a heading, a search
+    /// box, a reload link) stays put, and the rows move under it.
+    ///
+    /// `min_h_0` is the half that is easy to leave out: without it a flex child
+    /// refuses to shrink below its content, so a long list pushes the heading
+    /// and the search box off the top instead of scrolling beneath them.
+    fn panel_list(&self, id: &'static str) -> gpui::Stateful<gpui::Div> {
+        div()
+            .id(id)
+            .flex()
+            .flex_col()
+            .flex_1()
+            .min_h_0()
+            .w_full()
+            // Vertical scrolling only. `overflow_y_scroll` alone leaves the X
+            // axis visible, and a child is then free to size itself to its
+            // content — which is exactly how a long statement ends up wider
+            // than the panel and gets clipped with no ellipsis instead of
+            // being laid out to fit and truncated.
+            .overflow_x_hidden()
+            .overflow_y_scroll()
+    }
+
+    /// One line of free text that must not escape its panel: it ends in an
+    /// ellipsis at the panel's edge rather than running over the result area.
+    ///
+    /// NO `min_w_0` here, and that is the whole lesson of this helper. `min_w_0`
+    /// says "you may shrink to nothing", which is right for a flex ITEM sitting
+    /// beside a fixed-width sibling and wrong for the text itself: the first
+    /// version put it here, every metadata line computed to zero width, and the
+    /// panel rendered a column of bare ellipses. The permission to shrink goes
+    /// on the wrapper; the text takes the width it is given and cuts itself to
+    /// fit.
+    /// `w` is a real width in pixels, not `w_full`, and the comment on
+    /// `Metrics::line_w` says why: GPUI draws the ellipsis only when the text
+    /// was measured against a definite width, and a percentage inside a flex
+    /// chain is not one. With `w_full` the text was clipped at the panel's edge
+    /// mid-glyph and the `…` never appeared.
+    /// A [`line`] for a slot in a flex ROW.
+    ///
+    /// The extra wrapper is not decoration. A flex item is measured by the flex
+    /// algorithm before its own width is settled, and the text inside it is
+    /// sized against that measurement — so a `line` placed straight into a row
+    /// gets clipped at the slot's edge with no ellipsis, while the same `line`
+    /// as a block child of a block truncates correctly. The wrapper is the
+    /// block.
+    fn line_in(&self, text: impl Into<SharedString>, size: gpui::Pixels, colour: Rgba, w: f32) -> impl IntoElement {
+        div()
+            .flex_none()
+            .w(px(w))
+            .overflow_hidden()
+            .child(self.line(text, size, colour, w))
+    }
+
+    fn line(&self, text: impl Into<SharedString>, size: gpui::Pixels, colour: Rgba, w: f32) -> impl IntoElement {
+        div()
+            .w(px(w))
+            .flex_none()
+            .truncate()
+            .text_size(size)
+            .text_color(colour)
+            .child(text.into())
     }
 
     fn section(&self, text: &str) -> impl IntoElement {
         div()
             .px_2()
             .py_1()
-            .text_size(px(10.0))
+            .text_size(self.scale.tiny())
             .text_color(self.t().title())
             .child(SharedString::from(text.to_uppercase()))
     }
 
     fn rail_el(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let t = self.t();
+        let ms = self.scale;
         let mut col = div()
             .flex()
             .flex_col()
-            .w(px(44.0))
+            .w(px(ms.base() * 3.1))
             .h_full()
             .bg(t.status())
             .border_r_1()
             .border_color(t.border())
             .py_2()
             .gap_1();
-        for mode in [Rail::Connections, Rail::Instance, Rail::History, Rail::Tasks, Rail::Settings] {
+        for mode in [Rail::Connections, Rail::Instance, Rail::History, Rail::Audit, Rail::Tasks, Rail::Settings] {
             let on = self.rail == mode;
             col = col.child(
                 div()
@@ -2042,12 +2163,12 @@ impl Workspace {
                     .items_center()
                     .justify_center()
                     .w_full()
-                    .h(px(40.0))
+                    .h(px(ms.rail_h()))
                     // Bigger, and the chosen one says so twice: a filled
                     // background AND a bar down its leading edge. One of the two
                     // alone was invisible on a palette whose surfaces sit 1.06
                     // apart — which is most of them.
-                    .text_size(px(17.0))
+                    .text_size(ms.icon())
                     .text_color(if on { t.accent() } else { t.muted() })
                     .when(on, |d| d.bg(t.selected()).border_l_2().border_color(t.accent()))
                     .when(!on, |d| d.border_l_2().border_color(t.status()))
@@ -2058,6 +2179,9 @@ impl Workspace {
                         this.rail = mode;
                         if mode == Rail::History && this.history.is_empty() {
                             this.ask(Pending::History, "store.history.list", json!({ "limit": 200 }));
+                        }
+                        if mode == Rail::Audit && this.audit.is_empty() {
+                            this.ask(Pending::Audit, "store.audit.list", json!({ "limit": 300 }));
                         }
                         // Opening the panel is the request. Closing it is why
                         // nothing asks again.
@@ -2074,11 +2198,19 @@ impl Workspace {
 
     fn panel_el(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let t = self.t();
+        let ms = self.scale;
         let mut panel = div()
             .flex()
             .flex_col()
-            .w(px(280.0))
+            .w(px(ms.panel_w()))
+            .flex_none()
             .h_full()
+            // Nothing in a panel may paint outside its column. Set HERE rather
+            // than on each row, so it holds for the panels not written yet: a
+            // long path or a long statement leaking over the result area is a
+            // bug per panel if the rule lives in the rows, and impossible if it
+            // lives in the container.
+            .overflow_hidden()
             .bg(t.panel())
             .border_r_1()
             .border_color(t.border());
@@ -2088,10 +2220,77 @@ impl Workspace {
                 panel = panel.child(self.section("Theme")).child(
                     div()
                         .px_2()
-                        .text_size(px(12.0))
+                        .text_size(ms.body())
                         .text_color(t.fg())
                         .child(SharedString::from(self.theme_name.clone())),
                 );
+                panel = panel.child(self.section("Text size"));
+                // One number, and it moves everything: the steps, the grid row
+                // height, the rail. Here rather than only in an environment
+                // variable because "a bit bigger" is a thing somebody adjusts
+                // while looking at the result, not between restarts.
+                let step = |label: &'static str, delta: f32| {
+                    div()
+                        .id(label)
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .w(px(ms.base() * 1.8))
+                        .h(px(ms.base() * 1.8))
+                        .cursor_pointer()
+                        .bg(t.raised())
+                        .hover(|d| d.bg(t.hover()))
+                        .text_size(ms.body())
+                        .text_color(t.accent())
+                        .child(label)
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.scale = this.scale.with_base(this.scale.base() + delta);
+                            this.remember();
+                            cx.notify();
+                        }))
+                };
+                panel = panel.child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .px_2()
+                        .py_1()
+                        .child(step("\u{2212}", -1.0))
+                        .child(
+                            div()
+                                .min_w(px(ms.base() * 2.5))
+                                .text_size(ms.body())
+                                .text_color(t.fg())
+                                .child(SharedString::from(format!("{} px", ms.base()))),
+                        )
+                        .child(step("+", 1.0))
+                        .child(
+                            div()
+                                .id("size-reset")
+                                .px_2()
+                                .cursor_pointer()
+                                .hover(|d| d.bg(t.hover()))
+                                .text_size(ms.small())
+                                .text_color(t.muted())
+                                .child("reset")
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.scale = Metrics::new(crate::metrics::DEFAULT_BASE);
+                                    this.remember();
+                                    cx.notify();
+                                })),
+                        ),
+                );
+                panel = panel.child(div().px_2().child(self.small(
+                    format!(
+                        "every size comes off this one — headings {}, body {}, small {}, a grid row {}",
+                        f32::from(ms.heading()),
+                        f32::from(ms.body()),
+                        f32::from(ms.small()),
+                        ms.row_h()
+                    ),
+                    t.muted(),
+                )));
                 return panel;
             }
             Rail::Instance => {
@@ -2115,7 +2314,7 @@ impl Workspace {
                             .id(SharedString::from(format!("rate-{label}")))
                             .px_1()
                             .cursor_pointer()
-                            .text_size(px(10.0))
+                            .text_size(ms.tiny())
                             .text_color(if on { t.inverted() } else { t.muted() })
                             .when(on, |d| d.bg(t.accent()))
                             .child(label)
@@ -2130,7 +2329,7 @@ impl Workspace {
                         .id("metrics-now")
                         .px_1()
                         .cursor_pointer()
-                        .text_size(px(10.0))
+                        .text_size(ms.tiny())
                         .text_color(t.accent())
                         .child("\u{f021} now")
                         .on_click(cx.listener(|this, _, _, cx| {
@@ -2151,28 +2350,30 @@ impl Workspace {
                 }
 
                 let mut group = String::new();
-                for m in &self.metrics {
-                    if m.group != group {
-                        group = m.group.clone();
-                        panel = panel.child(self.section(&group));
+                let mut list = self.panel_list("instance-list");
+                for row in &self.metrics {
+                    if row.group != group {
+                        group = row.group.clone();
+                        list = list.child(self.section(&group));
                     }
-                    panel = panel.child(
+                    list = list.child(
                         div()
                             .flex()
                             .items_center()
+                            .w_full()
+                            .min_w_0()
+                            .gap_2()
                             .justify_between()
                             .px_2()
                             .py(px(1.0))
-                            .child(self.small(m.name.clone(), t.muted()))
-                            .child(
-                                div()
-                                    .text_size(px(11.0))
-                                    .text_color(t.fg())
-                                    .child(SharedString::from(m.value.clone())),
-                            ),
+                            // The NAME gives way first: a server that answers
+                            // with a long path or a long version string is
+                            // answering with the part worth reading.
+                            .child(self.line_in(row.name.clone(), ms.small(), t.muted(), ms.line_w() - ms.base() * 9.0 - 8.0))
+                            .child(self.line_in(row.value.clone(), ms.small(), t.fg(), ms.base() * 9.0)),
                     );
                 }
-                return panel;
+                return panel.child(list);
             }
             Rail::History => {
                 panel = panel.child(
@@ -2182,7 +2383,7 @@ impl Workspace {
                         .py_1()
                         .cursor_pointer()
                         .hover(|d| d.bg(t.hover()))
-                        .text_size(px(11.0))
+                        .text_size(ms.small())
                         .text_color(t.accent())
                         .child("\u{f021}  Reload history")
                         .on_click(cx.listener(|this, _, _, cx| {
@@ -2218,34 +2419,37 @@ impl Workspace {
                         t.muted(),
                     )));
                 }
-                for h in shown.into_iter().take(100) {
+                let mut list = self.panel_list("history-list");
+                for h in shown.into_iter().take(300) {
                     let failed = h.state.as_deref() == Some("failed");
                     let conn = h.conn.clone().unwrap_or_default();
                     let stmt = h.statement.clone();
-                    let one: String = stmt.replace('\n', " ").chars().take(70).collect();
-                    panel = panel.child(
+                    // One line, with the newlines flattened. The ellipsis comes
+                    // from the layout, not from a character count: 70 characters
+                    // of a wide font is wider than the panel.
+                    let one: String = stmt.replace('\n', " ");
+                    list = list.child(
                         div()
                             .id(SharedString::from(format!("hist-{}", h.id)))
                             .flex()
                             .flex_col()
+                            .w_full()
+                            .overflow_hidden()
                             .px_2()
                             .py(px(2.0))
                             .cursor_pointer()
                             .hover(|d| d.bg(t.hover()))
-                            .child(
-                                div()
-                                    .text_size(px(11.0))
-                                    .text_color(if failed { t.error() } else { t.fg() })
-                                    .child(SharedString::from(one)),
-                            )
-                            .child(self.small(
+                            .child(self.line(one, ms.small(), if failed { t.error() } else { t.fg() }, ms.line_w()))
+                            .child(self.line(
                                 format!(
                                     "{} · {} ms{}",
                                     if conn.is_empty() { "—".into() } else { conn.clone() },
                                     h.ms.unwrap_or(0),
                                     h.rows.map(|r| format!(" · {r} row(s)")).unwrap_or_default()
                                 ),
+                                ms.small(),
                                 t.muted(),
+                                ms.line_w(),
                             ))
                             .on_click(cx.listener({
                                 let (c, s) = (conn.clone(), stmt.clone());
@@ -2257,25 +2461,207 @@ impl Workspace {
                             })),
                     );
                 }
-                return panel;
+                return panel.child(list);
+            }
+            Rail::Audit => {
+                panel = panel.child(
+                    div()
+                        .id("audit-reload")
+                        .px_2()
+                        .py_1()
+                        .cursor_pointer()
+                        .hover(|d| d.bg(t.hover()))
+                        .text_size(ms.small())
+                        .text_color(t.accent())
+                        .child("\u{f021}  Reload audit")
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.ask(Pending::Audit, "store.audit.list", json!({ "limit": 300 }));
+                            cx.notify();
+                        })),
+                );
+                panel = panel.child(div().px_2().py_1().child(self.audit_filter.clone()));
+                let needle = self.audit_filter.read(cx).text().to_string();
+                let shown: Vec<&AuditRow> = self
+                    .audit
+                    .iter()
+                    .filter(|a| {
+                        needle.is_empty()
+                            || fuzzy_score(&a.statement, &needle).is_some()
+                            || fuzzy_score(&a.outcome, &needle).is_some()
+                            || fuzzy_score(&a.path, &needle).is_some()
+                            || a.conn.as_deref().map_or(false, |c| fuzzy_score(c, &needle).is_some())
+                            || a.reason.as_deref().map_or(false, |r| fuzzy_score(r, &needle).is_some())
+                    })
+                    .collect();
+                let stopped = shown.iter().filter(|a| a.stopped()).count();
+                panel = panel.child(self.section(&if needle.is_empty() {
+                    format!("Audit ({}, {} stopped)", self.audit.len(), stopped)
+                } else {
+                    format!("Audit ({} of {})", shown.len(), self.audit.len())
+                }));
+                // Why a statement might be blank. The engine decides this, and a
+                // reader who is not told reads the blank as a broken client.
+                if self.audit_mode != "full" {
+                    panel = panel.child(div().px_2().child(self.small(
+                        if self.audit_mode == "shape" {
+                            "this engine keeps only the SHAPE of a statement (LODE_AUDIT_STATEMENTS=shape)"
+                        } else {
+                            "this engine keeps no statement text (LODE_AUDIT_STATEMENTS=off)"
+                        },
+                        t.warning(),
+                    )));
+                }
+                if shown.is_empty() {
+                    panel = panel.child(div().px_2().child(self.small(
+                        if self.audit.is_empty() {
+                            "nothing has changed anything yet — reads are not in here"
+                        } else {
+                            "nothing matches"
+                        },
+                        t.muted(),
+                    )));
+                }
+                let mut list = self.panel_list("audit-list");
+                for a in shown.into_iter().take(400) {
+                    // Three outcomes, three colours, and `applied` is the quiet
+                    // one: the rows worth finding are the ones that were stopped.
+                    let colour = match a.outcome.as_str() {
+                        "refused" => t.warning(),
+                        "failed" => t.error(),
+                        "cancelled" => t.muted(),
+                        "connected" | "disconnected" => t.muted(),
+                        _ => t.fg(),
+                    };
+                    // No character count: the ellipsis is the layout's job, and
+                    // 68 characters of a proportional font is a different width
+                    // in every theme and at every text size.
+                    let one: String = if a.statement.is_empty() {
+                        format!("({} — not kept)", a.path)
+                    } else {
+                        a.statement.replace('\n', " ")
+                    };
+                    let open = self.audit_open == Some(a.id);
+                    let id = a.id;
+                    let mut row = div()
+                        .id(SharedString::from(format!("aud-{}", a.id)))
+                        .flex()
+                        .flex_col()
+                        .w_full()
+                        .overflow_hidden()
+                        .px_2()
+                        .py(px(2.0))
+                        .cursor_pointer()
+                        .hover(|d| d.bg(t.hover()))
+                        .child(
+                            div()
+                                .flex()
+                                // A real width, for the same reason `line` takes one: a
+                                // child of a flex row is measured against the row, and a row
+                                // that is 100%-of-something is not a width at measure time.
+                                .w(px(ms.line_w()))
+                                .gap_2()
+                                .child(
+                                    // A fixed width, so every statement starts
+                                    // at the same column: a list scanned for
+                                    // the rows that were STOPPED is scanned
+                                    // down one edge.
+                                    // "disconnected" is the longest word that
+                                    // goes here, so the column is sized from the
+                                    // scale rather than from a pixel count that
+                                    // was right at one font size and wrapped at
+                                    // the next.
+                                    div()
+                                        .w(px(ms.outcome_w()))
+                                        .flex_none()
+                                        .whitespace_nowrap()
+                                        .text_size(ms.tiny())
+                                        .text_color(colour)
+                                        .child(SharedString::from(a.outcome.clone())),
+                                )
+                                // flex_1 + min_w_0: without the second one a
+                                // flex child will not shrink below its text, so
+                                // a long statement widens the row instead of
+                                // being cut at the panel's edge.
+                                .child(self.line_in(
+                                    one,
+                                    ms.small(),
+                                    t.fg(),
+                                    ms.line_w() - ms.outcome_w() - 8.0,
+                                )),
+                        )
+                        .child(self.line(
+                            format!(
+                                "{} · {}{}{}{}",
+                                a.conn.clone().unwrap_or_else(|| "—".into()),
+                                a.path,
+                                a.policy.as_deref().map(|p| format!(" · {p}")).unwrap_or_default(),
+                                a.affected.map(|n| format!(" · {n} row(s)")).unwrap_or_default(),
+                                if a.confirmed { " · confirmed" } else { "" },
+                            ),
+                            ms.small(),
+                            t.muted(),
+                            ms.line_w(),
+                        ));
+                    // The reason, in full, for the row being looked at. Never
+                    // truncated: a refusal shortened to fit is a refusal that
+                    // stops explaining itself, which is the one thing it is for.
+                    if open {
+                        // The opened row is the one place text WRAPS instead of
+                        // being cut: a refusal shortened to fit is a refusal
+                        // that stops explaining itself, which is the one thing
+                        // it is for. It still cannot leave the panel, because
+                        // wrapping is not overflowing.
+                        if let Some(reason) = a.reason.clone() {
+                            row = row.child(
+                                div()
+                                    .w_full()
+                                    .px_1()
+                                    .py_1()
+                                    .text_size(ms.small())
+                                    .text_color(colour)
+                                    .child(SharedString::from(reason)),
+                            );
+                        }
+                        if !a.statement.is_empty() && a.statement.chars().count() > 68 {
+                            row = row.child(
+                                div()
+                                    .w_full()
+                                    .px_1()
+                                    .text_size(ms.small())
+                                    .text_color(t.fg())
+                                    .child(SharedString::from(a.statement.clone())),
+                            );
+                        }
+                        if let Some(fp) = a.fingerprint.clone() {
+                            row = row.child(self.line(format!("shape {fp}"), ms.small(), t.muted(), ms.line_w()));
+                        }
+                    }
+                    list = list.child(row.on_click(cx.listener(move |this, _, _, cx| {
+                        this.audit_open = if this.audit_open == Some(id) { None } else { Some(id) };
+                        cx.notify();
+                    })));
+                }
+                return panel.child(list);
             }
             Rail::Tasks => {
                 panel = panel.child(self.section(&format!("Tasks ({})", self.tasks.len())));
-                for task in self.tasks.iter().rev().take(40) {
-                    panel = panel.child(
+                let mut list = self.panel_list("tasks-list");
+                for task in self.tasks.iter().rev().take(200) {
+                    list = list.child(
                         div()
+                            .w_full()
+                            .overflow_hidden()
                             .px_2()
                             .py_1()
-                            .text_size(px(11.0))
-                            .text_color(if task.failed() { t.error() } else { t.muted() })
-                            .child(SharedString::from(format!(
-                                "{} · {}",
-                                task.label,
-                                fmt_duration(task.duration())
-                            ))),
+                            .child(self.line(
+                                format!("{} · {}", task.label, fmt_duration(task.duration())),
+                                ms.small(),
+                                if task.failed() { t.error() } else { t.muted() },
+                                ms.line_w(),
+                            )),
                     );
                 }
-                return panel;
+                return panel.child(list);
             }
             Rail::Connections => {}
         }
@@ -2288,7 +2674,7 @@ impl Workspace {
                 .py_1()
                 .cursor_pointer()
                 .hover(|d| d.bg(t.hover()))
-                .text_size(px(11.0))
+                .text_size(ms.small())
                 .text_color(t.accent())
                 .child("\u{f067}  New connection")
                 .on_click(cx.listener(|this, _, _, cx| {
@@ -2298,7 +2684,11 @@ impl Workspace {
         );
         let filter = self.filter.read(cx).text().to_string();
         let connected = self.conns.len();
-        panel = panel.child(self.section(&format!(
+        // The saved connections AND every open connection's schema below them:
+        // one list, because a deep tree is exactly what pushes a heading off the
+        // top of a panel that is not scrolling.
+        let mut list = self.panel_list("connections-list");
+        list = list.child(self.section(&format!(
             "Connections ({connected} connected · {} idle)",
             self.saved.len().saturating_sub(connected)
         )));
@@ -2311,7 +2701,7 @@ impl Workspace {
             let is_live = self.conns.iter().any(|l| l.name == c.name);
             let name = c.name.clone();
             let name2 = c.name.clone();
-            panel = panel.child(
+            list = list.child(
                 div()
                     .id(SharedString::from(format!("conn-{}", c.name)))
                     .flex()
@@ -2324,21 +2714,26 @@ impl Workspace {
                     .when(is_live, |d| d.bg(t.selected()))
                     .child(
                         div()
-                            .text_size(px(9.0))
+                            .text_size(ms.tiny())
                             .text_color(if is_live { t.success() } else { t.muted() })
                             .child(SharedString::from(if is_live { "\u{f111}" } else { "\u{f10c}" })),
                     )
                     .child(
                         div()
-                            .text_size(px(12.0))
-                            .text_color(if is_live { t.fg() } else { t.muted() })
-                            .child(SharedString::from(c.name.clone())),
+                            .flex_1()
+                            .min_w_0()
+                            .child(self.line_in(
+                            c.name.clone(),
+                            ms.body(),
+                            if is_live { t.fg() } else { t.muted() },
+                            ms.line_w() - ms.base() * 7.5,
+                        )),
                     )
-                    .child(self.small(c.driver.clone(), t.muted()))
+                    .child(div().flex_none().child(self.small(c.driver.clone(), t.muted())))
                     .child(
                         div()
                             .id(SharedString::from(format!("edit-{}", c.name)))
-                            .text_size(px(10.0))
+                            .text_size(ms.tiny())
                             .text_color(t.muted())
                             .child("\u{f044}")
                             .on_click(cx.listener({
@@ -2365,14 +2760,14 @@ impl Workspace {
         // two connections can be browsed at once — which is why a tab carries
         // its connection.
         for live in &self.conns {
-            panel = panel.child(self.section(&live.name));
+            list = list.child(self.section(&live.name));
             if live.nodes.is_empty() {
-                panel = panel.child(div().px_2().child(self.small("loading…", t.muted())));
+                list = list.child(div().px_2().child(self.small("loading…", t.muted())));
             }
             if !live.charts.is_empty() {
-                panel = panel.child(self.section("Saved charts"));
+                list = list.child(self.section("Saved charts"));
                 for c in &live.charts {
-                    panel = panel.child(
+                    list = list.child(
                         div()
                             .id(SharedString::from(format!("sc-{}-{}", live.name, c.name)))
                             .flex()
@@ -2383,13 +2778,8 @@ impl Workspace {
                             .py(px(2.0))
                             .cursor_pointer()
                             .hover(|d| d.bg(t.hover()))
-                            .child(div().text_size(px(10.0)).text_color(t.accent()).child("\u{f080}"))
-                            .child(
-                                div()
-                                    .text_size(px(11.0))
-                                    .text_color(t.fg())
-                                    .child(SharedString::from(c.name.clone())),
-                            )
+                            .child(div().flex_none().text_size(ms.tiny()).text_color(t.accent()).child("\u{f080}"))
+                            .child(self.line_in(c.name.clone(), ms.small(), t.fg(), ms.line_w() - ms.base() - 14.0))
                             .on_click(cx.listener({
                                 let (cn, n, sql, m) =
                                     (live.name.clone(), c.name.clone(), c.sql.clone(), c.measure.clone());
@@ -2402,9 +2792,9 @@ impl Workspace {
                 }
             }
             if !live.queries.is_empty() {
-                panel = panel.child(self.section("Saved queries"));
+                list = list.child(self.section("Saved queries"));
                 for q in &live.queries {
-                    panel = panel.child(
+                    list = list.child(
                         div()
                             .id(SharedString::from(format!("sq-{}-{}", live.name, q.name)))
                             .flex()
@@ -2415,13 +2805,8 @@ impl Workspace {
                             .py(px(2.0))
                             .cursor_pointer()
                             .hover(|d| d.bg(t.hover()))
-                            .child(div().text_size(px(10.0)).text_color(t.accent()).child("\u{f15c}"))
-                            .child(
-                                div()
-                                    .text_size(px(11.0))
-                                    .text_color(t.fg())
-                                    .child(SharedString::from(q.name.clone())),
-                            )
+                            .child(div().flex_none().text_size(ms.tiny()).text_color(t.accent()).child("\u{f15c}"))
+                            .child(self.line_in(q.name.clone(), ms.small(), t.fg(), ms.line_w() - ms.base() - 14.0))
                             .on_click(cx.listener({
                                 let (c, n, s) = (live.name.clone(), q.name.clone(), q.sql.clone());
                                 move |this, _, _, cx| {
@@ -2431,22 +2816,23 @@ impl Workspace {
                             })),
                     );
                 }
-                panel = panel.child(self.section("Schema"));
+                list = list.child(self.section("Schema"));
             }
             for node in live
                 .nodes
                 .iter()
                 .filter(|n| crate::workspace::node_matches(n, &filter))
             {
-                panel = panel.child(self.node_el(&live.name, node, 0, cx));
+                list = list.child(self.node_el(&live.name, node, 0, cx));
             }
         }
-        panel
+        panel.child(list)
     }
 
     /// One schema node. A branch toggles; a leaf OPENS and runs.
     fn node_el(&self, conn: &str, node: &Node, depth: usize, cx: &mut Context<Self>) -> gpui::AnyElement {
         let t = self.t();
+        let ms = self.scale;
         let key = format!("{conn}/{}/{}", node.kind, node.name);
         let is_branch = !node.children.is_empty();
         let open = self.open_nodes.contains(&key);
@@ -2479,7 +2865,7 @@ impl Workspace {
             .hover(|d| d.bg(t.hover()))
             .child(
                 div()
-                    .text_size(px(10.0))
+                    .text_size(ms.tiny())
                     .text_color(t.muted())
                     .child(SharedString::from(if is_branch {
                         if open {
@@ -2491,13 +2877,22 @@ impl Workspace {
                         " "
                     })),
             )
-            .child(div().text_size(px(11.0)).text_color(t.accent()).child(SharedString::from(glyph)))
             .child(
                 div()
-                    .text_size(px(12.0))
-                    .text_color(t.fg())
-                    .child(SharedString::from(node.name.clone())),
+                    .flex_none()
+                    .text_size(ms.small())
+                    .text_color(t.accent())
+                    .child(SharedString::from(glyph)),
             )
+            // A node is indented by its depth, so the room it has shrinks as
+            // the tree goes deeper — the width has to say so, or a deep leaf
+            // would be cut without an ellipsis again.
+            .child(self.line_in(
+                node.name.clone(),
+                ms.body(),
+                t.fg(),
+                (ms.line_w() - 8.0 - depth as f32 * 12.0 - ms.base() * 2.2).max(ms.base() * 3.0),
+            ))
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(move |this, _, _, cx| {
@@ -2525,6 +2920,7 @@ impl Workspace {
 
     fn tabs_el(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let t = self.t();
+        let ms = self.scale;
         let mut strip = div()
             .flex()
             .items_center()
@@ -2551,7 +2947,7 @@ impl Workspace {
                     .when(on, |d| d.bg(t.base()))
                     .child(
                         div()
-                            .text_size(px(10.0))
+                            .text_size(ms.tiny())
                             .text_color(t.accent())
                             // The tab carries its connection's driver, because
                             // tabs from different connections sit side by side.
@@ -2559,14 +2955,14 @@ impl Workspace {
                     )
                     .child(
                         div()
-                            .text_size(px(12.0))
+                            .text_size(ms.body())
                             .text_color(if on { t.fg() } else { t.muted() })
                             .child(SharedString::from(tab.title.clone())),
                     )
                     .child(
                         div()
                             .id(SharedString::from(format!("tabx-{}", tab.id)))
-                            .text_size(px(10.0))
+                            .text_size(ms.tiny())
                             .text_color(t.muted())
                             .child("\u{f00d}")
                             .on_click(cx.listener(move |this, _, _, cx| {
@@ -2590,6 +2986,7 @@ impl Workspace {
 
     fn result_el(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
         let t = self.t();
+        let ms = self.scale;
         let Some(tab) = self.tabs.get(self.active) else {
             return div()
                 .flex()
@@ -2619,7 +3016,7 @@ impl Workspace {
             let usable = s.implemented();
             sub_row = sub_row.child(
                 div()
-                    .text_size(px(11.0))
+                    .text_size(ms.small())
                     .text_color(if on {
                         t.fg()
                     } else if usable {
@@ -2670,7 +3067,7 @@ impl Workspace {
                     .id(SharedString::from(format!("view-{}-{}", tab_id, v.label())))
                     .px_2()
                     .cursor_pointer()
-                    .text_size(px(11.0))
+                    .text_size(ms.small())
                     .text_color(if on { t.inverted() } else { t.muted() })
                     .when(on, |d| d.bg(t.accent()))
                     .child(SharedString::from(v.label()))
@@ -2688,7 +3085,7 @@ impl Workspace {
                 .id("cancel")
                 .px_2()
                 .cursor_pointer()
-                .text_size(px(11.0))
+                .text_size(ms.small())
                 .text_color(if running { t.error() } else { t.border() })
                 .child("Cancel")
                 .on_click(cx.listener(|this, _, _, cx| {
@@ -2702,7 +3099,7 @@ impl Workspace {
                     .id("save-chart")
                     .px_2()
                     .cursor_pointer()
-                    .text_size(px(11.0))
+                    .text_size(ms.small())
                     .text_color(t.accent())
                     .child("Save chart")
                     .on_click(cx.listener(|this, _, _, cx| {
@@ -2716,7 +3113,7 @@ impl Workspace {
                 .id("save-query")
                 .px_2()
                 .cursor_pointer()
-                .text_size(px(11.0))
+                .text_size(ms.small())
                 .text_color(t.accent())
                 .child("Save query")
                 .on_click(cx.listener(|this, _, _, cx| {
@@ -2730,7 +3127,7 @@ impl Workspace {
                 .id("export-toggle")
                 .px_2()
                 .cursor_pointer()
-                .text_size(px(11.0))
+                .text_size(ms.small())
                 // A control nobody can use still has to be READABLE — greyed
                 // out to the border colour, it simply vanished, and a button
                 // that is invisible is not disabled, it is missing.
@@ -2754,7 +3151,7 @@ impl Workspace {
                     .p_2()
                     .border_1()
                     .border_color(t.error())
-                    .text_size(px(12.0))
+                    .text_size(ms.body())
                     .text_color(t.error())
                     .child(SharedString::from(err.clone())),
             );
@@ -2805,6 +3202,7 @@ impl Workspace {
     /// chartable, and a column declared INTEGER can still arrive holding text.
     fn chart_el(&self, tab: &Tab, cx: &mut Context<Self>) -> gpui::AnyElement {
         let t = self.t();
+        let ms = self.scale;
         let shape = match ChartShape::of(&tab.columns, &tab.rows) {
             Ok(s) => s,
             // Say WHY there is no chart. "No chart" on its own reads as a bug.
@@ -2855,7 +3253,7 @@ impl Workspace {
                         .id(SharedString::from(format!("ch-{tab_id}-{i}")))
                         .px_1()
                         .cursor_pointer()
-                        .text_size(px(11.0))
+                        .text_size(ms.small())
                         .text_color(if on { t.inverted() } else { t.fg() })
                         .when(on, |d| d.bg(t.accent()))
                         .hover(|d| d.bg(t.hover()))
@@ -2889,7 +3287,7 @@ impl Workspace {
                     .child(
                         div()
                             .w(px(160.0))
-                            .text_size(px(11.0))
+                            .text_size(ms.small())
                             .text_color(t.muted())
                             .child(SharedString::from(label)),
                     )
@@ -2907,7 +3305,7 @@ impl Workspace {
                     .child(
                         div()
                             .w(px(110.0))
-                            .text_size(px(11.0))
+                            .text_size(ms.small())
                             .text_color(if v.is_some() { t.fg() } else { t.muted() })
                             .child(SharedString::from(match v {
                                 Some(n) => format!("{n}"),
@@ -2945,6 +3343,7 @@ impl Workspace {
     /// WRITING a statement, not a way around the rules about running one.
     fn builder_el(&self, tab: &Tab, cx: &mut Context<Self>) -> gpui::AnyElement {
         let t = self.t();
+        let ms = self.scale;
         let tab_id = tab.id;
         let ops = self.meta(&tab.driver).map(|m| m.builder_ops.clone()).unwrap_or_default();
         let mut body = div().flex().flex_col().flex_1().overflow_hidden().p_3().gap_1();
@@ -2974,7 +3373,7 @@ impl Workspace {
                 .id("b-all")
                 .px_1()
                 .cursor_pointer()
-                .text_size(px(11.0))
+                .text_size(ms.small())
                 .text_color(if all { t.inverted() } else { t.muted() })
                 .when(all, |d| d.bg(t.accent()))
                 .child("every column")
@@ -2994,7 +3393,7 @@ impl Workspace {
                     .id(SharedString::from(format!("b-col-{}", c.name)))
                     .px_1()
                     .cursor_pointer()
-                    .text_size(px(11.0))
+                    .text_size(ms.small())
                     .text_color(if on { t.inverted() } else { t.fg() })
                     .when(on, |d| d.bg(t.accent()))
                     .hover(|d| d.bg(t.hover()))
@@ -3027,7 +3426,7 @@ impl Workspace {
                     .w(px(160.0))
                     .px_1()
                     .cursor_pointer()
-                    .text_size(px(11.0))
+                    .text_size(ms.small())
                     .text_color(t.fg())
                     .border_1()
                     .border_color(t.border())
@@ -3050,7 +3449,7 @@ impl Workspace {
                     .w(px(110.0))
                     .px_1()
                     .cursor_pointer()
-                    .text_size(px(11.0))
+                    .text_size(ms.small())
                     .text_color(t.accent())
                     .border_1()
                     .border_color(t.border())
@@ -3083,7 +3482,7 @@ impl Workspace {
                     .id(SharedString::from(format!("b-rm-{i}")))
                     .px_1()
                     .cursor_pointer()
-                    .text_size(px(11.0))
+                    .text_size(ms.small())
                     .text_color(t.muted())
                     .child("\u{f00d}")
                     .on_click(cx.listener(move |this, _, _, cx| {
@@ -3103,7 +3502,7 @@ impl Workspace {
                 .id("b-add")
                 .px_1()
                 .cursor_pointer()
-                .text_size(px(11.0))
+                .text_size(ms.small())
                 .text_color(t.accent())
                 .child("+ condition")
                 .on_click(cx.listener(move |this, _, _, cx| {
@@ -3124,7 +3523,7 @@ impl Workspace {
                 .w(px(300.0))
                 .px_1()
                 .cursor_pointer()
-                .text_size(px(11.0))
+                .text_size(ms.small())
                 .text_color(t.fg())
                 .border_1()
                 .border_color(t.border())
@@ -3153,6 +3552,7 @@ impl Workspace {
     /// that cannot ask its server for one says so instead.
     fn schema_el(&self, tab: &Tab) -> gpui::AnyElement {
         let t = self.t();
+        let ms = self.scale;
         let mut body = div().flex().flex_col().flex_1().overflow_hidden().p_3().gap_2();
 
         if tab.object.is_none() {
@@ -3174,7 +3574,7 @@ impl Workspace {
                     .flex()
                     .items_center()
                     .gap_2()
-                    .child(div().w(px(220.0)).text_size(px(12.0)).text_color(t.fg()).child(
+                    .child(div().w(px(220.0)).text_size(ms.body()).text_color(t.fg()).child(
                         SharedString::from(c.name.clone()),
                     ))
                     .child(div().w(px(160.0)).child(self.small(c.type_name.clone(), t.muted())))
@@ -3207,7 +3607,7 @@ impl Workspace {
                         .flex()
                         .items_center()
                         .gap_2()
-                        .child(div().w(px(220.0)).text_size(px(12.0)).text_color(t.fg()).child(
+                        .child(div().w(px(220.0)).text_size(ms.body()).text_color(t.fg()).child(
                             SharedString::from(i.name.clone()),
                         ))
                         .child(div().w(px(260.0)).child(self.small(i.columns.join(", "), t.muted())))
@@ -3222,7 +3622,7 @@ impl Workspace {
                 div()
                     .flex_1()
                     .overflow_hidden()
-                    .text_size(px(11.0))
+                    .text_size(ms.small())
                     .text_color(t.fg())
                     .child(SharedString::from(ddl.clone())),
             );
@@ -3236,6 +3636,7 @@ impl Workspace {
         let i = tab.detail?;
         let row = tab.rows.get(i)?;
         let t = self.t();
+        let ms = self.scale;
 
         let mut panel = div()
             .flex()
@@ -3257,7 +3658,7 @@ impl Workspace {
                 .bg(t.header_bg())
                 .child(
                     div()
-                        .text_size(px(11.0))
+                        .text_size(ms.small())
                         .text_color(t.header_fg())
                         .child(SharedString::from(format!("Row {}", tab.from + i + 1))),
                 )
@@ -3266,7 +3667,7 @@ impl Workspace {
                         .id("detail-close")
                         .px_1()
                         .cursor_pointer()
-                        .text_size(px(11.0))
+                        .text_size(ms.small())
                         .text_color(t.muted())
                         .child("\u{f00d}")
                         .on_click(cx.listener(|this, _, _, cx| {
@@ -3313,7 +3714,7 @@ impl Workspace {
                                 .id("edit-ok")
                                 .px_1()
                                 .cursor_pointer()
-                                .text_size(px(11.0))
+                                .text_size(ms.small())
                                 .text_color(t.accent())
                                 .child("\u{f00c}")
                                 .on_click(cx.listener(move |this, _, _, cx| {
@@ -3326,7 +3727,7 @@ impl Workspace {
                                 .id("edit-no")
                                 .px_1()
                                 .cursor_pointer()
-                                .text_size(px(11.0))
+                                .text_size(ms.small())
                                 .text_color(t.muted())
                                 .child("\u{f00d}")
                                 .on_click(cx.listener(move |this, _, _, cx| {
@@ -3344,7 +3745,7 @@ impl Workspace {
             } else {
                 div()
                     .id(SharedString::from(format!("val-{tab_id}-{ci}")))
-                    .text_size(px(12.0))
+                    .text_size(ms.body())
                     .text_color(if null { t.muted() } else { t.fg() })
                     .when(can, |d| d.cursor_pointer().hover(|h| h.bg(t.hover())))
                     .child(SharedString::from(
@@ -3385,7 +3786,7 @@ impl Workspace {
                 // about one thing and doing a different one.
                 .child(
                     div()
-                        .text_size(px(11.0))
+                        .text_size(ms.small())
                         .text_color(t.fg())
                         .child(SharedString::from(p.statement.clone())),
                 );
@@ -3398,7 +3799,7 @@ impl Workspace {
                             .id("write-yes")
                             .px_2()
                             .cursor_pointer()
-                            .text_size(px(11.0))
+                            .text_size(ms.small())
                             .bg(t.error())
                             .text_color(t.inverted())
                             .child(if p.delete { "Delete it" } else { "Write it" })
@@ -3412,7 +3813,7 @@ impl Workspace {
                             .id("write-no")
                             .px_2()
                             .cursor_pointer()
-                            .text_size(px(11.0))
+                            .text_size(ms.small())
                             .text_color(t.muted())
                             .child("Leave it")
                             .on_click(cx.listener(move |this, _, _, cx| {
@@ -3444,7 +3845,7 @@ impl Workspace {
                         .id("copy-select")
                         .px_2()
                         .cursor_pointer()
-                        .text_size(px(11.0))
+                        .text_size(ms.small())
                         .text_color(t.accent())
                         .child("Copy as SELECT")
                         .on_click(cx.listener(|this, _, _, cx| {
@@ -3457,7 +3858,7 @@ impl Workspace {
                         .id("copy-insert")
                         .px_2()
                         .cursor_pointer()
-                        .text_size(px(11.0))
+                        .text_size(ms.small())
                         .text_color(t.accent())
                         .child("Copy as INSERT")
                         .on_click(cx.listener(|this, _, _, cx| {
@@ -3474,7 +3875,7 @@ impl Workspace {
                     .id("row-delete")
                     .px_2()
                     .cursor_pointer()
-                    .text_size(px(11.0))
+                    .text_size(ms.small())
                     .text_color(t.error())
                     .child("Delete row")
                     .on_click(cx.listener(move |this, _, _, cx| {
@@ -3493,6 +3894,7 @@ impl Workspace {
     /// the JSON each contributes; every SQL driver sends none and gets a box.
     fn query_bar(&self, tab: &Tab, cx: &mut Context<Self>) -> gpui::AnyElement {
         let t = self.t();
+        let ms = self.scale;
         let meta = self.meta(&tab.driver);
         let structured = meta.map(|m| m.is_structured()).unwrap_or(false);
         let tab_id = tab.id;
@@ -3570,7 +3972,7 @@ impl Workspace {
                 .id(SharedString::from(format!("run-{tab_id}")))
                 .px_2()
                 .cursor_pointer()
-                .text_size(px(11.0))
+                .text_size(ms.small())
                 .bg(t.accent())
                 .text_color(t.inverted())
                 .child(SharedString::from(format!("{run_label} (↵)")))
@@ -3594,7 +3996,7 @@ impl Workspace {
                         .id("prev")
                         .px_2()
                         .cursor_pointer()
-                        .text_size(px(11.0))
+                        .text_size(ms.small())
                         .text_color(if can_prev { t.fg() } else { t.border() })
                         .child("◀")
                         .on_click(cx.listener(|this, _, _, cx| {
@@ -3611,7 +4013,7 @@ impl Workspace {
                         .id("next")
                         .px_2()
                         .cursor_pointer()
-                        .text_size(px(11.0))
+                        .text_size(ms.small())
                         .text_color(if can_next { t.fg() } else { t.border() })
                         .child("▶")
                         .on_click(cx.listener(|this, _, _, cx| {
@@ -3636,6 +4038,7 @@ impl Workspace {
     /// export that silently paged the whole table would be a different feature.
     fn export_row(&self, tab: &Tab, cx: &mut Context<Self>) -> gpui::AnyElement {
         let t = self.t();
+        let ms = self.scale;
         let mut row = div()
             .flex()
             .items_center()
@@ -3658,7 +4061,7 @@ impl Workspace {
                     .id(SharedString::from(format!("fmt-{}", f.label())))
                     .px_1()
                     .cursor_pointer()
-                    .text_size(px(10.0))
+                    .text_size(ms.tiny())
                     .text_color(if on { t.inverted() } else { t.muted() })
                     .when(on, |d| d.bg(t.accent()))
                     .child(SharedString::from(f.label()))
@@ -3682,7 +4085,7 @@ impl Workspace {
                 .id("export-write")
                 .px_2()
                 .cursor_pointer()
-                .text_size(px(11.0))
+                .text_size(ms.small())
                 .bg(t.accent())
                 .text_color(t.inverted())
                 .child("Write")
@@ -3696,6 +4099,7 @@ impl Workspace {
 
     fn table_el(&self, tab: &Tab, cx: &mut Context<Self>) -> gpui::AnyElement {
         let t = self.t();
+        let ms = self.scale;
         let cols: Vec<(usize, String)> = tab
             .grid_columns()
             .into_iter()
@@ -3729,10 +4133,10 @@ impl Workspace {
             header = header.child(
                 div()
                     .id(SharedString::from(format!("hdr-{tab_id}-{ci}")))
-                    .w(px(tab.widths.get(&ci).copied().unwrap_or(COL_W)))
+                    .w(px(tab.widths.get(&ci).copied().unwrap_or(ms.col_w())))
                     .px(px(6.0))
                     .cursor_pointer()
-                    .text_size(px(11.0))
+                    .text_size(ms.small())
                     .text_color(t.header_fg())
                     .hover(|d| d.bg(t.hover()))
                     .child(SharedString::from(format!("{name}{arrow}")))
@@ -3743,7 +4147,7 @@ impl Workspace {
             );
             // The handle between this column and the next. It is its own strip
             // so that dragging never sorts: a click that moved is not a click.
-            let start_w = tab.widths.get(&ci).copied().unwrap_or(COL_W);
+            let start_w = tab.widths.get(&ci).copied().unwrap_or(ms.col_w());
             header = header.child(
                 div()
                     .id(SharedString::from(format!("grip-{tab_id}-{ci}")))
@@ -3777,7 +4181,7 @@ impl Workspace {
                     let mut line = div()
                         .flex()
                         .w_full()
-                        .h(px(ROW_H))
+                        .h(px(ms.row_h()))
                         // Alternating rows: the stripe is a surface from the
                         // theme, not a computed shade.
                         .when(i % 2 == 1, |d| d.bg(row_alt))
@@ -3785,7 +4189,7 @@ impl Workspace {
                             div()
                                 .w(px(NUM_W))
                                 .px(px(6.0))
-                                .text_size(px(10.0))
+                                .text_size(ms.tiny())
                                 .text_color(muted)
                                 .child(SharedString::from((first + i + 1).to_string())),
                         );
@@ -3798,9 +4202,9 @@ impl Workspace {
                         line = line
                             .child(
                                 div()
-                                    .w(px(widths.get(ci).copied().unwrap_or(COL_W)))
+                                    .w(px(widths.get(ci).copied().unwrap_or(ms.col_w())))
                                     .px(px(6.0))
-                                    .text_size(px(12.0))
+                                    .text_size(ms.body())
                                     .text_color(colour)
                                     .child(SharedString::from(text)),
                             )
@@ -3827,6 +4231,7 @@ impl Workspace {
     /// previous client could not show at all.
     fn tree_el(&self, tab: &Tab, cx: &mut Context<Self>) -> gpui::AnyElement {
         let t = self.t();
+        let _ = self.scale;
         let mut out = div().flex().flex_col().size_full().overflow_hidden();
         for i in 0..tab.rows.len().min(200) {
             let doc = tab.document(i);
@@ -3864,6 +4269,7 @@ impl Workspace {
     /// One value inside a document, with its type beside it.
     fn value_el(&self, v: &Value, tab: &Tab, depth: usize) -> gpui::AnyElement {
         let t = self.t();
+        let ms = self.scale;
         let mut out = div().flex().flex_col();
         match v {
             Value::Object(m) => {
@@ -3883,20 +4289,20 @@ impl Workspace {
                             .py(px(1.0))
                             .child(
                                 div()
-                                    .text_size(px(11.0))
+                                    .text_size(ms.small())
                                     .text_color(t.muted())
                                     .child(SharedString::from(k.clone())),
                             )
                             .child(
                                 div()
-                                    .text_size(px(11.0))
+                                    .text_size(ms.small())
                                     .text_color(t.fg())
                                     .child(SharedString::from(preview(val))),
                             )
                             .child(
                                 // The badge, in the colour its type maps to.
                                 div()
-                                    .text_size(px(9.0))
+                                    .text_size(ms.tiny())
                                     .text_color(t.badge(badge))
                                     .child(SharedString::from(badge)),
                             ),
@@ -3910,7 +4316,7 @@ impl Workspace {
                 out = out.child(
                     div()
                         .pl(px(16.0 + depth as f32 * 14.0))
-                        .text_size(px(11.0))
+                        .text_size(ms.small())
                         .text_color(t.fg())
                         .child(SharedString::from(preview(other))),
                 );
@@ -3921,12 +4327,13 @@ impl Workspace {
 
     fn json_el(&self, tab: &Tab) -> gpui::AnyElement {
         let t = self.t();
+        let ms = self.scale;
         let docs: Vec<Value> = (0..tab.rows.len().min(200)).map(|i| tab.document(i)).collect();
         let text = serde_json::to_string_pretty(&docs).unwrap_or_else(|_| "[]".into());
         div()
             .size_full()
             .p_2()
-            .text_size(px(11.0))
+            .text_size(ms.small())
             .text_color(t.fg())
             .child(SharedString::from(text))
             .into_any_element()
@@ -3934,6 +4341,7 @@ impl Workspace {
 
     fn tasks_el(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let t = self.t();
+        let ms = self.scale;
         let failed = self.tasks.iter().filter(|x| x.failed()).count();
         let mut panel = div()
             .flex()
@@ -3965,7 +4373,7 @@ impl Workspace {
                 .child(
                     div()
                         .id("clear-finished")
-                        .text_size(px(11.0))
+                        .text_size(ms.small())
                         .text_color(t.muted())
                         .child("Clear finished")
                         .on_click(cx.listener(|this, _, _, cx| {
@@ -4003,7 +4411,7 @@ impl Workspace {
                             d.child(
                                 div()
                                     .pl_3()
-                                    .text_size(px(10.0))
+                                    .text_size(ms.tiny())
                                     .text_color(t.error())
                                     .child(SharedString::from(e)),
                             )
@@ -4019,6 +4427,7 @@ impl Workspace {
     /// buttons. Nothing runs from here without that answer.
     fn console_el(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let t = self.t();
+        let ms = self.scale;
         let target = self
             .conns
             .first()
@@ -4088,7 +4497,7 @@ impl Workspace {
                                         .id("confirm-run")
                                         .px_2()
                                         .cursor_pointer()
-                                        .text_size(px(11.0))
+                                        .text_size(ms.small())
                                         .bg(t.error())
                                         .text_color(t.inverted())
                                         .child("Run it")
@@ -4105,7 +4514,7 @@ impl Workspace {
                                         .id("confirm-cancel")
                                         .px_2()
                                         .cursor_pointer()
-                                        .text_size(px(11.0))
+                                        .text_size(ms.small())
                                         .text_color(t.muted())
                                         .child("Cancel")
                                         .on_click(cx.listener(|this, _, _, cx| {
@@ -4122,6 +4531,7 @@ impl Workspace {
 
     fn status_el(&self) -> impl IntoElement {
         let t = self.t();
+        let _ = self.scale;
         let failed = self.tasks.iter().filter(|x| x.failed()).count();
         let last = self
             .tasks
@@ -4197,6 +4607,7 @@ impl Workspace {
             return None;
         }
         let t = self.t();
+        let ms = self.scale;
         let mut stack = div().absolute().right(px(16.0)).bottom(px(16.0)).flex().flex_col().gap_1();
         for x in self.toasts.iter().rev().take(5) {
             stack = stack.child(
@@ -4206,7 +4617,7 @@ impl Workspace {
                     .bg(t.panel())
                     .border_l_2()
                     .border_color(if x.bad { t.error() } else { t.accent() })
-                    .text_size(px(12.0))
+                    .text_size(ms.body())
                     .text_color(if x.bad { t.error() } else { t.fg() })
                     .child(SharedString::from(x.text.clone())),
             );
@@ -4222,6 +4633,7 @@ impl Workspace {
             return None;
         }
         let t = self.t();
+        let ms = self.scale;
         let matches = self.palette_matches(cx);
         let sel = self.palette_sel.min(matches.len().saturating_sub(1));
 
@@ -4246,7 +4658,7 @@ impl Workspace {
                     .hover(|d| d.bg(t.hover()))
                     .child(
                         div()
-                            .text_size(px(12.0))
+                            .text_size(ms.body())
                             .text_color(t.fg())
                             .child(SharedString::from(it.label.clone())),
                     )
@@ -4302,6 +4714,8 @@ impl Render for Workspace {
         self.toasts.retain(|x| !x.expired(now));
 
         let t = self.t();
+
+        let ms = self.scale;
         let root = div()
             .key_context("Workspace")
             .track_focus(&self.focus)
@@ -4397,7 +4811,7 @@ impl Render for Workspace {
             .bg(t.base())
             .text_color(t.fg())
             .font_family("CodeNerdFont")
-            .text_size(px(13.0));
+            .text_size(ms.heading());
 
         if let Some(fatal) = self.fatal.clone() {
             return root.child(

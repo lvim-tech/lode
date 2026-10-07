@@ -19,6 +19,7 @@ mod app;
 mod export;
 mod form;
 mod input;
+mod metrics;
 mod session;
 mod theme;
 mod workspace;
