@@ -44,7 +44,7 @@ else
     echo "all: no engine binary — run scripts/build first" >&2
     exit 2
 fi
-SUITES=${*:-"smoke row dash hook tunnel profile access mcp driver icons"}
+SUITES=${*:-"smoke row dash hook tunnel profile access mcp driver icons panels"}
 LOGS=$(mktemp -d)
 BAD=0
 

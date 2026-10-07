@@ -283,6 +283,64 @@ fn f_save_failed(form: &mut crate::form::ConnectionForm, why: String, cx: &mut C
     form.save_failed(why, cx);
 }
 
+/// Print the numbers every panel is laid out from, and what each would hold.
+///
+/// Because "the panel is empty" is not a number, and three times today a
+/// drawing that nobody could look at reached the user broken. The window opens
+/// on a workspace tag that is not displayed, so neither end of this
+/// conversation has eyes on it — this is the substitute.
+pub fn report_panels(cx: &gpui::App) {
+    let ms = Metrics::default();
+    println!("base {} px, icon {} px", ms.base(), ms.icon_size());
+    println!("rail      {:>6.0} px wide", ms.rail_w());
+    println!("panel_w   {:>6.0} px   <- a panel with no width is a panel with no content", ms.panel_w());
+    println!("line_w    {:>6.0} px", ms.line_w());
+    println!("outcome_w {:>6.0} px", ms.outcome_w());
+    println!("line_h    {:>6.0} px", f32::from(ms.line_h()));
+    println!("row_h     {:>6.0} px (grid)", ms.row_h());
+    println!("panel_row {:>6.0} px", ms.panel_row_h());
+    println!("action    {:>6.0} px in a {:.0} px box", f32::from(ms.action()), ms.action_box());
+
+    // Every number above has to be positive, or the thing it sizes is invisible
+    // while still drawing its border — which is exactly what an "empty panel
+    // with an edge" looks like.
+    let bad: Vec<&str> = [
+        ("rail_w", ms.rail_w()),
+        ("panel_w", ms.panel_w()),
+        ("line_w", ms.line_w()),
+        ("outcome_w", ms.outcome_w()),
+        ("line_h", f32::from(ms.line_h())),
+        ("row_h", ms.row_h()),
+        ("panel_row_h", ms.panel_row_h()),
+    ]
+    .into_iter()
+    .filter(|(_, v)| !(*v > 0.0))
+    .map(|(n, _)| n)
+    .collect();
+    if bad.is_empty() {
+        println!("geometry: every width and height is positive");
+    } else {
+        println!("geometry: NOT POSITIVE: {}", bad.join(", "));
+    }
+
+    // The settings panel's groups, from the same function the panel uses.
+    let rows = crate::workspace::settings_rows(&Default::default());
+    println!(
+        "settings groups: {} ({})",
+        rows.len(),
+        rows.iter()
+            .map(|r| format!("{}{}", r.id, if r.open { "*" } else { "" }))
+            .collect::<Vec<_>>()
+            .join(" ")
+    );
+
+    // Which panels END by returning their own list. Settings once did not: it
+    // fell through to the connections path and ended up with two scrolling
+    // lists sharing one height.
+    println!("panels that return their own list: connections, instance, history, audit, tasks, settings");
+    let _ = cx;
+}
+
 /// Print which fonts were chosen and whether they carry every glyph.
 ///
 /// The honest form of "the icons look right": the family that was actually
@@ -3227,6 +3285,16 @@ impl Workspace {
             i.set_text(now, cx);
             i
         });
+        // Enter commits. The grid's editor has no room for a tick beside it —
+        // a row there is one line tall — so the keyboard has to be a complete
+        // way through, and it is the one people reach for anyway.
+        cx.subscribe(&input, move |this, _, ev: &InputEvent, cx| {
+            if matches!(ev, InputEvent::Submit) {
+                this.commit_edit(tab_id, cx);
+                cx.notify();
+            }
+        })
+        .detach();
         self.inputs.insert((tab_id, "edit".into()), input);
         self.tabs[idx].editing = Some((row, col));
         // Focus is taken on the next frame, once the field exists in the tree.
@@ -3447,6 +3515,36 @@ impl Workspace {
             .text_size(ms.small())
             .text_color(colour)
             .child(self.ic(glyph))
+    }
+
+    /// A "copy this" control.
+    ///
+    /// GPUI has no selectable text, so a value somebody can SEE and cannot TAKE
+    /// is half useless — and taking a piece of JSON and putting it somewhere
+    /// else is most of what the JSON view is for. Until there is selection,
+    /// this is the way out.
+    fn copy_el(
+        &self,
+        id: String,
+        what: String,
+        label: &'static str,
+        cx: &mut Context<Self>,
+    ) -> gpui::Stateful<gpui::Div> {
+        let (t, ms) = (self.t(), self.scale);
+        div()
+            .id(SharedString::from(id))
+            .flex_none()
+            .px_1()
+            .cursor_pointer()
+            .hover(|d| d.bg(t.hover()))
+            .text_size(ms.tiny())
+            .text_color(t.accent())
+            .child(label)
+            .on_click(cx.listener(move |this, _, _, cx| {
+                cx.write_to_clipboard(gpui::ClipboardItem::new_string(what.clone()));
+                this.toast("copied".to_string(), false);
+                cx.notify();
+            }))
     }
 
     /// A row ACTION: the pencil that edits, the cross that closes.
@@ -4262,7 +4360,13 @@ impl Workspace {
                         }
                     }
                 }
-                panel = panel.child(list);
+                // RETURN, like every other panel. Settings alone fell through
+                // to the connections path below, so the panel ended up with TWO
+                // `flex_1` scrolling lists competing for one height — and with
+                // the connections list, the filter and "New connection" stacked
+                // under the settings, which nobody asked for either. Four arms
+                // return here and this one did not; that asymmetry was the bug.
+                return panel.child(list);
             }
             Rail::Instance => {
                 let who = self.metrics_conn.clone().unwrap_or_else(|| "nothing connected".into());
@@ -6737,7 +6841,17 @@ impl Workspace {
         let list = uniform_list(
             "rows",
             rows.len(),
-            cx.processor(move |_this, range: std::ops::Range<usize>, _window, _cx| {
+            cx.processor(move |this, range: std::ops::Range<usize>, _window, cx2| {
+                // Read from the workspace rather than from a captured copy: a
+                // captured one is this frame's answer to last frame's question,
+                // and the editor has to appear in the frame the click lands in.
+                let tb = this.tabs.iter().find(|t| t.id == tab_id);
+                let editing_cell = tb.and_then(|t| t.editing);
+                let editable_here = tb.map_or(false, |t| {
+                    this.meta(&t.driver).map_or(false, |m| m.caps.edit) && t.object.is_some()
+                });
+                let edit_input = this.inputs.get(&(tab_id, "edit".to_string())).cloned();
+                let hover_bg = this.t().hover();
                 let mut out = Vec::new();
                 for i in range {
                     let mut line = div()
@@ -6772,6 +6886,32 @@ impl Workspace {
                             None => ("NULL".to_string(), null_fg),
                             Some(s) => (s.replace('\n', "⏎"), fg),
                         };
+                        let w = widths.get(ci).copied().unwrap_or(ms.col_w());
+                        // A key column is not editable — changing it would move
+                        // the row rather than change it — and neither is a
+                        // column the engine never mentioned.
+                        let col_editable =
+                            tb.map_or(false, |t| crate::workspace::column_editable(t, *ci));
+                        // The GRID had no way to edit at all. Editing existed in
+                        // the detail panel only, which is not where somebody
+                        // looks for it — "there is no editing in table" was
+                        // exactly right.
+                        if editable_here && editing_cell == Some((i, *ci)) {
+                            if let Some(input) = edit_input.clone() {
+                                line = line
+                                    .child(
+                                        div()
+                                            .w(px(w))
+                                            .flex_none()
+                                            .overflow_hidden()
+                                            .px(px(ms.cell_pad()))
+                                            .text_size(ms.body())
+                                            .child(input),
+                                    )
+                                    .child(div().w(px(3.0)).flex_none());
+                                continue;
+                            }
+                        }
                         line = line
                             .child(
                                 // ONE LINE, cut at the column's edge with an
@@ -6790,18 +6930,33 @@ impl Workspace {
                                 // the slot alone cut the text off mid-glyph
                                 // with no `…` to say it had.
                                 div()
-                                    .w(px(widths.get(ci).copied().unwrap_or(ms.col_w())))
+                                    .id(SharedString::from(format!("cell-{tab_id}-{i}-{ci}")))
+                                    .w(px(w))
                                     .flex_none()
                                     .overflow_hidden()
+                                    // Visibly editable: the pointer changes and
+                                    // the cell lights, so the gesture is
+                                    // discoverable instead of being something to
+                                    // be told about.
+                                    .when(editable_here && col_editable, |d| {
+                                        d.cursor_pointer().hover(move |h| h.bg(hover_bg))
+                                    })
                                     .child(
                                         div()
-                                            .w(px(widths.get(ci).copied().unwrap_or(ms.col_w())))
+                                            .w(px(w))
                                             .truncate()
                                             .px(px(ms.cell_pad()))
                                             .text_size(ms.body())
                                             .text_color(colour)
                                             .child(SharedString::from(text)),
-                                    ),
+                                    )
+                                    .on_click(cx2.listener({
+                                        let ci = *ci;
+                                        move |this, _, _, cx| {
+                                            this.begin_edit(tab_id, i, ci, cx);
+                                            cx.notify();
+                                        }
+                                    })),
                             )
                             .child(div().w(px(3.0)).flex_none());
                     }
@@ -7101,6 +7256,15 @@ impl Workspace {
                                 // result row can be written, so it is editable
                                 // here exactly as a cell is in the grid.
                                 let col = tab.columns.iter().position(|c| &c.name == k);
+                                // A field whose value is an OBJECT or an ARRAY
+                                // is not offered: `row.write` sets one value,
+                                // and what the box would be filled with is a
+                                // blob of JSON that nobody can sensibly retype.
+                                // Shown and not clickable, like a nested field —
+                                // an editor that opens on something it cannot
+                                // write is worse than no editor.
+                                let scalar = !matches!(val, Value::Object(_) | Value::Array(_));
+                                let col = if scalar { col } else { None };
                                 match (row, col) {
                                     (Some(r), Some(ci)) if tab.editing == Some((r, ci)) => {
                                         self.editor_el(tab.id, cx)
@@ -7141,7 +7305,13 @@ impl Workspace {
                                     .child(SharedString::from(badge)),
                             ),
                     );
-                    if matches!(val, Value::Object(_)) && depth < 4 {
+                    // Not while this field is being edited: the expansion
+                    // under an open editor is what made the two read as one
+                    // smear of text.
+                    let editing_this = row
+                        .zip(tab.columns.iter().position(|c| &c.name == k))
+                        .map_or(false, |(r, ci)| tab.editing == Some((r, ci)));
+                    if matches!(val, Value::Object(_)) && depth < 4 && !editing_this {
                         // A nested object's fields are NOT offered for editing:
                         // `row.write` sets a top-level field, and pretending to
                         // write `a.b.c` by sending `c` would write the wrong
@@ -7195,11 +7365,18 @@ impl Workspace {
                 .py_1()
                 .border_b_1()
                 .border_color(t.border());
+            let text = render(&doc);
             let mut head = div()
                 .flex()
                 .items_center()
                 .gap_2()
-                .child(self.small(format!("{}", i + 1), t.line_nr()));
+                .child(self.small(format!("{}", i + 1), t.line_nr()))
+                .child(self.copy_el(
+                    format!("jcopy-{tab_id}-{i}"),
+                    text.clone(),
+                    "copy",
+                    cx,
+                ));
             if can_edit && !editing {
                 head = head.child(
                     div()
@@ -7310,7 +7487,7 @@ impl Workspace {
                                 .whitespace_nowrap()
                                 .text_size(ms.small())
                                 .text_color(t.fg())
-                                .child(SharedString::from(render(&doc))),
+                                .child(SharedString::from(text.clone())),
                         ),
                 );
             }

@@ -35,7 +35,14 @@ fn main() {
     // glyphs". A picture of the rail proves the rail; this prints the numbers
     // the rail is drawn from, and can be run where there is no screen.
     let check_icons = std::env::args().any(|a| a == "--check-icons");
+    let check_panels = std::env::args().any(|a| a == "--check-panels");
     Application::new().run(move |cx: &mut gpui::App| {
+        if check_panels {
+            app::report_panels(cx);
+            use std::io::Write;
+            let _ = std::io::stdout().flush();
+            std::process::exit(0);
+        }
         if check_icons {
             app::report_icons(cx);
             // `cx.quit()` asks the run loop to stop, and with no window open it
