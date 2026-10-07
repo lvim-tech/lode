@@ -4382,6 +4382,7 @@ dependencies = [
  "futures-util",
  "hmac 0.10.1",
  "libc",
+ "lode-proto",
  "mongodb",
  "mysql_async",
  "redis",

@@ -13,7 +13,7 @@
 // some are not yet constructed by the single compiled driver of an early build.
 #![allow(dead_code)]
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize, Serializer};
 
 use crate::secret::Secret;
 
@@ -421,8 +421,14 @@ impl ConnSpec {
         match &self.auth {
             AuthSpec::Password { password, .. } => add(password.exposed()),
             AuthSpec::ClientCert { cert, key, key_password, .. } => {
-                add(cert);
-                add(key);
+                // Same rule: a certificate path is diagnostic, a value that is
+                // not shaped like one is somebody's secret in the wrong box.
+                for p in [cert, key] {
+                    if !lode_proto::looks_like_path(p.original()) {
+                        add(p.original());
+                        add(p.as_str());
+                    }
+                }
                 add(key_password.exposed());
             }
             AuthSpec::Provider { token, .. } => add(token.exposed()),
@@ -431,7 +437,21 @@ impl ConnSpec {
         if let Some(t) = &self.tunnel {
             match &t.auth {
                 TunnelAuth::Key { path, passphrase } => {
-                    add(path);
+                    // A path that LOOKS like a path is shown. `no such file` is
+                    // useless without the name of the file, and that name is the
+                    // one genuinely helpful thing in the message.
+                    //
+                    // A value that is not shaped like a path is a passphrase
+                    // somebody typed into the path box — the mistake that put a
+                    // credential in an audit log — and stays hidden. Shape is
+                    // what separates the two, and the shape rule is
+                    // `lode_proto::looks_like_path`, the same one the connection
+                    // window refuses a save with, so there is one answer to
+                    // "is this a path" rather than one per end.
+                    if !lode_proto::looks_like_path(path.original()) {
+                        add(path.original());
+                        add(path.as_str());
+                    }
                     add(passphrase.exposed());
                 }
                 TunnelAuth::Password { password } => add(password.exposed()),
@@ -472,6 +492,17 @@ impl ConnSpec {
             .ok_or_else(|| anyhow::anyhow!("missing required parameter '{key}'"))
     }
 
+    /// A required param that names a FILE, expanded.
+    ///
+    /// The params map is free-form text, so it cannot carry `FsPath` the way a
+    /// typed field does. This is the single place a file parameter is read, so
+    /// a driver cannot take one without the expansion — `sqlite` and `duckdb`
+    /// each remembered to call `expand_tilde` and the next one would have had
+    /// to remember too.
+    pub fn param_path(&self, key: &str) -> anyhow::Result<FsPath> {
+        Ok(FsPath::new(self.param(key)?))
+    }
+
     /// An optional string param.
     pub fn param_opt(&self, key: &str) -> Option<&str> {
         self.params.get(key).map(String::as_str).filter(|s| !s.is_empty())
@@ -498,8 +529,8 @@ pub enum AuthSpec {
         password: Secret,
     },
     ClientCert {
-        cert: String,
-        key: String,
+        cert: FsPath,
+        key: FsPath,
         #[serde(default)]
         key_password: Secret,
         #[serde(default)]
@@ -529,11 +560,11 @@ pub struct TlsSpec {
     #[serde(default)]
     pub mode: TlsMode,
     #[serde(default)]
-    pub ca: Option<String>,
+    pub ca: Option<FsPath>,
     #[serde(default)]
-    pub client_cert: Option<String>,
+    pub client_cert: Option<FsPath>,
     #[serde(default)]
-    pub client_key: Option<String>,
+    pub client_key: Option<FsPath>,
 }
 
 impl Default for TlsSpec {
@@ -726,7 +757,7 @@ fn default_ssh_port() -> u16 {
 pub enum TunnelAuth {
     Agent,
     Key {
-        path: String,
+        path: FsPath,
         #[serde(default)]
         passphrase: Secret,
     },
@@ -924,6 +955,84 @@ pub enum Value {
     },
 }
 
+/// A path out of a spec, expanded ONCE, where it is read.
+///
+/// Two readers forgot: `net.rs` handed the SSH key's path straight to
+/// `load_secret_key`, and `tls.rs` read the certificate and the key with
+/// `fs::read`, while `server.rs` expanded in four separate places. So
+/// `~/.ssh/neterra` — a file that exists — came back as "no such file", which
+/// is a lie about somebody's disk and sends them looking in the wrong place.
+///
+/// Expanding at USE means every new reader has to remember. Expanding at
+/// DESERIALIZE means none of them can forget, because by the time a reader sees
+/// the value there is no `~` left in it. That is the whole reason this is a type
+/// and not a function.
+///
+/// The original is kept and is what goes back out: a connection saved with
+/// `~/.ssh/id_ed25519` should still say that when it is read on another machine
+/// or by another person, rather than being quietly rewritten to one home
+/// directory.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct FsPath {
+    /// What was typed, and what is written back out.
+    original: String,
+    /// What the filesystem is actually asked for.
+    expanded: String,
+}
+
+impl FsPath {
+    pub fn new(original: impl Into<String>) -> FsPath {
+        let original = original.into();
+        let expanded = expand_tilde(&original);
+        FsPath { original, expanded }
+    }
+
+    /// The path to open. Deliberately the only cheap way to get a `&str` out.
+    pub fn as_str(&self) -> &str {
+        &self.expanded
+    }
+
+    /// What somebody typed — for a message, and for deciding what may be shown.
+    pub fn original(&self) -> &str {
+        &self.original
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.original.trim().is_empty()
+    }
+}
+
+impl std::ops::Deref for FsPath {
+    type Target = str;
+    fn deref(&self) -> &str {
+        &self.expanded
+    }
+}
+
+impl std::fmt::Display for FsPath {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.expanded)
+    }
+}
+
+impl AsRef<std::path::Path> for FsPath {
+    fn as_ref(&self) -> &std::path::Path {
+        std::path::Path::new(&self.expanded)
+    }
+}
+
+impl<'de> Deserialize<'de> for FsPath {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<FsPath, D::Error> {
+        Ok(FsPath::new(String::deserialize(d)?))
+    }
+}
+
+impl Serialize for FsPath {
+    fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(&self.original)
+    }
+}
+
 /// Expand a leading `~` / `~/` to $HOME (a file path a driver will open). Shared so the form's Test path
 /// and the drivers' `connect` agree — otherwise Test reports a `~/db.sqlite` readable while connect fails.
 pub fn expand_tilde(path: &str) -> String {
@@ -1088,6 +1197,133 @@ mod tests {
         })
         .expect("serializes");
         assert_eq!(json["type"], "aws_profile");
+    }
+
+    /// A `~` reaches the filesystem expanded, from EVERY field that holds a
+    /// path.
+    ///
+    /// Two readers forgot independently — `net.rs` handed the SSH key's path
+    /// raw to `load_secret_key`, `tls.rs` read the certificate and key with
+    /// `fs::read` — while `server.rs` expanded in four other places. A real file
+    /// came back as "no such file", which is a lie about somebody's disk.
+    ///
+    /// The fields are typed, so this asserts the TYPE does it. One test covers
+    /// every reader present and every reader to come, which is the point of
+    /// having moved it to deserialization.
+    #[test]
+    fn a_tilde_is_expanded_in_every_path_a_spec_carries() {
+        let home = std::env::var("HOME").expect("a home directory");
+        let spec: ConnSpec = serde_json::from_value(serde_json::json!({
+            "driver": "mongodb",
+            "params": { "host": "db.example", "database": "app" },
+            "auth": {
+                "kind": "client_cert",
+                "cert": "~/.certs/client.pem",
+                "key": "~/.certs/client.key",
+                "user": "u"
+            },
+            "tls": {
+                "mode": "verify_full",
+                "ca": "~/.certs/ca.pem",
+                "client_cert": "~/.certs/client.pem",
+                "client_key": "~/.certs/client.key"
+            },
+            "tunnel": {
+                "host": "bastion.example",
+                "user": "me",
+                "auth": { "kind": "key", "path": "~/.ssh/neterra", "passphrase": "" }
+            }
+        }))
+        .expect("the spec parses");
+
+        // The tunnel key — the one that was actually reported.
+        let tunnel = spec.tunnel.as_ref().expect("a tunnel");
+        match &tunnel.auth {
+            TunnelAuth::Key { path, .. } => {
+                assert_eq!(path.as_str(), format!("{home}/.ssh/neterra"));
+                // And what goes back out is still what was typed, so a saved
+                // connection does not get rewritten to one person's home.
+                assert_eq!(path.original(), "~/.ssh/neterra");
+            }
+            other => panic!("expected a key tunnel, got {other:?}"),
+        }
+
+        // TLS: the CA bundle and both client files.
+        assert_eq!(
+            spec.tls.ca.as_ref().map(|p| p.as_str().to_string()),
+            Some(format!("{home}/.certs/ca.pem"))
+        );
+        assert_eq!(
+            spec.tls.client_cert.as_ref().map(|p| p.as_str().to_string()),
+            Some(format!("{home}/.certs/client.pem"))
+        );
+        assert_eq!(
+            spec.tls.client_key.as_ref().map(|p| p.as_str().to_string()),
+            Some(format!("{home}/.certs/client.key"))
+        );
+
+        // Client-certificate auth.
+        match &spec.auth {
+            AuthSpec::ClientCert { cert, key, .. } => {
+                assert_eq!(cert.as_str(), format!("{home}/.certs/client.pem"));
+                assert_eq!(key.as_str(), format!("{home}/.certs/client.key"));
+            }
+            other => panic!("expected client_cert auth, got {other:?}"),
+        }
+
+        // And a driver's own file parameter, which is free-form text and so
+        // goes through the one accessor instead of a type.
+        let file_spec: ConnSpec = serde_json::from_value(serde_json::json!({
+            "driver": "sqlite",
+            "params": { "file": "~/data/app.db" }
+        }))
+        .expect("parses");
+        assert_eq!(
+            file_spec.param_path("file").expect("a file").as_str(),
+            format!("{home}/data/app.db")
+        );
+    }
+
+    /// A path is SHOWN; a secret typed into a path field is not.
+    ///
+    /// Hiding the path made the one useful part of `no such file` unreadable —
+    /// somebody could not see which path was tried, which is the only thing that
+    /// message is for. Hiding it only when it is not shaped like a path keeps
+    /// the ordinary case diagnosable and the mistaken one covered.
+    #[test]
+    fn a_real_path_stays_readable_and_a_misplaced_secret_does_not() {
+        let with_path: ConnSpec = serde_json::from_value(serde_json::json!({
+            "driver": "mongodb",
+            "params": {},
+            "tunnel": {
+                "host": "b.example", "user": "me",
+                "auth": { "kind": "key", "path": "~/.ssh/neterra", "passphrase": "" }
+            }
+        }))
+        .expect("parses");
+        let guard = with_path.sensitive();
+        let said = format!(
+            "cannot load ssh key '{}': No such file or directory",
+            std::env::var("HOME").unwrap_or_default() + "/.ssh/neterra"
+        );
+        let out = crate::audit::scrub(&said, &guard);
+        assert!(out.contains(".ssh/neterra"), "the path must stay readable: {out}");
+
+        // The same field holding what is plainly not a path.
+        let phrase = "correct-horse!battery#staple$42";
+        let with_secret: ConnSpec = serde_json::from_value(serde_json::json!({
+            "driver": "mongodb",
+            "params": {},
+            "tunnel": {
+                "host": "b.example", "user": "me",
+                "auth": { "kind": "key", "path": phrase, "passphrase": "" }
+            }
+        }))
+        .expect("parses");
+        let guard2 = with_secret.sensitive();
+        let said2 = format!("cannot load ssh key '{phrase}': No such file or directory");
+        let out2 = crate::audit::scrub(&said2, &guard2);
+        assert!(!out2.contains(phrase), "a misplaced secret must stay hidden: {out2}");
     }
 
     /// The reported leak, as a test.

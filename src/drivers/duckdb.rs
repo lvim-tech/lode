@@ -73,9 +73,9 @@ impl Driver for DuckdbDriver {
     }
 
     async fn connect(&self, spec: &ConnSpec, _net: NetContext) -> anyhow::Result<Box<dyn Connection>> {
-        let file = crate::spec::expand_tilde(spec.param("file")?);
+        let file = spec.param_path("file")?;
         let conn = tokio::task::spawn_blocking(move || {
-            if file == ":memory:" {
+            if file.as_str() == ":memory:" {
                 DuckConn::open_in_memory()
             } else {
                 DuckConn::open(&file)

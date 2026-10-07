@@ -243,12 +243,12 @@ impl Driver for MongoDriver {
         if tls.wanted() {
             let mut topts = mongodb::options::TlsOptions::default();
             if let Some(ca) = &tls.ca {
-                topts.ca_file_path = Some(ca.into());
+                topts.ca_file_path = Some(ca.as_str().into());
             }
             topts.allow_invalid_certificates = Some(!tls.verifies_cert());
             // Mutual X.509: MongoDB expects a single PEM holding cert+key.
             if let Some(cert) = &tls.client_cert {
-                topts.cert_key_file_path = Some(cert.into());
+                topts.cert_key_file_path = Some(cert.as_str().into());
             }
             let mut tls_opts = opts.clone();
             tls_opts.tls = Some(mongodb::options::Tls::Enabled(topts));

@@ -301,6 +301,41 @@ pub fn render_query(
     render_template(&meta.query_template, name, schema, limit, &fragments)
 }
 
+/// Does this text LOOK like a filesystem path?
+///
+/// One definition, shared by the engine and by every client, because two
+/// notions of "is this a path" is how the two ends end up disagreeing about the
+/// same string. It is deliberately a question about SHAPE and not about the
+/// filesystem: whether a file is there is a different question, asked later and
+/// answered differently.
+///
+/// Two places need exactly this:
+///
+///   * The connection window, before it refuses a save — its message says a key
+///     file "starts with / or ~", so `~` has to be accepted here.
+///   * The engine's redaction. A value out of a path field is normally a path
+///     and is the only useful thing in `no such file`; a value that is NOT
+///     shaped like one is somebody's passphrase typed into the wrong box, and
+///     that must never be printed. Shape is what tells the two apart.
+pub fn looks_like_path(s: &str) -> bool {
+    let s = s.trim();
+    if s.is_empty() {
+        return false;
+    }
+    // A newline is not in any path worth printing, and is how a value could
+    // smuggle a second line into a log.
+    if s.contains(['\n', '\r']) {
+        return false;
+    }
+    // Whitespace is legal in a path and common in a passphrase. A path that
+    // needs a space is rare enough to be worth losing here; a passphrase shown
+    // in a log is not.
+    if s.chars().any(char::is_whitespace) {
+        return false;
+    }
+    s.starts_with('/') || s.starts_with("~/") || s == "~" || s.starts_with("./") || s.starts_with("../")
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct ParamSpec {
     pub key: String,

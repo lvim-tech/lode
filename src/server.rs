@@ -981,8 +981,7 @@ impl Server {
     /// to be about.
     async fn test_endpoint(spec: &ConnSpec, meta: &'static DriverMeta) -> anyhow::Result<String> {
         if let Some(fp) = meta.params.iter().find(|p| matches!(p.kind, ParamType::File)) {
-            let raw = spec.param(fp.key)?;
-            let path = crate::spec::expand_tilde(raw);
+            let path = spec.param_path(fp.key)?;
             let md = std::fs::metadata(&path).map_err(|e| anyhow::anyhow!("cannot stat '{path}': {e}"))?;
             if !md.is_file() {
                 return Err(anyhow::anyhow!("'{path}' is not a regular file"));

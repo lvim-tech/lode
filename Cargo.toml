@@ -26,6 +26,10 @@ name = "loded"
 path = "src/main.rs"
 
 [dependencies]
+# The protocol crate, for the handful of definitions BOTH ends must agree on —
+# `looks_like_path` is one rule, not one rule per side. No cycle: lode-proto
+# spawns the engine as a process and has no code dependency on it.
+lode-proto = { path = "crates/lode-proto" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = [

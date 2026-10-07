@@ -129,12 +129,12 @@ fn ssl_opts_for(tls: &crate::spec::TlsSpec) -> mysql_async::SslOpts {
         .with_danger_accept_invalid_certs(!tls.verifies_cert())
         .with_danger_skip_domain_validation(!tls.verifies_hostname());
     if let Some(ca) = &tls.ca {
-        ssl = ssl.with_root_certs(vec![std::path::PathBuf::from(ca).into()]);
+        ssl = ssl.with_root_certs(vec![std::path::PathBuf::from(ca.as_str()).into()]);
     }
     if let (Some(cert), Some(key)) = (&tls.client_cert, &tls.client_key) {
         ssl = ssl.with_client_identity(Some(mysql_async::ClientIdentity::new(
-            std::path::PathBuf::from(cert).into(),
-            std::path::PathBuf::from(key).into(),
+            std::path::PathBuf::from(cert.as_str()).into(),
+            std::path::PathBuf::from(key.as_str()).into(),
         )));
     }
     ssl
