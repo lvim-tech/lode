@@ -128,7 +128,14 @@ use serde_json::json;
 ///      `edit` (a promise about binding values that the engine cannot check),
 ///      cannot take a built-in driver's name, and is not handed the
 ///      credentials. Additive.
-pub const PROTO: u32 = 13;
+///
+/// **14** — `store.profiles.users`: which connections point at a profile, asked
+///      WITHOUT removing it. `store.profiles.remove` has always returned the
+///      same list, but only once the profile was gone, which makes it a report
+///      of damage rather than a warning. A client that wanted to ask first had
+///      no way to. Additive: nothing else changed, and a client that does not
+///      call it behaves exactly as before.
+pub const PROTO: u32 = 14;
 
 /// One decoded incoming request.
 #[derive(Debug, Deserialize)]

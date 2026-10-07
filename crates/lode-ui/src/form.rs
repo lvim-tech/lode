@@ -89,6 +89,14 @@ pub struct Stash {
     by_source: HashMap<Source, String>,
 }
 
+impl Field {
+    /// A secret field with an empty stash. The stash fills as somebody moves
+    /// between sources; it starts empty because nothing has been typed yet.
+    pub fn secret(input: Entity<TextInput>, source: Source) -> Field {
+        Field { input, source, stash: Stash::default(), secret: true }
+    }
+}
+
 impl Stash {
     fn put(&mut self, s: Source, v: String) {
         self.by_source.insert(s, v);
@@ -155,12 +163,12 @@ impl FormTab {
 }
 
 /// One editable value: its own field, and where it comes from.
-struct Field {
-    input: Entity<TextInput>,
-    source: Source,
+pub struct Field {
+    pub input: Entity<TextInput>,
+    pub source: Source,
     /// What was typed under the OTHER sources, so switching back and forth
     /// keeps it. Without this, a glance at `Env` and back costs the password.
-    stash: Stash,
+    pub stash: Stash,
     /// Whether a source may be chosen at all. A host is a host; a password is
     /// the kind of thing that comes from a wallet.
     secret: bool,
@@ -216,6 +224,9 @@ pub struct ConnectionForm {
     tunnel_profile: Option<String>,
     /// The names the workspace knows about, handed over when the window opens.
     tunnel_profiles: Vec<String>,
+    /// Their specs too, so a chosen one can SHOW what it is. A name alone tells
+    /// somebody nothing about what their connection goes through.
+    tunnel_profile_specs: std::collections::BTreeMap<String, Value>,
     /// The AWS profile names the engine read out of `~/.aws/config`, offered for
     /// any parameter a driver declares as `ParamType::AwsProfile`.
     aws_profiles: Vec<String>,
@@ -253,6 +264,7 @@ impl ConnectionForm {
         scale: Metrics,
         drivers: Vec<DriverMeta>,
         tunnel_profiles: Vec<String>,
+        tunnel_profile_specs: std::collections::BTreeMap<String, Value>,
         aws_profiles: Vec<String>,
         existing: Option<(String, String, Value)>,
         cx: &mut Context<Self>,
@@ -355,6 +367,7 @@ impl ConnectionForm {
                 .and_then(Value::as_str)
                 .map(str::to_string),
             tunnel_profiles,
+            tunnel_profile_specs,
             aws_profiles,
             profile_name: mk(cx, "name this tunnel", ""),
             tunnel_host: mk(cx, "bastion.example", &get(&tunnel, "host")),
@@ -548,25 +561,18 @@ impl ConnectionForm {
     /// alike. Two builders of the same shape is how the last bug got in: a
     /// reader and a writer that disagreed about which key held what.
     fn tunnel_spec(&self, cx: &Context<Self>) -> Value {
-        let tauth = match self.tunnel_auth.as_str() {
-            "key" => json!({
-                "kind": "key",
-                "path": self.tunnel_key_path.read(cx).text(),
-                // Carried, not blanked. It used to be written out as a literal
-                // empty string, which quietly made every passphrase-protected
-                // key unusable.
-                "passphrase": self.tunnel_passphrase.source.wrap(
-                    self.tunnel_passphrase.input.read(cx).text()
-                ),
-            }),
-            "password" => json!({
-                "kind": "password",
-                "password": self.tunnel_password.source.wrap(
-                    self.tunnel_password.input.read(cx).text()
-                ),
-            }),
-            _ => json!({ "kind": "agent" }),
-        };
+        let tauth = tunnel_auth_json(
+            &self.tunnel_auth,
+            self.tunnel_key_path.read(cx).text(),
+            &self
+                .tunnel_passphrase
+                .source
+                .wrap(self.tunnel_passphrase.input.read(cx).text()),
+            &self
+                .tunnel_password
+                .source
+                .wrap(self.tunnel_password.input.read(cx).text()),
+        );
         json!({
             "host": self.tunnel_host.read(cx).text(),
             "port": self.tunnel_port.read(cx).text().trim().parse::<u16>().unwrap_or(22),
@@ -694,6 +700,24 @@ pub fn auth_json(p: AuthParts<'_>) -> Value {
     }
 }
 
+/// A tunnel's auth, as the engine's `TunnelAuth`.
+///
+/// ONE builder, used by the connection window and by the profile window alike.
+/// Two builders of this shape is exactly how a passphrase ended up written into
+/// a key path, and the second window is precisely the moment that would happen
+/// again.
+///
+/// The passphrase is CARRIED, not blanked. It used to be written out as a
+/// literal empty string, which quietly made every passphrase-protected key
+/// unusable.
+pub fn tunnel_auth_json(kind: &str, path: &str, passphrase: &str, password: &str) -> Value {
+    match kind {
+        "key" => json!({ "kind": "key", "path": path, "passphrase": passphrase }),
+        "password" => json!({ "kind": "password", "password": password }),
+        _ => json!({ "kind": "agent" }),
+    }
+}
+
 /// The provider names the engine's own `AuthSpec` documents.
 ///
 /// Not built from `access.list`: that returns the AWS PROFILE names out of
@@ -709,7 +733,7 @@ const PROVIDERS: [&str; 3] = ["aws", "oauth", "oidc"];
 /// key. The check exists because of a value typed into the wrong box: a
 /// passphrase has punctuation and spaces and no separator, and looks nothing
 /// like a path — so the form can say so before anything is dialled.
-fn path_problem(path: &str) -> Option<String> {
+pub fn path_problem(path: &str) -> Option<String> {
     if !path.starts_with('/') && !path.starts_with('~') && !path.starts_with('.') {
         return Some("that is not a path — it starts with / or ~".into());
     }
@@ -729,7 +753,7 @@ fn path_problem(path: &str) -> Option<String> {
     None
 }
 
-fn colors_of(t: &Theme) -> InputColors {
+pub fn colors_of(t: &Theme) -> InputColors {
     InputColors {
         text: t.fg(),
         placeholder: t.muted(),
@@ -1437,12 +1461,74 @@ impl Render for ConnectionForm {
                 // blanks next to its name reads as something left unfilled.
                 if self.tunnel_on && self.tunnel_profile.is_some() {
                     let name = self.tunnel_profile.clone().unwrap_or_default();
+                    // WHAT it is, not just that it is. A name on its own does not
+                    // tell somebody what their connection goes through, and
+                    // hunting for it in another window to find out is the thing
+                    // this is here to avoid.
+                    let summary = self
+                        .tunnel_profile_specs
+                        .get(&name)
+                        .map(|sp| {
+                            let g = |k: &str| {
+                                sp.get(k).and_then(Value::as_str).unwrap_or("").to_string()
+                            };
+                            let port = sp.get("port").and_then(Value::as_u64).unwrap_or(22);
+                            let auth = sp.get("auth").cloned().unwrap_or(json!({}));
+                            let kind = auth.get("kind").and_then(Value::as_str).unwrap_or("agent");
+                            let path = auth.get("path").and_then(Value::as_str).unwrap_or("");
+                            let who = {
+                                let u = g("user");
+                                if u.is_empty() { String::new() } else { format!("{u}@") }
+                            };
+                            if kind == "key" && !path.is_empty() {
+                                format!("{who}{}:{port} · key {path}", g("host"))
+                            } else {
+                                format!("{who}{}:{port} · {kind}", g("host"))
+                            }
+                        })
+                        .unwrap_or_else(|| "(its values are not loaded yet)".to_string());
+                    body = body.child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .py_1()
+                            .child(
+                                div()
+                                    .w(px(ms.label_w()))
+                                    .flex_none()
+                                    .child(self.small("Goes through", t.muted())),
+                            )
+                            .child(div().flex_1().child(self.small(summary, t.fg())))
+                            .child(
+                                div()
+                                    .id("edit-this-profile")
+                                    .flex_none()
+                                    .px_1()
+                                    .cursor_pointer()
+                                    .hover(|d| d.bg(t.hover()))
+                                    .text_size(ms.tiny())
+                                    .text_color(t.accent())
+                                    .child("edit this tunnel")
+                                    .on_click(cx.listener({
+                                        let n = name.clone();
+                                        move |this, _, _, cx| {
+                                            let sp = this
+                                                .tunnel_profile_specs
+                                                .get(&n)
+                                                .cloned()
+                                                .unwrap_or(json!({}));
+                                            let n2 = n.clone();
+                                            let _ = this.workspace.update(cx, move |w, cx| {
+                                                w.open_profile(Some((n2, sp)), cx);
+                                            });
+                                        }
+                                    })),
+                            ),
+                    );
                     body = body.child(self.small(
-                        format!(
-                            "This connection goes through the saved tunnel \"{name}\". Its host, \
-                             user and key live in the profile, and changing it there changes every \
-                             connection that uses it."
-                        ),
+                        "These values live in the profile. Changing them there changes every \
+                         connection that uses it.",
                         t.muted(),
                     ));
                     body = body.child(self.stage_row("tunnel", cx));

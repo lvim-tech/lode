@@ -726,6 +726,7 @@ impl Server {
             "store.profiles.get" => self.store_profile_get(params).await,
             "store.profiles.save" => self.store_profile_save(params).await,
             "store.profiles.remove" => self.store_profile_remove(params).await,
+            "store.profiles.users" => self.store_profile_users(params).await,
             "approvals.list" => self.approval_list(params).await,
             "approvals.decide" => self.approval_decide(params).await,
             "access.list" => self.access_list(params).await,
@@ -2409,6 +2410,23 @@ impl Server {
     /// leave them unable to clean up. But a removal that takes twenty
     /// connections down silently is a surprise, not a choice, so the names come
     /// back with the answer.
+    /// WHICH connections point at this profile — asked without removing it.
+    ///
+    /// `store.profiles.remove` has always returned this, but only once the
+    /// profile was gone, which makes it a report of damage rather than a
+    /// warning. A client that wants to ask before acting had no way to, so it
+    /// either deleted and then explained, or said nothing.
+    async fn store_profile_users(&self, params: Json) -> anyhow::Result<Json> {
+        #[derive(Deserialize)]
+        struct P {
+            kind: String,
+            name: String,
+        }
+        let p: P = serde_json::from_value(params)?;
+        check_profile_kind(&p.kind)?;
+        Ok(json!({ "users": self.store()?.profile_users(p.kind, p.name).await? }))
+    }
+
     async fn store_profile_remove(&self, params: Json) -> anyhow::Result<Json> {
         #[derive(Deserialize)]
         struct P {

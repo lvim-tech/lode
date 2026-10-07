@@ -24,6 +24,7 @@ mod input;
 mod metrics;
 mod session;
 mod theme;
+mod profile;
 mod tip;
 mod workspace;
 

@@ -448,6 +448,9 @@ pub enum PaletteAct {
     NewConnection,
     /// Open a SAVED connection's settings, by name.
     EditConnection(String),
+    NewProfile,
+    /// Open a saved tunnel's own window, by name.
+    EditProfile(String),
     /// A column's width sideways, signed.
     ScrollGrid(f32),
 }
@@ -574,6 +577,8 @@ enum Pending {
     AwsProfiles,
     /// A profile was stored; the list is asked for again.
     ProfileSaved { kind: &'static str },
+    /// Which connections point at one profile, asked before touching it.
+    ProfileUsers { name: String },
     /// A profile was removed, and the engine says which connections used it.
     ProfileRemoved { kind: &'static str, name: String },
     /// A connection saved from that window.
@@ -752,6 +757,13 @@ pub struct Workspace {
     /// The AWS profile names out of `~/.aws/config`, for a parameter that a
     /// driver declares as `ParamType::AwsProfile`.
     aws_profiles: Vec<String>,
+    /// The open tunnel window, if there is one.
+    profile_window: Option<gpui::WindowHandle<crate::profile::ProfileForm>>,
+    /// A profile somebody has pressed delete on, waiting to be confirmed.
+    confirm_profile_rm: Option<(&'static str, String)>,
+    /// Which connections point at each profile, by profile name. Asked before
+    /// anything is removed, which is what makes it a warning.
+    profile_users: std::collections::BTreeMap<String, Vec<String>>,
     /// The saved tunnel and proxy profiles, by kind.
     ///
     /// A bastion is one machine and twenty connections go through it. The engine
@@ -912,6 +924,9 @@ impl Workspace {
                 .collect(),
             theme_filter,
             profiles: std::collections::BTreeMap::new(),
+            profile_window: None,
+            profile_users: std::collections::BTreeMap::new(),
+            confirm_profile_rm: None,
             aws_profiles: Vec::new(),
             missing_glyphs: missing_in(cx, &icon_family),
             icon_family,
@@ -1462,9 +1477,29 @@ impl Workspace {
                 let rows: Vec<ProfileRow> =
                     serde_json::from_value(v.get("profiles").cloned().unwrap_or(json!([])))
                         .unwrap_or_default();
+                // Who depends on each, asked now rather than when somebody
+                // presses delete: a warning that arrives after the action is a
+                // report of damage.
+                for r in &rows {
+                    self.ask(
+                        Pending::ProfileUsers { name: r.name.clone() },
+                        "store.profiles.users",
+                        json!({ "kind": kind, "name": r.name }),
+                    );
+                }
                 self.profiles.insert(kind, rows);
             }
+            Pending::ProfileUsers { name } => {
+                let users: Vec<String> =
+                    serde_json::from_value(v.get("users").cloned().unwrap_or(json!([])))
+                        .unwrap_or_default();
+                self.profile_users.insert(name, users);
+            }
             Pending::ProfileSaved { kind } => {
+                // Stored. The window goes and the list is asked for again, so a
+                // saved profile is visible at once rather than after a refresh
+                // somebody has to know about.
+                self.close_profile(cx);
                 self.ask(Pending::Profiles { kind }, "store.profiles.list", json!({ "kind": kind }));
                 self.toast(format!("{kind} profile saved"), false);
             }
@@ -2106,6 +2141,11 @@ impl Workspace {
         let theme = self.theme.clone();
         let drivers = self.hello.as_ref().map(|h| h.drivers.clone()).unwrap_or_default();
         let tunnel_profiles = self.profile_names("tunnel");
+        let tunnel_profile_specs: std::collections::BTreeMap<String, Value> = self
+            .profiles
+            .get("tunnel")
+            .map(|v| v.iter().map(|p| (p.name.clone(), p.spec.clone())).collect())
+            .unwrap_or_default();
         let aws_profiles = self.aws_profiles.clone();
         // Asked on the way in, so a profile added to the file since the last
         // window is offered by this one.
@@ -2128,12 +2168,67 @@ impl Workspace {
                 }),
                 ..Default::default()
             },
-            |_window, cx| cx.new(|cx| ConnectionForm::new(me, theme, self.scale, drivers, tunnel_profiles, aws_profiles, existing, cx)),
+            |_window, cx| cx.new(|cx| ConnectionForm::new(me, theme, self.scale, drivers, tunnel_profiles, tunnel_profile_specs, aws_profiles, existing, cx)),
         );
         match opened {
             Ok(h) => self.form_window = Some(h),
             Err(e) => self.log.push(("error".into(), format!("could not open the window: {e}"))),
         }
+    }
+
+    /// Open the window for ONE saved tunnel, new or existing.
+    ///
+    /// Its own window: a profile is a host, a port, a user, a method and a key,
+    /// and the connection window would make somebody fill in a driver and a
+    /// database the profile has no use for. That is why "save over the same
+    /// name" was never editing — it was re-creating.
+    pub fn open_profile(&mut self, existing: Option<(String, Value)>, cx: &mut Context<Self>) {
+        if self.profile_window.is_some() {
+            return;
+        }
+        // Who depends on it, asked BEFORE the window opens, so the window can
+        // say so before anything is changed rather than after.
+        if let Some((name, _)) = &existing {
+            self.ask(
+                Pending::ProfileUsers { name: name.clone() },
+                "store.profiles.users",
+                json!({ "kind": "tunnel", "name": name }),
+            );
+        }
+        let users = existing
+            .as_ref()
+            .map(|(n, _)| self.profile_users.get(n).cloned().unwrap_or_default())
+            .unwrap_or_default();
+        let (theme, scale) = (self.theme.clone(), self.scale);
+        let me = cx.entity().downgrade();
+        let title = match &existing {
+            Some((n, _)) => format!("lode — Tunnel {n}"),
+            None => "lode — New tunnel".to_string(),
+        };
+        let bounds = Bounds::centered(None, size(px(620.0), px(420.0)), cx);
+        let opened = cx.open_window(
+            WindowOptions {
+                window_bounds: Some(WindowBounds::Windowed(bounds)),
+                titlebar: Some(TitlebarOptions { title: Some(title.into()), ..Default::default() }),
+                ..Default::default()
+            },
+            |_window, cx| {
+                cx.new(|cx| {
+                    crate::profile::ProfileForm::new(me, theme, scale, existing, users, cx)
+                })
+            },
+        );
+        match opened {
+            Ok(h) => self.profile_window = Some(h),
+            Err(e) => self.log.push(("error".into(), format!("could not open the window: {e}"))),
+        }
+    }
+
+    pub fn close_profile(&mut self, cx: &mut Context<Self>) {
+        if let Some(h) = self.profile_window.take() {
+            let _ = h.update(cx, |_, window, _| window.remove_window());
+        }
+        cx.notify();
     }
 
     pub fn close_form(&mut self, cx: &mut Context<Self>) {
@@ -2416,6 +2511,14 @@ impl Workspace {
         out.push(PaletteItem { label: "Save this query".into(), hint: "result".into(), act: PaletteAct::SaveQuery });
         out.push(PaletteItem { label: "Toggle console".into(), hint: "window".into(), act: PaletteAct::ToggleConsole });
         out.push(PaletteItem { label: "New connection".into(), hint: "window".into(), act: PaletteAct::NewConnection });
+        out.push(PaletteItem { label: "New tunnel profile".into(), hint: "window".into(), act: PaletteAct::NewProfile });
+        for p in self.profiles.get("tunnel").into_iter().flatten() {
+            out.push(PaletteItem {
+                label: format!("Edit tunnel: {}", p.name),
+                hint: "window".into(),
+                act: PaletteAct::EditProfile(p.name.clone()),
+            });
+        }
         // One per saved connection, so the settings can be reached by typing
         // the connection's name — the pencil in the list is easy to miss.
         for c in &self.saved {
@@ -2519,6 +2622,17 @@ impl Workspace {
             PaletteAct::SaveQuery => self.save_query(cx),
             PaletteAct::ToggleConsole => self.console_open = !self.console_open,
             PaletteAct::NewConnection => self.open_form(None, cx),
+            PaletteAct::NewProfile => self.open_profile(None, cx),
+            PaletteAct::EditProfile(name) => {
+                let found = self
+                    .profiles
+                    .get("tunnel")
+                    .and_then(|v| v.iter().find(|p| p.name == name))
+                    .map(|p| (p.name.clone(), p.spec.clone()));
+                if let Some(found) = found {
+                    self.open_profile(Some(found), cx);
+                }
+            }
             PaletteAct::EditConnection(name) => {
                 let found = self
                     .saved
@@ -3984,19 +4098,106 @@ impl Workspace {
                                                 ms.line_w() - ms.base() * 2.0,
                                             )),
                                     )
+                                    .child({
+                                        let n = r.name.clone();
+                                        div()
+                                            .id(SharedString::from(format!("prof-ed-{k}-{n}")))
+                                            .flex_none()
+                                            .cursor_pointer()
+                                            .tooltip(self.tip("tip.edit_profile", None))
+                                            .hover(|d| d.bg(t.hover()))
+                                            .child(self.icon_inline("\u{f044}", t.accent()))
+                                            .on_click(cx.listener({
+                                                let (n, sp) = (n.clone(), r.spec.clone());
+                                                move |this, _, _, cx| {
+                                                    this.open_profile(Some((n.clone(), sp.clone())), cx);
+                                                }
+                                            }))
+                                    })
                                     .child(
                                         div()
                                             .id(SharedString::from(format!("prof-rm-{k}-{name}")))
                                             .flex_none()
                                             .cursor_pointer()
                                             .tooltip(self.tip("tip.remove_profile", None))
+                                            .hover(|d| d.bg(t.hover()))
                                             .child(self.icon_inline("\u{f00d}", t.muted()))
-                                            .on_click(cx.listener(move |this, _, _, cx| {
-                                                this.remove_profile(k, &name);
-                                                cx.notify();
+                                            .on_click(cx.listener({
+                                                let n = name.clone();
+                                                move |this, _, _, cx| {
+                                                    // ASK first. The list of
+                                                    // dependants is already here.
+                                                    this.confirm_profile_rm = Some((k, n.clone()));
+                                                    cx.notify();
+                                                }
                                             })),
                                     ),
                             );
+                            // The warning stands where the row is, before
+                            // anything happens — not in a toast afterwards.
+                            let users = self.profile_users.get(&r.name).cloned().unwrap_or_default();
+                            if !users.is_empty() {
+                                list = list.child(div().px_2().child(self.small(
+                                    format!("used by {}: {}", users.len(), users.join(", ")),
+                                    t.muted(),
+                                )));
+                            }
+                            if self.confirm_profile_rm.as_ref()
+                                == Some(&(kind, r.name.clone()))
+                            {
+                                let why = if users.is_empty() {
+                                    format!("Remove \"{}\"? Nothing points at it.", r.name)
+                                } else {
+                                    format!(
+                                        "Remove \"{}\"? {} connection(s) point at it and would \
+                                         stop connecting: {}",
+                                        r.name,
+                                        users.len(),
+                                        users.join(", ")
+                                    )
+                                };
+                                list = list.child(div().px_2().child(self.small(why, t.warning())));
+                                let n = r.name.clone();
+                                list = list.child(
+                                    div()
+                                        .flex()
+                                        .gap_2()
+                                        .px_2()
+                                        .py_1()
+                                        .child(
+                                            div()
+                                                .id(SharedString::from(format!("prof-yes-{n}")))
+                                                .px_2()
+                                                .cursor_pointer()
+                                                .border_1()
+                                                .border_color(t.error())
+                                                .text_size(ms.small())
+                                                .text_color(t.fg())
+                                                .child("remove it")
+                                                .on_click(cx.listener({
+                                                    let n = n.clone();
+                                                    move |this, _, _, cx| {
+                                                        this.remove_profile(kind, &n);
+                                                        this.confirm_profile_rm = None;
+                                                        cx.notify();
+                                                    }
+                                                })),
+                                        )
+                                        .child(
+                                            div()
+                                                .id(SharedString::from(format!("prof-no-{n}")))
+                                                .px_2()
+                                                .cursor_pointer()
+                                                .text_size(ms.small())
+                                                .text_color(t.muted())
+                                                .child("keep it")
+                                                .on_click(cx.listener(|this, _, _, cx| {
+                                                    this.confirm_profile_rm = None;
+                                                    cx.notify();
+                                                })),
+                                        ),
+                                );
+                            }
                         }
                     }
                 }
