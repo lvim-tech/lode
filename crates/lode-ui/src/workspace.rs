@@ -289,6 +289,24 @@ impl Toast {
     }
 }
 
+/// Where the grid should sit when the bar is dragged to window position `x`.
+///
+/// The offset GPUI wants is NEGATIVE — it is how far the content has been moved
+/// left — and it is clamped to the real overflow, so a drag past either end
+/// stops at the end instead of running off into blank space.
+///
+/// The pointer grabs the MIDDLE of the thumb, so the thumb lands under the
+/// pointer rather than starting there, which is what makes a drag feel like it
+/// is holding something.
+pub fn hbar_offset(x: f32, left: f32, track: f32, total: f32, max: f32) -> f32 {
+    if total <= 0.0 || track <= 0.0 {
+        return 0.0;
+    }
+    let frac = (track / total).clamp(0.05, 1.0);
+    let at = ((x - left) / track - frac / 2.0).clamp(0.0, 1.0 - frac);
+    -(at * total).min(max).max(0.0)
+}
+
 /// Where a sideways scroll lands, clamped to what there is.
 ///
 /// GPUI's scroll offset is NEGATIVE as the content moves left, so the range is
@@ -824,6 +842,45 @@ pub fn node_matches(node: &Node, filter: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+
+    /// Dragging the bar lands somewhere sensible and never past the ends.
+    ///
+    /// The bar had no drag at all — it was two coloured divs. A bar that looks
+    /// like a control and is not one is worse than no bar: somebody tries it,
+    /// nothing happens, and they conclude the grid does not scroll sideways.
+    #[test]
+    fn dragging_the_bar_stays_within_what_there_is_to_scroll() {
+        // A grid twice as wide as the window showing it.
+        let (left, track, total) = (300.0_f32, 900.0_f32, 1800.0_f32);
+        let max = total - track;
+
+        // Hard left, and well past it: both stop at zero.
+        assert_eq!(hbar_offset(left, left, track, total, max), 0.0);
+        assert_eq!(hbar_offset(left - 500.0, left, track, total, max), 0.0);
+
+        // Hard right, and well past it: both stop at the real overflow.
+        assert_eq!(hbar_offset(left + track, left, track, total, max), -max);
+        assert_eq!(hbar_offset(left + track + 500.0, left, track, total, max), -max);
+
+        // The middle of the track shows the middle of the grid.
+        let mid = hbar_offset(left + track / 2.0, left, track, total, max);
+        assert!(mid < 0.0 && mid > -max, "{mid}");
+        assert!((mid + max / 2.0).abs() < 1.0, "the middle should be the middle: {mid}");
+
+        // Monotonic: further right is never further left.
+        let mut last = 1.0_f32;
+        let mut x = left - 50.0;
+        while x <= left + track + 50.0 {
+            let v = hbar_offset(x, left, track, total, max);
+            assert!(v <= last + 0.001, "went backwards at {x}: {v} after {last}");
+            last = v;
+            x += 10.0;
+        }
+
+        // Nothing to scroll: nothing moves, and no division by zero.
+        assert_eq!(hbar_offset(left + 10.0, left, track, track, 0.0), 0.0);
+        assert_eq!(hbar_offset(left + 10.0, left, 0.0, 0.0, 0.0), 0.0);
+    }
     /// The offset is negative as the content moves LEFT. Getting the sign wrong
     /// here compiles and scrolls nowhere, which is why it is a function with a
     /// test rather than three lines inside a click handler.

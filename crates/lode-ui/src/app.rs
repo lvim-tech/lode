@@ -735,6 +735,12 @@ pub struct Workspace {
     /// because `table_el` takes `&self`, and the alternative is threading a
     /// width back out of a render function.
     grid_overflow: std::cell::Cell<f32>,
+    /// Whether the horizontal bar is being dragged right now.
+    ///
+    /// A drawn bar that cannot be grabbed is decoration, and decoration that
+    /// looks like a control is worse than no control: somebody tries it, it
+    /// does nothing, and they conclude the grid does not scroll.
+    hbar_drag: std::cell::Cell<bool>,
     /// The language the chrome is drawn in. The ENGINE is not translated —
     /// its refusals and its audit log are the record, and a record whose
     /// meaning depends on who ran it cannot be read by anybody else.
@@ -886,6 +892,7 @@ impl Workspace {
             resizing: None,
             grid_scroll: gpui::ScrollHandle::new(),
             grid_overflow: std::cell::Cell::new(0.0),
+            hbar_drag: std::cell::Cell::new(false),
             lang: restore
                 .lang
                 .as_deref()
@@ -6536,14 +6543,29 @@ impl Workspace {
                     .child(header)
                     .child(div().flex_1().child(list)),
             )
-            // Shift and the wheel, which is what a mouse with one wheel has.
+            // Three ways, because people try them in this order and conclude
+            // from the FIRST one that there is no horizontal scrolling at all.
+            //
+            //   1. A horizontal delta of its own — two fingers on a trackpad, a
+            //      mouse wheel that tilts. This is what gets tried first and it
+            //      was the one being thrown away: the handler returned unless
+            //      shift was held, so the most natural gesture did nothing.
+            //   2. Shift and the wheel, for a mouse with one wheel.
+            //   3. The bar below, which now drags.
+            //
+            // A plain vertical wheel is left alone so it still scrolls rows.
             .on_scroll_wheel(cx.listener(move |this, ev: &gpui::ScrollWheelEvent, _, cx| {
-                if !ev.modifiers.shift {
+                let d = ev.delta.pixel_delta(px(ms.row_h()));
+                let (dx, dy) = (f32::from(d.x), f32::from(d.y));
+                if dx.abs() > 0.0 {
+                    this.scroll_grid(-dx);
+                    cx.notify();
                     return;
                 }
-                let d = ev.delta.pixel_delta(px(ms.row_h()));
-                this.scroll_grid(f32::from(d.y) - f32::from(d.x));
-                cx.notify();
+                if ev.modifiers.shift && dy.abs() > 0.0 {
+                    this.scroll_grid(dy);
+                    cx.notify();
+                }
             }));
 
         let mut out = div().flex().flex_col().size_full().child(body);
@@ -6561,18 +6583,83 @@ impl Workspace {
             // six-pixel absolutely positioned box is the kind of thing that
             // resolves to zero without complaining, and a scrollbar that is
             // invisible is the bug it was added to fix.
+            let dragging = self.hbar_drag.get();
             out = out.child(
                 div()
+                    .id("grid-hbar")
                     .flex()
                     .w_full()
-                    .h(px(7.0))
+                    // Thicker than the six pixels it was: a bar has to be
+                    // grabbable, and a seven-pixel target is a target people
+                    // miss.
+                    .h(px(12.0))
                     .flex_none()
                     .bg(t.status())
+                    .cursor_pointer()
                     .child(div().w(gpui::relative(at)).h_full())
-                    .child(div().w(gpui::relative(frac)).h_full().bg(t.accent())),
+                    .child(
+                        div()
+                            .w(gpui::relative(frac))
+                            .h_full()
+                            .bg(if dragging { t.accent() } else { t.accent() }),
+                    )
+                    // Pressing anywhere on the track jumps there, which is what
+                    // a click on a scrollbar's empty half should do anyway.
+                    .on_mouse_down(
+                        gpui::MouseButton::Left,
+                        cx.listener(move |this, ev: &gpui::MouseDownEvent, _, cx| {
+                            this.hbar_drag.set(true);
+                            this.drag_hbar_to(f32::from(ev.position.x), total_w);
+                            cx.notify();
+                        }),
+                    ),
             );
         }
+        // The move and the release are on the WHOLE result area, not on the bar:
+        // a drag that stopped the moment the pointer left a twelve-pixel strip
+        // would be a drag nobody could finish.
+        let out = out
+            .on_mouse_move(cx.listener(move |this, ev: &gpui::MouseMoveEvent, _, cx| {
+                if this.hbar_drag.get() {
+                    this.drag_hbar_to(f32::from(ev.position.x), total_w);
+                    cx.notify();
+                }
+            }))
+            .on_mouse_up(
+                gpui::MouseButton::Left,
+                cx.listener(|this, _: &gpui::MouseUpEvent, _, cx| {
+                    if this.hbar_drag.replace(false) {
+                        cx.notify();
+                    }
+                }),
+            );
         out.into_any_element()
+    }
+
+    /// Where the result area starts, in window coordinates.
+    ///
+    /// The rail plus the panel plus the left padding — the same subtraction the
+    /// layout performs, so the two cannot disagree about anything but a resize
+    /// in flight. It had been left at `base * 3.1`, the rail's width BEFORE the
+    /// rail got its own size, so every figure derived from it was out by
+    /// twenty-odd pixels: the grid thought it was wider than it was and the
+    /// scrollbar thought there was less to scroll.
+    fn grid_left(&self) -> f32 {
+        self.scale.rail_w() + self.scale.panel_w() + 8.0
+    }
+
+    /// Put the grid where a pointer at `x` says, treating the bar as a map of
+    /// the whole width.
+    fn drag_hbar_to(&self, x: f32, total_w: f32) {
+        let next = crate::workspace::hbar_offset(
+            x,
+            self.grid_left(),
+            self.canvas_w.max(1.0),
+            total_w,
+            self.grid_overflow.get(),
+        );
+        self.grid_scroll
+            .set_offset(gpui::point(px(next), self.grid_scroll.offset().y));
     }
 
     /// Move the grid sideways by `dx` pixels, clamped to what there is.
@@ -7095,11 +7182,7 @@ impl Render for Workspace {
         // frame's — and this is the same subtraction the layout below performs,
         // so the two cannot disagree about anything but a resize in flight.
         // rail + panel + the canvas's own padding.
-        self.canvas_w = (f32::from(window.viewport_size().width)
-            - self.scale.base() * 3.1
-            - self.scale.panel_w()
-            - 16.0)
-            .max(120.0);
+        self.canvas_w = (f32::from(window.viewport_size().width) - self.grid_left() - 8.0).max(120.0);
 
         // Toasts expire on the next frame they are late for; the pump redraws
         // often enough that nothing sits there after its time.
