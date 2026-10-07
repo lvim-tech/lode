@@ -295,6 +295,79 @@ impl Toast {
     }
 }
 
+/// One audit record, as the LINES it is drawn on.
+///
+/// Pulled out of the drawing for the same reason the settings groups were: a
+/// box that holds two lines of text and is one line tall cannot be told from a
+/// correct one without looking, and looking is the thing that is not available
+/// here. The renderer builds from this list and takes its HEIGHT from the
+/// length of it, so a record with two parts gets a box for two.
+///
+/// The history panel draws two plain lines and reads correctly; the audit panel
+/// drew the same two lines with the first one wrapped in a flex row, and left
+/// the height to be inferred. This removes the inference.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AuditPart {
+    /// The fixed-width outcome column, on the first line only.
+    pub outcome: Option<String>,
+    pub text: String,
+    /// Whether this part WRAPS instead of being cut. A refusal shortened to fit
+    /// is a refusal that has stopped explaining itself.
+    pub wraps: bool,
+}
+
+/// The parts of one audit record, in the order they are drawn.
+///
+/// `open` adds the reason, the full statement and the shape — the record being
+/// looked at is the one that may need more than a line.
+pub fn audit_parts(a: &lode_proto::AuditRow, open: bool) -> Vec<AuditPart> {
+    let mut parts = Vec::new();
+    parts.push(AuditPart {
+        outcome: Some(a.outcome.clone()),
+        text: if a.statement.is_empty() {
+            format!("({} \u{2014} not kept)", a.path)
+        } else {
+            a.statement.replace('\n', " ")
+        },
+        wraps: false,
+    });
+    parts.push(AuditPart {
+        outcome: None,
+        text: format!(
+            "{} \u{b7} {}{}{}{}",
+            a.conn.clone().unwrap_or_else(|| "\u{2014}".into()),
+            a.path,
+            a.policy.as_deref().map(|p| format!(" \u{b7} {p}")).unwrap_or_default(),
+            a.affected.map(|n| format!(" \u{b7} {n} row(s)")).unwrap_or_default(),
+            if a.confirmed { " \u{b7} confirmed" } else { "" },
+        ),
+        wraps: false,
+    });
+    if open {
+        if let Some(reason) = a.reason.clone() {
+            parts.push(AuditPart { outcome: None, text: reason, wraps: true });
+        }
+        if !a.statement.is_empty() {
+            parts.push(AuditPart { outcome: None, text: a.statement.clone(), wraps: true });
+        }
+        if let Some(fp) = a.fingerprint.clone() {
+            parts.push(AuditPart { outcome: None, text: format!("shape {fp}"), wraps: false });
+        }
+    }
+    parts
+}
+
+/// How tall a record's box has to be for the parts it holds.
+///
+/// Only the parts that do NOT wrap can be counted — a wrapped one is as tall as
+/// the text makes it, and the box must be free to grow rather than be told a
+/// number that is too small. So this is the FLOOR, applied to the closed rows
+/// that make up the list, and an open row sizes itself to its content.
+pub fn audit_row_h(parts: &[AuditPart], line_h: f32, pad: f32) -> f32 {
+    let fixed = parts.iter().filter(|p| !p.wraps).count().max(1) as f32;
+    fixed * line_h + pad * 2.0
+}
+
 /// The settings panel's groups, as DATA.
 ///
 /// Pulled out of the drawing so it can be counted without a screen. The panel
@@ -890,6 +963,65 @@ pub fn node_matches(node: &Node, filter: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+
+    fn an_audit_row() -> lode_proto::AuditRow {
+        serde_json::from_value(serde_json::json!({
+            "id": 1,
+            "path": "conn.connect",
+            "statement": "mongodb 127.0.0.1:27017",
+            "outcome": "connected",
+            "conn": "neterra-mongo",
+        }))
+        .expect("an audit row parses")
+    }
+
+    /// A record drawn on two lines gets a box for two lines.
+    ///
+    /// The audit panel drew two lines in a box sized for one: records overlapped,
+    /// descenders were cut, and a hovered second line lay across its neighbour.
+    /// The history panel, which draws the same two lines as two plain children,
+    /// was fine — so the fault was in this row and not in the scale.
+    #[test]
+    fn an_audit_record_is_as_tall_as_the_lines_it_has() {
+        let a = an_audit_row();
+
+        // Closed: the statement and the detail line. Two.
+        let parts = audit_parts(&a, false);
+        assert_eq!(parts.len(), 2, "{parts:#?}");
+        assert_eq!(parts[0].outcome.as_deref(), Some("connected"));
+        assert!(parts[0].text.contains("127.0.0.1"));
+        assert_eq!(parts[1].outcome, None, "the outcome column is on the first line only");
+        assert!(parts[1].text.contains("neterra-mongo") && parts[1].text.contains("conn.connect"));
+        assert!(parts.iter().all(|p| !p.wraps), "a closed record is cut, not wrapped");
+
+        // And the box is for TWO, not one.
+        let (line_h, pad) = (20.0_f32, 2.0_f32);
+        assert_eq!(audit_row_h(&parts, line_h, pad), 2.0 * line_h + 2.0 * pad);
+        assert!(
+            audit_row_h(&parts, line_h, pad) > line_h + 2.0 * pad,
+            "one line of room for two lines of text is the bug"
+        );
+
+        // A record with no statement still has both lines.
+        let mut empty = an_audit_row();
+        empty.statement = String::new();
+        let parts = audit_parts(&empty, false);
+        assert_eq!(parts.len(), 2);
+        assert!(parts[0].text.contains("not kept"));
+
+        // Opened: the reason and the shape join in, and the reason WRAPS — a
+        // refusal shortened to fit has stopped explaining itself.
+        let mut open_row = an_audit_row();
+        open_row.reason = Some("read only: refuses a harmless INSERT".into());
+        open_row.fingerprint = Some("a1b2c3".into());
+        let parts = audit_parts(&open_row, true);
+        assert!(parts.len() > 2, "{parts:#?}");
+        assert!(parts.iter().any(|p| p.wraps), "the reason must be free to wrap");
+        // A wrapping part is NOT counted into the fixed height, because its own
+        // height is whatever the text needs.
+        let fixed = parts.iter().filter(|p| !p.wraps).count();
+        assert_eq!(audit_row_h(&parts, line_h, pad), fixed as f32 * line_h + 2.0 * pad);
+    }
 
     /// The settings panel has five groups, whatever the session says.
     ///

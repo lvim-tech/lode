@@ -4503,108 +4503,90 @@ impl Workspace {
                         "connected" | "disconnected" => t.muted(),
                         _ => t.fg(),
                     };
-                    // No character count: the ellipsis is the layout's job, and
-                    // 68 characters of a proportional font is a different width
-                    // in every theme and at every text size.
-                    let one: String = if a.statement.is_empty() {
-                        format!("({} — not kept)", a.path)
-                    } else {
-                        a.statement.replace('\n', " ")
-                    };
                     let open = self.audit_open == Some(a.id);
                     let id = a.id;
+                    // The record's LINES, as data — and the box's height from
+                    // the count of them. It used to be two lines drawn into a
+                    // box whose height was left to be inferred, and the
+                    // inference came out at one: records overlapped, descenders
+                    // were cut, and a hovered second line lay over its
+                    // neighbour. `audit_parts` is tested, so the shape of this
+                    // is checkable without a screen.
+                    let parts = crate::workspace::audit_parts(&a, open);
+                    let line_h = f32::from(ms.line_h());
                     let mut row = div()
                         .id(SharedString::from(format!("aud-{}", a.id)))
                         .flex()
                         .flex_col()
                         .w_full()
-                        .overflow_hidden()
+                        .flex_none()
                         .px_2()
                         .py(px(2.0))
+                        // Space BETWEEN records, so thirty of them read as
+                        // thirty things rather than as one block.
+                        .mb(px(2.0))
                         .cursor_pointer()
-                        .hover(|d| d.bg(t.hover()))
-                        .child(
-                            div()
-                                .flex()
-                                // A real width, for the same reason `line` takes one: a
-                                // child of a flex row is measured against the row, and a row
-                                // that is 100%-of-something is not a width at measure time.
-                                .w(px(ms.line_w()))
-                                .gap_2()
-                                .child(
-                                    // A fixed width, so every statement starts
-                                    // at the same column: a list scanned for
-                                    // the rows that were STOPPED is scanned
-                                    // down one edge.
-                                    // "disconnected" is the longest word that
-                                    // goes here, so the column is sized from the
-                                    // scale rather than from a pixel count that
-                                    // was right at one font size and wrapped at
-                                    // the next.
-                                    div()
-                                        .w(px(ms.outcome_w()))
-                                        .flex_none()
-                                        .whitespace_nowrap()
-                                        .text_size(ms.tiny())
-                                        .text_color(colour)
-                                        .child(SharedString::from(a.outcome.clone())),
-                                )
-                                // flex_1 + min_w_0: without the second one a
-                                // flex child will not shrink below its text, so
-                                // a long statement widens the row instead of
-                                // being cut at the panel's edge.
-                                .child(self.line_in(
-                                    one,
-                                    ms.small(),
-                                    t.fg(),
-                                    ms.line_w() - ms.outcome_w() - 8.0,
-                                )),
-                        )
-                        .child(self.line(
-                            format!(
-                                "{} · {}{}{}{}",
-                                a.conn.clone().unwrap_or_else(|| "—".into()),
-                                a.path,
-                                a.policy.as_deref().map(|p| format!(" · {p}")).unwrap_or_default(),
-                                a.affected.map(|n| format!(" · {n} row(s)")).unwrap_or_default(),
-                                if a.confirmed { " · confirmed" } else { "" },
-                            ),
-                            ms.small(),
-                            t.muted(),
-                            ms.line_w(),
-                        ));
-                    // The reason, in full, for the row being looked at. Never
-                    // truncated: a refusal shortened to fit is a refusal that
-                    // stops explaining itself, which is the one thing it is for.
-                    if open {
-                        // The opened row is the one place text WRAPS instead of
-                        // being cut: a refusal shortened to fit is a refusal
-                        // that stops explaining itself, which is the one thing
-                        // it is for. It still cannot leave the panel, because
-                        // wrapping is not overflowing.
-                        if let Some(reason) = a.reason.clone() {
+                        .hover(|d| d.bg(t.hover()));
+                    // A closed record is exactly its lines; an open one is free
+                    // to grow, because a wrapped reason is as tall as it needs.
+                    if !open {
+                        row = row.h(px(crate::workspace::audit_row_h(&parts, line_h, 2.0)));
+                    }
+                    for p in parts {
+                        if p.wraps {
+                            // The one place text WRAPS instead of being cut: a
+                            // refusal shortened to fit is a refusal that has
+                            // stopped explaining itself.
                             row = row.child(
                                 div()
-                                    .w_full()
+                                    .w(px(ms.line_w()))
+                                    .flex_none()
                                     .px_1()
-                                    .py_1()
                                     .text_size(ms.small())
                                     .text_color(colour)
-                                    .child(SharedString::from(reason)),
+                                    .child(SharedString::from(p.text)),
                             );
+                            continue;
                         }
-                        if !a.statement.is_empty() && a.statement.chars().count() > 68 {
-                            row = row.child(
-                                div()
-                                    .w_full()
-                                    .px_1()
-                                    .text_size(ms.small())
-                                    .text_color(t.fg())
-                                    .child(SharedString::from(a.statement.clone())),
-                            );
-                        }
-                        if let Some(fp) = a.fingerprint.clone() {
-                            row = row.child(self.line(format!("shape {fp}"), ms.small(), t.muted(), ms.line_w()));
+                        match p.outcome {
+                            // The first line: a fixed outcome column so every
+                            // statement starts at the same edge, since a list
+                            // scanned for what was STOPPED is scanned down one.
+                            Some(outcome) => {
+                                row = row.child(
+                                    div()
+                                        .flex()
+                                        .flex_none()
+                                        .h(px(line_h))
+                                        .w(px(ms.line_w()))
+                                        .gap_2()
+                                        .child(
+                                            div()
+                                                .w(px(ms.outcome_w()))
+                                                .flex_none()
+                                                .whitespace_nowrap()
+                                                .text_size(ms.tiny())
+                                                .text_color(colour)
+                                                .child(SharedString::from(outcome)),
+                                        )
+                                        .child(self.line_in(
+                                            p.text,
+                                            ms.small(),
+                                            t.fg(),
+                                            ms.line_w() - ms.outcome_w() - 8.0,
+                                        )),
+                                );
+                            }
+                            None => {
+                                row = row.child(
+                                    div().flex_none().h(px(line_h)).child(self.line(
+                                        p.text,
+                                        ms.small(),
+                                        t.muted(),
+                                        ms.line_w(),
+                                    )),
+                                );
+                            }
                         }
                     }
                     list = list.child(row.on_click(cx.listener(move |this, _, _, cx| {
