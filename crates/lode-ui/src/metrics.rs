@@ -184,9 +184,16 @@ impl Metrics {
         (self.icon_box() + self.icon * 0.5).round()
     }
 
-    /// The gap between rail buttons — the other half of the same point.
+    /// The gap between rail buttons: none.
+    ///
+    /// They were spaced for a round, to stop six icons reading as one column of
+    /// marks. Butted together is what was wanted: ONE unbroken column, which is
+    /// what a navigation rail looks like. The separating is done by the filled
+    /// background and the accent edge of whichever is chosen, and by the hover
+    /// lighting exactly one button — so where one ends and the next begins is
+    /// still answerable, without air to answer it.
     pub fn rail_gap(self) -> f32 {
-        (self.icon * 0.35).round().max(2.0)
+        0.0
     }
 
     /// The side panel's width. Grows with the type, because a panel that stayed
@@ -312,7 +319,8 @@ mod tests {
             assert!(m.icon_box() > i, "icon {i}: the box must be bigger than the glyph");
             assert!(m.rail_w() > m.icon_box(), "icon {i}: air on both sides");
             assert!(m.rail_h() > m.icon_box(), "icon {i}: a button is taller than its icon");
-            assert!(m.rail_gap() >= 2.0, "icon {i}: buttons must not touch");
+            // Touching on purpose: see `rail_gap`.
+            assert_eq!(m.rail_gap(), 0.0, "icon {i}");
             i += 1.0;
         }
     }

@@ -103,6 +103,47 @@ pub struct TextInput {
     last_bounds: Option<Bounds<Pixels>>,
     is_selecting: bool,
     colors: InputColors,
+    /// Draw this value as dots.
+    ///
+    /// DRAWING, not a different value: `content` is untouched, and every offset
+    /// that crosses into the drawn line is translated. The cursor, the
+    /// selection, click-to-place and the input method all keep working on the
+    /// real text, because they are working on the real text.
+    mask: bool,
+    /// Showing it anyway, for now.
+    ///
+    /// Deliberately not persisted and not on the session: a field that
+    /// remembers it was revealed is a field that is one day revealed in front of
+    /// somebody. It dies with the window.
+    reveal: bool,
+}
+
+/// One dot per character. Per CHARACTER, so the count of dots is the length of
+/// the value and nothing more is told.
+const MASK_CH: char = '\u{2022}';
+
+/// A byte offset in `content` → the same byte offset in a line of dots.
+///
+/// One dot per CHARACTER, and a dot is three bytes while a character may be
+/// one, two, three or four — so the two strings do not share offsets and every
+/// offset that crosses between them has to be converted. Getting this wrong
+/// does not look like a bug in a password field: it looks like the cursor
+/// jumping, or like a panic on a character boundary the moment somebody types
+/// a non-ASCII passphrase.
+fn to_display_in(content: &str, off: usize) -> usize {
+    let off = off.min(content.len());
+    // Snap to a boundary rather than panicking on a stray offset.
+    let mut end = off;
+    while end > 0 && !content.is_char_boundary(end) {
+        end -= 1;
+    }
+    content[..end].chars().count() * MASK_CH.len_utf8()
+}
+
+/// A byte offset in a line of dots → the same place in `content`.
+fn from_display_in(content: &str, off: usize) -> usize {
+    let nth = off / MASK_CH.len_utf8();
+    content.char_indices().nth(nth).map(|(i, _)| i).unwrap_or(content.len())
 }
 
 impl EventEmitter<InputEvent> for TextInput {}
@@ -120,7 +161,59 @@ impl TextInput {
             last_bounds: None,
             is_selecting: false,
             colors,
+            mask: false,
+            reveal: false,
         }
+    }
+
+    /// Draw this field's value as dots.
+    pub fn set_mask(&mut self, mask: bool, cx: &mut Context<Self>) {
+        if self.mask != mask {
+            self.mask = mask;
+            // Changing what a field IS also puts away any showing of it: a field
+            // that becomes secret becomes secret now, not after the next click.
+            self.reveal = false;
+            cx.notify();
+        }
+    }
+
+    pub fn revealed(&self) -> bool {
+        self.reveal
+    }
+
+    pub fn toggle_reveal(&mut self, cx: &mut Context<Self>) {
+        self.reveal = !self.reveal;
+        cx.notify();
+    }
+
+    /// Is the drawn line different from the stored one right now?
+    fn masking(&self) -> bool {
+        self.mask && !self.reveal && !self.content.is_empty()
+    }
+
+    /// The line as it is DRAWN.
+    fn display_text(&self) -> SharedString {
+        if self.masking() {
+            SharedString::from(MASK_CH.to_string().repeat(self.content.chars().count()))
+        } else {
+            self.content.clone()
+        }
+    }
+
+    /// A byte offset in `content` → the same place in the drawn line.
+    fn to_display(&self, off: usize) -> usize {
+        if !self.masking() {
+            return off;
+        }
+        to_display_in(&self.content, off)
+    }
+
+    /// A byte offset in the drawn line → the same place in `content`.
+    fn from_display(&self, off: usize) -> usize {
+        if !self.masking() {
+            return off;
+        }
+        from_display_in(&self.content, off)
     }
 
     pub fn text(&self) -> &str {
@@ -271,7 +364,7 @@ impl TextInput {
         if position.y > bounds.bottom() {
             return self.content.len();
         }
-        line.closest_index_for_x(position.x - bounds.left())
+        self.from_display(line.closest_index_for_x(position.x - bounds.left()))
     }
 
     fn select_to(&mut self, offset: usize, cx: &mut Context<Self>) {
@@ -429,8 +522,14 @@ impl EntityInputHandler for TextInput {
         let last_layout = self.last_layout.as_ref()?;
         let range = self.range_from_utf16(&range_utf16);
         Some(Bounds::from_corners(
-            point(bounds.left() + last_layout.x_for_index(range.start), bounds.top()),
-            point(bounds.left() + last_layout.x_for_index(range.end), bounds.bottom()),
+            point(
+                bounds.left() + last_layout.x_for_index(self.to_display(range.start)),
+                bounds.top(),
+            ),
+            point(
+                bounds.left() + last_layout.x_for_index(self.to_display(range.end)),
+                bounds.bottom(),
+            ),
         ))
     }
 
@@ -442,7 +541,7 @@ impl EntityInputHandler for TextInput {
     ) -> Option<usize> {
         let line_point = self.last_bounds?.localize(&point)?;
         let last_layout = self.last_layout.as_ref()?;
-        let utf8_index = last_layout.index_for_x(point.x - line_point.x)?;
+        let utf8_index = self.from_display(last_layout.index_for_x(point.x - line_point.x)?);
         Some(self.offset_to_utf16(utf8_index))
     }
 }
@@ -507,11 +606,18 @@ impl Element for TextElement {
         let colors = input.colors;
         let style = window.text_style();
 
+        let masking = input.masking();
         let (display_text, text_color) = if content.is_empty() {
             (input.placeholder.clone(), colors.placeholder)
         } else {
-            (content, colors.text)
+            // Dots when this is a secret and nobody asked to see it. The
+            // placeholder is never masked: it is not a value.
+            (input.display_text(), colors.text)
         };
+        // Offsets are byte offsets into `content`; the shaped line is the DRAWN
+        // text. When those differ, every offset crossing over is translated.
+        let selected_range = input.to_display(selected_range.start)..input.to_display(selected_range.end);
+        let cursor = input.to_display(cursor);
 
         let run = TextRun {
             len: display_text.len(),
@@ -522,8 +628,9 @@ impl Element for TextElement {
             strikethrough: None,
         };
         // Text being composed by an input method is underlined, so it is visibly
-        // not yet committed.
-        let runs = if let Some(marked) = input.marked_range.as_ref() {
+        // not yet committed. Not while masked: the underline would mark out
+        // which of the dots are new.
+        let runs = if let Some(marked) = input.marked_range.as_ref().filter(|_| !masking) {
             vec![
                 TextRun { len: marked.start, ..run.clone() },
                 TextRun {
@@ -643,5 +750,57 @@ impl Render for TextInput {
 impl Focusable for TextInput {
     fn focus_handle(&self, _: &App) -> FocusHandle {
         self.focus_handle.clone()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The dots are DRAWING. Every offset that crosses between the stored value
+    /// and the drawn line survives the trip — including through a passphrase
+    /// that is not ASCII, which is where a naive one-byte-per-character mask
+    /// panics on a character boundary.
+    #[test]
+    fn an_offset_survives_the_round_trip_through_the_dots() {
+        for content in [
+            "hunter2",
+            "correct-horse!battery#staple$42",
+            "паролна-фраза-с-кирилица",
+            "mixed-Фраза-42-ü-ß",
+            "\u{1f511}-key-emoji",
+            "",
+        ] {
+            // Every character boundary, and the end.
+            let mut offsets: Vec<usize> = content.char_indices().map(|(i, _)| i).collect();
+            offsets.push(content.len());
+            for off in offsets {
+                let there = to_display_in(content, off);
+                let back = from_display_in(content, there);
+                assert_eq!(back, off, "content {content:?}, offset {off}");
+            }
+        }
+    }
+
+    /// The line of dots is as long as the value is, in characters — and says
+    /// nothing else about it.
+    #[test]
+    fn the_dots_count_characters_not_bytes() {
+        let content = "паролна-фраза";
+        let dots = MASK_CH.to_string().repeat(content.chars().count());
+        assert_eq!(dots.chars().count(), content.chars().count());
+        assert_ne!(dots.len(), content.len(), "the byte lengths differ, which is the point");
+        // The far end of the value is the far end of the dots.
+        assert_eq!(to_display_in(content, content.len()), dots.len());
+    }
+
+    /// An offset landing inside a character does not panic and does not run
+    /// past the end — both of which are reachable from a stray mouse position.
+    #[test]
+    fn a_stray_offset_is_survivable() {
+        let content = "фраза";
+        assert_eq!(to_display_in(content, 1), 0, "inside the first character");
+        assert_eq!(to_display_in(content, 9_999), to_display_in(content, content.len()));
+        assert_eq!(from_display_in(content, 9_999), content.len());
     }
 }

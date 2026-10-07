@@ -188,6 +188,7 @@ const GLYPHS: &[(&str, &str)] = &[
     ("\u{f07b}", "/"),
     ("\u{f0ce}", "T"),
     ("\u{f06e}", "V"),
+    ("\u{f070}", "-"),
     ("\u{f0d7}", "v"),
     ("\u{f0da}", ">"),
     ("\u{f0de}", "^"),
@@ -272,6 +273,14 @@ fn missing_in(cx: &gpui::App, family: &str) -> std::collections::HashSet<char> {
         }
     }
     missing
+}
+
+/// Hand a refused save back to the open connection window.
+///
+/// A free function because the window handle gives back the view itself, and
+/// the view's own context is what `save_failed` needs.
+fn f_save_failed(form: &mut crate::form::ConnectionForm, why: String, cx: &mut Context<crate::form::ConnectionForm>) {
+    form.save_failed(why, cx);
 }
 
 /// Print which fonts were chosen and whether they carry every glyph.
@@ -1302,7 +1311,13 @@ impl Workspace {
                 self.run_tab(tab);
             }
             Pending::FormSave => {
+                // Stored. Now the window goes, and the panel is asked for the
+                // list again so the new name and driver are there immediately —
+                // a save somebody has to go and refresh to see is a save they
+                // are not sure happened.
+                self.close_form(cx);
                 self.ask(Pending::Connections, "store.connections.list", json!({}));
+                self.toast("connection saved".to_string(), false);
             }
             Pending::Classify { conn, statement } => {
                 match v.get("reason").and_then(Value::as_str) {
@@ -1386,6 +1401,14 @@ impl Workspace {
             }
             // A failed stage is the engine naming the layer that is wrong, so it
             // goes back to the window beside the button that asked.
+            Pending::FormSave => {
+                // The window is still open, which is the point: the refusal
+                // goes into it, beside the fields that still hold the typing.
+                if let Some(h) = self.form_window.clone() {
+                    let _ = h.update(cx, |form, _, cx| f_save_failed(form, e.clone(), cx));
+                }
+                self.toast(e, true);
+            }
             Pending::FormTest { stage, form } => {
                 let _ = form.update(cx, |f, cx| f.test_answer(stage, Err(e), cx));
             }
@@ -1970,7 +1993,10 @@ impl Workspace {
                 json!({ "name": old }),
             );
         }
-        self.close_form(cx);
+        // NOT closed here. The window closes when the ENGINE says the
+        // connection is stored — see `Pending::FormSave`. Closing on the way out
+        // of this function closes it whether the save worked or not, and a
+        // window that vanishes on a failed save takes the typing with it.
     }
 
     /// Save the active tab's statement under its title, for this connection.
@@ -3154,6 +3180,8 @@ impl Workspace {
                     // could be read.
                     .when(on, |d| d.bg(t.selected()).border_l_3().border_color(t.accent()))
                     .when(!on, |d| d.border_l_3().border_color(t.status()))
+                    // The buttons touch, so the hover has to be what says where
+                    // one ends: it fills exactly one button's height.
                     .hover(|d| d.bg(t.hover()))
                     .cursor_pointer()
                     // In a box of its own, centred both ways, so the six glyphs

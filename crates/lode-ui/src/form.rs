@@ -399,6 +399,16 @@ impl ConnectionForm {
         cx.notify();
     }
 
+    /// The engine refused the save. The window stays, with the reason in it.
+    ///
+    /// The worst outcome for a failed save is a window that closes anyway:
+    /// everything typed is gone and nothing says why. So the refusal comes back
+    /// HERE, where the fields still hold what somebody wrote.
+    pub fn save_failed(&mut self, why: String, cx: &mut Context<Self>) {
+        self.error = Some(why);
+        cx.notify();
+    }
+
     fn save(&mut self, cx: &mut Context<Self>) {
         let name = self.name.read(cx).text().trim().to_string();
         if name.is_empty() {
@@ -481,10 +491,38 @@ impl ConnectionForm {
             }
             row = row.child(picker);
         }
-        // The field carries the form's body size, and so does its
-        // placeholder: what a field says before anything is typed is the size
-        // of what it will say after.
-        row.child(div().flex_1().text_size(ms.body()).child(field.input.clone()))
+        // Dots, and an eye to look.
+        //
+        // Only when the value IS the credential. Under `Env`, `Command` and
+        // `Keyring` the field holds the NAME of a variable, a command line or a
+        // keyring path — public text that somebody has to be able to read and
+        // check, and masking it hides nothing while making it unusable.
+        let hide = field.secret && field.source == Source::Literal;
+        let shown = field.input.read(cx).revealed();
+        field.input.update(cx, |i, cx| i.set_mask(hide, cx));
+        row = row.child(div().flex_1().text_size(ms.body()).child(field.input.clone()));
+        if hide {
+            let input = field.input.clone();
+            row = row.child(
+                div()
+                    .id(SharedString::from(format!("eye-{key}")))
+                    .flex_none()
+                    .cursor_pointer()
+                    .hover(|d| d.bg(t.hover()))
+                    // Open eye while it is showing, struck-through eye while it
+                    // is not: the icon says what you are looking at, not what
+                    // pressing it would do.
+                    .child(self.icon_inline(
+                        if shown { "\u{f06e}" } else { "\u{f070}" },
+                        if shown { t.warning() } else { t.muted() },
+                    ))
+                    .on_click(cx.listener(move |_, _, _, cx| {
+                        input.update(cx, |i, cx| i.toggle_reveal(cx));
+                        cx.notify();
+                    })),
+            );
+        }
+        row
     }
 
     fn set_source(&mut self, key: &str, s: Source) {
@@ -534,6 +572,23 @@ impl ConnectionForm {
             return Some(format!("there is no file at {path}"));
         }
         None
+    }
+
+    /// A small icon in a fixed square, the same one the main window uses.
+    fn icon_inline(&self, glyph: &'static str, colour: gpui::Rgba) -> gpui::Div {
+        let ms = self.scale;
+        let box_w = (ms.base() * 1.25).round();
+        div()
+            .flex()
+            .items_center()
+            .justify_center()
+            .flex_none()
+            .w(px(box_w))
+            .h(px(box_w))
+            .line_height(px(box_w))
+            .text_size(ms.small())
+            .text_color(colour)
+            .child(glyph)
     }
 
     /// A drawn checkbox: a box, with a tick in it when it is on.
