@@ -141,6 +141,17 @@ pub struct ConnectionForm {
     /// travels with the connection wherever it is opened from.
     policy: String,
     tunnel_on: bool,
+    /// A SAVED tunnel, by name, instead of one spelled out here.
+    ///
+    /// The engine has resolved these since protocol 9 and no client ever
+    /// offered them: a bastion is one machine and twenty connections go through
+    /// it, and writing its host, user and key into twenty specs means changing
+    /// twenty of them when the key rotates.
+    tunnel_profile: Option<String>,
+    /// The names the workspace knows about, handed over when the window opens.
+    tunnel_profiles: Vec<String>,
+    /// The name to save the fields above under.
+    profile_name: Entity<TextInput>,
     tunnel_host: Entity<TextInput>,
     tunnel_port: Entity<TextInput>,
     tunnel_user: Entity<TextInput>,
@@ -171,6 +182,7 @@ impl ConnectionForm {
         theme: Theme,
         scale: Metrics,
         drivers: Vec<DriverMeta>,
+        tunnel_profiles: Vec<String>,
         existing: Option<(String, String, Value)>,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -248,7 +260,13 @@ impl ConnectionForm {
                 .and_then(Value::as_str)
                 .unwrap_or("confirm")
                 .to_string(),
-            tunnel_on: !tunnel.is_null(),
+            tunnel_on: !tunnel.is_null() || spec.get("tunnel_profile").is_some(),
+            tunnel_profile: spec
+                .get("tunnel_profile")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+            tunnel_profiles,
+            profile_name: mk(cx, "name this tunnel", ""),
             tunnel_host: mk(cx, "bastion.example", &get(&tunnel, "host")),
             tunnel_port: mk(
                 cx,
@@ -346,35 +364,24 @@ impl ConnectionForm {
             "kerberos" => json!({ "kind": "kerberos", "principal": Value::Null }),
             _ => json!({ "kind": "none" }),
         };
-        let tunnel = if self.tunnel_on {
-            let tauth = match self.tunnel_auth.as_str() {
-                "key" => json!({
-                    "kind": "key",
-                    "path": self.tunnel_key_path.read(cx).text(),
-                    // Carried, not blanked. It used to be written out as a
-                    // literal empty string, which quietly made every
-                    // passphrase-protected key unusable.
-                    "passphrase": self.tunnel_passphrase.source.wrap(
-                        self.tunnel_passphrase.input.read(cx).text()
-                    ),
-                }),
-                "password" => json!({
-                    "kind": "password",
-                    "password": self.tunnel_password.source.wrap(
-                        self.tunnel_password.input.read(cx).text()
-                    ),
-                }),
-                _ => json!({ "kind": "agent" }),
-            };
-            json!({
-                "host": self.tunnel_host.read(cx).text(),
-                "port": self.tunnel_port.read(cx).text().trim().parse::<u16>().unwrap_or(22),
-                "user": self.tunnel_user.read(cx).text(),
-                "auth": tauth
-            })
-        } else {
-            Value::Null
-        };
+        // A profile INSTEAD of a spelled-out tunnel. Naming one and spelling one
+        // out is refused by the engine rather than resolved by precedence, so
+        // the form sends exactly one of them.
+        if let Some(name) = self.tunnel_profile.clone().filter(|_| self.tunnel_on) {
+            let mut out = json!({
+                "driver": self.driver,
+                "params": Value::Object(params),
+                "auth": auth,
+                "tls": { "mode": self.tls_mode },
+                "tunnel_profile": name,
+                "policy": self.policy
+            });
+            if let Some(m) = out.as_object_mut() {
+                m.remove("tunnel");
+            }
+            return out;
+        }
+        let tunnel = if self.tunnel_on { self.tunnel_spec(cx) } else { Value::Null };
         json!({
             "driver": self.driver,
             "params": Value::Object(params),
@@ -406,6 +413,68 @@ impl ConnectionForm {
     /// HERE, where the fields still hold what somebody wrote.
     pub fn save_failed(&mut self, why: String, cx: &mut Context<Self>) {
         self.error = Some(why);
+        cx.notify();
+    }
+
+    /// The tunnel, as the engine's `TunnelSpec`.
+    ///
+    /// ONE definition, used by the connection's own spec and by a saved profile
+    /// alike. Two builders of the same shape is how the last bug got in: a
+    /// reader and a writer that disagreed about which key held what.
+    fn tunnel_spec(&self, cx: &Context<Self>) -> Value {
+        let tauth = match self.tunnel_auth.as_str() {
+            "key" => json!({
+                "kind": "key",
+                "path": self.tunnel_key_path.read(cx).text(),
+                // Carried, not blanked. It used to be written out as a literal
+                // empty string, which quietly made every passphrase-protected
+                // key unusable.
+                "passphrase": self.tunnel_passphrase.source.wrap(
+                    self.tunnel_passphrase.input.read(cx).text()
+                ),
+            }),
+            "password" => json!({
+                "kind": "password",
+                "password": self.tunnel_password.source.wrap(
+                    self.tunnel_password.input.read(cx).text()
+                ),
+            }),
+            _ => json!({ "kind": "agent" }),
+        };
+        json!({
+            "host": self.tunnel_host.read(cx).text(),
+            "port": self.tunnel_port.read(cx).text().trim().parse::<u16>().unwrap_or(22),
+            "user": self.tunnel_user.read(cx).text(),
+            "auth": tauth
+        })
+    }
+
+    /// Store the tunnel fields as a named profile, for every other connection.
+    fn save_tunnel_profile(&mut self, cx: &mut Context<Self>) {
+        let name = self.profile_name.read(cx).text().trim().to_string();
+        if name.is_empty() {
+            self.error = Some("a profile needs a name".into());
+            cx.notify();
+            return;
+        }
+        // The same refusal a save gets, for the same reason: a profile with a
+        // passphrase in its key path is a profile that breaks every connection
+        // that adopts it.
+        if let Some(why) = self.key_path_problem(cx) {
+            self.error = Some(format!("SSH key: {why}"));
+            cx.notify();
+            return;
+        }
+        let spec = self.tunnel_spec(cx);
+        let _ = self.workspace.update(cx, |w, _| {
+            w.save_profile("tunnel", name.clone(), spec);
+        });
+        // It becomes selectable here without waiting for the panel to catch up.
+        if !self.tunnel_profiles.contains(&name) {
+            self.tunnel_profiles.push(name.clone());
+            self.tunnel_profiles.sort();
+        }
+        self.error = None;
         cx.notify();
     }
 
@@ -940,6 +1009,70 @@ impl Render for ConnectionForm {
                         })),
                 );
                 if self.tunnel_on {
+                    // Its own tunnel, or one of the saved ones. The engine
+                    // refuses a spec that names a profile AND spells a tunnel
+                    // out, so this is a choice rather than two things to fill.
+                    let mut pick = div().flex().items_center().gap_2().py_1().child(
+                        div().w(px(ms.label_w())).child(self.small("Tunnel", t.muted())),
+                    );
+                    let own = self.tunnel_profile.is_none();
+                    pick = pick.child(
+                        div()
+                            .id("tun-own")
+                            .px_1()
+                            .cursor_pointer()
+                            .text_size(ms.tiny())
+                            .text_color(if own { t.inverted() } else { t.muted() })
+                            .when(own, |d| d.bg(t.accent()))
+                            .child("this connection's own")
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.tunnel_profile = None;
+                                cx.notify();
+                            })),
+                    );
+                    for name in self.tunnel_profiles.clone() {
+                        let on = self.tunnel_profile.as_deref() == Some(name.as_str());
+                        let n = name.clone();
+                        pick = pick.child(
+                            div()
+                                .id(SharedString::from(format!("tun-p-{name}")))
+                                .px_1()
+                                .cursor_pointer()
+                                .text_size(ms.tiny())
+                                .text_color(if on { t.inverted() } else { t.muted() })
+                                .when(on, |d| d.bg(t.accent()))
+                                .child(SharedString::from(name.clone()))
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.tunnel_profile = Some(n.clone());
+                                    cx.notify();
+                                })),
+                        );
+                    }
+                    body = body.child(pick);
+                    if self.tunnel_profiles.is_empty() {
+                        body = body.child(self.small(
+                            "No saved tunnels yet. Fill these in and press \"save as profile\" to \
+                             reuse them on another connection.",
+                            t.muted(),
+                        ));
+                    }
+                }
+                // A chosen profile REPLACES the fields rather than sitting
+                // beside empty ones: the values are in the profile, and a row of
+                // blanks next to its name reads as something left unfilled.
+                if self.tunnel_on && self.tunnel_profile.is_some() {
+                    let name = self.tunnel_profile.clone().unwrap_or_default();
+                    body = body.child(self.small(
+                        format!(
+                            "This connection goes through the saved tunnel \"{name}\". Its host, \
+                             user and key live in the profile, and changing it there changes every \
+                             connection that uses it."
+                        ),
+                        t.muted(),
+                    ));
+                    body = body.child(self.stage_row("tunnel", cx));
+                }
+                if self.tunnel_on && self.tunnel_profile.is_none() {
                     for (label, input) in [
                         ("SSH host", self.tunnel_host.clone()),
                         ("SSH port", self.tunnel_port.clone()),
@@ -1025,6 +1158,48 @@ impl Render for ConnectionForm {
                         body = body.child(self.row("Password", &f, "tunnel-password".into(), cx));
                     }
                     body = body.child(self.stage_row("tunnel", cx));
+                    // This is how a profile is CREATED: out of the fields
+                    // somebody has just filled in and proved with "Test tunnel".
+                    // A separate editor would be a second place to type the same
+                    // three values.
+                    body = body.child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .py_1()
+                            .child(
+                                div()
+                                    .w(px(ms.label_w()))
+                                    .child(self.small("Save as profile", t.muted())),
+                            )
+                            .child(
+                                div()
+                                    .w(px(ms.field_w()))
+                                    .text_size(ms.body())
+                                    .child(self.profile_name.clone()),
+                            )
+                            .child(
+                                div()
+                                    .id("tun-save-profile")
+                                    .px_2()
+                                    .cursor_pointer()
+                                    .text_size(ms.small())
+                                    .border_1()
+                                    .border_color(t.accent())
+                                    .text_color(t.fg())
+                                    .hover(|d| d.bg(t.hover()))
+                                    .child("save")
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.save_tunnel_profile(cx);
+                                    })),
+                            ),
+                    );
+                    body = body.child(self.small(
+                        "Saving over a name replaces it — one bastion, one entry, changed in one \
+                         place.",
+                        t.muted(),
+                    ));
                 }
                 }
             }
@@ -1168,6 +1343,60 @@ impl Render for ConnectionForm {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Naming a profile and spelling a tunnel out are mutually exclusive: the
+    /// engine refuses a spec holding both rather than picking one, so the form
+    /// has to send exactly one of them.
+    #[test]
+    fn a_spec_carries_a_profile_or_a_tunnel_and_never_both() {
+        // What the form builds when a profile is chosen.
+        let with_profile = json!({
+            "driver": "mongodb",
+            "params": {},
+            "auth": { "kind": "none" },
+            "tls": { "mode": "prefer" },
+            "tunnel_profile": "bastion",
+            "policy": "confirm"
+        });
+        assert!(with_profile.get("tunnel").is_none(), "no spelled-out tunnel beside a profile");
+        assert_eq!(
+            with_profile.get("tunnel_profile").and_then(Value::as_str),
+            Some("bastion")
+        );
+
+        // And when it is spelled out.
+        let with_tunnel = json!({
+            "driver": "mongodb",
+            "params": {},
+            "auth": { "kind": "none" },
+            "tls": { "mode": "prefer" },
+            "tunnel": { "host": "b.example", "port": 22, "user": "me",
+                        "auth": { "kind": "agent" } },
+            "policy": "confirm"
+        });
+        assert!(
+            with_tunnel.get("tunnel_profile").is_none(),
+            "no profile name beside a spelled-out tunnel"
+        );
+        assert!(with_tunnel.get("tunnel").is_some());
+    }
+
+    /// A profile's one-line description is read off its own spec, so it cannot
+    /// go stale the way a description stored beside it would.
+    #[test]
+    fn a_profile_describes_itself_from_its_spec() {
+        use crate::app::ProfileRow;
+        let r = ProfileRow {
+            name: "bastion".into(),
+            spec: json!({ "host": "b.example", "port": 2222, "user": "me",
+                          "auth": { "kind": "key" } }),
+        };
+        assert_eq!(r.summary(), "me@b.example:2222 · key");
+
+        // A profile with nothing useful in it says so rather than inventing.
+        let empty = ProfileRow { name: "x".into(), spec: json!({}) };
+        assert_eq!(empty.summary(), "\u{2014}");
+    }
 
     /// The reported corruption, as a test on the shapes that caused it.
     ///

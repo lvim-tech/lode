@@ -338,6 +338,44 @@ pub fn report_icons(cx: &gpui::App) {
     );
 }
 
+/// One saved tunnel or proxy, as the engine lists it.
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct ProfileRow {
+    pub name: String,
+    #[serde(default)]
+    pub spec: Value,
+}
+
+impl ProfileRow {
+    /// What this profile IS, in one line, from its own spec.
+    ///
+    /// Read off the saved shape rather than stored beside it: a description
+    /// written at save time is a second copy that goes stale the first time the
+    /// profile is edited.
+    pub fn summary(&self) -> String {
+        let g = |k: &str| self.spec.get(k).and_then(Value::as_str).unwrap_or("");
+        let host = g("host");
+        if host.is_empty() {
+            return "—".into();
+        }
+        let user = g("user");
+        let port = self.spec.get("port").and_then(Value::as_u64).unwrap_or(22);
+        let auth = self
+            .spec
+            .get("auth")
+            .and_then(|a| a.get("kind"))
+            .and_then(Value::as_str)
+            .or_else(|| self.spec.get("kind").and_then(Value::as_str))
+            .unwrap_or("");
+        let who = if user.is_empty() { String::new() } else { format!("{user}@") };
+        if auth.is_empty() {
+            format!("{who}{host}:{port}")
+        } else {
+            format!("{who}{host}:{port} · {auth}")
+        }
+    }
+}
+
 /// A foldable group of settings.
 ///
 /// The theme list is 48 rows. Left open beside everything else it pushes the
@@ -530,6 +568,12 @@ enum Pending {
     Classify { conn: String, statement: String },
     /// One `conn.test` stage asked from the connection window.
     FormTest { stage: &'static str, form: WeakEntity<ConnectionForm> },
+    /// The saved tunnel or proxy profiles, by kind.
+    Profiles { kind: &'static str },
+    /// A profile was stored; the list is asked for again.
+    ProfileSaved { kind: &'static str },
+    /// A profile was removed, and the engine says which connections used it.
+    ProfileRemoved { kind: &'static str, name: String },
     /// A connection saved from that window.
     FormSave,
     History,
@@ -697,6 +741,12 @@ pub struct Workspace {
     /// argument about which is right is older than this program, so it is a
     /// setting rather than a decision.
     json_indent: u8,
+    /// The saved tunnel and proxy profiles, by kind.
+    ///
+    /// A bastion is one machine and twenty connections go through it. The engine
+    /// has had profiles since protocol 9 and no client has ever shown them, so
+    /// the feature existed and was unreachable.
+    profiles: std::collections::BTreeMap<&'static str, Vec<ProfileRow>>,
     /// Which settings groups are open. Remembered, like everything else here.
     open_groups: std::collections::BTreeSet<String>,
     /// The filter over the theme list, because there are 48 of them and their
@@ -849,6 +899,7 @@ impl Workspace {
                 .into_iter()
                 .collect(),
             theme_filter,
+            profiles: std::collections::BTreeMap::new(),
             missing_glyphs: missing_in(cx, &icon_family),
             icon_family,
             font_family,
@@ -1374,6 +1425,36 @@ impl Workspace {
                 // a column with a default, a trigger or a type coercion means
                 // the stored row is not always the row that was asked for.
                 self.run_tab(tab);
+            }
+            Pending::Profiles { kind } => {
+                let rows: Vec<ProfileRow> =
+                    serde_json::from_value(v.get("profiles").cloned().unwrap_or(json!([])))
+                        .unwrap_or_default();
+                self.profiles.insert(kind, rows);
+            }
+            Pending::ProfileSaved { kind } => {
+                self.ask(Pending::Profiles { kind }, "store.profiles.list", json!({ "kind": kind }));
+                self.toast(format!("{kind} profile saved"), false);
+            }
+            Pending::ProfileRemoved { kind, name } => {
+                // The engine says WHICH connections referred to it. Saying
+                // nothing would leave somebody to find out by a failing connect.
+                let users: Vec<String> =
+                    serde_json::from_value(v.get("was_used_by").cloned().unwrap_or(json!([])))
+                        .unwrap_or_default();
+                if users.is_empty() {
+                    self.toast(format!("removed the {kind} profile {name}"), false);
+                } else {
+                    let msg = format!(
+                        "removed {name}, which {} still refer{} to: {}",
+                        if users.len() == 1 { "1 connection" } else { "connections" },
+                        if users.len() == 1 { "s" } else { "" },
+                        users.join(", ")
+                    );
+                    self.toast(msg.clone(), true);
+                    self.log.push(("warn".into(), msg));
+                }
+                self.ask(Pending::Profiles { kind }, "store.profiles.list", json!({ "kind": kind }));
             }
             Pending::FormSave => {
                 // Stored. Now the window goes, and the panel is asked for the
@@ -1991,6 +2072,10 @@ impl Workspace {
         }
         let theme = self.theme.clone();
         let drivers = self.hello.as_ref().map(|h| h.drivers.clone()).unwrap_or_default();
+        let tunnel_profiles = self.profile_names("tunnel");
+        // Asked again on the way in, so a window opened right after one was
+        // saved elsewhere still lists it.
+        self.ask_profiles();
         let me = cx.entity().downgrade();
         let title = match &existing {
             Some((_, d, _)) => format!("lode — Edit {d} connection"),
@@ -2006,7 +2091,7 @@ impl Workspace {
                 }),
                 ..Default::default()
             },
-            |_window, cx| cx.new(|cx| ConnectionForm::new(me, theme, self.scale, drivers, existing, cx)),
+            |_window, cx| cx.new(|cx| ConnectionForm::new(me, theme, self.scale, drivers, tunnel_profiles, existing, cx)),
         );
         match opened {
             Ok(h) => self.form_window = Some(h),
@@ -2035,6 +2120,43 @@ impl Workspace {
             "conn.test",
             json!({ "stage": stage, "spec": spec }),
         );
+    }
+
+    /// Ask for the saved tunnel and proxy profiles.
+    pub fn ask_profiles(&mut self) {
+        for kind in ["tunnel", "proxy"] {
+            self.ask(
+                Pending::Profiles { kind },
+                "store.profiles.list",
+                json!({ "kind": kind }),
+            );
+        }
+    }
+
+    /// Store one, under a name. Saving over a name replaces it, which is how a
+    /// profile is edited: one bastion, one entry, changed in one place.
+    pub fn save_profile(&mut self, kind: &'static str, name: String, spec: Value) {
+        self.ask(
+            Pending::ProfileSaved { kind },
+            "store.profiles.save",
+            json!({ "kind": kind, "name": name, "spec": spec }),
+        );
+    }
+
+    pub fn remove_profile(&mut self, kind: &'static str, name: &str) {
+        self.ask(
+            Pending::ProfileRemoved { kind, name: name.to_string() },
+            "store.profiles.remove",
+            json!({ "kind": kind, "name": name }),
+        );
+    }
+
+    /// The names a connection window can choose from.
+    pub fn profile_names(&self, kind: &str) -> Vec<String> {
+        self.profiles
+            .get(kind)
+            .map(|v| v.iter().map(|p| p.name.clone()).collect())
+            .unwrap_or_default()
     }
 
     pub fn form_save(
@@ -3339,6 +3461,11 @@ impl Workspace {
                         if mode == Rail::Instance {
                             this.ask_metrics();
                         }
+                        // The profiles are small and change rarely; asked when
+                        // the panel that shows them is opened.
+                        if mode == Rail::Settings {
+                            this.ask_profiles();
+                        }
                         this.remember();
                         cx.notify();
                     })),
@@ -3689,6 +3816,73 @@ impl Workspace {
                     ms.line_w(),
                 )));
                 return panel;
+                }
+
+                let g_prof = self.group_open(SettingsGroup::Profiles);
+                let n_prof: usize = self.profiles.values().map(Vec::len).sum();
+                list = list.child(self.group_header(
+                    SettingsGroup::Profiles,
+                    format!("{n_prof}"),
+                    cx,
+                ));
+                if g_prof {
+                    for kind in ["tunnel", "proxy"] {
+                        list = list.child(self.section(kind));
+                        let rows = self.profiles.get(kind).cloned().unwrap_or_default();
+                        if rows.is_empty() {
+                            list = list.child(div().px_2().child(self.small(
+                                format!(
+                                    "none yet — build one in a connection's Access tab and press \
+                                     \"save as profile\""
+                                ),
+                                t.muted(),
+                            )));
+                        }
+                        for r in rows {
+                            let (k, name) = (kind, r.name.clone());
+                            list = list.child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .gap_1()
+                                    .px_2()
+                                    .py(px(2.0))
+                                    .hover(|d| d.bg(t.hover()))
+                                    .child(
+                                        div()
+                                            .flex_1()
+                                            .min_w_0()
+                                            .flex()
+                                            .flex_col()
+                                            .child(self.line_in(
+                                                r.name.clone(),
+                                                ms.small(),
+                                                t.fg(),
+                                                ms.line_w() - ms.base() * 2.0,
+                                            ))
+                                            // WHAT it is, read off its own spec.
+                                            .child(self.line_in(
+                                                r.summary(),
+                                                ms.tiny(),
+                                                t.muted(),
+                                                ms.line_w() - ms.base() * 2.0,
+                                            )),
+                                    )
+                                    .child(
+                                        div()
+                                            .id(SharedString::from(format!("prof-rm-{k}-{name}")))
+                                            .flex_none()
+                                            .cursor_pointer()
+                                            .tooltip(self.tip("tip.remove_profile", None))
+                                            .child(self.icon_inline("\u{f00d}", t.muted()))
+                                            .on_click(cx.listener(move |this, _, _, cx| {
+                                                this.remove_profile(k, &name);
+                                                cx.notify();
+                                            })),
+                                    ),
+                            );
+                        }
+                    }
                 }
                 panel = panel.child(list);
             }
