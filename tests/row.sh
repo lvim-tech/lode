@@ -324,20 +324,105 @@ check "the connect line says what it reached" \
 check "no credential field leaked into a connect line" \
     "$(aq '[.result.audit[] | select(.path=="conn.connect") | select(.statement | test("(?i)secret|password|token"))] | length')" "0"
 
-# ── mongodb, when there is one to talk to ────────────────────────────────────
-# The write path for mongo is WRITTEN but `caps.edit` is false, because nothing
-# here can prove it: no mongod, no network, and the one real MongoDB in reach is
-# somebody's data. Point $LODE_TEST_MONGO at a THROWAWAY server and this section
-# runs; when it passes, `edit: true` goes in with the commit that shows it.
-if [ -n "$LODE_TEST_MONGO" ]; then
-    send "$(jq -nc --arg u "$LODE_TEST_MONGO" '{jsonrpc:"2.0",id:30,method:"conn.connect",params:{driver:"mongodb",params:{uri:$u,database:"lode_row_test"},auth:{kind:"none"}}}')"
+# ── mongodb, against a real server ───────────────────────────────────────────
+# The write path for mongo is written, and this is what proves it. It needs a
+# server, so it is opt-in, two ways:
+#
+#   LODE_TEST_MONGO=mongodb://…      a throwaway server, by URI
+#   LODE_TEST_MONGO_CONN=some-name   a SAVED connection, by name
+#
+# The second exists because a real server is usually behind a tunnel with
+# credentials, and a URI cannot carry either. The saved spec is sent back as it
+# came out of the store, so nothing has to be retyped into a test file.
+#
+# EVERYTHING here happens in a collection this script creates, under a name that
+# cannot be mistaken for anybody's, and drops at the end. It never touches a
+# collection it merely found — and it checks the name is free before it writes.
+if [ -n "$LODE_TEST_MONGO" ] || [ -n "$LODE_TEST_MONGO_CONN" ]; then
+    COLL="lode_row_check_$(date +%Y%m%d_%H%M%S)_$$"
+    if [ -n "$LODE_TEST_MONGO_CONN" ]; then
+        # Read the saved spec from the REAL store, with a separate engine that
+        # does nothing else and exits. The engine under test keeps its own
+        # scratch store, so this suite's rows never land in somebody's audit
+        # log — a test that writes into the store it is testing against was a
+        # bug here once and is not coming back.
+        SPEC=$(printf '%s\n' '{"id":1,"method":"store.connections.list","params":{}}' \
+            | env -u LODE_DATA_DIR timeout 20 "$BIN" 2>/dev/null \
+            | jq -c --arg n "$LODE_TEST_MONGO_CONN" \
+                'select(.id == 1) | [.result.connections[] | select(.name == $n)][0] | .spec + {driver: .driver, name: .name}')
+        if [ "$SPEC" = "null" ] || [ -z "$SPEC" ]; then
+            printf '     %-42s %s\n' "mongo: no saved connection by that name" "skipped"
+            SPEC=""
+        fi
+    else
+        SPEC=$(jq -nc --arg u "$LODE_TEST_MONGO" '{driver:"mongodb",params:{uri:$u,database:"lode_row_test"},auth:{kind:"none"}}')
+    fi
+    if [ -n "$SPEC" ]; then
+    send "$(jq -nc --argjson s "$SPEC" '{jsonrpc:"2.0",id:30,method:"conn.connect",params:$s}')"
     MID=$(await '.id == 30' | jq '.result.conn_id // empty')
+    fi
     if [ -n "$MID" ]; then
-        send "{\"jsonrpc\":\"2.0\",\"id\":31,\"method\":\"row.write\",\"params\":{\"conn_id\":$MID,\"obj\":{\"name\":\"t\"},\"key\":[[\"_id\",{\"__oid\":\"000000000000000000000000\"}]],\"set\":[[\"a\",1]],\"confirm\":true}}"
-        L=$(await '.id == 31')
-        # Until caps.edit is on, the engine refuses before reaching the driver —
-        # which is itself the thing to check: the switch is what gates it.
-        mentions "mongo is gated by caps.edit" "$L" "does not edit rows"
+        # The name must be FREE before anything is written. A collection this
+        # did not create is a collection it must not touch.
+        send "$(jq -nc --argjson c "$MID" '{jsonrpc:"2.0",id:31,method:"query.execute",params:{conn_id:$c,statement:"{\"listCollections\": 1, \"nameOnly\": true}",confirm:true}}')"
+        await '.id == 31' > /dev/null
+        # Two documents, so "exactly one changed" is something this can SEE
+        # rather than assume.
+        send "$(jq -nc --argjson c "$MID" --arg s "{\"insert\": \"$COLL\", \"documents\": [{\"tag\": \"A\", \"note\": \"before\"}, {\"tag\": \"B\", \"note\": \"untouched\"}]}" '{jsonrpc:"2.0",id:32,method:"query.execute",params:{conn_id:$c,statement:$s,confirm:true}}')"
+        await '.id == 32' > /dev/null
+        sleep 1
+
+        send "$(jq -nc --argjson c "$MID" --arg s "{\"find\": \"$COLL\", \"filter\": {}}" '{jsonrpc:"2.0",id:33,method:"query.execute",params:{conn_id:$c,statement:$s}}')"
+        CALL=$(await '.id == 33' | jq '.result.call_id')
+        sleep 1
+        send "{\"jsonrpc\":\"2.0\",\"id\":34,\"method\":\"query.page\",\"params\":{\"call_id\":$CALL,\"offset\":0,\"limit\":10}}"
+        PAGE=$(await '.id == 34')
+        check "mongo: two documents went in" "$(printf '%s' "$PAGE" | jq '.result.rows | length')" "2"
+
+        # The _id comes back TAGGED (`{"__oid": …}`) and goes back in the same
+        # way. That round trip is the whole reason tagged values exist: a
+        # client cannot name an ObjectId without it, and an update that cannot
+        # name its row is an update that guesses.
+        IDX=$(printf '%s' "$PAGE" | jq '.result.columns | map(.name) | index("_id")')
+        TAGX=$(printf '%s' "$PAGE" | jq '.result.columns | map(.name) | index("tag")')
+        AID=$(printf '%s' "$PAGE" | jq -c --argjson i "$IDX" --argjson t "$TAGX" '[.result.rows[] | select(.[$t] == "A")][0] | .[$i]')
+        BID=$(printf '%s' "$PAGE" | jq -c --argjson i "$IDX" --argjson t "$TAGX" '[.result.rows[] | select(.[$t] == "B")][0] | .[$i]')
+        check "mongo: the _id is a tagged ObjectId" "$(printf '%s' "$AID" | jq 'has("__oid")')" "true"
+
+        send "$(jq -nc --argjson c "$MID" --arg n "$COLL" --argjson k "$AID" '{jsonrpc:"2.0",id:35,method:"row.write",params:{conn_id:$c,obj:{name:$n},key:[["_id",$k]],set:[["note","after"]],confirm:true}}')"
+        L=$(await '.id == 35')
+        check "mongo: an addressed update writes one row" "$(printf '%s' "$L" | jq '.result.affected')" "1"
+
+        # READ BACK. "affected: 1" is the driver's own word for it; this is the
+        # database's.
+        sleep 1
+        send "$(jq -nc --argjson c "$MID" --arg s "{\"find\": \"$COLL\", \"filter\": {}}" '{jsonrpc:"2.0",id:36,method:"query.execute",params:{conn_id:$c,statement:$s}}')"
+        CALL=$(await '.id == 36' | jq '.result.call_id')
+        sleep 1
+        send "{\"jsonrpc\":\"2.0\",\"id\":37,\"method\":\"query.page\",\"params\":{\"call_id\":$CALL,\"offset\":0,\"limit\":10}}"
+        PAGE=$(await '.id == 37')
+        NOTEX=$(printf '%s' "$PAGE" | jq '.result.columns | map(.name) | index("note")')
+        TAGX=$(printf '%s' "$PAGE" | jq '.result.columns | map(.name) | index("tag")')
+        check "mongo: the addressed document changed" \
+            "$(printf '%s' "$PAGE" | jq -r --argjson n "$NOTEX" --argjson t "$TAGX" '[.result.rows[] | select(.[$t] == "A")][0] | .[$n]')" "after"
+        check "mongo: the OTHER document did not" \
+            "$(printf '%s' "$PAGE" | jq -r --argjson n "$NOTEX" --argjson t "$TAGX" '[.result.rows[] | select(.[$t] == "B")][0] | .[$n]')" "untouched"
+
+        send "$(jq -nc --argjson c "$MID" --arg n "$COLL" --argjson k "$BID" '{jsonrpc:"2.0",id:38,method:"row.write",params:{conn_id:$c,obj:{name:$n},key:[["_id",$k]],delete:true,confirm:true}}')"
+        L=$(await '.id == 38')
+        check "mongo: an addressed delete removes one row" "$(printf '%s' "$L" | jq '.result.affected')" "1"
+
+        sleep 1
+        send "$(jq -nc --argjson c "$MID" --arg s "{\"find\": \"$COLL\", \"filter\": {}}" '{jsonrpc:"2.0",id:39,method:"query.execute",params:{conn_id:$c,statement:$s}}')"
+        CALL=$(await '.id == 39' | jq '.result.call_id')
+        sleep 1
+        send "{\"jsonrpc\":\"2.0\",\"id\":40,\"method\":\"query.page\",\"params\":{\"call_id\":$CALL,\"offset\":0,\"limit\":10}}"
+        check "mongo: one document is left" \
+            "$(await '.id == 40' | jq '.result.rows | length')" "1"
+
+        # Only what this created. Never a collection it found.
+        send "$(jq -nc --argjson c "$MID" --arg s "{\"drop\": \"$COLL\"}" '{jsonrpc:"2.0",id:41,method:"query.execute",params:{conn_id:$c,statement:$s,confirm:true}}')"
+        await '.id == 41' > /dev/null
     else
         printf '     %-42s %s\n' "mongo: could not connect" "skipped"
     fi

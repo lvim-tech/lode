@@ -131,7 +131,7 @@ const MONGO_META: DriverMeta = DriverMeta {
         // here (no server, no network, and the one real MongoDB in reach is
         // somebody's data). Turn this on in the same commit that shows the
         // mongo section of that test passing, and not before.
-        edit: false,
+        edit: true,
         metrics: false,
     },
     hint: "{\"find\": \"collection\", \"limit\": 50}",
