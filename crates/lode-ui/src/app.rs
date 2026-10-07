@@ -3774,6 +3774,12 @@ impl Workspace {
             // bug per panel if the rule lives in the rows, and impossible if it
             // lives in the container.
             .overflow_hidden()
+            // The leading for everything in here, set ONCE on the container
+            // rather than per row. A line box the size of the text leaves
+            // nothing below the baseline, and the tails of `p`, `y` and `д` are
+            // drawn below it — which is why they were meeting the bottom edge
+            // and being cut. Inherited, so a row written later cannot forget.
+            .line_height(ms.line_h())
             .bg(t.panel())
             .border_r_1()
             .border_color(t.border());

@@ -198,7 +198,11 @@ impl Metrics {
     /// a 20 px row is pinched, and the pinch is invisible in a screenshot of
     /// the old size. 1.7× is what the old 20 px was against the old 12 px body.
     pub fn row_h(self) -> f32 {
-        (self.base * 1.7).round()
+        // Never less than the line box it has to hold. 1.7 of the base is more
+        // than 1.45 at every size, so this is a floor that currently never
+        // binds — it is here so that changing either number cannot silently
+        // make a grid row shorter than its own text.
+        (self.base * 1.7).round().max(f32::from(self.line_h()))
     }
 
     /// A grid column, before anybody drags it. Widths a person has set are
@@ -206,6 +210,18 @@ impl Metrics {
     /// and re-deriving it would undo that decision every time the font moved.
     pub fn col_w(self) -> f32 {
         (self.base * 11.0).round()
+    }
+
+    /// The leading for a line of panel text.
+    ///
+    /// A line box the SIZE of the text leaves nothing below the baseline, and
+    /// the tails of `p`, `y` and `д` are drawn below the baseline — so they met
+    /// the bottom of the row and were clipped. 1.45 is room for the descenders
+    /// of the fonts this draws in, and it comes off the text size, so raising
+    /// the text raises the line with it instead of leaving the question to come
+    /// back.
+    pub fn line_h(self) -> Pixels {
+        px((self.base * 1.45).round())
     }
 
     /// The height of a row in a side panel.
@@ -389,6 +405,28 @@ mod tests {
             let w = longest * f32::from(m.small()) * 0.55;
             assert!(m.label_w() >= w, "base {b}: {} vs {w}", m.label_w());
             assert!(m.field_w() > m.label_w(), "base {b}: a field wants more room than its label");
+            b += 1.0;
+        }
+    }
+
+    /// A line box leaves room BELOW the baseline, at every size.
+    ///
+    /// Descenders were being clipped because the line box was the size of the
+    /// text. This asserts the leading across the whole range rather than at the
+    /// default, since the default was not where it was noticed.
+    #[test]
+    fn a_line_leaves_room_for_what_hangs_below_it() {
+        let mut b = MIN_BASE;
+        while b <= MAX_BASE {
+            let m = Metrics::new(b);
+            let text = f32::from(m.body());
+            assert!(
+                f32::from(m.line_h()) >= text * 1.4,
+                "base {b}: a {}px line box for {text}px text clips the tails",
+                f32::from(m.line_h())
+            );
+            // And the row is at least the line it holds.
+            assert!(m.panel_row_h() >= f32::from(m.line_h()), "base {b}");
             b += 1.0;
         }
     }
