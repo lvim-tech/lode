@@ -8,7 +8,7 @@
 // driver's detached cancel handle, so a running query can be stopped even while
 // its connection is busy.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
@@ -40,6 +40,11 @@ const DIAL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 /// tunnel stays up as long as this entry lives, and is torn down on disconnect.
 struct ConnEntry {
     conn: Conn,
+    /// The spec this connection was opened from, kept so the disconnect hooks
+    /// can be given the same context the connect hooks were. Its credentials
+    /// are `Secret`s and are never read again — the hook environment is built
+    /// from the non-secret fields only.
+    spec: ConnSpec,
     /// The SAVED connection's name, when the client sent one.
     ///
     /// Recorded for the audit log: a conn_id is a handle that means nothing an
@@ -145,6 +150,10 @@ struct Inner {
     /// per call: an audit mode that could change between two statements is an
     /// audit mode a running process could be talked out of.
     audit_mode: audit::Mode,
+    next_run: AtomicU64,
+    /// Scripts that are running, so one can be stopped. The sender fires the
+    /// cancel; removing the entry is what marks a run finished.
+    runs: Mutex<HashMap<u64, tokio::sync::oneshot::Sender<()>>>,
 }
 
 impl Server {
@@ -169,6 +178,8 @@ impl Server {
                 out,
                 store,
                 audit_mode: audit::Mode::from_env(),
+                next_run: AtomicU64::new(1),
+                runs: Mutex::new(HashMap::new()),
             }),
         }
     }
@@ -369,6 +380,11 @@ impl Server {
             "store.profiles.get" => self.store_profile_get(params).await,
             "store.profiles.save" => self.store_profile_save(params).await,
             "store.profiles.remove" => self.store_profile_remove(params).await,
+            "store.scripts.list" => self.store_script_list(params).await,
+            "store.scripts.save" => self.store_script_save(params).await,
+            "store.scripts.remove" => self.store_script_remove(params).await,
+            "script.run" => self.script_run(params).await,
+            "script.cancel" => self.script_cancel(params).await,
             "store.history.record" => self.store_history_record(params).await,
             "store.history.list" => self.store_history_list(params).await,
             "store.import" => self.store_import(params).await,
@@ -407,6 +423,10 @@ impl Server {
         // is the shape of something worth seeing, and only the successes being
         // in the log is how it stays invisible.
         let target = spec.target(meta);
+        // BEFORE the dial. A PreConnect hook that fails stops the connection,
+        // which is the only reason to have one before rather than after.
+        self.run_hooks(&spec, spec.name.as_deref(), crate::spec::HookEvent::PreConnect)
+            .await?;
         let net = NetContext::with_proxy(spec.tunnel.clone(), spec.proxy.clone());
         let started = Instant::now();
         let conn = match driver.connect(&spec, net.clone()).await {
@@ -434,6 +454,7 @@ impl Server {
             id,
             ConnEntry {
                 conn: Arc::new(AsyncMutex::new(conn)),
+                spec: spec.clone(),
                 name: spec.name.clone(),
                 policy: spec.policy,
                 driver: spec.driver.clone(),
@@ -450,6 +471,13 @@ impl Server {
         r.statement = format!("{target} encrypted={encrypted}");
         r.ms = Some(started.elapsed().as_millis() as i64);
         self.audit(r).await;
+        // AFTER it is open, and a failure here does NOT take it down again: the
+        // connection exists, somebody asked for it, and closing it because a
+        // notification script could not run would be the hook deciding
+        // something that is not its decision.
+        let _ = self
+            .run_hooks(&spec, spec.name.as_deref(), crate::spec::HookEvent::PostConnect)
+            .await;
         // Surface a clear warning when a network link ended up UNENCRYPTED (never
         // silent): the client shows it and health flags it.
         if !encrypted {
@@ -662,6 +690,25 @@ impl Server {
             conn_id: u64,
         }
         let p: P = serde_json::from_value(params)?;
+        // Before anything is taken down, while the link is still there — which
+        // is what makes a PreDisconnect hook able to use it at all.
+        // Cloned out of the map and the guard DROPPED before any await: a
+        // std MutexGuard held across one makes the whole dispatch future
+        // non-Send, and the compiler is right that it would also be a lock held
+        // for as long as somebody's hook takes to run.
+        let pre = self
+            .inner
+            .conns
+            .lock()
+            .unwrap()
+            .get(&p.conn_id)
+            .map(|e| e.spec.clone());
+        if let Some(spec) = pre {
+            let name = spec.name.clone();
+            let _ = self
+                .run_hooks(&spec, name.as_deref(), crate::spec::HookEvent::PreDisconnect)
+                .await;
+        }
         let entry = self.inner.conns.lock().unwrap().remove(&p.conn_id);
         if let Some(entry) = entry {
             let mut r = audit::Record::new("conn.disconnect", "disconnected");
@@ -675,6 +722,10 @@ impl Server {
                 let boxed = mutex.into_inner();
                 let _ = boxed.close().await;
             }
+            let name = entry.spec.name.clone();
+            let _ = self
+                .run_hooks(&entry.spec, name.as_deref(), crate::spec::HookEvent::PostDisconnect)
+                .await;
         }
         Ok(json!({}))
     }
@@ -1324,6 +1375,342 @@ impl Server {
         }
         self.store()?.save_chart(p.conn, p.name, p.sql, p.measure).await?;
         Ok(json!({ "saved": true }))
+    }
+
+    // ── scripts and hooks ────────────────────────────────────────────────────
+
+    /// What a hook or a script is told about the connection it runs around.
+    ///
+    /// CONTEXT and never a credential. A hook that needs a password fetches it
+    /// the same way the engine does, from the keyring, under its own name.
+    /// Putting a resolved secret in here would publish it to `ps`, to
+    /// `/proc/<pid>/environ`, and to everything the child goes on to start —
+    /// which is why `auth`, `tls` and the tunnel's own credentials are not read
+    /// at all when this is built, rather than read and then filtered.
+    fn hook_env(spec: &ConnSpec, name: Option<&str>, event: &str) -> BTreeMap<String, String> {
+        let mut env = BTreeMap::new();
+        env.insert("LODE_EVENT".into(), event.to_string());
+        env.insert("LODE_DRIVER".into(), spec.driver.clone());
+        if let Some(n) = name {
+            env.insert("LODE_CONN".into(), n.to_string());
+        }
+        // Only the three params every driver spells the same way, and only
+        // because the engine already reads them generically elsewhere. The rest
+        // of `params` is driver-interpreted free text, and copying all of it
+        // into an environment is how something nobody meant to export gets
+        // exported.
+        for key in ["host", "port", "database"] {
+            if let Some(v) = spec.param_opt(key) {
+                env.insert(format!("LODE_{}", key.to_uppercase()), v.to_string());
+            }
+        }
+        env
+    }
+
+    /// Run the hooks for one moment.
+    ///
+    /// Every one is audited, whatever it is and whether it worked — a hook is
+    /// somebody's own code running against their database on the engine's
+    /// initiative, and there is no reading of "what happened here" that leaves
+    /// that out. A PreConnect failure is returned as an error, which stops the
+    /// connection; the other three are reported and do not.
+    async fn run_hooks(&self, spec: &ConnSpec, name: Option<&str>, event: crate::spec::HookEvent) -> anyhow::Result<()> {
+        let hooks: Vec<_> = spec.hooks.iter().filter(|h| h.on == event).collect();
+        if hooks.is_empty() {
+            return Ok(());
+        }
+        let env = Self::hook_env(spec, name, event.label());
+        for h in hooks {
+            // Preparing a hook can fail too — a named script that is gone, an
+            // inline one with no language. That goes down the SAME path as a
+            // hook that ran and failed, so a PreConnect hook which could not
+            // even be assembled stops the connection and says so in the same
+            // words. The first version let it out through `?`, and the message
+            // named the missing script but not what had happened to the
+            // connection.
+            let prepared: anyhow::Result<(Option<crate::runner::Lang>, String)> = match h.kind {
+                crate::spec::HookKind::Command => Ok((None, h.source.clone())),
+                crate::spec::HookKind::Inline => h
+                    .lang
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("an inline {} hook must say which language it is", event.label())
+                    })
+                    .map(|l| (Some(l), h.source.clone())),
+                crate::spec::HookKind::Script => {
+                    (|| async {
+                    let store = self.store()?;
+                    let (lang, body) = store
+                        .get_script(name.unwrap_or_default().to_string(), h.source.clone())
+                        .await?
+                        .ok_or_else(|| {
+                            // By NAME, so the message can say which. A hook that
+                            // quietly did nothing because its script was deleted
+                            // is a hook that stopped protecting anything.
+                            anyhow::anyhow!(
+                                "the {} hook names the saved script '{}', which does not exist",
+                                event.label(),
+                                h.source
+                            )
+                        })?;
+                    let lang: crate::runner::Lang = serde_json::from_value(json!(lang))
+                        .map_err(|_| anyhow::anyhow!("the saved script '{}' has an unknown language", h.source))?;
+                    Ok((Some(lang), body))
+                    })()
+                    .await
+                }
+            };
+            let (lang, source) = match prepared {
+                Ok(v) => v,
+                Err(e) => {
+                    let mut r = audit::Record::new(&format!("hook.{}", event.label()), "failed");
+                    r.conn = name.map(str::to_string);
+                    r.driver = Some(spec.driver.clone());
+                    r.about(self.inner.audit_mode, &h.source);
+                    r.because(e.to_string());
+                    self.audit(r).await;
+                    if event.blocking() {
+                        return Err(anyhow::anyhow!("{e} — the connection was NOT opened"));
+                    }
+                    self.send(rpc::notification(
+                        "daemon.log",
+                        json!({ "level": "warn", "message": e.to_string() }),
+                    ));
+                    continue;
+                }
+            };
+            let timeout = h
+                .timeout_ms
+                .map(std::time::Duration::from_millis)
+                .unwrap_or(crate::runner::DEFAULT_TIMEOUT);
+            let run_id = self.inner.next_run.fetch_add(1, Ordering::Relaxed);
+            let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<crate::runner::Line>();
+            let me = self.clone();
+            let label = event.label().to_string();
+            // The output of a hook is shown as it arrives, like a script's: a
+            // PreConnect hook that is going to stop the connection should be
+            // readable WHILE it runs, not only once it has failed.
+            let pump = tokio::spawn(async move {
+                while let Some(l) = rx.recv().await {
+                    me.send(rpc::notification(
+                        "script.output",
+                        json!({ "run_id": run_id, "stream": l.stream, "text": l.text, "hook": label }),
+                    ));
+                }
+            });
+            let outcome = crate::runner::run(lang, &source, &env, timeout, tx).await;
+            let _ = pump.await;
+
+            let mut r = audit::Record::new(&format!("hook.{}", event.label()), "applied");
+            r.conn = name.map(str::to_string);
+            r.driver = Some(spec.driver.clone());
+            r.policy = Some(spec.policy.label().to_string());
+            // Through the same redaction as a statement: a command line is
+            // where somebody writes `psql --password=…` without thinking.
+            r.about(self.inner.audit_mode, &source);
+            match &outcome {
+                Ok(o) if o.ok() => {
+                    r.ms = Some(o.ms as i64);
+                    self.audit(r).await;
+                }
+                Ok(o) => {
+                    r.outcome = "failed".into();
+                    r.ms = Some(o.ms as i64);
+                    r.because(o.why());
+                    self.audit(r).await;
+                    let why = format!("the {} hook failed: {}", event.label(), o.why());
+                    if event.blocking() {
+                        return Err(anyhow::anyhow!("{why} — the connection was NOT opened"));
+                    }
+                    self.send(rpc::notification(
+                        "daemon.log",
+                        json!({ "level": "warn", "message": why }),
+                    ));
+                }
+                Err(e) => {
+                    r.outcome = "failed".into();
+                    r.because(e.to_string());
+                    self.audit(r).await;
+                    let why = format!("the {} hook could not run: {e}", event.label());
+                    if event.blocking() {
+                        return Err(anyhow::anyhow!("{why} — the connection was NOT opened"));
+                    }
+                    self.send(rpc::notification(
+                        "daemon.log",
+                        json!({ "level": "warn", "message": why }),
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    async fn store_script_list(&self, params: Json) -> anyhow::Result<Json> {
+        #[derive(Deserialize)]
+        struct P {
+            #[serde(default)]
+            conn: String,
+        }
+        let p: P = serde_json::from_value(params)?;
+        Ok(json!({ "scripts": self.store()?.list_scripts(p.conn).await? }))
+    }
+
+    async fn store_script_save(&self, params: Json) -> anyhow::Result<Json> {
+        #[derive(Deserialize)]
+        struct P {
+            #[serde(default)]
+            conn: String,
+            name: String,
+            lang: crate::runner::Lang,
+            #[serde(default)]
+            body: String,
+        }
+        let p: P = serde_json::from_value(params)?;
+        if p.name.trim().is_empty() {
+            return Err(anyhow::anyhow!("a script needs a name"));
+        }
+        self.store()?
+            .save_script(p.conn, p.name, p.lang.label().into(), p.body)
+            .await?;
+        Ok(json!({ "saved": true }))
+    }
+
+    async fn store_script_remove(&self, params: Json) -> anyhow::Result<Json> {
+        #[derive(Deserialize)]
+        struct P {
+            #[serde(default)]
+            conn: String,
+            name: String,
+        }
+        let p: P = serde_json::from_value(params)?;
+        Ok(json!({ "removed": self.store()?.remove_script(p.conn, p.name).await? }))
+    }
+
+    /// Run a script, answering with its id NOW and streaming its output.
+    ///
+    /// The same shape as `query.execute`, and for the same reason: a script that
+    /// takes a minute must not hold the pipe, and its output is worth watching
+    /// while it happens rather than in one lump at the end.
+    async fn script_run(&self, params: Json) -> anyhow::Result<Json> {
+        #[derive(Deserialize)]
+        struct P {
+            #[serde(default)]
+            conn: String,
+            /// A saved script by name, or…
+            #[serde(default)]
+            name: Option<String>,
+            /// …a body typed here and now.
+            #[serde(default)]
+            body: Option<String>,
+            #[serde(default)]
+            lang: Option<crate::runner::Lang>,
+            #[serde(default)]
+            timeout_ms: Option<u64>,
+        }
+        let p: P = serde_json::from_value(params)?;
+        let (lang, body, what) = match (&p.name, &p.body) {
+            (Some(n), None) => {
+                let (lang, body) = self
+                    .store()?
+                    .get_script(p.conn.clone(), n.clone())
+                    .await?
+                    .ok_or_else(|| anyhow::anyhow!("there is no saved script called '{n}'"))?;
+                let lang: crate::runner::Lang = serde_json::from_value(json!(lang))
+                    .map_err(|_| anyhow::anyhow!("the saved script '{n}' has an unknown language"))?;
+                (lang, body, n.clone())
+            }
+            (None, Some(b)) => (
+                p.lang
+                    .ok_or_else(|| anyhow::anyhow!("a script typed here has to say which language it is"))?,
+                b.clone(),
+                "(unsaved)".to_string(),
+            ),
+            // Both or neither: refused rather than picked between, because
+            // either choice would silently run something other than what was
+            // asked for.
+            _ => {
+                return Err(anyhow::anyhow!(
+                    "say either the NAME of a saved script or a body to run, not both and not neither"
+                ))
+            }
+        };
+
+        let run_id = self.inner.next_run.fetch_add(1, Ordering::Relaxed);
+        let timeout = p
+            .timeout_ms
+            .map(std::time::Duration::from_millis)
+            .unwrap_or(crate::runner::DEFAULT_TIMEOUT);
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<crate::runner::Line>();
+        let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel::<()>();
+        self.inner.runs.lock().unwrap().insert(run_id, cancel_tx);
+
+        let me = self.clone();
+        let conn = p.conn.clone();
+        let what2 = what.clone();
+        tokio::spawn(async move {
+            let pumping = {
+                let me = me.clone();
+                tokio::spawn(async move {
+                    while let Some(l) = rx.recv().await {
+                        me.send(rpc::notification(
+                            "script.output",
+                            json!({ "run_id": run_id, "stream": l.stream, "text": l.text }),
+                        ));
+                    }
+                })
+            };
+            // A script typed in a client gets no connection context: it was not
+            // run around a connection, so there is nothing true to tell it.
+            let env = BTreeMap::new();
+            let running = crate::runner::run(Some(lang), &body, &env, timeout, tx);
+            let outcome = tokio::select! {
+                o = running => o,
+                _ = cancel_rx => Ok(crate::runner::Outcome { code: None, ms: 0, timed_out: false }),
+            };
+            let _ = pumping.await;
+            me.inner.runs.lock().unwrap().remove(&run_id);
+
+            let mut r = audit::Record::new("script", "applied");
+            r.conn = if conn.is_empty() { None } else { Some(conn) };
+            r.about(me.inner.audit_mode, &body);
+            let (state, ms) = match &outcome {
+                Ok(o) if o.ok() => ("done", o.ms),
+                Ok(o) => {
+                    r.outcome = "failed".into();
+                    r.because(o.why());
+                    ("failed", o.ms)
+                }
+                Err(e) => {
+                    r.outcome = "failed".into();
+                    r.because(e.to_string());
+                    ("failed", 0)
+                }
+            };
+            r.ms = Some(ms as i64);
+            me.audit(r).await;
+            me.send(rpc::notification(
+                "script.state",
+                json!({
+                    "run_id": run_id,
+                    "name": what2,
+                    "state": state,
+                    "ms": ms,
+                    "code": outcome.as_ref().ok().and_then(|o| o.code),
+                    "error": outcome.as_ref().err().map(|e| e.to_string())
+                        .or_else(|| outcome.as_ref().ok().filter(|o| !o.ok()).map(|o| o.why())),
+                }),
+            ));
+        });
+        Ok(json!({ "run_id": run_id, "name": what }))
+    }
+
+    async fn script_cancel(&self, params: Json) -> anyhow::Result<Json> {
+        #[derive(Deserialize)]
+        struct P {
+            run_id: u64,
+        }
+        let p: P = serde_json::from_value(params)?;
+        let sender = self.inner.runs.lock().unwrap().remove(&p.run_id);
+        Ok(json!({ "cancelled": sender.map(|s| s.send(()).is_ok()).unwrap_or(false) }))
     }
 
     // ── profiles ─────────────────────────────────────────────────────────────

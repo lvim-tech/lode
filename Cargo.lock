@@ -4380,6 +4380,7 @@ dependencies = [
  "chrono",
  "duckdb",
  "futures-util",
+ "libc",
  "mongodb",
  "mysql_async",
  "redis",

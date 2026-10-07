@@ -42,6 +42,12 @@ async-trait = "0.1"
 futures-util = "0.3"
 base64 = "0.22"
 anyhow = "1"
+# For killing a PROCESS GROUP. A script's timeout has to stop what the script
+# STARTED, not only the interpreter: `bash -` running `sleep 30` forks, and
+# killing bash leaves sleep holding the output pipes, so the engine waits the
+# full thirty seconds for a timeout it set at four hundred milliseconds.
+# Already in the dependency tree; this only makes it reachable from here.
+libc = "0.2"
 
 # ── driver crates, each behind a feature so a build can pick its DB set ───────
 # tokio-postgres also backs the cockroachdb registry alias (postgres wire).

@@ -173,6 +173,23 @@ impl Store {
                 updated_at INTEGER
             );
             CREATE UNIQUE INDEX IF NOT EXISTS profiles_kind_name ON profiles (kind, name);
+            -- Scripts, as DOCUMENTS. Lua, Python, Bash.
+            --
+            -- `conn` is the connection a script belongs to, or '' for one that
+            -- belongs to no particular connection — a script that tars up a
+            -- backup directory is not about a database. Empty rather than NULL
+            -- so the unique index covers it: two global scripts may not share a
+            -- name, and with NULL they could.
+            CREATE TABLE IF NOT EXISTS scripts (
+                id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                conn       TEXT NOT NULL DEFAULT '',
+                name       TEXT NOT NULL,
+                -- "bash" | "python" | "lua"
+                lang       TEXT NOT NULL,
+                body       TEXT NOT NULL,
+                updated_at INTEGER
+            );
+            CREATE UNIQUE INDEX IF NOT EXISTS scripts_conn_name ON scripts (conn, name);
             -- Every attempt to CHANGE something, and every connection opened or
             -- closed — including the attempts that were REFUSED. A log of what
             -- succeeded answers "what happened"; a log that also holds what was
@@ -496,6 +513,81 @@ impl Store {
                 .query_map(params![conn_name], |r| r.get::<_, String>(0))?
                 .collect::<Result<Vec<_>, _>>()?;
             Ok(rows)
+        })
+        .await
+    }
+
+    // ── scripts ──────────────────────────────────────────────────────────────
+
+    /// The scripts for one connection AND the ones that belong to none.
+    ///
+    /// Both, because a script list that hid the global ones would make them
+    /// reachable only by knowing they exist.
+    pub async fn list_scripts(&self, conn_name: String) -> anyhow::Result<Vec<Json>> {
+        self.with(move |c| {
+            let mut st = c.prepare(
+                "SELECT conn, name, lang, body, updated_at FROM scripts \
+                 WHERE conn = ?1 OR conn = '' ORDER BY conn, name",
+            )?;
+            let rows = st
+                .query_map(params![conn_name], |r| {
+                    Ok(serde_json::json!({
+                        "conn": r.get::<_, String>(0)?,
+                        "name": r.get::<_, String>(1)?,
+                        "lang": r.get::<_, String>(2)?,
+                        "body": r.get::<_, String>(3)?,
+                        "updated_at": r.get::<_, Option<i64>>(4)?,
+                    }))
+                })?
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(rows)
+        })
+        .await
+    }
+
+    /// One script by name, looking at this connection's first and falling back
+    /// to the global ones — so a connection may OVERRIDE a global script with
+    /// one of its own under the same name, which is what somebody means when
+    /// they write one.
+    pub async fn get_script(&self, conn_name: String, name: String) -> anyhow::Result<Option<(String, String)>> {
+        self.with(move |c| {
+            Ok(c.query_row(
+                "SELECT lang, body FROM scripts WHERE name = ?1 AND (conn = ?2 OR conn = '') \
+                 ORDER BY CASE WHEN conn = '' THEN 1 ELSE 0 END LIMIT 1",
+                params![name, conn_name],
+                |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
+            )
+            .optional()?)
+        })
+        .await
+    }
+
+    pub async fn save_script(
+        &self,
+        conn_name: String,
+        name: String,
+        lang: String,
+        body: String,
+    ) -> anyhow::Result<()> {
+        self.with(move |c| {
+            c.execute(
+                "INSERT INTO scripts (conn, name, lang, body, updated_at) VALUES (?1,?2,?3,?4,?5) \
+                 ON CONFLICT(conn, name) DO UPDATE SET lang = excluded.lang, \
+                 body = excluded.body, updated_at = excluded.updated_at",
+                params![conn_name, name, lang, body, now()],
+            )?;
+            Ok(())
+        })
+        .await
+    }
+
+    pub async fn remove_script(&self, conn_name: String, name: String) -> anyhow::Result<bool> {
+        self.with(move |c| {
+            let n = c.execute(
+                "DELETE FROM scripts WHERE conn = ?1 AND name = ?2",
+                params![conn_name, name],
+            )?;
+            Ok(n > 0)
         })
         .await
     }

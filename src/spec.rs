@@ -305,6 +305,9 @@ pub struct ConnSpec {
     /// A saved proxy, by name. Same rule as `tunnel_profile`.
     #[serde(default)]
     pub proxy_profile: Option<String>,
+    /// The person's own code, run around this connection's lifetime.
+    #[serde(default)]
+    pub hooks: Vec<Hook>,
     /// What this connection is ALLOWED to do, enforced by the engine.
     ///
     /// On the connection rather than on a client, because a client is a thing
@@ -531,6 +534,73 @@ impl TlsMode {
             TlsMode::VerifyFull => "verify_full",
         }
     }
+}
+
+/// Something of the person's own that runs when a connection opens or closes.
+///
+/// The four moments are the four that mean anything: before the dial, after it
+/// succeeded, before the link is taken down, after it is gone. A PreConnect hook
+/// that FAILS stops the connection, which is the only reason to have one before
+/// rather than after — opening a VPN, warming a credential, refusing to let
+/// anybody near production on a Friday.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct Hook {
+    pub on: HookEvent,
+    #[serde(default)]
+    pub kind: HookKind,
+    /// A command line, a saved script's NAME, or an inline body — whichever the
+    /// kind says. A saved script by NAME rather than by position, for the same
+    /// reason a dashboard tile names its chart.
+    pub source: String,
+    /// For an inline hook: which language the body is.
+    #[serde(default)]
+    pub lang: Option<crate::runner::Lang>,
+    /// How long it may take. `None` is the engine's default, not "forever": a
+    /// hook with no limit is a connection that never opens and never says why.
+    #[serde(default)]
+    pub timeout_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HookEvent {
+    PreConnect,
+    PostConnect,
+    PreDisconnect,
+    PostDisconnect,
+}
+
+impl HookEvent {
+    pub fn label(self) -> &'static str {
+        match self {
+            HookEvent::PreConnect => "pre_connect",
+            HookEvent::PostConnect => "post_connect",
+            HookEvent::PreDisconnect => "pre_disconnect",
+            HookEvent::PostDisconnect => "post_disconnect",
+        }
+    }
+
+    /// Whether a failure here stops what was about to happen.
+    ///
+    /// Only PreConnect. The others run after the thing they are named for, so
+    /// there is nothing left to stop — and pretending otherwise (refusing to
+    /// disconnect because a hook failed) would leave a connection open that
+    /// somebody asked to close.
+    pub fn blocking(self) -> bool {
+        matches!(self, HookEvent::PreConnect)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HookKind {
+    /// `source` is a command line, run through a shell.
+    #[default]
+    Command,
+    /// `source` names a saved script.
+    Script,
+    /// `source` is the body, and `lang` says what it is written in.
+    Inline,
 }
 
 /// A proxy every TCP dial goes through: the DB's, and the SSH server's.

@@ -20,6 +20,7 @@ mod net;
 mod proxy;
 mod registry;
 mod rpc;
+mod runner;
 mod secret;
 mod server;
 mod spec;

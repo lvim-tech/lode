@@ -82,7 +82,7 @@ notification   {"method":"…","params":{…}}
 
 `proto` grows **additively**: a client accepts any engine reporting
 `proto >= its minimum`, so a newer engine keeps working with an older client.
-The current protocol is **9**. What each version added is listed in
+The current protocol is **10**. What each version added is listed in
 `src/rpc.rs` beside the constant.
 
 ### Handshake
@@ -193,6 +193,71 @@ time. The source file is only read.
 
 The database lives at `$LODE_DATA_DIR/lode.db`, else
 `$XDG_DATA_HOME/lode/lode.db`, else `~/.local/share/lode/lode.db`.
+
+### Hooks and scripts (`proto >= 10`)
+
+A **hook** is the person's own code, run at one of four moments in a
+connection's life. A **script** is a document in Bash, Python or Lua that they
+run themselves. The same runner does both, because they are the same act seen
+from two sides.
+
+| method | params | result |
+|---|---|---|
+| `store.scripts.list` | `{ conn }` | `{ scripts }` — this connection's, and the global ones |
+| `store.scripts.save` | `{ conn?, name, lang, body }` | `{ saved }` |
+| `store.scripts.remove` | `{ conn?, name }` | `{ removed }` |
+| `script.run` | `{ conn?, name }` or `{ body, lang }` | `{ run_id, name }` |
+| `script.cancel` | `{ run_id }` | `{ cancelled }` |
+
+Output streams as `script.output` `{ run_id, stream, text, hook? }` and the end
+arrives as `script.state` `{ run_id, state, ms, code, error }`. The stream is
+NAMED — stdout and stderr kept apart, because which one a message came from is
+most of what a failing script is telling you.
+
+`ConnSpec.hooks` is a list of `{ on, kind, source, lang?, timeout_ms? }`:
+
+| `on` | when | a failure |
+|---|---|---|
+| `pre_connect` | before the dial | **stops the connection** |
+| `post_connect` | once it is open | is reported, and does not undo it |
+| `pre_disconnect` | while the link is still there | is reported |
+| `post_disconnect` | after it is gone | is reported |
+
+Only PreConnect blocks, and that is the only reason to have a hook before rather
+than after. The others come *after* the thing they are named for, so there is
+nothing left to stop — and refusing to disconnect because a hook failed would
+leave a connection open that somebody asked to close.
+
+`kind` is `command` (a command line, through a shell, so a pipe is a pipe),
+`script` (the NAME of a saved script — by name, so a hook whose script was
+deleted says which one rather than quietly doing nothing), or `inline` (the body,
+with `lang`).
+
+**The environment carries context and never a credential.** `LODE_EVENT`,
+`LODE_CONN`, `LODE_DRIVER`, `LODE_HOST`, `LODE_PORT`, `LODE_DATABASE` — and
+nothing from `auth`, `tls` or the tunnel, which are not read at all when it is
+built rather than read and filtered. A child's environment is visible in `ps` and
+in `/proc/<pid>/environ`, and to everything the child goes on to start. A hook
+that needs a password fetches it from the keyring under its own name.
+
+**Every hook and every script is in the audit log**, worked or not. A hook is
+somebody's code running against their database on the engine's initiative, and
+no honest reading of "what happened here" leaves that out.
+
+A script's body goes in on **stdin**: not as an argument (length limits, and it
+would show in `ps`) and not through a temporary file (a path somebody else can
+read or replace between writing and running).
+
+A run gets its **own process group**, so a timeout stops what the script started
+and not merely the interpreter. Without that, `bash -` running `sleep 30` forks:
+killing bash leaves `sleep` holding the output pipes, and a four-hundred-
+millisecond timeout takes thirty seconds to report.
+
+**Lua is not embedded**, and that is a limitation rather than a choice: an
+in-process Lua needs `mlua`, which is not in this lock file and cannot be fetched
+here, so `lua` runs as an interpreter like `python3` and `bash` do. An embedded
+Lua could be given a sandbox and an API onto the open connection; an interpreter
+can be given neither.
 
 ### Profiles and proxies (`proto >= 9`)
 

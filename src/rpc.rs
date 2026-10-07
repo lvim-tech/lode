@@ -81,7 +81,19 @@ use serde_json::json;
 ///     A proxy (SOCKS5 or HTTP CONNECT) sits UNDER everything: the database's
 ///     dial and the SSH server's dial both go through it, since a proxy that is
 ///     sometimes bypassed is not a rule. Additive.
-pub const PROTO: u32 = 9;
+/// 10 — added HOOKS and SCRIPTS: `store.scripts.{list,save,remove}`,
+///      `script.run`, `script.cancel`, `ConnSpec.hooks`, and the
+///      `script.output` / `script.state` notifications. A hook is the person's
+///      own code run at one of four moments; a PreConnect hook that fails STOPS
+///      the connection, which is the only reason to have one before rather than
+///      after, and the other three cannot undo what they come after. Every hook
+///      and every script is in the audit log, worked or not. The environment a
+///      child gets carries CONTEXT and never a credential — a child's
+///      environment is readable from `ps` and `/proc`. Lua runs through the
+///      interpreter rather than embedded: `mlua` is not in this lock file and
+///      cannot be fetched here, and the difference (no sandbox, no API onto the
+///      open connection) is real. Additive.
+pub const PROTO: u32 = 10;
 
 /// One decoded incoming request.
 #[derive(Debug, Deserialize)]
