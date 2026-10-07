@@ -32,7 +32,7 @@ use crate::theme::Theme;
 
 /// Where a value comes from. The engine's `secret.rs` resolves exactly these,
 /// which is why the list is this and not a wish.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Source {
     Literal,
     Env,
@@ -54,6 +54,52 @@ impl Source {
         [Source::Literal, Source::Env, Source::Command, Source::Keyring]
     }
 
+    /// What the field holds in this mode.
+    ///
+    /// Four different things wearing one box. Under `Env` it is the NAME of a
+    /// variable, under `Command` a command line, under `Keyring` a path in the
+    /// keyring, and only under `Literal` is it the credential itself. The field
+    /// looked identical in all four, so nothing said which was expected.
+    pub fn field_label(self) -> &'static str {
+        match self {
+            Source::Literal => "Value",
+            Source::Env => "Variable",
+            Source::Command => "Command",
+            Source::Keyring => "Keyring path",
+        }
+    }
+
+    pub fn hint(self) -> &'static str {
+        match self {
+            Source::Literal => "the value itself",
+            Source::Env => "PGPASSWORD",
+            Source::Command => "aws rds generate-db-auth-token …",
+            Source::Keyring => "prod/db",
+        }
+    }
+}
+
+/// One value, kept per source.
+///
+/// Switching `Literal → Env → Literal` used to show the variable name where the
+/// password had been and then save it as the password. Each mode keeps its own
+/// text, so moving between them loses nothing and shows nothing of the others.
+#[derive(Default)]
+pub struct Stash {
+    by_source: HashMap<Source, String>,
+}
+
+impl Stash {
+    fn put(&mut self, s: Source, v: String) {
+        self.by_source.insert(s, v);
+    }
+
+    fn take(&self, s: Source) -> String {
+        self.by_source.get(&s).cloned().unwrap_or_default()
+    }
+}
+
+impl Source {
     /// Wrap what was typed in the template the engine understands. A literal is
     /// stored as typed, which is also what makes a literal distinguishable from
     /// a template that happens to look like one.
@@ -112,6 +158,9 @@ impl FormTab {
 struct Field {
     input: Entity<TextInput>,
     source: Source,
+    /// What was typed under the OTHER sources, so switching back and forth
+    /// keeps it. Without this, a glance at `Env` and back costs the password.
+    stash: Stash,
     /// Whether a source may be chosen at all. A host is a host; a password is
     /// the kind of thing that comes from a wallet.
     secret: bool,
@@ -133,8 +182,25 @@ pub struct ConnectionForm {
     /// Driver parameters, by key.
     params: HashMap<String, Field>,
     auth_kind: String,
+    /// Shared on purpose: every kind that has a user calls it `user` and means
+    /// the same thing by it. Shared where the ENGINE shares it, nowhere else.
     auth_user: Entity<TextInput>,
-    auth_secret: Field,
+    /// `password` — and only `password`.
+    auth_password: Field,
+    /// `client_cert`: a certificate, a key and the key's password. `cert` and
+    /// `key` used to be written out as hardcoded empty strings, which made a
+    /// client-certificate connection impossible through this window — the same
+    /// shape of fault as the blanked tunnel passphrase.
+    auth_cert: Entity<TextInput>,
+    auth_key: Entity<TextInput>,
+    auth_key_password: Field,
+    /// `provider`: which one, and its token. The provider used to be hardcoded
+    /// to the literal string "token", so the engine's real providers could not
+    /// be chosen at all.
+    auth_provider: String,
+    auth_token: Field,
+    /// `kerberos`: a principal, which used to be written out as null.
+    auth_principal: Entity<TextInput>,
     tls_mode: String,
     /// "read_only" | "confirm" | "open" — what the engine will let this
     /// connection do. It belongs on the connection, not on a preference, so it
@@ -150,6 +216,7 @@ pub struct ConnectionForm {
     tunnel_profile: Option<String>,
     /// The names the workspace knows about, handed over when the window opens.
     tunnel_profiles: Vec<String>,
+
     /// The name to save the fields above under.
     profile_name: Entity<TextInput>,
     tunnel_host: Entity<TextInput>,
@@ -214,18 +281,16 @@ impl ConnectionForm {
             v.get(k).and_then(Value::as_str).unwrap_or("").to_string()
         };
 
-        let stored_secret = {
-            let p = get(&auth, "password");
-            if p.is_empty() {
-                get(&auth, "token")
-            } else {
-                p
-            }
-        };
-        let (secret_src, secret_arg) = Source::unwrap(&stored_secret);
+        // Each value from ITS OWN key. The old code read `password`, fell back
+        // to `token`, and wrote whichever it found back out under whatever the
+        // chosen kind happened to be — the same read-one-write-another fault
+        // that moved a passphrase into a key path.
+        let (pw_src, pw_arg) = Source::unwrap(&get(&auth, "password"));
+        let (kp_src, kp_arg) = Source::unwrap(&get(&auth, "key_password"));
+        let (tok_src, tok_arg) = Source::unwrap(&get(&auth, "token"));
         let tunnel_auth_v = tunnel.get("auth").cloned().unwrap_or(json!({}));
         let (pass_src, pass_arg) = Source::unwrap(&get(&tunnel_auth_v, "passphrase"));
-        let (pw_src, pw_arg) = Source::unwrap(&get(&tunnel_auth_v, "password"));
+        let (tpw_src, tpw_arg) = Source::unwrap(&get(&tunnel_auth_v, "password"));
         let key_path = get(&tunnel_auth_v, "path");
 
         let mut form = ConnectionForm {
@@ -242,11 +307,31 @@ impl ConnectionForm {
                 .unwrap_or("none")
                 .to_string(),
             auth_user: mk(cx, "user", &get(&auth, "user")),
-            auth_secret: Field {
-                input: mk(cx, "", &secret_arg),
-                source: secret_src,
+            auth_password: Field {
+                input: mk(cx, pw_src.hint(), &pw_arg),
+                source: pw_src,
+                stash: Stash::default(),
                 secret: true,
             },
+            auth_cert: mk(cx, "/etc/ssl/certs/client.pem", &get(&auth, "cert")),
+            auth_key: mk(cx, "/etc/ssl/private/client.key", &get(&auth, "key")),
+            auth_key_password: Field {
+                input: mk(cx, kp_src.hint(), &kp_arg),
+                source: kp_src,
+                stash: Stash::default(),
+                secret: true,
+            },
+            auth_provider: {
+                let p = get(&auth, "provider");
+                if p.is_empty() { "aws".to_string() } else { p }
+            },
+            auth_token: Field {
+                input: mk(cx, tok_src.hint(), &tok_arg),
+                source: tok_src,
+                stash: Stash::default(),
+                secret: true,
+            },
+            auth_principal: mk(cx, "user@REALM", &get(&auth, "principal")),
             tls_mode: spec
                 .get("tls")
                 .and_then(|t| t.get("mode"))
@@ -286,13 +371,15 @@ impl ConnectionForm {
                 .to_string(),
             tunnel_key_path: mk(cx, "~/.ssh/id_ed25519", &key_path),
             tunnel_passphrase: Field {
-                input: mk(cx, "", &pass_arg),
+                input: mk(cx, pass_src.hint(), &pass_arg),
                 source: pass_src,
+                stash: Stash::default(),
                 secret: true,
             },
             tunnel_password: Field {
-                input: mk(cx, "", &pw_arg),
-                source: pw_src,
+                input: mk(cx, tpw_src.hint(), &tpw_arg),
+                source: tpw_src,
+                stash: Stash::default(),
                 secret: true,
             },
             tests: HashMap::new(),
@@ -335,7 +422,7 @@ impl ConnectionForm {
             });
             self.params.insert(
                 p.key.clone(),
-                Field { input, source: src, secret: p.secret },
+                Field { input, source: src, stash: Stash::default(), secret: p.secret },
             );
         }
     }
@@ -355,15 +442,7 @@ impl ConnectionForm {
                 params.insert(k.clone(), json!(v));
             }
         }
-        let user = self.auth_user.read(cx).text().to_string();
-        let secret = self.auth_secret.source.wrap(self.auth_secret.input.read(cx).text());
-        let auth = match self.auth_kind.as_str() {
-            "password" => json!({ "kind": "password", "user": user, "password": secret }),
-            "provider" => json!({ "kind": "provider", "provider": "token", "user": user, "token": secret }),
-            "client_cert" => json!({ "kind": "client_cert", "cert": "", "key": "", "key_password": secret, "user": user }),
-            "kerberos" => json!({ "kind": "kerberos", "principal": Value::Null }),
-            _ => json!({ "kind": "none" }),
-        };
+        let auth = self.auth_spec(cx);
         // A profile INSTEAD of a spelled-out tunnel. Naming one and spelling one
         // out is refused by the engine rather than resolved by precedence, so
         // the form sends exactly one of them.
@@ -414,6 +493,48 @@ impl ConnectionForm {
     pub fn save_failed(&mut self, why: String, cx: &mut Context<Self>) {
         self.error = Some(why);
         cx.notify();
+    }
+
+    /// The chosen auth kind, as the engine's `AuthSpec`.
+    ///
+    /// Each kind writes ITS OWN keys and nothing else's. The engine's variants
+    /// (`src/spec.rs`) are the list, so there is one place that says what each
+    /// kind consists of and this follows it rather than guessing.
+    fn auth_spec(&self, cx: &Context<Self>) -> Value {
+        let val = |f: &Field| f.source.wrap(f.input.read(cx).text());
+        auth_json(AuthParts {
+            kind: &self.auth_kind,
+            user: self.auth_user.read(cx).text(),
+            password: &val(&self.auth_password),
+            cert: self.auth_cert.read(cx).text(),
+            key: self.auth_key.read(cx).text(),
+            key_password: &val(&self.auth_key_password),
+            provider: &self.auth_provider,
+            token: &val(&self.auth_token),
+            principal: self.auth_principal.read(cx).text(),
+        })
+    }
+
+    /// Why a file-backed auth field cannot be right, said before a save.
+    ///
+    /// The same check the tunnel's key path gets, for the same reason: a
+    /// certificate path that is not a path fails at dial time with the value
+    /// quoted back at it.
+    fn auth_file_problem(&self, cx: &Context<Self>) -> Option<String> {
+        if self.auth_kind != "client_cert" {
+            return None;
+        }
+        for (what, field) in [("certificate", &self.auth_cert), ("key", &self.auth_key)] {
+            let raw = field.read(cx).text();
+            let path = raw.trim();
+            if path.is_empty() {
+                return Some(format!("a {what} file is needed for a client certificate"));
+            }
+            if let Some(why) = path_problem(path) {
+                return Some(format!("{what}: {why}"));
+            }
+        }
+        None
     }
 
     /// The tunnel, as the engine's `TunnelSpec`.
@@ -494,6 +615,14 @@ impl ConnectionForm {
             cx.notify();
             return;
         }
+        // The same refusal for a client certificate, which is a pair of files
+        // and until now could not be given either.
+        if let Some(why) = self.auth_file_problem(cx) {
+            self.error = Some(why);
+            self.tab = FormTab::Main;
+            cx.notify();
+            return;
+        }
         let mut spec = self.spec(cx);
         if let Some(m) = spec.as_object_mut() {
             m.remove("driver");
@@ -503,6 +632,96 @@ impl ConnectionForm {
             w.form_save(name, driver, spec, old, cx);
         });
     }
+}
+
+/// The typed-in values an auth kind is built from.
+pub struct AuthParts<'a> {
+    pub kind: &'a str,
+    pub user: &'a str,
+    pub password: &'a str,
+    pub cert: &'a str,
+    pub key: &'a str,
+    pub key_password: &'a str,
+    pub provider: &'a str,
+    pub token: &'a str,
+    pub principal: &'a str,
+}
+
+/// One auth kind, as the engine's `AuthSpec` wants it.
+///
+/// Free of the widgets on purpose, so the thing under test is the thing that
+/// runs. A test asserting against hand-written JSON beside this would agree
+/// with itself forever and catch nothing — which is how three of these bugs
+/// survived.
+///
+/// Each arm writes ONLY the keys its own variant in `src/spec.rs` declares.
+pub fn auth_json(p: AuthParts<'_>) -> Value {
+    match p.kind {
+        "password" => json!({
+            "kind": "password",
+            "user": p.user,
+            "password": p.password,
+        }),
+        "client_cert" => json!({
+            "kind": "client_cert",
+            "cert": p.cert.trim(),
+            "key": p.key.trim(),
+            "key_password": p.key_password,
+            "user": p.user,
+        }),
+        "provider" => json!({
+            "kind": "provider",
+            "provider": p.provider,
+            "token": p.token,
+            "user": p.user,
+        }),
+        "kerberos" => json!({
+            "kind": "kerberos",
+            // Absent rather than empty: the engine's field is an `Option`, and
+            // "" is a principal nobody has.
+            "principal": if p.principal.trim().is_empty() {
+                Value::Null
+            } else {
+                json!(p.principal.trim())
+            },
+        }),
+        _ => json!({ "kind": "none" }),
+    }
+}
+
+/// The provider names the engine's own `AuthSpec` documents.
+///
+/// Not built from `access.list`: that returns the AWS PROFILE names out of
+/// `~/.aws/config`, which is a different thing entirely, and `AuthSpec` has no
+/// field to put one in. Offering them here would be putting a value of one kind
+/// into a box meaning another — which is the exact fault this change exists to
+/// undo.
+const PROVIDERS: [&str; 3] = ["aws", "oauth", "oidc"];
+
+/// Why this text is not a usable path to an existing file.
+///
+/// ONE definition, used by the tunnel's key, the client certificate and its
+/// key. The check exists because of a value typed into the wrong box: a
+/// passphrase has punctuation and spaces and no separator, and looks nothing
+/// like a path — so the form can say so before anything is dialled.
+fn path_problem(path: &str) -> Option<String> {
+    if !path.starts_with('/') && !path.starts_with('~') && !path.starts_with('.') {
+        return Some("that is not a path — it starts with / or ~".into());
+    }
+    if path.chars().any(char::is_whitespace) {
+        return Some("a path has no spaces in it".into());
+    }
+    let expanded = match path.strip_prefix('~') {
+        Some(rest) => match std::env::var("HOME") {
+            Ok(home) => format!("{home}{rest}"),
+            Err(_) => path.to_string(),
+        },
+        None => path.to_string(),
+    };
+    if !std::path::Path::new(&expanded).is_file() {
+        return Some(format!("there is no file at {path}"));
+    }
+    None
 }
 
 fn colors_of(t: &Theme) -> InputColors {
@@ -522,10 +741,17 @@ impl ConnectionForm {
     }
 
     /// A labelled row: label, source chooser where one applies, field.
+    /// A labelled field with its source picker.
+    ///
+    /// Takes the PARTS rather than a `Field`, so no call site has to build a
+    /// throwaway `Field` to be able to draw one — those copies are how a field's
+    /// stash would silently be left behind.
     fn row(
         &self,
         label: &str,
-        field: &Field,
+        input: &Entity<TextInput>,
+        source: Source,
+        secret: bool,
         key: SharedString,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
@@ -536,12 +762,21 @@ impl ConnectionForm {
             .items_center()
             .gap_2()
             .py(px(2.0))
-            .child(div().w(px(ms.label_w())).child(self.small(label.to_string(), t.muted())));
+            .child(div().w(px(ms.label_w())).child(self.small(
+                // Under a template source the row is not asking for the
+                // credential, so it stops saying it is.
+                if secret && source != Source::Literal {
+                    format!("{label} · {}", source.field_label())
+                } else {
+                    label.to_string()
+                },
+                t.muted(),
+            )));
 
-        if field.secret {
+        if secret {
             let mut picker = div().flex().gap_1();
             for s in Source::all() {
-                let on = field.source == s;
+                let on = source == s;
                 let k = key.clone();
                 picker = picker.child(
                     div()
@@ -553,7 +788,7 @@ impl ConnectionForm {
                         .when(on, |d| d.bg(t.accent()))
                         .child(SharedString::from(s.label()))
                         .on_click(cx.listener(move |this, _, _, cx| {
-                            this.set_source(&k, s);
+                            this.set_source(&k, s, cx);
                             cx.notify();
                         })),
                 );
@@ -566,12 +801,12 @@ impl ConnectionForm {
         // `Keyring` the field holds the NAME of a variable, a command line or a
         // keyring path — public text that somebody has to be able to read and
         // check, and masking it hides nothing while making it unusable.
-        let hide = field.secret && field.source == Source::Literal;
-        let shown = field.input.read(cx).revealed();
-        field.input.update(cx, |i, cx| i.set_mask(hide, cx));
-        row = row.child(div().flex_1().text_size(ms.body()).child(field.input.clone()));
+        let hide = secret && source == Source::Literal;
+        let shown = input.read(cx).revealed();
+        input.update(cx, |i, cx| i.set_mask(hide, cx));
+        row = row.child(div().flex_1().text_size(ms.body()).child(input.clone()));
         if hide {
-            let input = field.input.clone();
+            let input = input.clone();
             row = row.child(
                 div()
                     .id(SharedString::from(format!("eye-{key}")))
@@ -600,16 +835,42 @@ impl ConnectionForm {
         row
     }
 
-    fn set_source(&mut self, key: &str, s: Source) {
-        if key == "auth-secret" {
-            self.auth_secret.source = s;
-        } else if key == "tunnel-passphrase" {
-            self.tunnel_passphrase.source = s;
-        } else if key == "tunnel-password" {
-            self.tunnel_password.source = s;
-        } else if let Some(f) = self.params.get_mut(key) {
-            f.source = s;
+    /// Move a field to a different source, keeping what was typed in the old one.
+    ///
+    /// The swap is the point: each mode holds a DIFFERENT KIND of value, so
+    /// carrying one across would show a variable name where a password was and
+    /// then save it as the password. The hint changes too, because an empty box
+    /// that wants `PGPASSWORD` and an empty box that wants a password look the
+    /// same.
+    fn swap_source(f: &mut Field, to: Source, cx: &mut gpui::App) {
+        if f.source == to {
+            return;
         }
+        let current = f.input.read(cx).text().to_string();
+        f.stash.put(f.source, current);
+        let next = f.stash.take(to);
+        f.source = to;
+        f.input.update(cx, |i, cx| {
+            i.set_text(next, cx);
+            i.set_placeholder(to.hint(), cx);
+            // Only a literal is the secret itself.
+            i.set_mask(f.secret && to == Source::Literal, cx);
+        });
+    }
+
+    fn set_source(&mut self, key: &str, s: Source, cx: &mut gpui::App) {
+        let f = match key {
+            "auth-password" => &mut self.auth_password,
+            "auth-key-password" => &mut self.auth_key_password,
+            "auth-token" => &mut self.auth_token,
+            "tunnel-passphrase" => &mut self.tunnel_passphrase,
+            "tunnel-password" => &mut self.tunnel_password,
+            other => match self.params.get_mut(other) {
+                Some(f) => f,
+                None => return,
+            },
+        };
+        Self::swap_source(f, s, cx);
     }
 
     /// Why this key path cannot be right, said before anything is saved.
@@ -627,26 +888,7 @@ impl ConnectionForm {
         if path.is_empty() {
             return Some("a key file is needed, or choose another method".into());
         }
-        // A path has separators and no whitespace. Whitespace and punctuation
-        // with no separator at all is somebody's passphrase in the wrong field,
-        // which is the mistake this exists to catch.
-        if !path.starts_with('/') && !path.starts_with('~') && !path.starts_with('.') {
-            return Some("that is not a path — a key file starts with / or ~".into());
-        }
-        if path.chars().any(char::is_whitespace) {
-            return Some("a key file path has no spaces in it".into());
-        }
-        let expanded = match path.strip_prefix('~') {
-            Some(rest) => match std::env::var("HOME") {
-                Ok(home) => format!("{home}{rest}"),
-                Err(_) => path.to_string(),
-            },
-            None => path.to_string(),
-        };
-        if !std::path::Path::new(&expanded).is_file() {
-            return Some(format!("there is no file at {path}"));
-        }
-        None
+        path_problem(path)
     }
 
     /// A small icon in a fixed square, the same one the main window uses.
@@ -882,8 +1124,15 @@ impl Render for ConnectionForm {
 
                 for (key, label) in keys {
                     if let Some(f) = self.params.get(&key) {
-                        let f = Field { input: f.input.clone(), source: f.source, secret: f.secret };
-                        body = body.child(self.row(&label, &f, SharedString::from(key.clone()), cx));
+                        let (input, source, secret) = (f.input.clone(), f.source, f.secret);
+                        body = body.child(self.row(
+                            &label,
+                            &input,
+                            source,
+                            secret,
+                            SharedString::from(key.clone()),
+                            cx,
+                        ));
                     }
                 }
 
@@ -909,22 +1158,88 @@ impl Render for ConnectionForm {
                     );
                 }
                 body = body.child(auth_picker);
+                // EACH KIND ITS OWN FIELDS. One pair of boxes stood for all of
+                // them and was squeezed into whichever shape the kind wanted on
+                // the way out, which is why a client certificate could not be
+                // given one and a provider could not be chosen.
+                let plain = |this: &Self, label: &'static str, input: &Entity<TextInput>| {
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .py(px(2.0))
+                        .child(div().w(px(ms.label_w())).child(this.small(label, t.muted())))
+                        .child(div().flex_1().text_size(ms.body()).child(input.clone()))
+                };
+                if matches!(self.auth_kind.as_str(), "password" | "client_cert" | "provider") {
+                    body = body.child(plain(self, "User", &self.auth_user));
+                }
+                match self.auth_kind.as_str() {
+                    "password" => {
+                        let (i, src) = (self.auth_password.input.clone(), self.auth_password.source);
+                        body = body.child(self.row("Password", &i, src, true, "auth-password".into(), cx));
+                    }
+                    "client_cert" => {
+                        body = body.child(plain(self, "Certificate", &self.auth_cert));
+                        body = body.child(plain(self, "Key", &self.auth_key));
+                        if let Some(why) = self.auth_file_problem(cx) {
+                            body = body.child(self.small(why, t.error()));
+                        }
+                        let (i, src) =
+                            (self.auth_key_password.input.clone(), self.auth_key_password.source);
+                        body = body.child(self.row(
+                            "Key password",
+                            &i,
+                            src,
+                            true,
+                            "auth-key-password".into(),
+                            cx,
+                        ));
+                    }
+                    "provider" => {
+                        // The providers the ENGINE found, not free text. A name
+                        // typed by hand is a name that fails at connect time.
+                        let mut pr = div().flex().items_center().gap_2().py_1().child(
+                            div().w(px(ms.label_w())).child(self.small("Provider", t.muted())),
+                        );
+                        for p in PROVIDERS {
+                            let on = self.auth_provider == p;
+                            let pick = p;
+                            pr = pr.child(
+                                div()
+                                    .id(SharedString::from(format!("prov-{p}")))
+                                    .px_1()
+                                    .cursor_pointer()
+                                    .text_size(ms.tiny())
+                                    .text_color(if on { t.inverted() } else { t.muted() })
+                                    .when(on, |d| d.bg(t.accent()))
+                                    .child(p)
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        this.auth_provider = pick.to_string();
+                                        cx.notify();
+                                    })),
+                            );
+                        }
+                        body = body.child(pr);
+                        let (i, src) = (self.auth_token.input.clone(), self.auth_token.source);
+                        body = body.child(self.row("Token", &i, src, true, "auth-token".into(), cx));
+                        // Said plainly: the name is RECORDED and, today, read by
+                        // nothing. Snowflake is the only driver that takes a
+                        // provider and it uses the token alone. Better to say so
+                        // than to let a chosen name imply an effect it has not
+                        // got.
+                        body = body.child(self.small(
+                            "The token is what connects. The provider name is stored with the \
+                             connection and no driver reads it yet.",
+                            t.muted(),
+                        ));
+                    }
+                    "kerberos" => {
+                        body = body.child(plain(self, "Principal", &self.auth_principal));
+                    }
+                    _ => {}
+                }
                 if self.auth_kind != "none" {
-                    body = body.child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .gap_2()
-                            .py(px(2.0))
-                            .child(div().w(px(ms.label_w())).child(self.small("User", t.muted())))
-                            .child(div().flex_1().child(self.auth_user.clone())),
-                    );
-                    let f = Field {
-                        input: self.auth_secret.input.clone(),
-                        source: self.auth_secret.source,
-                        secret: true,
-                    };
-                    body = body.child(self.row("Secret", &f, "auth-secret".into(), cx));
                     body = body.child(self.small(
                         "Literal is stored as typed. Env, Command and Keyring are resolved by the \
                          engine at connect time — the client never sees the value.",
@@ -1133,14 +1448,13 @@ impl Render for ConnectionForm {
                         if let Some(why) = self.key_path_problem(cx) {
                             body = body.child(self.small(why, t.error()));
                         }
-                        let f = Field {
-                            input: self.tunnel_passphrase.input.clone(),
-                            source: self.tunnel_passphrase.source,
-                            secret: true,
-                        };
+                        let (i, src) =
+                            (self.tunnel_passphrase.input.clone(), self.tunnel_passphrase.source);
                         body = body.child(self.row(
                             "Passphrase",
-                            &f,
+                            &i,
+                            src,
+                            true,
                             "tunnel-passphrase".into(),
                             cx,
                         ));
@@ -1150,12 +1464,9 @@ impl Render for ConnectionForm {
                         ));
                     }
                     if self.tunnel_auth == "password" {
-                        let f = Field {
-                            input: self.tunnel_password.input.clone(),
-                            source: self.tunnel_password.source,
-                            secret: true,
-                        };
-                        body = body.child(self.row("Password", &f, "tunnel-password".into(), cx));
+                        let (i, src) =
+                            (self.tunnel_password.input.clone(), self.tunnel_password.source);
+                        body = body.child(self.row("Password", &i, src, true, "tunnel-password".into(), cx));
                     }
                     body = body.child(self.stage_row("tunnel", cx));
                     // This is how a profile is CREATED: out of the fields
@@ -1343,6 +1654,115 @@ impl Render for ConnectionForm {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Each auth kind carries ITS OWN keys and not one belonging to another.
+    ///
+    /// This is the check that would have caught all three of the field-sharing
+    /// bugs: the tunnel path that was really a passphrase, the `cert` and `key`
+    /// hardcoded empty so a client certificate could never be configured, and
+    /// the provider pinned to the literal string "token". Every one of them is
+    /// a value written under a key that did not mean it.
+    ///
+    /// The engine's `AuthSpec` (`src/spec.rs`) is the list being asserted.
+    #[test]
+    fn every_auth_kind_writes_its_own_keys_and_no_others() {
+        // kind → exactly the keys the engine's variant declares.
+        let expected: [(&str, &[&str]); 5] = [
+            ("none", &[]),
+            ("password", &["user", "password"]),
+            ("client_cert", &["cert", "key", "key_password", "user"]),
+            ("provider", &["provider", "token", "user"]),
+            ("kerberos", &["principal"]),
+        ];
+        // Every key any kind uses, so a stray one can be spotted by name.
+        let all: Vec<&str> = vec![
+            "user", "password", "cert", "key", "key_password", "provider", "token", "principal",
+        ];
+
+        for (kind, keys) in expected {
+            // THE REAL BUILDER, with every box filled in — so a value that
+            // leaks from one kind into another is visible as itself.
+            let built = auth_json(AuthParts {
+                kind,
+                user: "the-user",
+                password: "the-password",
+                cert: "/the/cert.pem",
+                key: "/the/key.pem",
+                key_password: "the-key-password",
+                provider: "aws",
+                token: "the-token",
+                principal: "me@REALM",
+            });
+            let obj = built.as_object().expect("an object");
+
+            for k in keys {
+                assert!(obj.contains_key(*k), "{kind} is missing its own key {k}");
+            }
+            for k in &all {
+                if keys.contains(k) {
+                    continue;
+                }
+                assert!(
+                    !obj.contains_key(*k),
+                    "{kind} carries {k}, which belongs to another kind"
+                );
+            }
+            // And nothing is present-but-blank, which is how `cert` and `key`
+            // were "there" while making the kind unusable.
+            for k in keys {
+                if let Some(v) = obj.get(*k).and_then(Value::as_str) {
+                    assert!(!v.is_empty(), "{kind}: {k} is present but empty");
+                }
+            }
+        }
+
+        // The three faults that were actually in the code, named one by one.
+        let cc = auth_json(AuthParts {
+            kind: "client_cert",
+            user: "u",
+            password: "",
+            cert: "/the/cert.pem",
+            key: "/the/key.pem",
+            key_password: "kp",
+            provider: "aws",
+            token: "",
+            principal: "",
+        });
+        assert_eq!(cc["cert"], "/the/cert.pem", "cert was hardcoded empty");
+        assert_eq!(cc["key"], "/the/key.pem", "key was hardcoded empty");
+
+        let pv = auth_json(AuthParts {
+            kind: "provider",
+            user: "u",
+            password: "",
+            cert: "",
+            key: "",
+            key_password: "",
+            provider: "oidc",
+            token: "t",
+            principal: "",
+        });
+        assert_eq!(pv["provider"], "oidc", "the provider was hardcoded to \"token\"");
+
+        let kb = auth_json(AuthParts {
+            kind: "kerberos",
+            user: "u",
+            password: "",
+            cert: "",
+            key: "",
+            key_password: "",
+            provider: "",
+            token: "",
+            principal: "me@REALM",
+        });
+        assert_eq!(kb["principal"], "me@REALM", "the principal was hardcoded null");
+        // An empty principal is absent, not "".
+        let kb2 = auth_json(AuthParts { principal: "  ", ..AuthParts {
+            kind: "kerberos", user: "", password: "", cert: "", key: "",
+            key_password: "", provider: "", token: "", principal: "",
+        }});
+        assert!(kb2["principal"].is_null());
+    }
 
     /// Naming a profile and spelling a tunnel out are mutually exclusive: the
     /// engine refuses a spec holding both rather than picking one, so the form

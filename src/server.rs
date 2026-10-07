@@ -891,7 +891,27 @@ impl Server {
             "proxy" => Self::test_proxy(&p.spec).await,
             "endpoint" => Self::test_endpoint(&p.spec, meta).await,
             "tunnel" => Self::test_tunnel(&p.spec, meta).await,
-            "tls" | "auth" => self.test_connect(&p.spec, &p.stage).await,
+            "tls" | "auth" => {
+                // These two dial the whole way, so they ride the tunnel. When
+                // the tunnel is what is broken, the connect fails with the
+                // tunnel's words — `cannot load ssh key …` under a button
+                // labelled "Test auth" — and nothing says the fault is a
+                // different section of the form.
+                //
+                // So the earlier stage is checked FIRST and named when it is
+                // the one that failed. A later stage cannot pass if an earlier
+                // one does not, and saying which one fell over is the whole
+                // point of having stages.
+                if p.spec.tunnel.is_some() {
+                    if let Err(e) = Self::test_tunnel(&p.spec, meta).await {
+                        Err(anyhow::anyhow!("the TUNNEL stage failed first, so {} was not reached: {e}", p.stage))
+                    } else {
+                        self.test_connect(&p.spec, &p.stage).await
+                    }
+                } else {
+                    self.test_connect(&p.spec, &p.stage).await
+                }
+            }
             other => Err(anyhow::anyhow!("unknown test stage '{other}'")),
         };
         let detail = match outcome {
