@@ -889,7 +889,20 @@ impl Workspace {
             board_time_from,
             board_time_to,
             scale: Metrics::new(restore.font_size.unwrap_or(crate::metrics::DEFAULT_BASE))
-                .with_icon(restore.icon_size.unwrap_or(crate::metrics::DEFAULT_ICON)),
+                .with_icon(match restore.icon_size {
+                    // A value equal to a default this client has shipped is
+                    // treated as NOT CHOSEN. The session has always written the
+                    // size out, picked or not, so nobody is distinguishable as
+                    // "never chose one" — and without this a raised default
+                    // would reach nobody who had ever opened the window.
+                    // Nobody types a size by hand to exactly the number it
+                    // already was.
+                    Some(v) if crate::metrics::SHIPPED_ICON_DEFAULTS.contains(&v) => {
+                        crate::metrics::DEFAULT_ICON
+                    }
+                    Some(v) => v,
+                    None => crate::metrics::DEFAULT_ICON,
+                }),
             metrics: Vec::new(),
             metrics_conn: None,
             metrics_error: None,
@@ -2011,8 +2024,13 @@ impl Workspace {
             theme: Some(self.theme_name.clone()),
             json_indent: Some(self.json_indent),
             lang: Some(self.lang.tag().into()),
-            font_size: Some(self.scale.base()),
-            icon_size: Some(self.scale.icon_size()),
+            // `None` when it is the default, so a later change to the default
+            // reaches anybody who has not picked a size of their own. Writing
+            // the number out unconditionally is what froze everyone at the old
+            // one.
+            font_size: Some(self.scale.base()).filter(|v| *v != crate::metrics::DEFAULT_BASE),
+            icon_size: Some(self.scale.icon_size())
+                .filter(|v| *v != crate::metrics::DEFAULT_ICON),
             settings_open: Some(self.open_groups.iter().cloned().collect()),
             rail: match self.rail {
                 Rail::Connections => "connections",
@@ -3431,6 +3449,33 @@ impl Workspace {
             .child(self.ic(glyph))
     }
 
+    /// A row ACTION: the pencil that edits, the cross that closes.
+    ///
+    /// Drawn at the icon scale rather than at a text step. These were `tiny` and
+    /// `small`, which on a palette with a quiet accent came out nearly invisible
+    /// in a narrow row — and an action nobody can see is an action nobody knows
+    /// is there.
+    ///
+    /// Two further things it fixes: the colour is the ordinary foreground, so it
+    /// is visible WITHOUT hovering (hover brightens it rather than revealing
+    /// it), and the clickable square is bigger than the glyph, because a target
+    /// the size of its own drawing is a target people miss.
+    fn action_el(&self, glyph: &'static str, colour: Rgba) -> gpui::Div {
+        let ms = self.scale;
+        div()
+            .flex()
+            .items_center()
+            .justify_center()
+            .flex_none()
+            .w(px(ms.action_box()))
+            .h(px(ms.action_box()))
+            .line_height(px(ms.action_box()))
+            .font_family(self.icon_family.clone())
+            .text_size(ms.action())
+            .text_color(colour)
+            .child(self.ic(glyph))
+    }
+
     /// An icon in a fixed square, centred both ways.
     ///
     /// The reported complaint, and its cause: Font Awesome's glyphs are drawn
@@ -4116,7 +4161,7 @@ impl Workspace {
                                             .cursor_pointer()
                                             .tooltip(self.tip("tip.edit_profile", None))
                                             .hover(|d| d.bg(t.hover()))
-                                            .child(self.icon_inline("\u{f044}", t.accent()))
+                                            .child(self.action_el("\u{f044}", t.fg()))
                                             .on_click(cx.listener({
                                                 let (n, sp) = (n.clone(), r.spec.clone());
                                                 move |this, _, _, cx| {
@@ -4131,7 +4176,7 @@ impl Workspace {
                                             .cursor_pointer()
                                             .tooltip(self.tip("tip.remove_profile", None))
                                             .hover(|d| d.bg(t.hover()))
-                                            .child(self.icon_inline("\u{f00d}", t.muted()))
+                                            .child(self.action_el("\u{f00d}", t.fg()))
                                             .on_click(cx.listener({
                                                 let n = name.clone();
                                                 move |this, _, _, cx| {
@@ -4631,7 +4676,9 @@ impl Workspace {
                     .items_center()
                     .gap_2()
                     .px_2()
-                    .py_1()
+                    // Tall enough for the text AND the action in it, derived
+                    // rather than chosen — see `panel_row_h`.
+                    .h(px(ms.panel_row_h()))
                     .cursor_pointer()
                     .hover(|d| d.bg(t.hover()))
                     .when(is_live, |d| d.bg(t.selected()))
@@ -4665,7 +4712,10 @@ impl Workspace {
                             // up under the pointer.
                             .hover(|d| d.bg(t.hover()))
                             .tooltip(self.tip("tip.edit_conn", None))
-                            .child(self.icon_inline("\u{f044}", t.accent()))
+                            // The ordinary foreground, not the accent: on a
+                            // palette with a quiet accent the pencil was barely
+                            // separable from the panel it sat on.
+                            .child(self.action_el("\u{f044}", t.fg()))
                             .on_click(cx.listener({
                                 let (n, d, sp) = (c.name.clone(), c.driver.clone(), c.spec.clone());
                                 move |this, _, _, cx| {
@@ -4940,9 +4990,8 @@ impl Workspace {
                         div()
                             .id(SharedString::from(format!("tabx-{}", tab.id)))
                             .tooltip(self.tip("tip.close_tab", None))
-                            .text_size(ms.tiny())
-                            .text_color(t.muted())
-                            .child("\u{f00d}")
+                            .hover(|d| d.bg(t.hover()))
+                            .child(self.action_el("\u{f00d}", t.muted()))
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 this.close_tab(id);
                                 cx.notify();
@@ -6007,11 +6056,10 @@ impl Workspace {
                 div()
                     .id(SharedString::from(format!("b-rm-{i}")))
                     .tooltip(self.tip("tip.remove_tile", None))
+                    .hover(|d| d.bg(t.hover()))
                     .px_1()
                     .cursor_pointer()
-                    .text_size(ms.small())
-                    .text_color(t.muted())
-                    .child("\u{f00d}")
+                                                            .child(self.action_el("\u{f00d}", t.muted()))
                     .on_click(cx.listener(move |this, _, _, cx| {
                         if let Some(tb) = this.tabs.iter_mut().find(|x| x.id == tab_id) {
                             if i < tb.builder.conds.len() {
@@ -6201,11 +6249,10 @@ impl Workspace {
                     div()
                         .id("detail-close")
                         .tooltip(self.tip("tip.close_detail", Some("esc")))
+                        .hover(|d| d.bg(t.hover()))
                         .px_1()
                         .cursor_pointer()
-                        .text_size(ms.small())
-                        .text_color(t.muted())
-                        .child("\u{f00d}")
+                                                                        .child(self.action_el("\u{f00d}", t.muted()))
                         .on_click(cx.listener(|this, _, _, cx| {
                             if let Some(tb) = this.tabs.get_mut(this.active) {
                                 tb.detail = None;

@@ -42,7 +42,21 @@ pub const MAX_BASE: f32 = 24.0;
 /// at the old size the glyph took about a third of the rail's width and read
 /// as a dot rather than as a sign. Somebody who finds it too big now has a
 /// setting; somebody who finds it too small has to guess there is one.
-pub const DEFAULT_ICON: f32 = 26.0;
+pub const DEFAULT_ICON: f32 = 28.0;
+
+/// Defaults this client has shipped before.
+///
+/// A session has always written the icon size out, chosen or not, so nobody is
+/// distinguishable as "never picked one" — and raising the default would reach
+/// nobody who had ever opened the window. A stored value equal to a default we
+/// once shipped is therefore treated as "not chosen": nobody sets a size by
+/// hand to exactly the number it already was.
+///
+/// It is written out from now on only when it DIFFERS from the current default,
+/// so this list does not have to grow again.
+pub const SHIPPED_ICON_DEFAULTS: [f32; 2] = [26.0, 28.0];
+
+
 pub const MIN_ICON: f32 = 12.0;
 pub const MAX_ICON: f32 = 40.0;
 
@@ -139,6 +153,24 @@ impl Metrics {
         px(self.icon)
     }
 
+    /// The size for a control that is an ACTION rather than a label.
+    ///
+    /// The rail's size, wherever it appears: the pencil that edits a connection, the
+    /// cross that closes a tab. They were drawn at a TEXT step — `tiny` and `small`
+    /// — so on a palette with a quiet accent they were nearly invisible, and an
+    /// action nobody can see is an action nobody knows is there.
+    pub fn action(self) -> Pixels {
+        px((self.icon * 0.72).round())
+    }
+
+    /// The square an action is clicked in.
+    ///
+    /// Bigger than the glyph on purpose. A target the size of its own drawing is a
+    /// target people miss, and these sit at the end of a narrow row.
+    pub fn action_box(self) -> f32 {
+        (self.icon * 1.15).round()
+    }
+
     /// The square an icon is drawn in.
     ///
     /// A BOX, not a line of text. Font Awesome's glyphs are drawn at different
@@ -174,6 +206,17 @@ impl Metrics {
     /// and re-deriving it would undo that decision every time the font moved.
     pub fn col_w(self) -> f32 {
         (self.base * 11.0).round()
+    }
+
+    /// The height of a row in a side panel.
+    ///
+    /// DERIVED, from whichever is taller: the text that goes in it, or the
+    /// action that sits at its end. Chosen as a number, it stops following the
+    /// scale the moment either grows — which is how descenders came to be
+    /// clipped and how the pencil came to have nowhere to breathe.
+    pub fn panel_row_h(self) -> f32 {
+        let text = f32::from(self.body()) * 1.6;
+        (text.max(self.action_box() + 4.0)).round()
     }
 
     /// The height of one rail button, with room around the icon.
@@ -346,6 +389,38 @@ mod tests {
             let w = longest * f32::from(m.small()) * 0.55;
             assert!(m.label_w() >= w, "base {b}: {} vs {w}", m.label_w());
             assert!(m.field_w() > m.label_w(), "base {b}: a field wants more room than its label");
+            b += 1.0;
+        }
+    }
+
+    /// A panel row is tall enough for its text AND for the action in it, at
+    /// every size either can be.
+    ///
+    /// Descenders were being clipped: the row height was a number, so raising
+    /// the text did not raise the row. This asserts the derivation across the
+    /// whole range of both numbers, which is the only way the question stops
+    /// coming back.
+    #[test]
+    fn a_panel_row_fits_its_text_and_its_action() {
+        let mut b = MIN_BASE;
+        while b <= MAX_BASE {
+            let mut i = MIN_ICON;
+            while i <= MAX_ICON {
+                let m = Metrics::new(b).with_icon(i);
+                let text = f32::from(m.body());
+                // Room for the line AND for what hangs below it.
+                assert!(
+                    m.panel_row_h() >= text * 1.5,
+                    "base {b} icon {i}: {} is not enough for {text}px text",
+                    m.panel_row_h()
+                );
+                // And for the action that sits at the end of the row.
+                assert!(
+                    m.panel_row_h() > m.action_box(),
+                    "base {b} icon {i}: the action does not fit"
+                );
+                i += 2.0;
+            }
             b += 1.0;
         }
     }
