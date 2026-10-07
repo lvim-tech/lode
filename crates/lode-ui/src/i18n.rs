@@ -140,6 +140,7 @@ const EN: &[(&str, &str)] = &[
     // Settings.
     ("settings.theme",      "Theme"),
     ("settings.text_size",  "Text size"),
+    ("settings.icon_size",  "Icon size"),
     ("settings.json_indent", "JSON indent"),
     ("settings.language",   "Language"),
     ("settings.text",       "Text"),
@@ -217,6 +218,7 @@ const BG: &[(&str, &str)] = &[
 
     ("settings.theme",      "Тема"),
     ("settings.text_size",  "Размер на текста"),
+    ("settings.icon_size",  "Размер на иконите"),
     ("settings.json_indent", "Отстъп в JSON"),
     ("settings.language",   "Език"),
     ("settings.text",       "Текст"),

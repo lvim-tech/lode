@@ -135,6 +135,8 @@ fn pick_font(cx: &gpui::App) -> String {
     for name in [
         "CodeNerdFont",
         "CodeNerdFontMono",
+        "Inconsolata LGC Nerd Font Mono",
+        "Inconsolata LGC Nerd Font",
         "FiraCode Nerd Font",
         "JetBrainsMono Nerd Font",
         "Hack Nerd Font",
@@ -157,6 +159,174 @@ fn pick_font(cx: &gpui::App) -> String {
         }
     }
     "monospace".to_string()
+}
+
+/// Every glyph the interface draws, so each can be checked against the font
+/// that was actually chosen.
+///
+/// Listed rather than discovered, because the check has to happen once at
+/// startup: asking the text system per frame would be a font lookup per icon
+/// per paint.
+const GLYPHS: &[(&str, &str)] = &[
+    // The rail.
+    ("\u{f1c0}", "DB"),
+    ("\u{f080}", "||"),
+    ("\u{f1da}", "H"),
+    ("\u{f132}", "A"),
+    ("\u{f0ae}", "T"),
+    ("\u{f013}", "S"),
+    // Everything else.
+    ("\u{f021}", "~"),
+    ("\u{f00c}", "+"),
+    ("\u{f00d}", "x"),
+    ("\u{f067}", "+"),
+    ("\u{f10c}", "o"),
+    ("\u{f111}", "*"),
+    ("\u{f044}", "e"),
+    ("\u{f00a}", "#"),
+    ("\u{f15c}", "Q"),
+    ("\u{f07b}", "/"),
+    ("\u{f0ce}", "T"),
+    ("\u{f06e}", "V"),
+    ("\u{f0d7}", "v"),
+    ("\u{f0da}", ">"),
+    ("\u{f0de}", "^"),
+    ("\u{f0dd}", "v"),
+];
+
+/// Does this family have every glyph the interface draws?
+///
+/// Measured, not assumed from the name. `typographic_bounds` errors when the
+/// glyph is absent, which is exactly the question — and the names are no guide:
+/// on this machine not ONE of the six families the picker used to ask for was
+/// installed under that name, so it had been falling through to whatever was
+/// left, and six of the rail's glyphs were drawing as empty rectangles.
+fn covers_all_glyphs(cx: &gpui::App, family: &str) -> bool {
+    missing_in(cx, family).is_empty()
+}
+
+/// The font the ICONS are drawn in, which is not the font the text is drawn in.
+///
+/// Two separate jobs. A text font is chosen for reading a result; an icon font
+/// is chosen for having the glyphs and drawing them at one width. Nerd Fonts
+/// ship a `Mono` variant whose symbols are all one cell wide, and `Symbols Nerd
+/// Font Mono` is nothing but those symbols — which is precisely this job.
+///
+/// Measured against the installed fonts rather than hardcoded, because the
+/// hardcoded list is what failed.
+fn pick_icon_font(cx: &gpui::App, text_font: &str) -> String {
+    if let Ok(want) = std::env::var("LODE_ICON_FONT") {
+        if covers_all_glyphs(cx, &want) {
+            return want;
+        }
+    }
+    let installed = cx.text_system().all_font_names();
+    // Purpose-built symbol fonts first, then any monospaced Nerd variant, then
+    // any Nerd font at all, then the text font. First one that COVERS wins.
+    let named = |n: &str| installed.iter().any(|f| f == n);
+    for name in ["Symbols Nerd Font Mono", "Symbols Nerd Font"] {
+        if named(name) && covers_all_glyphs(cx, name) {
+            return name.to_string();
+        }
+    }
+    for want_mono in [true, false] {
+        for f in installed.iter() {
+            if !f.contains("Nerd") {
+                continue;
+            }
+            if want_mono && !f.contains("Mono") {
+                continue;
+            }
+            if covers_all_glyphs(cx, f) {
+                return f.clone();
+            }
+        }
+    }
+    text_font.to_string()
+}
+
+/// Which of those glyphs the given font does NOT have.
+///
+/// A font without a glyph draws an empty rectangle, and an empty rectangle is
+/// read as "that icon is a different size" — which is what was reported. Asking
+/// the font is cheap and is the difference between a letter somebody can read
+/// and a box that tells them nothing.
+///
+/// `typographic_bounds` errors when the glyph is absent, which is exactly the
+/// question.
+fn missing_in(cx: &gpui::App, family: &str) -> std::collections::HashSet<char> {
+    let font = gpui::Font {
+        family: family.to_string().into(),
+        features: Default::default(),
+        fallbacks: None,
+        weight: Default::default(),
+        style: Default::default(),
+    };
+    let id = cx.text_system().resolve_font(&font);
+    let mut missing = std::collections::HashSet::new();
+    for (g, _) in GLYPHS {
+        if let Some(ch) = g.chars().next() {
+            if cx.text_system().typographic_bounds(id, px(16.0), ch).is_err() {
+                missing.insert(ch);
+            }
+        }
+    }
+    missing
+}
+
+/// Print which fonts were chosen and whether they carry every glyph.
+///
+/// The honest form of "the icons look right": the family that was actually
+/// resolved, and per glyph its presence and its measured ink box. Equal boxes
+/// are the claim, so the boxes are what gets printed.
+pub fn report_icons(cx: &gpui::App) {
+    let text = pick_font(cx);
+    let icons = pick_icon_font(cx, &text);
+    println!("text font:  {text}");
+    println!("icon font:  {icons}");
+    let font = gpui::Font {
+        family: icons.clone().into(),
+        features: Default::default(),
+        fallbacks: None,
+        weight: Default::default(),
+        style: Default::default(),
+    };
+    let id = cx.text_system().resolve_font(&font);
+    let (mut present, mut widths) = (0usize, Vec::new());
+    for (g, fallback) in GLYPHS {
+        let ch = g.chars().next().unwrap_or(' ');
+        match cx.text_system().typographic_bounds(id, px(20.0), ch) {
+            Ok(b) => {
+                present += 1;
+                widths.push(cx
+                    .text_system()
+                    .advance(id, px(20.0), ch)
+                    .map(|a| f32::from(a.width))
+                    .unwrap_or(0.0));
+                println!(
+                    "  U+{:04x}  present  ink {:5.1} x {:5.1}",
+                    ch as u32, f32::from(b.size.width), f32::from(b.size.height)
+                );
+            }
+            Err(_) => println!("  U+{:04x}  MISSING  drawn as \"{fallback}\"", ch as u32),
+        }
+    }
+    println!("{present}/{} glyphs present", GLYPHS.len());
+    if let (Some(lo), Some(hi)) = (
+        widths.iter().cloned().reduce(f32::min),
+        widths.iter().cloned().reduce(f32::max),
+    ) {
+        println!("advance width: {lo:.1} .. {hi:.1} (equal means one cell per icon)");
+    }
+    let ms = Metrics::default();
+    println!(
+        "icon {} px, box {} px, rail {} px wide, button {} px tall, gap {} px",
+        ms.icon_size(),
+        ms.icon_box(),
+        ms.rail_w(),
+        ms.rail_h(),
+        ms.rail_gap()
+    );
 }
 
 /// One line in the command palette.
@@ -467,6 +637,10 @@ pub struct Workspace {
     /// argument about which is right is older than this program, so it is a
     /// setting rather than a decision.
     json_indent: u8,
+    /// The glyphs the ICON font does not have, worked out once at startup.
+    missing_glyphs: std::collections::HashSet<char>,
+    /// The font the icons are drawn in — not the font the text is drawn in.
+    icon_family: String,
     /// The font family the window is actually drawing in.
     ///
     /// Was the literal `"CodeNerdFont"`, which is a font on ONE machine. It is
@@ -498,6 +672,8 @@ impl Workspace {
         // Read ONCE, and FIRST: the theme, the type scale and the window's
         // fields all come out of it.
         let restore = session::load();
+        let font_family = pick_font(cx);
+        let icon_family = pick_icon_font(cx, &font_family);
         // The session's theme before anything else. It was being saved and
         // never read, so the choice survived to the file and no further.
         let (theme_name, theme) = theme::pick_named(restore.theme.as_deref());
@@ -573,7 +749,8 @@ impl Workspace {
             board_time_col,
             board_time_from,
             board_time_to,
-            scale: Metrics::new(restore.font_size.unwrap_or(crate::metrics::DEFAULT_BASE)),
+            scale: Metrics::new(restore.font_size.unwrap_or(crate::metrics::DEFAULT_BASE))
+                .with_icon(restore.icon_size.unwrap_or(crate::metrics::DEFAULT_ICON)),
             metrics: Vec::new(),
             metrics_conn: None,
             metrics_error: None,
@@ -596,7 +773,9 @@ impl Workspace {
                 .unwrap_or_default(),
             json_indent: restore.json_indent.unwrap_or(4).clamp(2, 4),
             themes: theme::discover(),
-            font_family: pick_font(cx),
+            missing_glyphs: missing_in(cx, &icon_family),
+            icon_family,
+            font_family,
             focus: cx.focus_handle(),
             export_open: false,
             export_format: Format::Csv,
@@ -1594,6 +1773,7 @@ impl Workspace {
             json_indent: Some(self.json_indent),
             lang: Some(self.lang.tag().into()),
             font_size: Some(self.scale.base()),
+            icon_size: Some(self.scale.icon_size()),
             rail: match self.rail {
                 Rail::Connections => "connections",
                 Rail::Instance => "instance",
@@ -2746,6 +2926,72 @@ impl Workspace {
         out
     }
 
+    /// One icon, or a readable stand-in when the font has no such glyph.
+    ///
+    /// A missing glyph draws an empty rectangle, and a rectangle is read as a
+    /// badly-sized icon rather than as a missing one. A letter says what the
+    /// button is; a box says nothing.
+    fn ic(&self, glyph: &'static str) -> SharedString {
+        let ch = glyph.chars().next().unwrap_or(' ');
+        if !self.missing_glyphs.contains(&ch) {
+            return SharedString::from(glyph);
+        }
+        let fallback = GLYPHS
+            .iter()
+            .find(|(g, _)| *g == glyph)
+            .map(|(_, f)| *f)
+            .unwrap_or("?");
+        SharedString::from(fallback)
+    }
+
+    /// A SMALL icon, for the places one sits beside a line of text.
+    ///
+    /// The same fixed box as the rail's, scaled to the text it stands next to:
+    /// the point is not the size, it is that every glyph gets the same square,
+    /// so a tree of tables and views does not look like a tree of two sizes.
+    fn icon_inline(&self, glyph: &'static str, colour: Rgba) -> gpui::Div {
+        let ms = self.scale;
+        let box_w = (ms.base() * 1.25).round();
+        div()
+            .flex()
+            .items_center()
+            .justify_center()
+            .flex_none()
+            .w(px(box_w))
+            .h(px(box_w))
+            .line_height(px(box_w))
+            .font_family(self.icon_family.clone())
+            .text_size(ms.small())
+            .text_color(colour)
+            .child(self.ic(glyph))
+    }
+
+    /// An icon in a fixed square, centred both ways.
+    ///
+    /// The reported complaint, and its cause: Font Awesome's glyphs are drawn
+    /// at different widths and ink heights, so six of them at one point size,
+    /// each sitting on a text baseline, come out visibly different sizes. In a
+    /// box of its own, centred, what differs is only the drawing inside it.
+    fn icon_el(&self, glyph: &'static str, colour: Rgba) -> gpui::Div {
+        let ms = self.scale;
+        div()
+            .flex()
+            .items_center()
+            .justify_center()
+            .flex_none()
+            .w(px(ms.icon_box()))
+            .h(px(ms.icon_box()))
+            // The line box is the square, so the glyph is centred on the box
+            // and not hung off a text baseline.
+            .line_height(px(ms.icon_box()))
+            // The ICON font, which is not the text font: chosen for having the
+            // glyphs and drawing them at one width.
+            .font_family(self.icon_family.clone())
+            .text_size(ms.icon())
+            .text_color(colour)
+            .child(self.ic(glyph))
+    }
+
     /// One phrase of the interface, in the chosen language.
     fn tr(&self, key: &str) -> SharedString {
         SharedString::from(self.lang.tr(key))
@@ -2836,16 +3082,23 @@ impl Workspace {
     fn rail_el(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let t = self.t();
         let ms = self.scale;
+        // The width comes OFF the icon, so a bigger icon widens the rail by
+        // itself. A second number here would be a second place to set the same
+        // thing, and the two would drift.
         let mut col = div()
             .flex()
             .flex_col()
-            .w(px(ms.base() * 3.1))
+            .items_center()
+            .w(px(ms.rail_w()))
+            .flex_none()
             .h_full()
             .bg(t.status())
             .border_r_1()
             .border_color(t.border())
             .py_2()
-            .gap_1();
+            // Spaced, so six of them read as six BUTTONS. Touching vertically,
+            // they read as one column of marks.
+            .gap(px(ms.rail_gap()));
         for mode in [Rail::Connections, Rail::Instance, Rail::History, Rail::Audit, Rail::Tasks, Rail::Settings] {
             let on = self.rail == mode;
             col = col.child(
@@ -2856,17 +3109,19 @@ impl Workspace {
                     .justify_center()
                     .w_full()
                     .h(px(ms.rail_h()))
-                    // Bigger, and the chosen one says so twice: a filled
-                    // background AND a bar down its leading edge. One of the two
-                    // alone was invisible on a palette whose surfaces sit 1.06
-                    // apart — which is most of them.
-                    .text_size(ms.icon())
-                    .text_color(if on { t.accent() } else { t.muted() })
-                    .when(on, |d| d.bg(t.selected()).border_l_2().border_color(t.accent()))
-                    .when(!on, |d| d.border_l_2().border_color(t.status()))
+                    // The chosen one says so twice: a filled background AND a
+                    // bar down its leading edge. One of the two alone was
+                    // invisible on a palette whose surfaces sit 1.06 apart —
+                    // which is most of them. The bar is now three pixels and
+                    // full height, because at two on a narrow rail neither mark
+                    // could be read.
+                    .when(on, |d| d.bg(t.selected()).border_l_3().border_color(t.accent()))
+                    .when(!on, |d| d.border_l_3().border_color(t.status()))
                     .hover(|d| d.bg(t.hover()))
                     .cursor_pointer()
-                    .child(SharedString::from(mode.glyph()))
+                    // In a box of its own, centred both ways, so the six glyphs
+                    // come out the same optical size whatever the font draws.
+                    .child(self.icon_el(mode.glyph(), if on { t.accent() } else { t.muted() }))
                     .on_click(cx.listener(move |this, _, _, cx| {
                         this.rail = mode;
                         if mode == Rail::History && this.history.is_empty() {
@@ -3038,11 +3293,63 @@ impl Workspace {
                 )));
                 list = list.child(self.section(self.lang.tr("settings.text")));
                 list = list.child(div().px_2().child(self.line(
-                    format!("font: {}", self.font_family),
+                    format!("text: {} · icons: {}", self.font_family, self.icon_family),
                     ms.small(),
                     t.muted(),
                     ms.line_w(),
                 )));
+                list = list.child(self.section(self.lang.tr("settings.icon_size")));
+                // Its own row, beside its own stepper: the rail is navigation
+                // and the text is content, and enlarging one is not a request
+                // for the other.
+                let istep = |label: &'static str, delta: f32| {
+                    div()
+                        .id(SharedString::from(format!("icon{label}")))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .w(px(ms.base() * 1.8))
+                        .h(px(ms.base() * 1.8))
+                        .cursor_pointer()
+                        .bg(t.raised())
+                        .hover(|d| d.bg(t.hover()))
+                        .text_size(ms.body())
+                        .text_color(t.accent())
+                        .child(label)
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.scale = this.scale.with_icon(this.scale.icon_size() + delta);
+                            this.remember();
+                            cx.notify();
+                        }))
+                };
+                list = list.child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .px_2()
+                        .py_1()
+                        .child(istep("\u{2212}", -2.0))
+                        .child(
+                            div()
+                                .min_w(px(ms.base() * 2.5))
+                                .text_size(ms.body())
+                                .text_color(t.fg())
+                                .child(SharedString::from(format!("{} px", ms.icon_size()))),
+                        )
+                        .child(istep("+", 2.0))
+                        // Shown beside the number, so the effect is visible
+                        // before anything is pressed.
+                        .child(self.icon_el("\u{f1c0}", t.muted()))
+                        .child(self.icon_el("\u{f013}", t.accent())),
+                );
+                list = list.child(div().px_2().child(self.line(
+                    format!("the rail is {} px wide, which comes off this", ms.rail_w()),
+                    ms.small(),
+                    t.muted(),
+                    ms.line_w(),
+                )));
+
                 panel = panel.child(list);
                 panel = panel.child(self.section(self.lang.tr("settings.text_size")));
                 // One number, and it moves everything: the steps, the grid row
@@ -3603,7 +3910,7 @@ impl Workspace {
                             .py(px(2.0))
                             .cursor_pointer()
                             .hover(|d| d.bg(t.hover()))
-                            .child(div().flex_none().text_size(ms.tiny()).text_color(t.accent()).child("\u{f080}"))
+                            .child(self.icon_inline("\u{f080}", t.accent()))
                             .child(self.line_in(c.name.clone(), ms.small(), t.fg(), ms.line_w() - ms.base() - 14.0))
                             .on_click(cx.listener({
                                 let (cn, n, sql, m) =
@@ -3630,7 +3937,7 @@ impl Workspace {
                     .py(px(2.0))
                     .cursor_pointer()
                     .hover(|d| d.bg(t.hover()))
-                    .child(div().flex_none().text_size(ms.tiny()).text_color(t.accent()).child("\u{f067}"))
+                    .child(self.icon_inline("\u{f067}", t.accent()))
                     .child(self.line_in(self.tr("panel.new_dashboard"), ms.small(), t.accent(), ms.line_w() - ms.base() - 14.0))
                     .on_click(cx.listener({
                         let cn = live.name.clone();
@@ -3651,7 +3958,7 @@ impl Workspace {
                         .py(px(2.0))
                         .cursor_pointer()
                         .hover(|d| d.bg(t.hover()))
-                        .child(div().flex_none().text_size(ms.tiny()).text_color(t.accent()).child("\u{f00a}"))
+                        .child(self.icon_inline("\u{f00a}", t.accent()))
                         .child(self.line_in(name.clone(), ms.small(), t.fg(), ms.line_w() - ms.base() - 14.0))
                         .on_click(cx.listener({
                             let (cn, n) = (live.name.clone(), name.clone());
@@ -3675,7 +3982,7 @@ impl Workspace {
                             .py(px(2.0))
                             .cursor_pointer()
                             .hover(|d| d.bg(t.hover()))
-                            .child(div().flex_none().text_size(ms.tiny()).text_color(t.accent()).child("\u{f15c}"))
+                            .child(self.icon_inline("\u{f15c}", t.accent()))
                             .child(self.line_in(q.name.clone(), ms.small(), t.fg(), ms.line_w() - ms.base() - 14.0))
                             .on_click(cx.listener({
                                 let (c, n, s) = (live.name.clone(), q.name.clone(), q.sql.clone());
@@ -3747,13 +4054,7 @@ impl Workspace {
                         " "
                     })),
             )
-            .child(
-                div()
-                    .flex_none()
-                    .text_size(ms.small())
-                    .text_color(t.accent())
-                    .child(SharedString::from(glyph)),
-            )
+            .child(self.icon_inline(glyph, t.accent()))
             // A node is indented by its depth, so the room it has shrinks as
             // the tree goes deeper — the width has to say so, or a deep leaf
             // would be cut without an ellipsis again.
@@ -3816,12 +4117,11 @@ impl Workspace {
                     .border_color(t.border())
                     .when(on, |d| d.bg(t.base()))
                     .child(
-                        div()
-                            .text_size(ms.tiny())
-                            .text_color(t.accent())
-                            // The tab carries its connection's driver, because
-                            // tabs from different connections sit side by side.
-                            .child(SharedString::from(driver_glyph(&tab.driver))),
+                        // The tab carries its connection's driver, because tabs
+                        // from different connections sit side by side — and in
+                        // the same square as every other inline icon, so a row
+                        // of tabs does not look like a row of two sizes.
+                        self.icon_inline(driver_glyph(&tab.driver), t.accent()),
                     )
                     .child(
                         div()

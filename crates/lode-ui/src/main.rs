@@ -29,7 +29,16 @@ mod workspace;
 use gpui::{px, size, AppContext as _, Application, Bounds, WindowBounds, WindowOptions};
 
 fn main() {
-    Application::new().run(|cx: &mut gpui::App| {
+    // A window is not the only way to answer "which font, and has it the
+    // glyphs". A picture of the rail proves the rail; this prints the numbers
+    // the rail is drawn from, and can be run where there is no screen.
+    let check_icons = std::env::args().any(|a| a == "--check-icons");
+    Application::new().run(move |cx: &mut gpui::App| {
+        if check_icons {
+            app::report_icons(cx);
+            cx.quit();
+            return;
+        }
         // The field needs its keys before any window exists.
         input::bind_keys(cx);
         app::bind_workspace_keys(cx);

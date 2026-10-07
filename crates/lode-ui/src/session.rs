@@ -43,6 +43,11 @@ pub struct Session {
     /// How many spaces the JSON view indents by. `None` is the default.
     #[serde(default)]
     pub json_indent: Option<u8>,
+    /// The icon rail's size, when somebody has set one. Its OWN setting: the
+    /// rail is navigation and the text is content, and enlarging one is not
+    /// asking for the other.
+    #[serde(default)]
+    pub icon_size: Option<f32>,
     /// The base of the type scale, in pixels, when somebody has set one.
     ///
     /// `None` means "whatever the application's default is", so raising the
@@ -152,6 +157,7 @@ mod tests {
             font_size: Some(16.0),
             json_indent: Some(4),
             lang: Some("bg".into()),
+            icon_size: Some(24.0),
         };
         let text = serde_json::to_string(&s).unwrap();
         let back: Session = serde_json::from_str(&text).unwrap();
@@ -166,6 +172,7 @@ mod tests {
         assert_eq!(back.font_size, Some(16.0), "a chosen text size comes back");
         assert_eq!(back.json_indent, Some(4));
         assert_eq!(back.lang.as_deref(), Some("bg"));
+        assert_eq!(back.icon_size, Some(24.0));
 
         // A tab with no object is a typed one, and its words come back.
         let typed = Session {
@@ -187,6 +194,7 @@ mod tests {
             font_size: None,
             json_indent: None,
             lang: None,
+            icon_size: None,
         };
         let round: Session = serde_json::from_str(&serde_json::to_string(&typed).unwrap()).unwrap();
         assert_eq!(round.tabs[0].draft, "SELECT 1 WHERE", "half a statement is still someone's work");

@@ -30,6 +30,22 @@ pub const MIN_BASE: f32 = 11.0;
 /// Above this a panel holds four rows and the result grid holds six.
 pub const MAX_BASE: f32 = 24.0;
 
+/// The icon rail's own size, independent of the text.
+///
+/// Its OWN number, not a step off `base`, and that is the point: the rail is
+/// NAVIGATION, not content. Somebody who makes the text bigger to read a result
+/// is not asking for bigger buttons, and somebody who wants the rail easier to
+/// hit is not asking for a bigger grid. Two separate wishes, two separate
+/// numbers.
+///
+/// Chosen for a wide screen and read at arm's length, not chosen cautiously:
+/// at the old size the glyph took about a third of the rail's width and read
+/// as a dot rather than as a sign. Somebody who finds it too big now has a
+/// setting; somebody who finds it too small has to guess there is one.
+pub const DEFAULT_ICON: f32 = 26.0;
+pub const MIN_ICON: f32 = 12.0;
+pub const MAX_ICON: f32 = 40.0;
+
 /// The named steps, and the lengths that have to grow with them.
 ///
 /// `Copy`, and one `f32` wide, so it can be taken by value into a closure
@@ -37,11 +53,15 @@ pub const MAX_BASE: f32 = 24.0;
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Metrics {
     base: f32,
+    icon: f32,
 }
 
 impl Default for Metrics {
     fn default() -> Self {
-        Metrics { base: DEFAULT_BASE }
+        Metrics {
+            base: DEFAULT_BASE,
+            icon: DEFAULT_ICON,
+        }
     }
 }
 
@@ -51,22 +71,41 @@ impl Metrics {
     /// rather than at the settings control, because the session file is the
     /// other way a number gets in.
     pub fn new(base: f32) -> Metrics {
-        // `clamp` passes NaN through — a NaN size lays nothing out and draws
-        // nothing, which looks like a dead window rather than a bad setting.
-        let base = if base.is_finite() {
-            base.clamp(MIN_BASE, MAX_BASE)
+        Metrics::default().with_base(base)
+    }
+
+    /// Clamp one number, with NaN sent to the default rather than through.
+    ///
+    /// `clamp` passes NaN along, and a NaN size lays nothing out and draws
+    /// nothing — which looks like a dead window rather than like a bad setting.
+    fn ok(v: f32, lo: f32, hi: f32, fallback: f32) -> f32 {
+        if v.is_finite() {
+            v.clamp(lo, hi)
         } else {
-            DEFAULT_BASE
-        };
-        Metrics { base }
+            fallback
+        }
     }
 
     pub fn base(self) -> f32 {
         self.base
     }
 
+    pub fn icon_size(self) -> f32 {
+        self.icon
+    }
+
     pub fn with_base(self, base: f32) -> Metrics {
-        Metrics::new(base)
+        Metrics {
+            base: Self::ok(base, MIN_BASE, MAX_BASE, DEFAULT_BASE),
+            ..self
+        }
+    }
+
+    pub fn with_icon(self, icon: f32) -> Metrics {
+        Metrics {
+            icon: Self::ok(icon, MIN_ICON, MAX_ICON, DEFAULT_ICON),
+            ..self
+        }
     }
 
     // ── the steps ────────────────────────────────────────────────────────────
@@ -95,10 +134,28 @@ impl Metrics {
         px(self.base - 2.0)
     }
 
-    /// The icon rail's glyphs, which carry no text beside them and so have to
-    /// be read at a glance.
+    /// The icon rail's glyphs. Its OWN number — see `DEFAULT_ICON`.
     pub fn icon(self) -> Pixels {
-        px(self.base + 5.0)
+        px(self.icon)
+    }
+
+    /// The square an icon is drawn in.
+    ///
+    /// A BOX, not a line of text. Font Awesome's glyphs are drawn at different
+    /// widths and ink heights, so six of them at one point size, each sitting
+    /// on a text baseline, come out visibly different sizes — which is exactly
+    /// what they looked like. Centred in a fixed square, what differs is only
+    /// the drawing inside it.
+    pub fn icon_box(self) -> f32 {
+        (self.icon * 1.6).round()
+    }
+
+    /// The rail's width: the icon's box and the same air on both sides.
+    ///
+    /// DERIVED, so a bigger icon widens the rail by itself. A second number
+    /// here would be a second place to set the same thing, and they would drift.
+    pub fn rail_w(self) -> f32 {
+        (self.icon_box() + self.icon * 1.0).round()
     }
 
     // ── the lengths that must move with the type ─────────────────────────────
@@ -119,9 +176,17 @@ impl Metrics {
         (self.base * 11.0).round()
     }
 
-    /// The height of one row in the icon rail.
+    /// The height of one rail button, with room around the icon.
+    ///
+    /// Taller than the box so six of them read as six BUTTONS. Touching
+    /// vertically, they read as one column of marks.
     pub fn rail_h(self) -> f32 {
-        (self.base * 2.9).round()
+        (self.icon_box() + self.icon * 0.5).round()
+    }
+
+    /// The gap between rail buttons — the other half of the same point.
+    pub fn rail_gap(self) -> f32 {
+        (self.icon * 0.35).round().max(2.0)
     }
 
     /// The side panel's width. Grows with the type, because a panel that stayed
@@ -170,7 +235,6 @@ mod tests {
             assert!(m.tiny() < m.small(), "base {b}");
             assert!(m.small() < m.body(), "base {b}");
             assert!(m.body() < m.heading(), "base {b}");
-            assert!(m.heading() < m.icon(), "base {b}");
             b += 0.5;
         }
     }
@@ -185,7 +249,9 @@ mod tests {
         assert_eq!(m.tiny(), px(12.0), "was px(10.0), and px(9.0) is gone");
         assert_eq!(m.body(), px(14.0), "was px(12.0)");
         assert_eq!(m.heading(), px(15.0), "was px(13.0)");
-        assert_eq!(m.icon(), px(19.0), "was px(17.0)");
+        // The icon is no longer a step off the text at all: it has its own
+        // number, and the default is bigger than the 19 it used to compute to.
+        assert_eq!(m.icon(), px(DEFAULT_ICON));
     }
 
     /// Text must not outgrow the row it sits in. This is the check that a
@@ -207,6 +273,43 @@ mod tests {
 
     /// A number from a session file written by hand, or by an older version,
     /// cannot make the window unreadable either way.
+    /// The rail is navigation, not content: the two sizes move independently.
+    /// Somebody enlarging the text to read a result is not asking for bigger
+    /// buttons.
+    #[test]
+    fn the_icon_size_is_independent_of_the_text_size() {
+        let m = Metrics::default();
+        let bigger_text = m.with_base(22.0);
+        assert_eq!(bigger_text.icon_size(), m.icon_size(), "text must not move the icons");
+        assert_ne!(bigger_text.body(), m.body());
+        let bigger_icons = m.with_icon(32.0);
+        assert_eq!(bigger_icons.base(), m.base(), "icons must not move the text");
+        assert!(bigger_icons.rail_w() > m.rail_w(), "a bigger icon widens the rail by itself");
+    }
+
+    /// The rail comes OFF the icon, so there is one number and not two to keep
+    /// in step — and an icon always has air around it.
+    #[test]
+    fn the_rail_is_derived_from_the_icon_and_leaves_it_room() {
+        let mut i = MIN_ICON;
+        while i <= MAX_ICON {
+            let m = Metrics::default().with_icon(i);
+            assert!(m.icon_box() > i, "icon {i}: the box must be bigger than the glyph");
+            assert!(m.rail_w() > m.icon_box(), "icon {i}: air on both sides");
+            assert!(m.rail_h() > m.icon_box(), "icon {i}: a button is taller than its icon");
+            assert!(m.rail_gap() >= 2.0, "icon {i}: buttons must not touch");
+            i += 1.0;
+        }
+    }
+
+    /// The reported complaint: the rail was too thin to read the selected
+    /// marker. It is now comfortably wider than it was.
+    #[test]
+    fn the_rail_is_wider_than_it_was() {
+        // It used to be `base * 3.1` — 43 pixels at the default text size.
+        assert!(Metrics::default().rail_w() >= 52.0, "{}", Metrics::default().rail_w());
+    }
+
     #[test]
     fn a_base_from_outside_is_clamped() {
         assert_eq!(Metrics::new(0.0).base(), MIN_BASE);
@@ -215,5 +318,10 @@ mod tests {
         assert_eq!(Metrics::new(f32::NAN).base(), DEFAULT_BASE, "NaN must not survive as a size");
         assert_eq!(Metrics::new(f32::INFINITY).base(), DEFAULT_BASE);
         assert_eq!(Metrics::new(15.0).base(), 15.0);
+        // And the icon, which has its own range.
+        assert_eq!(Metrics::default().with_icon(0.0).icon_size(), MIN_ICON);
+        assert_eq!(Metrics::default().with_icon(900.0).icon_size(), MAX_ICON);
+        assert_eq!(Metrics::default().with_icon(f32::NAN).icon_size(), DEFAULT_ICON);
+        assert_eq!(Metrics::default().with_icon(26.0).icon_size(), 26.0);
     }
 }
