@@ -508,6 +508,12 @@ impl ConnectionForm {
                     .id(SharedString::from(format!("eye-{key}")))
                     .flex_none()
                     .cursor_pointer()
+                    .tooltip(crate::tip::Tip::build(
+                        if shown { "Hide the value" } else { "Show the value" },
+                        None,
+                        self.theme.clone(),
+                        ms,
+                    ))
                     .hover(|d| d.bg(t.hover()))
                     // Open eye while it is showing, struck-through eye while it
                     // is not: the icon says what you are looking at, not what

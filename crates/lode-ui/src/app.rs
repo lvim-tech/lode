@@ -3055,6 +3055,18 @@ impl Workspace {
         div().text_size(size).child(el)
     }
 
+    /// A tip for a control that is only an icon.
+    ///
+    /// Takes the catalogue KEY, not a sentence: the words are the ones the
+    /// panel already calls itself, so a translation reaches both at once.
+    fn tip(
+        &self,
+        key: &str,
+        shortcut: Option<&'static str>,
+    ) -> impl Fn(&mut gpui::Window, &mut gpui::App) -> gpui::AnyView + 'static {
+        crate::tip::Tip::build(self.lang.tr(key), shortcut, self.theme.clone(), self.scale)
+    }
+
     /// One phrase of the interface, in the chosen language.
     fn tr(&self, key: &str) -> SharedString {
         SharedString::from(self.lang.tr(key))
@@ -3184,6 +3196,10 @@ impl Workspace {
                     // one ends: it fills exactly one button's height.
                     .hover(|d| d.bg(t.hover()))
                     .cursor_pointer()
+                    // The name of the panel, from the same catalogue key its own
+                    // heading uses — a rail of glyphs is otherwise learned only
+                    // by pressing all six.
+                    .tooltip(self.tip(mode.key(), None))
                     // In a box of its own, centred both ways, so the six glyphs
                     // come out the same optical size whatever the font draws.
                     .child(self.icon_el(mode.glyph(), if on { t.accent() } else { t.muted() }))
@@ -3938,6 +3954,7 @@ impl Workspace {
                             // is at the icon size, in the accent, and it lights
                             // up under the pointer.
                             .hover(|d| d.bg(t.hover()))
+                            .tooltip(self.tip("tip.edit_conn", None))
                             .child(self.icon_inline("\u{f044}", t.accent()))
                             .on_click(cx.listener({
                                 let (n, d, sp) = (c.name.clone(), c.driver.clone(), c.spec.clone());
@@ -4015,6 +4032,7 @@ impl Workspace {
                     .py(px(2.0))
                     .cursor_pointer()
                     .hover(|d| d.bg(t.hover()))
+                    .tooltip(self.tip("tip.new_board", None))
                     .child(self.icon_inline("\u{f067}", t.accent()))
                     .child(self.line_in(self.tr("panel.new_dashboard"), ms.small(), t.accent(), ms.line_w() - ms.base() - 14.0))
                     .on_click(cx.listener({
@@ -4036,6 +4054,7 @@ impl Workspace {
                         .py(px(2.0))
                         .cursor_pointer()
                         .hover(|d| d.bg(t.hover()))
+                        .tooltip(self.tip("tip.open_board", None))
                         .child(self.icon_inline("\u{f00a}", t.accent()))
                         .child(self.line_in(name.clone(), ms.small(), t.fg(), ms.line_w() - ms.base() - 14.0))
                         .on_click(cx.listener({
@@ -4210,6 +4229,7 @@ impl Workspace {
                     .child(
                         div()
                             .id(SharedString::from(format!("tabx-{}", tab.id)))
+                            .tooltip(self.tip("tip.close_tab", None))
                             .text_size(ms.tiny())
                             .text_color(t.muted())
                             .child("\u{f00d}")
@@ -5276,6 +5296,7 @@ impl Workspace {
             row = row.child(
                 div()
                     .id(SharedString::from(format!("b-rm-{i}")))
+                    .tooltip(self.tip("tip.remove_tile", None))
                     .px_1()
                     .cursor_pointer()
                     .text_size(ms.small())
@@ -5469,6 +5490,7 @@ impl Workspace {
                 .child(
                     div()
                         .id("detail-close")
+                        .tooltip(self.tip("tip.close_detail", Some("esc")))
                         .px_1()
                         .cursor_pointer()
                         .text_size(ms.small())
@@ -5529,6 +5551,7 @@ impl Workspace {
                         .child(
                             div()
                                 .id("edit-no")
+                                .tooltip(self.tip("tip.cancel_edit", Some("esc")))
                                 .px_1()
                                 .cursor_pointer()
                                 .text_size(ms.small())

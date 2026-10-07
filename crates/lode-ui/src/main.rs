@@ -24,6 +24,7 @@ mod input;
 mod metrics;
 mod session;
 mod theme;
+mod tip;
 mod workspace;
 
 use gpui::{px, size, AppContext as _, Application, Bounds, WindowBounds, WindowOptions};
