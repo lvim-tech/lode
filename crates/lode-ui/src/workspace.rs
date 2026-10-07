@@ -103,11 +103,15 @@ impl ChartShape {
 /// The text under a bar: the label column, or the row number where every column
 /// turned out to be a measurement.
 pub fn bar_label(tab: &Tab, shape: &ChartShape, row: usize) -> String {
+    bar_label_of(&tab.rows, tab.from, shape, row)
+}
+
+/// The same, for rows that are not a tab's — a dashboard tile holds its own.
+pub fn bar_label_of(rows: &[Vec<Value>], from: usize, shape: &ChartShape, row: usize) -> String {
     if shape.label == usize::MAX {
-        return (tab.from + row + 1).to_string();
+        return (from + row + 1).to_string();
     }
-    tab.rows
-        .get(row)
+    rows.get(row)
         .and_then(|r| r.get(shape.label))
         .map(preview)
         .unwrap_or_default()
@@ -165,8 +169,9 @@ impl SubTab {
     }
 }
 
-#[derive(PartialEq, Eq, Clone, Copy, Debug)]
+#[derive(PartialEq, Eq, Clone, Copy, Debug, Default)]
 pub enum RunState {
+    #[default]
     Idle,
     Running,
     Done,
@@ -184,6 +189,9 @@ pub struct Live {
     pub nodes: Vec<Node>,
     pub queries: Vec<SavedQuery>,
     pub charts: Vec<SavedChart>,
+    /// The dashboards saved on this connection, by name. Names only: a list is
+    /// for choosing from, and the layout comes when one is opened.
+    pub boards: Vec<String>,
 }
 
 /// One tab: a query, its connection, and the result it produced.
@@ -251,6 +259,14 @@ pub struct Tab {
     /// fields may rewrite it; if it does not, somebody typed in there and their
     /// words win.
     pub rendered: String,
+    /// When this tab is a DASHBOARD rather than a result, the board it holds.
+    ///
+    /// A board tab has no statement, no grid and no row; it draws saved charts
+    /// on a grid of twelve columns. Carried on `Tab` rather than in a parallel
+    /// list so that everything already true of a tab — it belongs to a
+    /// connection, it has a title, it survives a restart, Ctrl-Tab reaches
+    /// it — stays true of a board without being written twice.
+    pub board: Option<crate::board::Board>,
 }
 
 /// A short-lived message in the corner.
@@ -580,6 +596,7 @@ impl Tab {
             chart_measure: None,
             pending_write: None,
             rendered: String::new(),
+            board: None,
         }
     }
 

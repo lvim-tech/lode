@@ -140,6 +140,7 @@ const MONGO_META: DriverMeta = DriverMeta {
     query_form: QUERY_FORM,
     query_template: "{\"find\": \"{name}\"{fragments}}",
     browse_form: &[],
+    time_filter: "{\"{col}\": {\"$gte\": {\"$date\": \"{from}\"}, \"$lt\": {\"$date\": \"{to}\"}}}",
     builder_ops: &[],
 };
 

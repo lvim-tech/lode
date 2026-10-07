@@ -141,6 +141,25 @@ pub struct DriverMeta {
     /// driver still owns every word of SQL — the client contributes a value, not
     /// a syntax.
     pub browse_form: &'static [QueryFieldSpec],
+    /// How THIS engine spells "between these two moments", as a fragment.
+    ///
+    /// For a dashboard's shared time range. `{col}` is the column carrying the
+    /// time, `{from}` and `{to}` the ends of the range — and those two have
+    /// already been through `dashboard::parse_timestamp`, which refuses
+    /// anything that is not exactly a timestamp, so what reaches this template
+    /// is a date and nothing else.
+    ///
+    /// A TEMPLATE, like `browse`, for the same reason: the client holds every
+    /// value and a round trip to format a string is a round trip to format a
+    /// string. What it must not do is INVENT the words, and this is where the
+    /// words come from — MongoDB's is a JSON object and Redis has no such thing
+    /// at all, which an empty string says.
+    ///
+    /// A chart statement marks where this goes with `{{time}}`. One that does
+    /// not carry the marker is not time-filtered, and the board says so on that
+    /// tile rather than pretending — a range that silently applies to four
+    /// charts out of six is worse than one that says which two it missed.
+    pub time_filter: &'static str,
     /// The comparisons this dialect offers in the visual builder.
     ///
     /// A label and the fragment it produces, with `{col}` and `{value}` filled
@@ -200,6 +219,12 @@ pub const SQL_BUILDER_OPS: &[BuilderOp] = &[
     BuilderOp { label: "IS NULL", fragment: "{col} IS NULL" },
     BuilderOp { label: "IS NOT NULL", fragment: "{col} IS NOT NULL" },
 ];
+
+/// How nearly every SQL dialect spells a time window. Half-open at the top:
+/// `BETWEEN` would include the final instant, so two adjacent ranges would both
+/// contain the row exactly on the boundary and a total split in two would come
+/// out larger than the whole.
+pub const SQL_TIME_FILTER: &str = "{col} >= '{from}' AND {col} < '{to}'";
 
 /// The clauses every SQL driver offers on a browse. Identical across them
 /// because this much of SQL genuinely is: a `WHERE` and an `ORDER BY` after the

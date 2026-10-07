@@ -131,6 +131,25 @@ impl Store {
                 updated_at INTEGER
             );
             CREATE UNIQUE INDEX IF NOT EXISTS charts_conn_name ON charts (conn, name);
+            -- A dashboard is an ARRANGEMENT of saved charts, with the dividers
+            -- and the words that say what is being looked at, and one time
+            -- range they all answer to.
+            --
+            -- `layout` is the whole board as JSON, validated by
+            -- `dashboard::Dashboard::validate` BEFORE it gets here — so a row
+            -- in this table is a board that was legal when it was written.
+            -- Charts are referenced inside it BY NAME, never by position: an
+            -- index would move the moment a chart was renamed or removed, and
+            -- the board would go on drawing the wrong one under the old
+            -- heading.
+            CREATE TABLE IF NOT EXISTS dashboards (
+                id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                conn       TEXT NOT NULL,
+                name       TEXT NOT NULL,
+                layout     TEXT NOT NULL,
+                updated_at INTEGER
+            );
+            CREATE UNIQUE INDEX IF NOT EXISTS dashboards_conn_name ON dashboards (conn, name);
             -- Every attempt to CHANGE something, and every connection opened or
             -- closed — including the attempts that were REFUSED. A log of what
             -- succeeded answers "what happened"; a log that also holds what was
@@ -441,6 +460,80 @@ impl Store {
                 params![conn_name, name, sql, measure, now()],
             )?;
             Ok(())
+        })
+        .await
+    }
+
+    /// The saved chart NAMES on one connection — what a dashboard's tiles are
+    /// checked against.
+    pub async fn chart_names(&self, conn_name: String) -> anyhow::Result<Vec<String>> {
+        self.with(move |c| {
+            let mut st = c.prepare("SELECT name FROM charts WHERE conn = ?1")?;
+            let rows = st
+                .query_map(params![conn_name], |r| r.get::<_, String>(0))?
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(rows)
+        })
+        .await
+    }
+
+    // ── dashboards ───────────────────────────────────────────────────────────
+
+    /// The boards on one connection: name and when it changed, WITHOUT the
+    /// layout. A list is for choosing from, and shipping every board's whole
+    /// layout to draw a list of names is a page of JSON per row nobody reads.
+    pub async fn list_dashboards(&self, conn_name: String) -> anyhow::Result<Vec<Json>> {
+        self.with(move |c| {
+            let mut st =
+                c.prepare("SELECT name, updated_at FROM dashboards WHERE conn = ?1 ORDER BY name")?;
+            let rows = st
+                .query_map(params![conn_name], |r| {
+                    Ok(serde_json::json!({
+                        "name": r.get::<_, String>(0)?,
+                        "updated_at": r.get::<_, Option<i64>>(1)?,
+                    }))
+                })?
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(rows)
+        })
+        .await
+    }
+
+    /// One board's layout, as stored. `None` when there is no such board.
+    pub async fn get_dashboard(&self, conn_name: String, name: String) -> anyhow::Result<Option<String>> {
+        self.with(move |c| {
+            let got = c
+                .query_row(
+                    "SELECT layout FROM dashboards WHERE conn = ?1 AND name = ?2",
+                    params![conn_name, name],
+                    |r| r.get::<_, String>(0),
+                )
+                .optional()?;
+            Ok(got)
+        })
+        .await
+    }
+
+    pub async fn save_dashboard(&self, conn_name: String, name: String, layout: String) -> anyhow::Result<()> {
+        self.with(move |c| {
+            c.execute(
+                "INSERT INTO dashboards (conn, name, layout, updated_at) VALUES (?1, ?2, ?3, ?4) \
+                 ON CONFLICT(conn, name) DO UPDATE SET layout = excluded.layout, \
+                 updated_at = excluded.updated_at",
+                params![conn_name, name, layout, now()],
+            )?;
+            Ok(())
+        })
+        .await
+    }
+
+    pub async fn remove_dashboard(&self, conn_name: String, name: String) -> anyhow::Result<bool> {
+        self.with(move |c| {
+            let n = c.execute(
+                "DELETE FROM dashboards WHERE conn = ?1 AND name = ?2",
+                params![conn_name, name],
+            )?;
+            Ok(n > 0)
         })
         .await
     }

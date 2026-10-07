@@ -19,6 +19,7 @@ use tokio::sync::mpsc::UnboundedSender;
 use tokio::sync::Mutex as AsyncMutex;
 
 use crate::audit;
+use crate::dashboard;
 use crate::driver::{CancelHandle, Connection, ResultStream};
 use crate::net::NetContext;
 use crate::registry::Registry;
@@ -349,6 +350,10 @@ impl Server {
             "store.charts.list" => self.store_chart_list(params).await,
             "store.charts.save" => self.store_chart_save(params).await,
             "store.charts.remove" => self.store_chart_remove(params).await,
+            "store.dashboards.list" => self.store_dashboard_list(params).await,
+            "store.dashboards.get" => self.store_dashboard_get(params).await,
+            "store.dashboards.save" => self.store_dashboard_save(params).await,
+            "store.dashboards.remove" => self.store_dashboard_remove(params).await,
             "store.history.record" => self.store_history_record(params).await,
             "store.history.list" => self.store_history_list(params).await,
             "store.import" => self.store_import(params).await,
@@ -1254,6 +1259,85 @@ impl Server {
         }
         self.store()?.save_chart(p.conn, p.name, p.sql, p.measure).await?;
         Ok(json!({ "saved": true }))
+    }
+
+    // ── dashboards ───────────────────────────────────────────────────────────
+
+    async fn store_dashboard_list(&self, params: Json) -> anyhow::Result<Json> {
+        #[derive(Deserialize)]
+        struct P {
+            conn: String,
+        }
+        let p: P = serde_json::from_value(params)?;
+        Ok(json!({ "dashboards": self.store()?.list_dashboards(p.conn).await? }))
+    }
+
+    /// One board, re-validated on the way OUT as well as on the way in.
+    ///
+    /// Not belt and braces: a board is legal when it is saved and can stop being
+    /// legal afterwards, because a saved chart it names can be deleted from the
+    /// other client while this one has the board open. The error says which
+    /// chart, which is the thing somebody can act on; returning the layout and
+    /// letting the client draw an empty square would say only that something is
+    /// missing.
+    async fn store_dashboard_get(&self, params: Json) -> anyhow::Result<Json> {
+        #[derive(Deserialize)]
+        struct P {
+            conn: String,
+            name: String,
+        }
+        let p: P = serde_json::from_value(params)?;
+        let store = self.store()?;
+        let Some(text) = store.get_dashboard(p.conn.clone(), p.name).await? else {
+            return Ok(json!({ "dashboard": Json::Null }));
+        };
+        let mut board: dashboard::Dashboard = serde_json::from_str(&text)?;
+        let charts = store.chart_names(p.conn).await?;
+        let stale = board.validate(&charts).err().map(|e| e.to_string());
+        Ok(json!({
+            "dashboard": board,
+            // The board comes back EITHER WAY, with the complaint beside it: a
+            // layout somebody spent time on should be openable and repairable,
+            // not withheld because one of its charts went away.
+            "stale": stale,
+            "columns": dashboard::COLUMNS,
+        }))
+    }
+
+    async fn store_dashboard_save(&self, params: Json) -> anyhow::Result<Json> {
+        #[derive(Deserialize)]
+        struct P {
+            conn: String,
+            name: String,
+            dashboard: dashboard::Dashboard,
+        }
+        let p: P = serde_json::from_value(params)?;
+        if p.name.trim().is_empty() {
+            return Err(anyhow::anyhow!("a dashboard needs a name"));
+        }
+        let store = self.store()?;
+        let charts = store.chart_names(p.conn.clone()).await?;
+        // Validated HERE, in the engine, before a single byte is written. A
+        // client could check the same things; the point is that it does not
+        // have to be trusted to, because a board saved wrong is a board that is
+        // wrong every time it is opened, by every client, for as long as it
+        // exists.
+        let mut board = p.dashboard;
+        board.validate(&charts)?;
+        store
+            .save_dashboard(p.conn, p.name, serde_json::to_string(&board)?)
+            .await?;
+        Ok(json!({ "saved": true, "dashboard": board }))
+    }
+
+    async fn store_dashboard_remove(&self, params: Json) -> anyhow::Result<Json> {
+        #[derive(Deserialize)]
+        struct P {
+            conn: String,
+            name: String,
+        }
+        let p: P = serde_json::from_value(params)?;
+        Ok(json!({ "removed": self.store()?.remove_dashboard(p.conn, p.name).await? }))
     }
 
     async fn store_chart_remove(&self, params: Json) -> anyhow::Result<Json> {

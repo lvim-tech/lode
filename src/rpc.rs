@@ -57,7 +57,20 @@ use serde_json::json;
 ///     client that does not send `name` gets rows that name the driver and
 ///     leave the name empty, and a client that never asks for the log is
 ///     unaffected — the log is still written.
-pub const PROTO: u32 = 7;
+/// 8 — added DASHBOARDS: `store.dashboards.{list,get,save,remove}`, and
+///     `DriverMeta.time_filter`. A dashboard is an arrangement of saved charts
+///     on a grid of 12 columns, with dividers, text, and one time range they
+///     all answer to; it lives in the engine's store for the same reason saved
+///     charts do. Its tiles reference a chart BY NAME — an index would move the
+///     moment a chart was renamed and the board would go on drawing the wrong
+///     one under the old heading. The engine REFUSES a board whose tile names a
+///     chart that does not exist, runs past the twelfth column, has no size, or
+///     overlaps another, and a time range whose ends are not timestamps or that
+///     runs backwards. `time_filter` is how each engine spells a time window,
+///     as a template over `{col}`, `{from}` and `{to}`; empty where there is no
+///     such thing (Redis). Additive: a client that never asks for a dashboard
+///     is unaffected, and an older client simply sees a field it ignores.
+pub const PROTO: u32 = 8;
 
 /// One decoded incoming request.
 #[derive(Debug, Deserialize)]

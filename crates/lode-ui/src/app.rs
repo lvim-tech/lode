@@ -17,23 +17,27 @@ use std::time::Instant;
 
 use gpui::{
     div, prelude::*, px, size, uniform_list, Bounds, ClipboardItem, Context, Entity, FocusHandle,
-    MouseButton, MouseMoveEvent, MouseUpEvent, Rgba, SharedString, TitlebarOptions, WeakEntity,
+    MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Rgba, SharedString,
+    TitlebarOptions, WeakEntity,
     Window, WindowBounds, WindowHandle, WindowOptions,
 };
 use lode_proto::{
-    cell_text, AuditRow, DriverMeta, Engine, Hello, HistoryRow, Index, Message, Node, QueryState,
-    SavedChart, SavedConnection, SavedQuery, TableColumn,
+    apply_time, cell_text, AuditRow, Dashboard, DriverMeta, Engine, Hello, HistoryRow, Index,
+    Message, Node, QueryState, SavedChart, SavedConnection, SavedQuery, TableColumn, Tile, TimeFit,
+    TileKind,
+    TimeRange,
 };
 use serde_json::{json, Value};
 
 use crate::export::{self, Format};
 use crate::form::ConnectionForm;
+use crate::board::{self, Board, DragMode, Pane};
 use crate::input::{InputColors, InputEvent, TextInput};
 use crate::metrics::Metrics;
 use crate::session::{self, Session, SessionTab};
 use crate::theme::{self, Theme};
 use crate::workspace::{
-    bar_label, column_editable, copy_as_insert, copy_as_select, fuzzy_score, row_key,
+    bar_label, bar_label_of, column_editable, copy_as_insert, copy_as_select, fuzzy_score, row_key,
     value_range, ChartShape, Cond,
     PendingWrite, Toast,
     fmt_duration, preview, type_badge, Live, ResultView, RunState, SubTab, Tab, Task,
@@ -235,6 +239,18 @@ enum Pending {
     Metrics { conn: String },
     SavedQueries { conn: String },
     SavedCharts { conn: String },
+    /// The dashboards on one connection, by name.
+    Dashboards { conn: String },
+    /// One board's layout, on its way into a tab.
+    Board { tab: u64 },
+    /// The saved charts a board needs to find the statements behind its names.
+    BoardCharts { tab: u64 },
+    /// One tile's statement, launched. `tile` is the index into the board's
+    /// tiles — a board is drawn from that list in that order, and the index is
+    /// what connects a running call back to the square it belongs to.
+    BoardRun { tab: u64, tile: usize },
+    BoardPage { tab: u64, tile: usize },
+    BoardSaved { tab: u64 },
     /// The columns of a tab's object — where the identifying key comes from.
     Columns { tab: u64 },
     Indexes { tab: u64 },
@@ -266,6 +282,27 @@ pub struct Workspace {
     pending: HashMap<u64, Pending>,
     /// call_id → tab id.
     calls: HashMap<u64, u64>,
+    /// A dashboard tile's running call: call_id to (tab, tile). Separate from
+    /// `calls` because a board tile is not the tab's one result — a board has
+    /// as many results at once as it has charts.
+    board_calls: HashMap<u64, (u64, usize)>,
+    /// Words to put in the tile box on the next pump.
+    ///
+    /// Set from `board_drag_start`, which is a mouse-down handler already
+    /// borrowing the workspace and has no `Context` to update an entity with.
+    pending_tile_text: Option<String>,
+    /// Which TAB has a tile being dragged, tracked at the root like a column
+    /// resize: the pointer leaves the tile's own square long before the drag is
+    /// over. What is being dragged, and how, is on the board's own `Drag`.
+    dragging: Option<u64>,
+    /// How wide the canvas was last time it was drawn.
+    ///
+    /// DERIVED from the viewport rather than measured: GPUI lays out after the
+    /// element tree is built, so the width a drag needs is not available while
+    /// the drag handler is being written. Derived is enough because the drag
+    /// only needs it to decide WHICH CELL the pointer is over, and the layout
+    /// it is derived from is the one this file also writes.
+    canvas_w: f32,
     /// call_id → task id, so a finished call closes its task.
     call_tasks: HashMap<u64, u64>,
 
@@ -301,6 +338,15 @@ pub struct Workspace {
     audit: Vec<AuditRow>,
     audit_mode: String,
     audit_filter: Entity<TextInput>,
+    /// The three boxes of a board's shared time range. One set, not one per
+    /// board: only one board is being looked at at a time, and three boxes per
+    /// open tab would be three boxes nobody can see.
+    /// The board's name, and the selected tile's words.
+    board_name: Entity<TextInput>,
+    tile_text: Entity<TextInput>,
+    board_time_col: Entity<TextInput>,
+    board_time_from: Entity<TextInput>,
+    board_time_to: Entity<TextInput>,
     /// The type scale. One number; every size in the window comes off it.
     scale: Metrics,
     /// Which row's full reason is open. One at a time: a refusal's reason is a
@@ -364,6 +410,11 @@ impl Workspace {
         let export_path = cx.new(|cx| TextInput::new(cx, "result.csv", colors));
         let history_filter = cx.new(|cx| TextInput::new(cx, "Search history…", colors));
         let audit_filter = cx.new(|cx| TextInput::new(cx, "Search the audit log…", colors));
+        let board_name = cx.new(|cx| TextInput::new(cx, "name this dashboard", colors));
+        let tile_text = cx.new(|cx| TextInput::new(cx, "heading for this tile", colors));
+        let board_time_col = cx.new(|cx| TextInput::new(cx, "column", colors));
+        let board_time_from = cx.new(|cx| TextInput::new(cx, "2026-01-01", colors));
+        let board_time_to = cx.new(|cx| TextInput::new(cx, "2026-02-01", colors));
         let palette_input = cx.new(|cx| TextInput::new(cx, "Type to find a command…", colors));
         let console = cx.new(|cx| {
             TextInput::new(cx, "Type a command and press Enter — it runs against the open connection", colors)
@@ -393,6 +444,10 @@ impl Workspace {
             next_tab: 1,
             pending: HashMap::new(),
             calls: HashMap::new(),
+            board_calls: HashMap::new(),
+            pending_tile_text: None,
+            dragging: None,
+            canvas_w: 900.0,
             call_tasks: HashMap::new(),
             tasks: Vec::new(),
             next_task: 1,
@@ -411,6 +466,11 @@ impl Workspace {
             audit_mode: "full".into(),
             audit_filter,
             audit_open: None,
+            board_name,
+            tile_text,
+            board_time_col,
+            board_time_from,
+            board_time_to,
             scale: Metrics::new(restore.font_size.unwrap_or(crate::metrics::DEFAULT_BASE)),
             metrics: Vec::new(),
             metrics_conn: None,
@@ -505,8 +565,28 @@ impl Workspace {
         self.conns.iter().find(|c| c.name == name)
     }
 
+    /// The driver metadata for a connection BY NAME — what a board needs to ask
+    /// the driver how it spells a time window.
+    fn meta_of(&self, conn: &str) -> Option<&DriverMeta> {
+        let driver = self
+            .conns
+            .iter()
+            .find(|c| c.name == conn)
+            .map(|c| c.driver.as_str())
+            .or_else(|| {
+                self.saved
+                    .iter()
+                    .find(|c| c.name == conn)
+                    .map(|c| c.driver.as_str())
+            })?;
+        self.meta(driver)
+    }
+
     fn pump(&mut self, cx: &mut Context<Self>) {
         let mut changed = false;
+        if let Some(words) = self.pending_tile_text.take() {
+            self.tile_text.update(cx, |i, cx| i.set_text(words, cx));
+        }
         self.poll_metrics();
         loop {
             let Some(engine) = &self.engine else { break };
@@ -544,6 +624,32 @@ impl Workspace {
         match method {
             "query.state" => {
                 let Ok(st) = serde_json::from_value::<QueryState>(params) else { return };
+                // A board tile's call first: a board has as many results at once
+                // as it has charts, and none of them is the tab's one result.
+                if let Some(&(tab, tile)) = self.board_calls.get(&st.call_id) {
+                    let want_page = match st.state.as_str() {
+                        "done" => true,
+                        "failed" | "cancelled" => false,
+                        _ => return,
+                    };
+                    if let Some(p) = self.pane_mut(tab, tile) {
+                        p.state = match st.state.as_str() {
+                            "done" => RunState::Done,
+                            "failed" => RunState::Failed,
+                            _ => RunState::Cancelled,
+                        };
+                        p.error = st.error.clone();
+                    }
+                    if want_page {
+                        let call_id = st.call_id;
+                        self.ask(
+                            Pending::BoardPage { tab, tile },
+                            "query.page",
+                            json!({ "call_id": call_id, "from": 0, "n": PAGE }),
+                        );
+                    }
+                    return;
+                }
                 let Some(&tab_id) = self.calls.get(&st.call_id) else { return };
                 let want_page = {
                     let Some(tab) = self.tabs.iter_mut().find(|t| t.id == tab_id) else { return };
@@ -658,9 +764,15 @@ impl Workspace {
                     nodes: Vec::new(),
                     queries: Vec::new(),
                     charts: Vec::new(),
+                    boards: Vec::new(),
                 });
                 self.status = format!("connected: {name}");
                 self.remember();
+                self.ask(
+                    Pending::Dashboards { conn: name.clone() },
+                    "store.dashboards.list",
+                    json!({ "conn": name }),
+                );
                 self.ask(
                     Pending::Structure { name },
                     "schema.structure",
@@ -742,6 +854,99 @@ impl Workspace {
                 if let Some(c) = self.conns.iter_mut().find(|c| c.name == conn) {
                     c.charts = cs;
                 }
+            }
+            Pending::Dashboards { conn } => {
+                let names: Vec<String> = v
+                    .get("dashboards")
+                    .and_then(|d| d.as_array())
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(|d| d.get("name").and_then(Value::as_str).map(str::to_string))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                if let Some(c) = self.conns.iter_mut().find(|c| c.name == conn) {
+                    c.boards = names;
+                }
+            }
+            Pending::Board { tab } => {
+                let raw = v.get("dashboard").cloned().unwrap_or(Value::Null);
+                let stale = v.get("stale").and_then(Value::as_str).map(str::to_string);
+                let columns = v.get("columns").and_then(Value::as_u64).unwrap_or(12) as u32;
+                let dash: Dashboard = serde_json::from_value(raw).unwrap_or_default();
+                let conn = self.tabs.iter().find(|t| t.id == tab).map(|t| t.conn_name.clone());
+                if let Some(t) = self.tabs.iter_mut().find(|t| t.id == tab) {
+                    if let Some(b) = t.board.as_mut() {
+                        b.dash = dash;
+                        b.stale = stale;
+                        b.columns = columns;
+                        b.panes.clear();
+                        b.dirty = false;
+                    }
+                }
+                // The charts come next, and only then can anything be run: a
+                // tile holds a NAME, and the statement behind it lives with the
+                // saved chart.
+                if let Some(conn) = conn {
+                    self.ask(
+                        Pending::BoardCharts { tab },
+                        "store.charts.list",
+                        json!({ "conn": conn }),
+                    );
+                }
+            }
+            Pending::BoardCharts { tab } => {
+                let cs: Vec<SavedChart> =
+                    serde_json::from_value(v.get("charts").cloned().unwrap_or(json!([]))).unwrap_or_default();
+                if let Some(t) = self.tabs.iter_mut().find(|t| t.id == tab) {
+                    if let Some(b) = t.board.as_mut() {
+                        b.charts = cs;
+                    }
+                }
+                self.run_board(tab);
+            }
+            Pending::BoardRun { tab, tile } => {
+                let call_id = v.get("call_id").and_then(Value::as_u64).unwrap_or(0);
+                self.board_calls.insert(call_id, (tab, tile));
+                if let Some(p) = self.pane_mut(tab, tile) {
+                    p.call_id = Some(call_id);
+                    p.state = RunState::Running;
+                }
+            }
+            Pending::BoardPage { tab, tile } => {
+                if !v.get("ready").and_then(Value::as_bool).unwrap_or(false) {
+                    return;
+                }
+                let Ok(page) = serde_json::from_value::<lode_proto::Page>(v) else { return };
+                if let Some(p) = self.pane_mut(tab, tile) {
+                    p.columns = page.columns;
+                    p.rows = page.rows;
+                }
+            }
+            Pending::BoardSaved { tab } => {
+                // The engine hands back the board it ACTUALLY stored, with the
+                // time range canonicalised. Taking that back rather than keeping
+                // what was sent is what stops a range reading one way here and
+                // another after a reload.
+                if let Ok(d) = serde_json::from_value::<Dashboard>(v.get("dashboard").cloned().unwrap_or(Value::Null))
+                {
+                    if let Some(t) = self.tabs.iter_mut().find(|t| t.id == tab) {
+                        if let Some(b) = t.board.as_mut() {
+                            b.dash = d;
+                            b.dirty = false;
+                            b.stale = None;
+                        }
+                    }
+                }
+                let conn = self.tabs.iter().find(|t| t.id == tab).map(|t| t.conn_name.clone());
+                if let Some(conn) = conn {
+                    self.ask(
+                        Pending::Dashboards { conn: conn.clone() },
+                        "store.dashboards.list",
+                        json!({ "conn": conn }),
+                    );
+                }
+                self.toast("dashboard saved", false);
             }
             Pending::SavedQueries { conn } => {
                 let qs: Vec<SavedQuery> =
@@ -835,6 +1040,27 @@ impl Workspace {
                     t.state = RunState::Failed;
                     t.error = Some(e);
                 }
+            }
+            Pending::BoardRun { tab, tile } | Pending::BoardPage { tab, tile } => {
+                if let Some(p) = self.pane_mut(tab, tile) {
+                    p.state = RunState::Failed;
+                    p.error = Some(e);
+                }
+            }
+            Pending::Board { tab } | Pending::BoardCharts { tab } => {
+                if let Some(t) = self.tabs.iter_mut().find(|t| t.id == tab) {
+                    if let Some(b) = t.board.as_mut() {
+                        b.stale = Some(e.clone());
+                    }
+                }
+                self.log.push(("error".into(), e));
+            }
+            Pending::BoardSaved { .. } => {
+                // The engine refuses a board that is wrong and says WHICH tile.
+                // It goes to the toast AND to the log, because the toast
+                // expires and this is the sentence that explains the refusal.
+                self.toast(e.clone(), true);
+                self.log.push(("error".into(), e));
             }
             Pending::Connect { name, .. } => {
                 self.status = format!("could not connect to {name}");
@@ -1152,6 +1378,13 @@ impl Workspace {
             .collect();
         self.restore.tabs.retain(|t| t.conn != conn);
         for t in mine {
+            // A dashboard tab. It comes back by NAME and reloads its layout
+            // from the engine rather than from the session file, so a board
+            // rearranged in the editor is the board that reopens here.
+            if t.kind == "dashboard" {
+                self.open_board(&t.conn, &t.name, cx);
+                continue;
+            }
             if t.name.is_empty() {
                 // A typed tab. It comes back with its words in the box and
                 // NOTHING run: a statement someone was halfway through writing
@@ -1209,6 +1442,23 @@ impl Workspace {
                 .iter()
                 .map(|t| {
                     let (name, schema) = t.object.clone().unzip();
+                    // A dashboard tab is remembered by NAME and nothing else.
+                    // The layout is the engine's, and writing a copy of it here
+                    // would be a second place for it to live and a second place
+                    // for it to be out of date.
+                    if let Some(b) = t.board.as_ref() {
+                        return SessionTab {
+                            conn: t.conn_name.clone(),
+                            name: b.name.clone(),
+                            schema: None,
+                            kind: "dashboard".into(),
+                            view: String::new(),
+                            title: t.title.clone(),
+                            draft: String::new(),
+                            sub: String::new(),
+                            detail: None,
+                        };
+                    }
                     SessionTab {
                         conn: t.conn_name.clone(),
                         name: name.unwrap_or_default(),
@@ -1756,6 +2006,254 @@ impl Workspace {
             tab.view = ResultView::Chart;
             tab.chart_measure = Some(measure.to_string());
         }
+    }
+
+    // ── dashboards ───────────────────────────────────────────────────────────
+
+    fn pane_mut(&mut self, tab: u64, tile: usize) -> Option<&mut Pane> {
+        self.tabs
+            .iter_mut()
+            .find(|t| t.id == tab)?
+            .board
+            .as_mut()
+            .map(|b| b.panes.entry(tile).or_default())
+    }
+
+    fn board_mut(&mut self, tab: u64) -> Option<&mut Board> {
+        self.tabs.iter_mut().find(|t| t.id == tab)?.board.as_mut()
+    }
+
+    /// Put a new tile at the bottom of the board.
+    ///
+    /// A chart tile takes the FIRST saved chart that is not already on the
+    /// board — a tile that opens naming nothing is a tile that fails the
+    /// engine's check the moment anybody presses Save, and the point of the
+    /// check is to be told early, not to be told at the end.
+    fn board_add(&mut self, tab: u64, kind: TileKind) {
+        let Some(b) = self.board_mut(tab) else { return };
+        match kind {
+            TileKind::Chart => {
+                let used: Vec<String> = b.dash.tiles.iter().map(|t| t.chart.clone()).collect();
+                let pick = b
+                    .charts
+                    .iter()
+                    .find(|c| !used.contains(&c.name))
+                    .or_else(|| b.charts.first())
+                    .map(|c| c.name.clone());
+                match pick {
+                    Some(name) => b.push(TileKind::Chart, &name, "", 6, 4),
+                    None => {
+                        // Nothing to put on it, said plainly rather than by
+                        // adding an empty square.
+                        self.toast(
+                            "there are no saved charts on this connection yet — save a chart first",
+                            true,
+                        );
+                        return;
+                    }
+                }
+            }
+            TileKind::Divider => b.push(TileKind::Divider, "", "", 12, 1),
+            TileKind::Text => b.push(TileKind::Text, "", "", 12, 1),
+        }
+        self.run_board(tab);
+    }
+
+    fn board_drag_start(&mut self, tab: u64, tile: usize, mode: DragMode, pos: (f32, f32)) {
+        let Some(b) = self.board_mut(tab) else { return };
+        let Some(t) = b.dash.tiles.get(tile) else { return };
+        let start = (t.x, t.y, t.w, t.h);
+        b.selected = Some(tile);
+        b.drag = Some(board::Drag { tile, mode, from: pos, start });
+        self.dragging = Some(tab);
+    }
+
+    /// Where the drag has got to. Called from the root on every mouse move,
+    /// because the pointer leaves the tile's own square long before the drag is
+    /// over.
+    fn board_drag_to(&mut self, pos: (f32, f32)) {
+        let Some(tab) = self.dragging else { return };
+        let (cw, rh, gap, cols) = {
+            let Some(b) = self.tabs.iter().find(|t| t.id == tab).and_then(|t| t.board.as_ref()) else {
+                return;
+            };
+            let cols = b.columns.max(1);
+            (
+                board::cell_w(self.canvas_w, cols, 0.0),
+                self.scale.base() * 4.0,
+                0.0f32,
+                cols,
+            )
+        };
+        let Some(b) = self.board_mut(tab) else { return };
+        let Some(d) = b.drag.as_ref() else { return };
+        let (tile, start, from, mode) = (d.tile, d.start, d.from, d.mode);
+        let delta = (pos.0 - from.0, pos.1 - from.1);
+        let candidate = match mode {
+            DragMode::Move => {
+                let (x, y) = board::moved(start, delta, cw, rh, gap, cols);
+                (x, y, start.2, start.3)
+            }
+            DragMode::Resize => {
+                let (w, h) = board::resized(start, delta, cw, rh, gap, cols);
+                (start.0, start.1, w, h)
+            }
+        };
+        // A drop that would overlap is simply NOT TAKEN: the engine refuses an
+        // overlapping board, and a client that asks it to store one is a client
+        // that loses somebody's arrangement at the last step.
+        if board::collides(&b.dash.tiles, tile, candidate) {
+            return;
+        }
+        if let Some(t) = b.dash.tiles.get_mut(tile) {
+            if (t.x, t.y, t.w, t.h) != candidate {
+                t.x = candidate.0;
+                t.y = candidate.1;
+                t.w = candidate.2;
+                t.h = candidate.3;
+                b.dirty = true;
+            }
+        }
+    }
+
+    /// Read the three time boxes into the board and run it again.
+    fn board_apply_time(&mut self, tab: u64, cx: &mut Context<Self>) {
+        let col = self.board_time_col.read(cx).text().trim().to_string();
+        let from = self.board_time_from.read(cx).text().trim().to_string();
+        let to = self.board_time_to.read(cx).text().trim().to_string();
+        if col.is_empty() || from.is_empty() || to.is_empty() {
+            self.toast("a time range needs a column, a start and an end", true);
+            return;
+        }
+        if let Some(b) = self.board_mut(tab) {
+            b.dash.time = Some(TimeRange { column: col, from, to });
+            b.dirty = true;
+        }
+        // The ENGINE decides whether those are timestamps. Saving is how it is
+        // asked — the answer comes back canonicalised, or refused with a reason.
+        self.save_board(tab, cx);
+        self.run_board(tab);
+        cx.notify();
+    }
+
+    /// Open a dashboard in its own tab. An empty `name` makes a new one.
+    fn open_board(&mut self, conn: &str, name: &str, cx: &mut Context<Self>) {
+        let driver = self
+            .conns
+            .iter()
+            .find(|c| c.name == conn)
+            .map(|c| c.driver.clone())
+            .unwrap_or_default();
+        let id = self.next_tab;
+        self.next_tab += 1;
+        let title = if name.is_empty() { "New dashboard".to_string() } else { name.to_string() };
+        let mut tab = Tab::new(id, conn.to_string(), driver, title, self.meta_of(conn));
+        let mut b = Board::new(name.to_string(), Dashboard::default(), None, board::COLUMNS);
+        // A board with no name has never been saved, so there is nothing to
+        // read and everything to arrange: it opens ready to be edited.
+        b.editing = name.is_empty();
+        tab.board = Some(b);
+        self.tabs.push(tab);
+        self.active = self.tabs.len() - 1;
+        if name.is_empty() {
+            // Still needs the charts, or there is nothing to put on it.
+            let conn = conn.to_string();
+            self.ask(
+                Pending::BoardCharts { tab: id },
+                "store.charts.list",
+                json!({ "conn": conn }),
+            );
+        } else {
+            self.ask(
+                Pending::Board { tab: id },
+                "store.dashboards.get",
+                json!({ "conn": conn, "name": name }),
+            );
+        }
+        self.remember();
+        cx.notify();
+    }
+
+    /// Run every chart tile on a board.
+    ///
+    /// One call per tile, all at once: they are independent statements and the
+    /// engine runs each in its own task, so waiting for one before starting the
+    /// next would make a board of six charts six times slower for no reason.
+    fn run_board(&mut self, tab_id: u64) {
+        let Some(tab) = self.tabs.iter().find(|t| t.id == tab_id) else { return };
+        let Some(b) = tab.board.as_ref() else { return };
+        let Some(conn_id) = self.live(&tab.conn_name).map(|l| l.conn_id) else { return };
+        let meta = self.meta_of(&tab.conn_name).cloned();
+        let time = b.dash.time.clone();
+        let driver = tab.driver.clone();
+        let mut jobs: Vec<(usize, String, TimeFit, Option<String>)> = Vec::new();
+        for (i, tile) in b.dash.tiles.iter().enumerate() {
+            if tile.kind != TileKind::Chart {
+                continue;
+            }
+            match b.chart_of(tile) {
+                Some(c) => {
+                    let (sql, fit) = match &meta {
+                        Some(m) => apply_time(&c.sql, m, time.as_ref()),
+                        None => (c.sql.clone(), TimeFit::NotMarked),
+                    };
+                    jobs.push((i, sql, fit, None));
+                }
+                // The tile stays, and says what is missing. The board does not
+                // silently become a board with one fewer chart.
+                None => jobs.push((
+                    i,
+                    String::new(),
+                    TimeFit::NotMarked,
+                    Some(format!("the saved chart '{}' is not on this connection", tile.chart)),
+                )),
+            }
+        }
+        for (tile, sql, fit, missing) in jobs {
+            // A chart that asked for a range it cannot have is NOT SENT to a
+            // database. The first version stripped the marker and sent
+            // `… WHERE  ORDER BY …`, and the engine answered with a syntax
+            // error — a terrible way to say "you have not picked a date".
+            let say = missing.clone().or_else(|| {
+                if fit.runnable() {
+                    None
+                } else {
+                    fit.note(&driver)
+                }
+            });
+            if let Some(p) = self.pane_mut(tab_id, tile) {
+                p.statement = sql.clone();
+                p.fit = fit;
+                p.error = say.clone();
+                p.state = if say.is_some() { RunState::Failed } else { RunState::Running };
+                p.rows.clear();
+            }
+            if say.is_some() {
+                continue;
+            }
+            self.ask(
+                Pending::BoardRun { tab: tab_id, tile },
+                "query.execute",
+                json!({ "conn_id": conn_id, "statement": sql }),
+            );
+        }
+    }
+
+    /// Hand the board to the engine, which decides whether it is a board.
+    fn save_board(&mut self, tab_id: u64, cx: &mut Context<Self>) {
+        let Some(tab) = self.tabs.iter().find(|t| t.id == tab_id) else { return };
+        let Some(b) = tab.board.as_ref() else { return };
+        let (conn, name, dash) = (tab.conn_name.clone(), b.name.clone(), b.dash.clone());
+        if name.trim().is_empty() {
+            self.toast("the dashboard needs a name before it can be saved", true);
+            return;
+        }
+        self.ask(
+            Pending::BoardSaved { tab: tab_id },
+            "store.dashboards.save",
+            json!({ "conn": conn, "name": name, "dashboard": dash }),
+        );
+        cx.notify();
     }
 
     /// Save what the chart is showing. The statement and the measured column,
@@ -2791,6 +3289,51 @@ impl Workspace {
                     );
                 }
             }
+            // Dashboards come before the saved charts, because a board is what
+            // somebody opens and a chart is what a board is made of.
+            list = list.child(self.section("Dashboards"));
+            list = list.child(
+                div()
+                    .id(SharedString::from(format!("nb-{}", live.name)))
+                    .flex()
+                    .items_center()
+                    .gap_1()
+                    .pl(px(10.0))
+                    .pr_2()
+                    .py(px(2.0))
+                    .cursor_pointer()
+                    .hover(|d| d.bg(t.hover()))
+                    .child(div().flex_none().text_size(ms.tiny()).text_color(t.accent()).child("\u{f067}"))
+                    .child(self.line_in("New dashboard", ms.small(), t.accent(), ms.line_w() - ms.base() - 14.0))
+                    .on_click(cx.listener({
+                        let cn = live.name.clone();
+                        move |this, _, _, cx| {
+                            this.open_board(&cn, "", cx);
+                        }
+                    })),
+            );
+            for name in &live.boards {
+                list = list.child(
+                    div()
+                        .id(SharedString::from(format!("db-{}-{}", live.name, name)))
+                        .flex()
+                        .items_center()
+                        .gap_1()
+                        .pl(px(10.0))
+                        .pr_2()
+                        .py(px(2.0))
+                        .cursor_pointer()
+                        .hover(|d| d.bg(t.hover()))
+                        .child(div().flex_none().text_size(ms.tiny()).text_color(t.accent()).child("\u{f00a}"))
+                        .child(self.line_in(name.clone(), ms.small(), t.fg(), ms.line_w() - ms.base() - 14.0))
+                        .on_click(cx.listener({
+                            let (cn, n) = (live.name.clone(), name.clone());
+                            move |this, _, _, cx| {
+                                this.open_board(&cn, &n, cx);
+                            }
+                        })),
+                );
+            }
             if !live.queries.is_empty() {
                 list = list.child(self.section("Saved queries"));
                 for q in &live.queries {
@@ -3003,6 +3546,12 @@ impl Workspace {
                 .into_any_element();
         };
 
+        // A dashboard tab is not a result tab: no statement box, no grid, no
+        // row. It draws saved charts on a grid of twelve columns.
+        if tab.board.is_some() {
+            return self.board_el(tab, cx);
+        }
+
         let mut body = div().flex().flex_col().size_full();
 
         // ── breadcrumbs and numbers ─────────────────────────────────────────
@@ -3200,6 +3749,548 @@ impl Workspace {
     /// Drawn from the ROWS, not from the declared column types: a driver that
     /// declares nothing — sqlite usually does — would otherwise never be
     /// chartable, and a column declared INTEGER can still arrive holding text.
+    // ── the dashboard canvas ─────────────────────────────────────────────────
+
+    /// A board: a toolbar, a time range, and tiles on a grid of twelve columns.
+    ///
+    /// Tiles are placed ABSOLUTELY, with the left edge and the width as a
+    /// fraction of twelve. That is the whole reason the grid is twelve: a
+    /// fraction of twelve is exact for halves, thirds, quarters and sixths, so
+    /// two tiles side by side meet on a pixel rather than nearly. The gutter is
+    /// the tile's own padding, not a gap in the layout, which keeps the
+    /// arithmetic to one division.
+    fn board_el(&self, tab: &Tab, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let t = self.t();
+        let ms = self.scale;
+        let Some(b) = tab.board.as_ref() else {
+            return div().into_any_element();
+        };
+        let tab_id = tab.id;
+        let cols = b.columns.max(1) as f32;
+        let row_h = ms.base() * 4.0;
+
+        let mut top = div()
+            .flex()
+            .items_center()
+            .gap_2()
+            .px_3()
+            .py_1()
+            .bg(t.panel())
+            .border_b_1()
+            .border_color(t.border())
+            ;
+        let editing = b.editing;
+        // A board that has never been saved has no name, and the box is the
+        // only way to give it one — so it is shown whenever the name is empty,
+        // not only while arranging.
+        if editing || b.name.is_empty() {
+            top = top
+                .child(div().w(px(ms.base() * 12.0)).child(self.board_name.clone()))
+                .child(
+                    div()
+                        .id("board-rename")
+                        .px_2()
+                        .cursor_pointer()
+                        .text_size(ms.small())
+                        .text_color(t.accent())
+                        .hover(|d| d.bg(t.hover()))
+                        .child("Name it")
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            let n = this.board_name.read(cx).text().trim().to_string();
+                            if n.is_empty() {
+                                this.toast("a dashboard needs a name", true);
+                                return;
+                            }
+                            if let Some(bd) = this.board_mut(tab_id) {
+                                bd.name = n.clone();
+                                bd.dirty = true;
+                            }
+                            if let Some(tb) = this.tabs.iter_mut().find(|x| x.id == tab_id) {
+                                tb.title = n;
+                            }
+                            cx.notify();
+                        })),
+                );
+        } else {
+            top = top.child(
+                div()
+                    .text_size(ms.heading())
+                    .text_color(t.title())
+                    .child(SharedString::from(b.name.clone())),
+            );
+        }
+        top = top.child(
+            div()
+                .id("board-edit")
+                .px_2()
+                .cursor_pointer()
+                .text_size(ms.small())
+                .text_color(if editing { t.inverted() } else { t.accent() })
+                .when(editing, |d| d.bg(t.accent()))
+                .hover(|d| d.bg(t.hover()))
+                .child(if editing { "Done" } else { "Arrange" })
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    if let Some(bd) = this.board_mut(tab_id) {
+                        bd.editing = !bd.editing;
+                        bd.selected = None;
+                    }
+                    cx.notify();
+                })),
+        );
+        if editing {
+            for (label, kind) in [
+                ("+ chart", TileKind::Chart),
+                ("+ divider", TileKind::Divider),
+                ("+ text", TileKind::Text),
+            ] {
+                top = top.child(
+                    div()
+                        .id(SharedString::from(format!("add-{label}")))
+                        .px_2()
+                        .cursor_pointer()
+                        .text_size(ms.small())
+                        .text_color(t.accent())
+                        .hover(|d| d.bg(t.hover()))
+                        .child(label)
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.board_add(tab_id, kind);
+                            cx.notify();
+                        })),
+                );
+            }
+        }
+        top = top
+            .child(div().flex_1())
+            .child(
+                div()
+                    .id("board-refresh")
+                    .px_2()
+                    .cursor_pointer()
+                    .text_size(ms.small())
+                    .text_color(t.accent())
+                    .hover(|d| d.bg(t.hover()))
+                    .child("\u{f021}  Refresh")
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.run_board(tab_id);
+                        cx.notify();
+                    })),
+            )
+            .child(
+                div()
+                    .id("board-save")
+                    .px_2()
+                    .cursor_pointer()
+                    .text_size(ms.small())
+                    .text_color(if b.dirty { t.inverted() } else { t.muted() })
+                    .when(b.dirty, |d| d.bg(t.accent()))
+                    .hover(|d| d.bg(t.hover()))
+                    .child(if b.dirty { "Save" } else { "Saved" })
+                    .on_click(cx.listener(move |this, _, _, cx| this.save_board(tab_id, cx))),
+            );
+
+        // The shared time range. One range, every chart on the board, and the
+        // tiles that could not take it say so on themselves.
+        let mut timebar = div()
+            .flex()
+            .items_center()
+            .gap_2()
+            .px_3()
+            .py_1()
+            .bg(t.status())
+            .child(self.small("time", t.muted()))
+            // Real widths: a text field with none collapses to nothing, and the
+            // three of them drew on top of one another.
+            .child(div().w(px(ms.base() * 9.0)).flex_none().child(self.board_time_col.clone()))
+            .child(self.small("from", t.muted()))
+            .child(div().w(px(ms.base() * 9.0)).flex_none().child(self.board_time_from.clone()))
+            .child(self.small("to", t.muted()))
+            .child(div().w(px(ms.base() * 9.0)).flex_none().child(self.board_time_to.clone()))
+            .child(
+                div()
+                    .id("board-time-apply")
+                    .px_2()
+                    .cursor_pointer()
+                    .text_size(ms.small())
+                    .text_color(t.accent())
+                    .hover(|d| d.bg(t.hover()))
+                    .child("Apply")
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.board_apply_time(tab_id, cx);
+                    })),
+            );
+        if b.dash.time.is_some() {
+            timebar = timebar.child(
+                div()
+                    .id("board-time-clear")
+                    .px_2()
+                    .cursor_pointer()
+                    .text_size(ms.small())
+                    .text_color(t.muted())
+                    .hover(|d| d.bg(t.hover()))
+                    .child("clear")
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        if let Some(bd) = this.board_mut(tab_id) {
+                            bd.dash.time = None;
+                            bd.dirty = true;
+                        }
+                        this.run_board(tab_id);
+                        cx.notify();
+                    })),
+            );
+        }
+        // How many charts the range did NOT reach. Counted and SAID, because a
+        // range that silently applies to four charts out of six is worse than
+        // one that says which two it missed.
+        if b.dash.time.is_some() {
+            let missed = b
+                .dash
+                .tiles
+                .iter()
+                .enumerate()
+                .filter(|(i, tl)| {
+                    tl.kind == TileKind::Chart
+                        && b.panes.get(i).map(|p| p.fit) != Some(TimeFit::Applied)
+                })
+                .count();
+            if missed > 0 {
+                timebar = timebar.child(self.small(
+                    format!("{missed} chart(s) are NOT time-filtered — their statement has no {{{{time}}}} in it"),
+                    t.warning(),
+                ));
+            }
+        }
+
+        // What the selected tile is, and the two things that can be done to it:
+        // say what it shows, and take it off the board.
+        let mut selected_row = None;
+        if editing {
+            if let Some(i) = b.selected {
+                if let Some(tile) = b.dash.tiles.get(i) {
+                    let mut row = div()
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .px_3()
+                        .py_1()
+                        .bg(t.raised())
+                        .child(self.small(
+                            match tile.kind {
+                                TileKind::Chart => format!("chart tile \u{2014} {}", tile.chart),
+                                TileKind::Divider => "divider".to_string(),
+                                TileKind::Text => "text tile".to_string(),
+                            },
+                            t.muted(),
+                        ));
+                    if tile.kind != TileKind::Divider {
+                        row = row
+                            .child(div().w(px(ms.base() * 16.0)).child(self.tile_text.clone()))
+                            .child(
+                                div()
+                                    .id("tile-set-text")
+                                    .px_2()
+                                    .cursor_pointer()
+                                    .text_size(ms.small())
+                                    .text_color(t.accent())
+                                    .hover(|d| d.bg(t.hover()))
+                                    .child("Set")
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        let txt = this.tile_text.read(cx).text().to_string();
+                                        if let Some(bd) = this.board_mut(tab_id) {
+                                            if let Some(tl) = bd.dash.tiles.get_mut(i) {
+                                                tl.text = txt;
+                                                bd.dirty = true;
+                                            }
+                                        }
+                                        cx.notify();
+                                    })),
+                            );
+                    }
+                    // Which saved chart this tile shows, chosen by NAME from the
+                    // charts that exist — so a tile cannot come to name one that
+                    // does not.
+                    if tile.kind == TileKind::Chart {
+                        for c in &b.charts {
+                            let on = c.name == tile.chart;
+                            let name = c.name.clone();
+                            row = row.child(
+                                div()
+                                    .id(SharedString::from(format!("pick-{}", c.name)))
+                                    .px_1()
+                                    .cursor_pointer()
+                                    .text_size(ms.small())
+                                    .text_color(if on { t.inverted() } else { t.fg() })
+                                    .when(on, |d| d.bg(t.accent()))
+                                    .hover(|d| d.bg(t.hover()))
+                                    .child(SharedString::from(c.name.clone()))
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        if let Some(bd) = this.board_mut(tab_id) {
+                                            if let Some(tl) = bd.dash.tiles.get_mut(i) {
+                                                tl.chart = name.clone();
+                                                bd.dirty = true;
+                                            }
+                                        }
+                                        this.run_board(tab_id);
+                                        cx.notify();
+                                    })),
+                            );
+                        }
+                    }
+                    row = row.child(div().flex_1()).child(
+                        div()
+                            .id("tile-remove")
+                            .px_2()
+                            .cursor_pointer()
+                            .text_size(ms.small())
+                            .text_color(t.error())
+                            .hover(|d| d.bg(t.hover()))
+                            .child("Remove")
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                if let Some(bd) = this.board_mut(tab_id) {
+                                    bd.remove(i);
+                                }
+                                this.run_board(tab_id);
+                                cx.notify();
+                            })),
+                    );
+                    selected_row = Some(row);
+                }
+            }
+        }
+
+        let mut canvas = div().relative().w_full().p_2();
+        if b.dash.tiles.is_empty() {
+            canvas = canvas.child(
+                div().p_3().child(self.small(
+                    "an empty board — press Arrange, then add a chart you have saved",
+                    t.muted(),
+                )),
+            );
+        }
+        for (i, tile) in b.dash.tiles.iter().enumerate() {
+            canvas = canvas.child(self.tile_el(tab_id, b, i, tile, cols, row_h, &tab.driver, cx));
+        }
+
+        let mut out = div().flex().flex_col().size_full().child(top).child(timebar);
+        if let Some(row) = selected_row {
+            out = out.child(row);
+        }
+        if let Some(stale) = &b.stale {
+            out = out.child(
+                div()
+                    .px_3()
+                    .py_1()
+                    .bg(t.status())
+                    .child(self.small(stale.clone(), t.warning())),
+            );
+        }
+        out.child(div().id("board-canvas").flex_1().overflow_y_scroll().child(canvas))
+            .into_any_element()
+    }
+
+    /// One tile.
+    #[allow(clippy::too_many_arguments)]
+    fn tile_el(
+        &self,
+        tab_id: u64,
+        b: &Board,
+        i: usize,
+        tile: &Tile,
+        cols: f32,
+        row_h: f32,
+        driver: &str,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let t = self.t();
+        let ms = self.scale;
+        let selected = b.selected == Some(i);
+        let editing = b.editing;
+        // Stateful from the start: `.id()` changes a `Div` into a
+        // `Stateful<Div>`, so adding it later in an `if` cannot be an
+        // assignment back to the same binding.
+        let mut el = div()
+            .id(SharedString::from(format!("tile-{tab_id}-{i}")))
+            .absolute()
+            .left(gpui::relative(tile.x as f32 / cols))
+            .top(px(tile.y as f32 * row_h))
+            .w(gpui::relative(tile.w as f32 / cols))
+            .h(px(tile.h as f32 * row_h))
+            // The gutter is padding, not a gap in the grid: one division to get
+            // a tile's place, and two tiles side by side still meet exactly.
+            .p(px(4.0));
+
+        let mut inner = div()
+            .flex()
+            .flex_col()
+            .size_full()
+            .overflow_hidden()
+            .bg(t.panel())
+            .border_1()
+            .border_color(if selected { t.accent() } else { t.border() });
+
+        match tile.kind {
+            TileKind::Divider => {
+                inner = div()
+                    .flex()
+                    .items_center()
+                    .size_full()
+                    .bg(t.base())
+                    .child(div().w_full().h(px(1.0)).bg(if selected { t.accent() } else { t.border() }));
+            }
+            TileKind::Text => {
+                inner = inner.bg(t.base()).child(
+                    div()
+                        .p_2()
+                        .text_size(ms.body())
+                        .text_color(t.fg())
+                        .child(SharedString::from(if tile.text.is_empty() {
+                            "(empty text tile — select it and type a heading)".to_string()
+                        } else {
+                            tile.text.clone()
+                        })),
+                );
+            }
+            TileKind::Chart => {
+                let heading = if tile.text.is_empty() { tile.chart.clone() } else { tile.text.clone() };
+                let pane = b.panes.get(&i);
+                let mut head = div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .px_2()
+                    .py_1()
+                    .bg(t.header_bg())
+                    .child(
+                        div()
+                            .flex_1()
+                            .text_size(ms.small())
+                            .text_color(t.header_fg())
+                            .child(SharedString::from(heading)),
+                    );
+                // The honest label on a tile the range did not reach. Shown
+                // only when there IS a range: "not time-filtered" on a board
+                // with no range is noise about a thing nobody asked for.
+                if b.dash.time.is_some() {
+                    if let Some(note) = pane.and_then(|p| p.fit.note(driver)) {
+                        head = head.child(
+                            div()
+                                .text_size(ms.tiny())
+                                .text_color(t.warning())
+                                .child(SharedString::from(note)),
+                        );
+                    }
+                }
+                inner = inner.child(head).child(self.tile_chart_el(pane, ms, &t));
+            }
+        }
+
+        el = el.child(inner);
+
+        if editing {
+            let mode_move = DragMode::Move;
+            el = el
+                .cursor_pointer()
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |this, ev: &MouseDownEvent, _, cx| {
+                        let pos = (f32::from(ev.position.x), f32::from(ev.position.y));
+                        this.board_drag_start(tab_id, i, mode_move, pos);
+                        cx.notify();
+                    }),
+                )
+                // The resize grip, in the corner, and OUTSIDE the move handler
+                // so a drag that starts on it resizes instead of moving.
+                .child(
+                    div()
+                        .id(SharedString::from(format!("grip-{tab_id}-{i}")))
+                        .absolute()
+                        .right(px(4.0))
+                        .bottom(px(4.0))
+                        .w(px(ms.base()))
+                        .h(px(ms.base()))
+                        .bg(t.accent())
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(move |this, ev: &MouseDownEvent, _, cx| {
+                                let pos = (f32::from(ev.position.x), f32::from(ev.position.y));
+                                this.board_drag_start(tab_id, i, DragMode::Resize, pos);
+                                cx.notify();
+                            }),
+                        ),
+                );
+        }
+        el.into_any_element()
+    }
+
+    /// The bars inside a chart tile. The same rules as the chart view: a
+    /// measurement is a column whose every non-null value is a number, a missing
+    /// value is drawn as NOTHING rather than as a bar of zero, and the axis
+    /// includes zero.
+    fn tile_chart_el(&self, pane: Option<&Pane>, ms: Metrics, t: &Theme) -> gpui::AnyElement {
+        let Some(pane) = pane else {
+            return div()
+                .flex_1()
+                .p_2()
+                .child(self.small("not loaded", t.muted()))
+                .into_any_element();
+        };
+        if let Some(e) = &pane.error {
+            return div()
+                .flex_1()
+                .p_2()
+                .text_size(ms.small())
+                .text_color(t.error())
+                .child(SharedString::from(e.clone()))
+                .into_any_element();
+        }
+        if pane.state == RunState::Running {
+            return div()
+                .flex_1()
+                .p_2()
+                .child(self.small("running\u{2026}", t.muted()))
+                .into_any_element();
+        }
+        let shape = match ChartShape::of(&pane.columns, &pane.rows) {
+            Ok(s) => s,
+            Err(why) => {
+                return div()
+                    .flex_1()
+                    .p_2()
+                    .child(self.small(why, t.muted()))
+                    .into_any_element()
+            }
+        };
+        let col = shape.values[0];
+        let (lo, hi) = value_range(&pane.rows, col);
+        let span = hi - lo;
+        let mut bars = div().flex().flex_col().flex_1().overflow_hidden().px_2().py_1().gap(px(1.0));
+        for r in 0..pane.rows.len().min(24) {
+            let v = pane.rows.get(r).and_then(|row| row.get(col)).and_then(|x| x.as_f64());
+            let frac = v.map(|n| ((n - lo) / span).clamp(0.0, 1.0)).unwrap_or(0.0);
+            bars = bars.child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_1()
+                    .h(px(ms.base()))
+                    .child(self.line(
+                        bar_label_of(&pane.rows, 0, &shape, r),
+                        ms.tiny(),
+                        t.muted(),
+                        ms.base() * 6.0,
+                    ))
+                    .child(
+                        div().flex_1().h_full().child(
+                            div()
+                                .h_full()
+                                .w(gpui::relative(frac as f32))
+                                .bg(if v.is_some() { t.accent() } else { t.panel() }),
+                        ),
+                    ),
+            );
+        }
+        bars.into_any_element()
+    }
+
     fn chart_el(&self, tab: &Tab, cx: &mut Context<Self>) -> gpui::AnyElement {
         let t = self.t();
         let ms = self.scale;
@@ -4117,7 +5208,7 @@ impl Workspace {
             .bg(t.header_bg())
             .border_b_1()
             .border_color(t.border())
-            .child(div().w(px(NUM_W)).px(px(6.0)).child(self.small("#", t.header_fg())));
+            .child(div().w(px(NUM_W)).px(px(ms.cell_pad())).child(self.small("#", t.header_fg())));
         for (ci, name) in &cols {
             let (ci, name) = (*ci, name.clone());
             let arrow = match sort {
@@ -4134,7 +5225,7 @@ impl Workspace {
                 div()
                     .id(SharedString::from(format!("hdr-{tab_id}-{ci}")))
                     .w(px(tab.widths.get(&ci).copied().unwrap_or(ms.col_w())))
-                    .px(px(6.0))
+                    .px(px(ms.cell_pad()))
                     .cursor_pointer()
                     .text_size(ms.small())
                     .text_color(t.header_fg())
@@ -4188,7 +5279,7 @@ impl Workspace {
                         .child(
                             div()
                                 .w(px(NUM_W))
-                                .px(px(6.0))
+                                .px(px(ms.cell_pad()))
                                 .text_size(ms.tiny())
                                 .text_color(muted)
                                 .child(SharedString::from((first + i + 1).to_string())),
@@ -4203,7 +5294,7 @@ impl Workspace {
                             .child(
                                 div()
                                     .w(px(widths.get(ci).copied().unwrap_or(ms.col_w())))
-                                    .px(px(6.0))
+                                    .px(px(ms.cell_pad()))
                                     .text_size(ms.body())
                                     .text_color(colour)
                                     .child(SharedString::from(text)),
@@ -4707,7 +5798,19 @@ impl Workspace {
 }
 
 impl Render for Workspace {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // How wide the dashboard canvas is, for the drag arithmetic. DERIVED
+        // from the viewport rather than measured: GPUI lays out after the
+        // element tree is built, so a width measured this frame would be last
+        // frame's — and this is the same subtraction the layout below performs,
+        // so the two cannot disagree about anything but a resize in flight.
+        // rail + panel + the canvas's own padding.
+        self.canvas_w = (f32::from(window.viewport_size().width)
+            - self.scale.base() * 3.1
+            - self.scale.panel_w()
+            - 16.0)
+            .max(120.0);
+
         // Toasts expire on the next frame they are late for; the pump redraws
         // often enough that nothing sits there after its time.
         let now = Instant::now();
@@ -4788,6 +5891,10 @@ impl Render for Workspace {
             // A column being dragged is tracked at the root, because the mouse
             // leaves the narrow handle long before the drag is over.
             .on_mouse_move(cx.listener(|this, ev: &MouseMoveEvent, _, cx| {
+                if this.dragging.is_some() {
+                    this.board_drag_to((f32::from(ev.position.x), f32::from(ev.position.y)));
+                    cx.notify();
+                }
                 if let Some((tab_id, col, from, was)) = this.resizing {
                     let w = (was + (f32::from(ev.position.x) - from)).clamp(40.0, 900.0);
                     if let Some(tab) = this.tabs.iter_mut().find(|x| x.id == tab_id) {
@@ -4799,6 +5906,12 @@ impl Render for Workspace {
             .on_mouse_up(
                 MouseButton::Left,
                 cx.listener(|this, _: &MouseUpEvent, _, cx| {
+                    if let Some(tab) = this.dragging.take() {
+                        if let Some(b) = this.board_mut(tab) {
+                            b.drag = None;
+                        }
+                        cx.notify();
+                    }
                     if this.resizing.take().is_some() {
                         this.remember();
                         cx.notify();

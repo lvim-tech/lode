@@ -13,6 +13,7 @@
 // notices the pipe close, reports it, and can respawn.
 
 mod audit;
+mod dashboard;
 mod driver;
 mod drivers;
 mod net;

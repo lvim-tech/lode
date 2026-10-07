@@ -104,6 +104,13 @@ pub struct DriverMeta {
     /// engine with no builder, which the client reads the same way: no builder.
     #[serde(default)]
     pub builder_ops: Vec<BuilderOp>,
+    /// How this engine spells a time window, over `{col}`, `{from}`, `{to}`.
+    ///
+    /// Empty where the engine has no such thing (Redis), and empty on an
+    /// engine from before protocol 8 — a client reads both the same way, which
+    /// is the right answer for both: no time filter here.
+    #[serde(default)]
+    pub time_filter: String,
 }
 
 /// One input of a structured query bar, as the engine declares it.
@@ -482,6 +489,139 @@ pub struct HistoryRow {
     pub rows: Option<i64>,
     #[serde(default)]
     pub ts: Option<i64>,
+}
+
+// ── dashboards ─────────────────────────────────────────────────────────────────
+
+/// The marker a chart statement puts where the board's time range should go.
+///
+/// A statement WITHOUT it is not time-filtered. That is deliberate: no client
+/// can know where in somebody's statement a condition belongs — before a GROUP
+/// BY, inside a sub-select, nowhere at all — and guessing would put a filter in
+/// a place that changes what the chart means. The author says where; a board
+/// says which of its charts did not.
+pub const TIME_MARKER: &str = "{{time}}";
+
+/// A dashboard, as the engine stores it.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct Dashboard {
+    #[serde(default)]
+    pub tiles: Vec<Tile>,
+    #[serde(default)]
+    pub time: Option<TimeRange>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Tile {
+    pub kind: TileKind,
+    pub x: u32,
+    pub y: u32,
+    pub w: u32,
+    pub h: u32,
+    /// For a chart tile: the saved chart's NAME. Never an index — an index
+    /// would move the moment a chart was renamed or removed, and the board
+    /// would go on drawing the wrong one under the old heading.
+    #[serde(default)]
+    pub chart: String,
+    #[serde(default)]
+    pub text: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TileKind {
+    Chart,
+    Divider,
+    Text,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TimeRange {
+    /// The column carrying the time, by name.
+    pub column: String,
+    /// Both already canonicalised by the engine, which refuses anything that is
+    /// not exactly a timestamp before it is stored.
+    pub from: String,
+    pub to: String,
+}
+
+/// One board as it comes back, with the complaint the engine has about it.
+#[derive(Debug, Clone, Default)]
+pub struct LoadedDashboard {
+    pub dashboard: Dashboard,
+    /// Why this board is no longer valid — most often a saved chart it names
+    /// having been deleted from the other client. `None` when it is fine.
+    pub stale: Option<String>,
+    pub columns: u32,
+}
+
+/// What became of a chart's time filter.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TimeFit {
+    /// The range went in. The statement is time-filtered.
+    Applied,
+    /// The statement does not ask for one. It runs unfiltered, and the tile
+    /// says so — a range that silently applies to four charts out of six is
+    /// worse than one that says which two it missed.
+    ///
+    /// The default, because a chart nobody has run yet has had nothing done to
+    /// it, and "not filtered" is the true thing to say about it.
+    #[default]
+    NotMarked,
+    /// The statement is WRITTEN AROUND a range and there is none set.
+    ///
+    /// This does not run. The first version took the marker out and left
+    /// `… WHERE  ORDER BY …` behind, which is not a statement; the engine
+    /// answered with a syntax error, and a syntax error is a terrible way to
+    /// say "you have not picked a date". A chart written as
+    /// `WHERE {{time}}` is a chart ABOUT a window, and the honest answer when
+    /// there is no window is to ask for one.
+    NeedsRange,
+    /// The statement asks for a range and this engine has no way to spell one —
+    /// Redis, or an engine from before protocol 8. Also does not run, for the
+    /// same reason.
+    Unsupported,
+}
+
+impl TimeFit {
+    pub fn runnable(self) -> bool {
+        matches!(self, TimeFit::Applied | TimeFit::NotMarked)
+    }
+
+    /// What to show on the tile. `None` where there is nothing to say.
+    pub fn note(self, driver: &str) -> Option<String> {
+        match self {
+            TimeFit::Applied => None,
+            TimeFit::NotMarked => Some("not time-filtered".into()),
+            TimeFit::NeedsRange => {
+                Some("this chart is written around a time range — set one above".into())
+            }
+            TimeFit::Unsupported => Some(format!("{driver} has no way to express a time window")),
+        }
+    }
+}
+
+/// Put the board's time range into one chart's statement.
+///
+/// Every word of the condition comes from the driver's own template, and the
+/// two timestamps have already been refused by the engine if they were anything
+/// but timestamps. The client contributes a column name and a position.
+pub fn apply_time(statement: &str, meta: &DriverMeta, time: Option<&TimeRange>) -> (String, TimeFit) {
+    if !statement.contains(TIME_MARKER) {
+        return (statement.to_string(), TimeFit::NotMarked);
+    }
+    let Some(time) = time else {
+        return (statement.to_string(), TimeFit::NeedsRange);
+    };
+    if meta.time_filter.is_empty() {
+        return (statement.to_string(), TimeFit::Unsupported);
+    }
+    let fragment = meta
+        .time_filter
+        .replace("{col}", &time.column)
+        .replace("{from}", &time.from)
+        .replace("{to}", &time.to);
+    (statement.replace(TIME_MARKER, &fragment), TimeFit::Applied)
 }
 
 /// One audit row.
@@ -914,6 +1054,40 @@ impl Engine {
         })
     }
 
+    pub fn dashboards(&self, conn: &str, timeout: Duration) -> anyhow::Result<Vec<Value>> {
+        let v = self.call("store.dashboards.list", json!({ "conn": conn }), timeout)?;
+        Ok(serde_json::from_value(
+            v.get("dashboards").cloned().unwrap_or_else(|| json!([])),
+        )?)
+    }
+
+    pub fn dashboard(&self, conn: &str, name: &str, timeout: Duration) -> anyhow::Result<Option<LoadedDashboard>> {
+        let v = self.call("store.dashboards.get", json!({ "conn": conn, "name": name }), timeout)?;
+        let raw = v.get("dashboard").cloned().unwrap_or(Value::Null);
+        if raw.is_null() {
+            return Ok(None);
+        }
+        Ok(Some(LoadedDashboard {
+            dashboard: serde_json::from_value(raw)?,
+            stale: v.get("stale").and_then(|s| s.as_str()).map(str::to_string),
+            columns: v.get("columns").and_then(|c| c.as_u64()).unwrap_or(12) as u32,
+        }))
+    }
+
+    pub fn save_dashboard(&self, conn: &str, name: &str, d: &Dashboard, timeout: Duration) -> anyhow::Result<()> {
+        self.call(
+            "store.dashboards.save",
+            json!({ "conn": conn, "name": name, "dashboard": d }),
+            timeout,
+        )?;
+        Ok(())
+    }
+
+    pub fn remove_dashboard(&self, conn: &str, name: &str, timeout: Duration) -> anyhow::Result<()> {
+        self.call("store.dashboards.remove", json!({ "conn": conn, "name": name }), timeout)?;
+        Ok(())
+    }
+
     pub fn structure(&self, conn_id: u64, timeout: Duration) -> anyhow::Result<Vec<Node>> {
         let v = self.call("schema.structure", json!({ "conn_id": conn_id }), timeout)?;
         Ok(serde_json::from_value(
@@ -953,6 +1127,110 @@ mod tests {
 
     fn meta_from(json: Value) -> DriverMeta {
         serde_json::from_value(json).unwrap()
+    }
+
+    /// The time range reaches a chart only where its author put the marker, and
+    /// the condition is the DRIVER'S words with values in them.
+    #[test]
+    fn the_time_range_lands_where_the_marker_is_and_nowhere_else() {
+        let pg = meta_from(json!({
+            "kind": "postgres", "display": "PostgreSQL",
+            "time_filter": "{col} >= '{from}' AND {col} < '{to}'"
+        }));
+        let range = TimeRange {
+            column: "created_at".into(),
+            from: "2026-01-01".into(),
+            to: "2026-02-01".into(),
+        };
+        let (sql, fit) = apply_time(
+            "SELECT date_trunc('day', created_at) d, count(*) FROM signups WHERE {{time}} GROUP BY 1",
+            &pg,
+            Some(&range),
+        );
+        assert_eq!(fit, TimeFit::Applied);
+        assert_eq!(
+            sql,
+            "SELECT date_trunc('day', created_at) d, count(*) FROM signups \
+             WHERE created_at >= '2026-01-01' AND created_at < '2026-02-01' GROUP BY 1"
+        );
+    }
+
+    /// The other half, and the one that has to be SAID on the tile: a statement
+    /// with no marker is not filtered, and comes back untouched.
+    #[test]
+    fn a_statement_with_no_marker_is_not_filtered_and_is_not_changed() {
+        let pg = meta_from(json!({ "kind": "postgres", "display": "p", "time_filter": "{col} >= '{from}'" }));
+        let range = TimeRange {
+            column: "ts".into(),
+            from: "2026-01-01".into(),
+            to: "2026-02-01".into(),
+        };
+        let src = "SELECT country, count(*) FROM signups GROUP BY 1";
+        let (sql, fit) = apply_time(src, &pg, Some(&range));
+        assert_eq!(fit, TimeFit::NotMarked);
+        assert!(fit.runnable());
+        assert_eq!(sql, src);
+    }
+
+    /// An engine with no way to spell a time window — Redis — and an engine
+    /// from before protocol 8 look the same from here, and both are honest: the
+    /// marker goes, the statement still runs, and the tile is told it was not
+    /// filtered.
+    /// An engine with no way to spell a time window — Redis — and an engine
+    /// from before protocol 8 look the same from here, and neither statement
+    /// is run: a chart that asks for a window it cannot have is a chart to
+    /// explain, not to execute.
+    #[test]
+    fn an_engine_with_no_time_filter_does_not_run_a_chart_that_wanted_one() {
+        let redis = meta_from(json!({ "kind": "redis", "display": "Redis", "time_filter": "" }));
+        let old = meta_from(json!({ "kind": "postgres", "display": "p" }));
+        let range = TimeRange {
+            column: "ts".into(),
+            from: "2026-01-01".into(),
+            to: "2026-02-01".into(),
+        };
+        for meta in [&redis, &old] {
+            let (_, fit) = apply_time("KEYS {{time}} *", meta, Some(&range));
+            assert_eq!(fit, TimeFit::Unsupported);
+            assert!(!fit.runnable());
+            assert!(fit.note(&meta.kind).unwrap().contains(&meta.kind));
+        }
+    }
+
+    /// The bug this enum exists for. Taking the marker out of
+    /// `… WHERE {{time}} ORDER BY …` leaves `WHERE ORDER BY`, which is not a
+    /// statement — and the engine's answer, `near "ORDER": syntax error`, is a
+    /// terrible way to say "you have not picked a date".
+    #[test]
+    fn a_chart_written_around_a_range_asks_for_one_instead_of_running_broken_sql() {
+        let pg = meta_from(json!({ "kind": "postgres", "display": "p", "time_filter": "{col} >= '{from}'" }));
+        let src = "SELECT who, amount FROM payments WHERE {{time}} ORDER BY amount DESC";
+        let (sql, fit) = apply_time(src, &pg, None);
+        assert_eq!(fit, TimeFit::NeedsRange);
+        assert!(!fit.runnable(), "this must NOT be sent to a database");
+        // Returned untouched, so what the tile can show is the statement as its
+        // author wrote it.
+        assert_eq!(sql, src);
+        assert!(fit.note("postgres").unwrap().contains("time range"));
+    }
+
+    /// Tiles name charts. A board read back must still name the same ones.
+    #[test]
+    fn a_dashboard_round_trips_with_its_charts_named() {
+        let d = Dashboard {
+            tiles: vec![
+                Tile { kind: TileKind::Chart, x: 0, y: 0, w: 6, h: 4, chart: "revenue".into(), text: String::new() },
+                Tile { kind: TileKind::Divider, x: 0, y: 4, w: 12, h: 1, chart: String::new(), text: String::new() },
+                Tile { kind: TileKind::Text, x: 0, y: 5, w: 12, h: 2, chart: String::new(), text: "Quarter to date".into() },
+            ],
+            time: Some(TimeRange { column: "ts".into(), from: "2026-01-01".into(), to: "2026-02-01".into() }),
+        };
+        let back: Dashboard = serde_json::from_str(&serde_json::to_string(&d).unwrap()).unwrap();
+        assert_eq!(back.tiles.len(), 3);
+        assert_eq!(back.tiles[0].chart, "revenue");
+        assert_eq!(back.tiles[0].kind, TileKind::Chart);
+        assert_eq!(back.tiles[2].text, "Quarter to date");
+        assert_eq!(back.time.unwrap().column, "ts");
     }
 
     /// An audit row parses field for field, and `stopped()` divides the rows

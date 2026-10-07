@@ -82,7 +82,7 @@ notification   {"method":"…","params":{…}}
 
 `proto` grows **additively**: a client accepts any engine reporting
 `proto >= its minimum`, so a newer engine keeps working with an older client.
-The current protocol is **7**. What each version added is listed in
+The current protocol is **8**. What each version added is listed in
 `src/rpc.rs` beside the constant.
 
 ### Handshake
@@ -255,6 +255,76 @@ A failure to write an audit row never fails the operation it describes: it is
 reported on `daemon.log` at `error` level, because refusing to run something on
 the grounds that the record could not be written is worse than a gap in the
 record that says loudly that it is a gap.
+
+### Dashboards (`proto >= 8`)
+
+A saved CHART is one statement read as a picture. A DASHBOARD is an arrangement
+of several of them on a grid of **twelve columns**, with the dividers and the
+words that say what the reader is looking at, and one time range they all answer
+to. Twelve because it divides by 2, 3, 4 and 6 — halves, thirds, quarters, and a
+sidebar beside a wide one.
+
+| method | params | result |
+|---|---|---|
+| `store.dashboards.list` | `{ conn }` | `{ dashboards }` — names and times only |
+| `store.dashboards.get` | `{ conn, name }` | `{ dashboard, stale, columns }` |
+| `store.dashboards.save` | `{ conn, name, dashboard }` | `{ saved, dashboard }` |
+| `store.dashboards.remove` | `{ conn, name }` | `{ removed }` |
+
+A tile is `{ kind, x, y, w, h, chart?, text? }`, where `kind` is `chart`,
+`divider` or `text`.
+
+**A chart tile references its chart BY NAME.** An index would move the moment a
+chart was renamed, removed or re-sorted, and the board would go on drawing
+confidently — with the wrong chart under the old heading. A name that no longer
+resolves is an error with the name in it, which is a thing somebody can fix.
+
+**What the engine refuses**, and why it is the engine that refuses it: a tile
+naming a chart that does not exist on this connection; a tile outside the twelve
+columns, or with no width or height; two tiles overlapping; a time range whose
+ends are not timestamps, or that runs backwards. A client could check all four.
+The point is that it does not have to be trusted to — a board saved by a client
+with a bug is a board that is wrong every time it is opened, by every client, for
+as long as it exists.
+
+A board that has become invalid since it was saved — usually because a chart it
+names was deleted from the other client — still comes back, with `stale` saying
+what is wrong. A layout somebody spent time on should be openable and repairable,
+not withheld.
+
+#### The shared time range
+
+`{ column, from, to }`. The ends are canonicalised to `YYYY-MM-DD[Thh:mm:ss]`
+by a deliberately strict reader, and anything that is not exactly a timestamp is
+refused — that is a safety check, not a parsing convenience, because the value is
+pasted into a statement by the driver's own template.
+
+Each driver declares `time_filter` in its `DriverMeta`: how THAT engine spells a
+time window, over `{col}`, `{from}` and `{to}`. PostgreSQL's is
+`{col} >= '{from}' AND {col} < '{to}'`; MongoDB's is a `$gte`/`$lt` document;
+Redis's is **empty**, because Redis has no such thing and an empty template is
+how a driver says so. Half-open at the top, so two adjacent ranges do not both
+contain the row on the boundary.
+
+A chart statement marks where the condition goes with `{{time}}`:
+
+```sql
+SELECT who, amount FROM payments WHERE {{time}} ORDER BY amount DESC
+```
+
+A statement **without** the marker is not time-filtered, and the board says so on
+that tile and counts them in the toolbar — a range that silently applies to four
+charts out of six is worse than one that says which two it missed. No client can
+know where in somebody's statement a condition belongs (before a `GROUP BY`,
+inside a sub-select, nowhere at all), and guessing would put a filter where it
+changes what the chart means.
+
+A statement **with** the marker and no range set does **not run**. The first
+version took the marker out, which left `… WHERE  ORDER BY …` behind, and the
+engine answered `near "ORDER": syntax error` — a terrible way to say "you have
+not picked a date". A chart written as `WHERE {{time}}` is a chart about a
+window; the honest answer when there is no window is to ask for one. The same
+goes for a marker on an engine with no `time_filter`.
 
 ### Notifications
 

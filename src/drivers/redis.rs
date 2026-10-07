@@ -87,6 +87,7 @@ const META: DriverMeta = DriverMeta {
     query_form: &[],
     query_template: "",
     browse_form: &[],
+    time_filter: "",
     builder_ops: &[],
 };
 
