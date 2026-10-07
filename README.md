@@ -456,6 +456,25 @@ goes for a marker on an engine with no `time_filter`.
 | `query.state` | `{ call_id, state, ms, error?, affected? }` — `running` / `done` / `failed` / `cancelled` |
 | `daemon.log` | `{ level, message }` |
 
+## The shell suites
+
+```
+scripts/build
+tests/all.sh              every suite, each under a ceiling, with its exit status
+tests/all.sh row dash     only those
+```
+
+`tests/all.sh` prints the time each suite took and the status it exited with,
+because two of them lied and neither was caught by reading the output.
+`profile.sh` printed all 26 of its checks and then hung for ever: its toy servers
+had inherited the engine's stdin pipe, so closing it never reached the engine as
+EOF. `tunnel.sh` printed `tunnel: PASS` and exited 1, because its cleanup trap ran
+`[ -n "$PID" ] && kill "$PID"` under `set -e` against a process that had already
+gone — the kill failed, the trap ended early, and its status became the script's.
+
+A suite that hangs reports nothing and stops everything behind it; a suite that
+passes and exits non-zero is worse, because the reason reads like a passing test.
+
 ## Talking to it by hand
 
 ```sh

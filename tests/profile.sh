@@ -38,7 +38,8 @@ IN=$WORK/in
 OUT=$WORK/out
 FAILED=0
 PROXY_PID=
-trap 'kill $PID $PROXY_PID 2>/dev/null || true' EXIT
+ECHO_PID=
+trap 'kill $PID $PROXY_PID $ECHO_PID 2>/dev/null || true' EXIT
 
 sqlite3 "$DB" "CREATE TABLE t(a INTEGER); INSERT INTO t VALUES (1),(2);"
 
@@ -219,7 +220,7 @@ while True:
     conn, _ = srv.accept()
     threading.Thread(target=one, args=(conn,), daemon=True).start()
 PY
-    python3 "$WORK/socks.py" > "$WORK/socks.port" 2>"$WORK/socks.err" &
+    python3 "$WORK/socks.py" > "$WORK/socks.port" 2>"$WORK/socks.err" 3>&- &
     PROXY_PID=$!
     i=0
     while [ ! -s "$WORK/socks.port" ] && [ $i -lt 50 ]; do sleep 0.1; i=$((i+1)); done
@@ -227,7 +228,7 @@ PY
 
     # Something on the far side for the proxy to reach: a listener that answers
     # and closes. The point is that the PROXY got there, not what it found.
-    python3 - "$WORK/echo.port" <<'PY' &
+    python3 - "$WORK/echo.port" 3>&- <<'PY' &
 import socket, sys, threading
 srv = socket.socket(); srv.bind(("127.0.0.1", 0)); srv.listen(4)
 open(sys.argv[1], "w").write(str(srv.getsockname()[1]))
@@ -279,6 +280,16 @@ else
     printf '     %-48s %s\n' "no python3 for the toy proxy" "skipped"
 fi
 
+# Shut everything this suite started, THEN close the pipe, THEN wait with a
+# ceiling. Unlike the other suites this one stands up toy servers, and the first
+# version ended on a bare `wait $PID`: the servers had inherited fd 3, so the
+# engine never saw EOF and the whole suite hung after its last check with every
+# assertion passed. A test that hangs reports nothing, which is worse than
+# reporting a failure — and in a sequence it stops everything behind it.
+kill $PROXY_PID $ECHO_PID 2>/dev/null || true
 exec 3>&-
-wait $PID 2>/dev/null || true
+i=0
+while kill -0 $PID 2>/dev/null && [ $i -lt 50 ]; do sleep 0.1; i=$((i + 1)); done
+kill $PID 2>/dev/null || true
 if [ "$FAILED" -eq 0 ]; then echo "profile: PASS"; else echo "profile: FAIL"; exit 1; fi
+exit 0

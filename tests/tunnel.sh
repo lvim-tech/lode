@@ -43,9 +43,15 @@ fi
 WORK=$(mktemp -d)
 SSHD_PID=""
 ENGINE_PID=""
+# Every line ends in `|| true`, and that is not belt and braces. This runs
+# under `set -e`, and `[ -n x ] && kill x` returns non-zero when the process has
+# already gone — which ends the TRAP early, before `return 0`, and the failed
+# kill becomes the script's exit status. The suite printed "tunnel: PASS" and
+# exited 1, which is the worst of both: a sequence stops and the reason reads
+# like a passing test.
 cleanup() {
-    [ -n "$SSHD_PID" ] && kill "$SSHD_PID" 2>/dev/null
-    [ -n "$ENGINE_PID" ] && kill "$ENGINE_PID" 2>/dev/null
+    [ -n "$SSHD_PID" ] && kill "$SSHD_PID" 2>/dev/null || true
+    [ -n "$ENGINE_PID" ] && kill "$ENGINE_PID" 2>/dev/null || true
     return 0
 }
 trap cleanup EXIT
