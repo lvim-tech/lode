@@ -16,8 +16,8 @@ use gpui::{div, px, Context, Entity, SharedString, WeakEntity, Window};
 use serde_json::{json, Value};
 
 use crate::app::Workspace;
-use crate::form::{path_problem, tunnel_auth_json, Field, Source, Stash};
-use crate::input::{InputColors, TextInput};
+use crate::form::{path_problem, pick_file, tunnel_auth_json, Field, Source};
+use crate::input::TextInput;
 use crate::metrics::Metrics;
 use crate::theme::Theme;
 
@@ -223,7 +223,52 @@ impl Render for ProfileForm {
         body = body.child(methods);
 
         if self.auth == "key" {
-            body = body.child(row("Key file", self.key_path.clone()));
+            // The same system chooser the connection window offers, and the
+            // same check on what it returns.
+            let target = self.key_path.clone();
+            body = body.child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .py(px(2.0))
+                    .child(
+                        div()
+                            .w(px(ms.label_w()))
+                            .flex_none()
+                            .text_size(ms.small())
+                            .text_color(t.muted())
+                            .child("Key file"),
+                    )
+                    .child(div().flex_1().text_size(ms.body()).child(self.key_path.clone()))
+                    .child(
+                        div()
+                            .id("pick-profile-key")
+                            .flex_none()
+                            .px_2()
+                            .cursor_pointer()
+                            .border_1()
+                            .border_color(t.border())
+                            .hover(|d| d.bg(t.hover()))
+                            .text_size(ms.small())
+                            .text_color(t.fg())
+                            .child("browse\u{2026}")
+                            .on_click(cx.listener(move |_this, _, _, cx| {
+                                let me = cx.entity().downgrade();
+                                pick_file(
+                                    target.clone(),
+                                    move |why, cx| {
+                                        let _ = me.update(cx, |f: &mut ProfileForm, cx| {
+                                            f.error = Some(why);
+                                            cx.notify();
+                                        });
+                                    },
+                                    cx,
+                                );
+                                cx.notify();
+                            })),
+                    ),
+            );
             if let Some(why) = self.key_problem(cx) {
                 body = body.child(small(why.into(), t.error()));
             }

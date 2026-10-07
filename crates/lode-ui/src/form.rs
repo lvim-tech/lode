@@ -700,6 +700,54 @@ pub fn auth_json(p: AuthParts<'_>) -> Value {
     }
 }
 
+/// Open the system file chooser and put what comes back in `input`.
+///
+/// The SYSTEM one, through GPUI, which on Linux goes to `xdg-desktop-portal` —
+/// so it is the dialog the rest of this desktop uses, with its own bookmarks and
+/// places, and it works under Wayland like everything else here. Checked before
+/// relying on it: the portal and its GTK backend are both running on this
+/// machine.
+///
+/// The field stays a TEXT field and this is an addition to it. A path can come
+/// from a variable, from a script, or from a machine where no portal answers,
+/// and a typed path must never be the harder road.
+///
+/// When the portal cannot be reached the button SAYS so rather than doing
+/// nothing — a control that silently fails is one somebody presses twice and
+/// then stops trusting.
+pub fn pick_file<F>(input: Entity<TextInput>, on_fail: F, cx: &mut gpui::App)
+where
+    F: FnOnce(String, &mut gpui::AsyncApp) + 'static,
+{
+    let rx = cx.prompt_for_paths(gpui::PathPromptOptions {
+        files: true,
+        directories: false,
+        multiple: false,
+        prompt: Some("Choose".into()),
+    });
+    cx.spawn(async move |cx: &mut gpui::AsyncApp| {
+        match rx.await {
+            // A path was chosen.
+            Ok(Ok(Some(paths))) => {
+                if let Some(p) = paths.into_iter().next() {
+                    let text = p.to_string_lossy().to_string();
+                    let _ = input.update(cx, |i, cx| i.set_text(text, cx));
+                }
+            }
+            // Cancelled: nothing to say and nothing to change.
+            Ok(Ok(None)) => {}
+            Ok(Err(e)) => on_fail(format!("the file chooser could not open: {e}"), cx),
+            Err(_) => on_fail(
+                "the file chooser did not answer — this desktop may have no \
+                 xdg-desktop-portal running"
+                    .to_string(),
+                cx,
+            ),
+        }
+    })
+    .detach();
+}
+
 /// A tunnel's auth, as the engine's `TunnelAuth`.
 ///
 /// ONE builder, used by the connection window and by the profile window alike.
@@ -918,6 +966,110 @@ impl ConnectionForm {
             return Some("a key file is needed, or choose another method".into());
         }
         path_problem(path)
+    }
+
+    /// A path field: the box, and a button that opens the system chooser.
+    ///
+    /// The chosen path goes into the SAME box a typed one would, so it meets
+    /// exactly the same check (`path_problem`) and there are not two answers
+    /// about one file.
+    fn path_row(
+        &self,
+        label: &'static str,
+        input: &Entity<TextInput>,
+        id: &'static str,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let (t, ms) = (&self.theme, self.scale);
+        let target = input.clone();
+        div()
+            .flex()
+            .items_center()
+            .gap_2()
+            .py(px(2.0))
+            .child(div().w(px(ms.label_w())).flex_none().child(self.small(label, t.muted())))
+            .child(div().flex_1().text_size(ms.body()).child(input.clone()))
+            .child(
+                div()
+                    .id(SharedString::from(id))
+                    .flex_none()
+                    .px_2()
+                    .cursor_pointer()
+                    .border_1()
+                    .border_color(t.border())
+                    .hover(|d| d.bg(t.hover()))
+                    .text_size(ms.small())
+                    .text_color(t.fg())
+                    .child("browse\u{2026}")
+                    .on_click(cx.listener(move |_this, _, _, cx| {
+                        let me = cx.entity().downgrade();
+                        pick_file(
+                            target.clone(),
+                            move |why, cx| {
+                                // The reason lands in the window, beside the
+                                // button. A control that fails in silence is one
+                                // somebody presses twice and then stops trusting.
+                                let _ = me.update(cx, |f: &mut ConnectionForm, cx| {
+                                    f.error = Some(why);
+                                    cx.notify();
+                                });
+                            },
+                            cx,
+                        );
+                        cx.notify();
+                    })),
+            )
+    }
+
+    /// `path_row` for a label and id only known at runtime.
+    fn path_row_dyn(
+        &self,
+        label: &str,
+        input: &Entity<TextInput>,
+        key: &str,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let (t, ms) = (&self.theme, self.scale);
+        let target = input.clone();
+        div()
+            .flex()
+            .items_center()
+            .gap_2()
+            .py(px(2.0))
+            .child(
+                div()
+                    .w(px(ms.label_w()))
+                    .flex_none()
+                    .child(self.small(label.to_string(), t.muted())),
+            )
+            .child(div().flex_1().text_size(ms.body()).child(input.clone()))
+            .child(
+                div()
+                    .id(SharedString::from(format!("pick-{key}")))
+                    .flex_none()
+                    .px_2()
+                    .cursor_pointer()
+                    .border_1()
+                    .border_color(t.border())
+                    .hover(|d| d.bg(t.hover()))
+                    .text_size(ms.small())
+                    .text_color(t.fg())
+                    .child("browse\u{2026}")
+                    .on_click(cx.listener(move |_this, _, _, cx| {
+                        let me = cx.entity().downgrade();
+                        pick_file(
+                            target.clone(),
+                            move |why, cx| {
+                                let _ = me.update(cx, |f: &mut ConnectionForm, cx| {
+                                    f.error = Some(why);
+                                    cx.notify();
+                                });
+                            },
+                            cx,
+                        );
+                        cx.notify();
+                    })),
+            )
     }
 
     /// A small icon in a fixed square, the same one the main window uses.
@@ -1162,6 +1314,13 @@ impl Render for ConnectionForm {
                     // TYPE: a client that matched the key `aws_profile` would
                     // need editing for the next driver that wants one, and would
                     // be guessing at a name instead of reading a declaration.
+                    // A driver's own FILE parameter — sqlite, duckdb,
+                    // firebird — gets the chooser too, by TYPE rather than by
+                    // the client knowing those three by name.
+                    if kind == "file" {
+                        body = body.child(self.path_row_dyn(&label, &input, &key, cx));
+                        continue;
+                    }
                     if kind == "aws_profile" {
                         let mut pick = div().flex().flex_wrap().items_center().gap_1().py_1().child(
                             div().w(px(ms.label_w())).child(self.small(label.clone(), t.muted())),
@@ -1264,8 +1423,9 @@ impl Render for ConnectionForm {
                         body = body.child(self.row("Password", &i, src, true, "auth-password".into(), cx));
                     }
                     "client_cert" => {
-                        body = body.child(plain(self, "Certificate", &self.auth_cert));
-                        body = body.child(plain(self, "Key", &self.auth_key));
+                        let (c, k) = (self.auth_cert.clone(), self.auth_key.clone());
+                        body = body.child(self.path_row("Certificate", &c, "pick-cert", cx));
+                        body = body.child(self.path_row("Key", &k, "pick-ckey", cx));
                         if let Some(why) = self.auth_file_problem(cx) {
                             body = body.child(self.small(why, t.error()));
                         }
@@ -1573,24 +1733,8 @@ impl Render for ConnectionForm {
                     // Each method shows ITS OWN fields. Nothing a method writes
                     // is read back by another one.
                     if self.tunnel_auth == "key" {
-                        body = body.child(
-                            div()
-                                .flex()
-                                .items_center()
-                                .gap_2()
-                                .py(px(2.0))
-                                .child(
-                                    div()
-                                        .w(px(ms.label_w()))
-                                        .child(self.small("Key file", t.muted())),
-                                )
-                                .child(
-                                    div()
-                                        .flex_1()
-                                        .text_size(ms.body())
-                                        .child(self.tunnel_key_path.clone()),
-                                ),
-                        );
+                        let kp = self.tunnel_key_path.clone();
+                        body = body.child(self.path_row("Key file", &kp, "pick-tkey", cx));
                         if let Some(why) = self.key_path_problem(cx) {
                             body = body.child(self.small(why, t.error()));
                         }
