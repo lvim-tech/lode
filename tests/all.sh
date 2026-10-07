@@ -22,6 +22,28 @@
 
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 LIMIT=${LODE_TEST_TIMEOUT:-180}
+
+# THE BINARY MUST BE NEWER THAN THE SOURCE.
+#
+# Twice now a result has been read off a build that never happened: an edit was
+# applied, the build step was skipped or failed, and the suite exercised the
+# previous binary. The output looks exactly like a real run — which is the whole
+# problem, because a passing test of the wrong code is worse than no test.
+#
+# A check, not a habit. Habits are what the last two failures were made of.
+BIN=${LODE_DAEMON:-$ROOT/build/loded}
+[ -x "$BIN" ] || BIN=$ROOT/target/release/loded
+if [ -x "$BIN" ]; then
+    NEWER=$(find "$ROOT/src" "$ROOT/Cargo.toml" -newer "$BIN" -print -quit 2>/dev/null)
+    if [ -n "$NEWER" ]; then
+        echo "all: STALE — $BIN is older than $NEWER" >&2
+        echo "     run scripts/build first; a pass here would be a pass for the previous build" >&2
+        exit 2
+    fi
+else
+    echo "all: no engine binary — run scripts/build first" >&2
+    exit 2
+fi
 SUITES=${*:-"smoke row dash hook tunnel profile access mcp driver"}
 LOGS=$(mktemp -d)
 BAD=0

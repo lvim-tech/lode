@@ -25,6 +25,8 @@ mod registry;
 mod rpc;
 mod runner;
 mod secret;
+#[cfg(feature = "aws")]
+mod sigv4;
 mod server;
 mod spec;
 mod store;

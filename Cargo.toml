@@ -48,6 +48,11 @@ anyhow = "1"
 # full thirty seconds for a timeout it set at four hundred milliseconds.
 # Already in the dependency tree; this only makes it reachable from here.
 libc = "0.2"
+# AWS SigV4, for the drivers whose database is an HTTP API. The signing is the
+# part that is actually testable offline (AWS publishes canonical vectors), so
+# it is written here rather than taken from a crate that would hide it.
+sha2 = { version = "0.9", optional = true }
+hmac = { version = "0.10", optional = true }
 
 # ── driver crates, each behind a feature so a build can pick its DB set ───────
 # tokio-postgres also backs the cockroachdb registry alias (postgres wire).
@@ -92,6 +97,8 @@ redis = { version = "0.27", optional = true, features = [
 # ClickHouse + Snowflake speak HTTP; reqwest with rustls (no OpenSSL) is the seam
 # (the client needs DYNAMIC result columns, which the typed `clickhouse` crate is
 # not built for — the HTTP JSONCompact interface gives them directly).
+# Shared by every driver whose database is an HTTP API: clickhouse, s3,
+# dynamodb, cloudwatch, influxdb and the remote half of libsql.
 reqwest = { version = "0.12", optional = true, default-features = false, features = [
     "rustls-tls",
     "json",
@@ -125,6 +132,12 @@ default = [
     "tunnel",
     "postgres",
     "cockroachdb",
+    "redshift",
+    "s3",
+    "dynamodb",
+    "cloudwatch",
+    "influxdb",
+    "libsql",
     "mariadb",
     "mysql",
     "mongodb",
@@ -144,6 +157,16 @@ tls = ["dep:rustls", "dep:rustls-pemfile", "dep:rustls-native-certs", "dep:tokio
 tunnel = ["dep:russh", "tls"]
 postgres = ["dep:tokio-postgres", "dep:tokio-postgres-rustls", "tls"]
 cockroachdb = ["postgres"] # registry alias over the postgres wire driver
+# The drivers whose database is an HTTP API. `aws` is the signing they share.
+aws = ["dep:sha2", "dep:hmac", "dep:reqwest", "tls"]
+s3 = ["aws"]
+dynamodb = ["aws"]
+cloudwatch = ["aws"]
+# InfluxDB is a token, not a signature: no AWS signing in it.
+influxdb = ["dep:reqwest", "tls"]
+# A LOCAL libSQL file is a SQLite file, so that half is the sqlite driver.
+libsql = ["dep:reqwest", "tls", "sqlite"]
+redshift = ["postgres"]    # the same: Redshift speaks the PostgreSQL wire
 mariadb = ["dep:mysql_async", "tls"]
 mysql = ["dep:mysql_async", "tls"] # same impl as mariadb, distinct registry kind
 mongodb = ["dep:mongodb", "tls"]

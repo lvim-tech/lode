@@ -194,6 +194,43 @@ time. The source file is only read.
 The database lives at `$LODE_DATA_DIR/lode.db`, else
 `$XDG_DATA_HOME/lode/lode.db`, else `~/.local/share/lode/lode.db`.
 
+### The cloud drivers, and what is NOT verified about them
+
+`redshift`, `libsql`, `s3`, `dynamodb`, `cloudwatch` and `influxdb` complete the
+driver list. **None of their network halves has been run against a real server**,
+because there is neither here. Rather than claim otherwise, each one splits in
+two and only the untested half is untested:
+
+| driver | verified here | NOT verified |
+|---|---|---|
+| `redshift` | that the alias registers and carries its own metadata | the wire, which is the postgres driver's |
+| `libsql` | **the whole local half** — a libSQL file is a SQLite file, opened by the sqlite driver; and the Turso request/answer shapes | the HTTP round trip to Turso |
+| `s3` | the command language, the request each command becomes, the AWS/R2/MinIO endpoint rules, the XML parsed into rows, the errors | the HTTP round trip |
+| `dynamodb` | the request document, which call it becomes, every attribute type, documents with differing attributes, the errors | the HTTP round trip |
+| `cloudwatch` | the command language, the time arithmetic in UTC, the request bodies, the answers | the HTTP round trip |
+| `influxdb` | which version a connection is, both request shapes, both answer formats, and the danger rules for InfluxQL *and* Flux | the HTTP round trip |
+
+The AWS **signing** is verified, and is the reason it is written out here rather
+than taken from a crate: AWS publishes a canonical derivation, so the signing key
+is checked against an answer somebody else computed. A signer tested against
+itself proves only that it is consistent, which a wrong signer also is.
+
+The four whose network half is untested **refuse to connect**, and say so in
+those words. Offering a connection that has never been made would be exactly the
+green that means nothing. `libsql` does not refuse for a local file, because that
+half really is tested.
+
+Two bugs the tests found before any server could have:
+
+* Every Flux script begins `from(`, and the default SQL rule treats an
+  unrecognised leading verb as a write — so a read-only connection would have
+  refused every Flux **read**. Flux is now judged by its own rule, where `to()`
+  is the only thing that writes.
+* InfluxDB v2's annotated CSV has one fewer `#datatype` entry than a data line,
+  because every line starts with InfluxDB's own empty column. Typing each raw
+  field by its index was off by one the whole way across: `table` read as a date,
+  `_time` as a number.
+
 ### External drivers (`proto >= 13`)
 
 A program that speaks a small protocol on its stdio **is** a driver. It appears

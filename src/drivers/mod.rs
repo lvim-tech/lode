@@ -72,6 +72,16 @@ pub mod sqlite;
 #[cfg(feature = "duckdb")]
 pub mod duckdb;
 
+#[cfg(feature = "cloudwatch")]
+pub mod cloudwatch;
+#[cfg(feature = "dynamodb")]
+pub mod dynamodb;
+#[cfg(feature = "influxdb")]
+pub mod influxdb;
+#[cfg(feature = "libsql")]
+pub mod libsql;
+#[cfg(feature = "s3")]
+pub mod s3;
 #[cfg(feature = "redis")]
 pub mod redis;
 

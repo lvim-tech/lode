@@ -28,6 +28,8 @@ impl Registry {
             reg.add(Arc::new(crate::drivers::postgres::PostgresDriver::postgres()));
             #[cfg(feature = "cockroachdb")]
             reg.add(Arc::new(crate::drivers::postgres::PostgresDriver::cockroachdb()));
+            #[cfg(feature = "redshift")]
+            reg.add(Arc::new(crate::drivers::postgres::PostgresDriver::redshift()));
         }
 
         #[cfg(feature = "mariadb")]
@@ -43,6 +45,21 @@ impl Registry {
 
         #[cfg(feature = "duckdb")]
         reg.add(Arc::new(crate::drivers::duckdb::DuckdbDriver::new()));
+
+        #[cfg(feature = "dynamodb")]
+        reg.add(Arc::new(crate::drivers::dynamodb::DynamoDriver::new()));
+
+        #[cfg(feature = "cloudwatch")]
+        reg.add(Arc::new(crate::drivers::cloudwatch::CloudwatchDriver::new()));
+
+        #[cfg(feature = "influxdb")]
+        reg.add(Arc::new(crate::drivers::influxdb::InfluxDriver::new()));
+
+        #[cfg(feature = "libsql")]
+        reg.add(Arc::new(crate::drivers::libsql::LibsqlDriver::new()));
+
+        #[cfg(feature = "s3")]
+        reg.add(Arc::new(crate::drivers::s3::S3Driver::new()));
 
         #[cfg(feature = "redis")]
         reg.add(Arc::new(crate::drivers::redis::RedisDriver::new()));

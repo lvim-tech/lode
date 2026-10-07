@@ -114,8 +114,43 @@ const CRDB_META: DriverMeta = DriverMeta {
     builder_ops: PG_BUILDER_OPS,
 };
 
-/// The Postgres-wire driver. One impl serves both the `postgres` and
-/// `cockroachdb` registry kinds (they differ only in metadata/defaults).
+/// Amazon Redshift, which speaks the PostgreSQL wire protocol.
+///
+/// A registry alias and nothing more, for the same reason CockroachDB is one:
+/// the wire is the same, so a second implementation would be the same code with
+/// a second set of bugs. What differs is the metadata — the port, the name, and
+/// a hint that says what Redshift is actually for.
+///
+/// NOT VERIFIED against a real Redshift cluster: there is none here and no
+/// network. What IS verified is that the alias registers, resolves, and carries
+/// its own metadata — which is the whole of what an alias adds. The wire
+/// underneath is the postgres driver, which is the one that was already there.
+#[cfg(feature = "redshift")]
+const REDSHIFT_META: DriverMeta = DriverMeta {
+    kind: "redshift",
+    display: "Amazon Redshift",
+    default_port: Some(5439),
+    params: PARAMS,
+    auth: AUTH,
+    caps: Caps {
+        // Redshift has no per-object CREATE to ask for the way PostgreSQL does
+        // (`pg_get_tabledef` is not there), so the drawer does not offer a
+        // helper that would dead-end.
+        ddl: false,
+        ..PG_META.caps
+    },
+    hint: "SELECT * FROM table LIMIT 100",
+    browse: "SELECT {columns} FROM {qualified} {clauses} LIMIT {limit};",
+    browse_by_kind: &[],
+    query_form: &[],
+    query_template: "",
+    browse_form: crate::spec::SQL_BROWSE_FORM,
+    time_filter: crate::spec::SQL_TIME_FILTER,
+    builder_ops: PG_BUILDER_OPS,
+};
+
+/// The Postgres-wire driver. One impl serves the `postgres`, `cockroachdb` and
+/// `redshift` registry kinds (they differ only in metadata/defaults).
 pub struct PostgresDriver {
     meta: &'static DriverMeta,
 }
@@ -128,6 +163,11 @@ impl PostgresDriver {
     #[cfg(feature = "cockroachdb")]
     pub fn cockroachdb() -> Self {
         Self { meta: &CRDB_META }
+    }
+
+    #[cfg(feature = "redshift")]
+    pub fn redshift() -> Self {
+        Self { meta: &REDSHIFT_META }
     }
 }
 
