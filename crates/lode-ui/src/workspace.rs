@@ -243,6 +243,12 @@ pub struct Tab {
     pub ddl: Option<String>,
     /// A cell being edited: which row, which column.
     pub editing: Option<(usize, usize)>,
+    /// Which document the JSON view has open for editing, if any.
+    ///
+    /// A whole document at once, not a field at a time: for a document store
+    /// that IS the unit somebody thinks in, and all its changed fields go in
+    /// one `row.write` — one classification, one confirmation, one audit row.
+    pub editing_doc: Option<usize>,
     /// What the visual builder has been told so far.
     pub builder: Builder,
     /// Which measurement the chart is drawing, when the result has several.
@@ -621,6 +627,7 @@ impl Tab {
             indexes: Vec::new(),
             ddl: None,
             editing: None,
+            editing_doc: None,
             builder: Builder::default(),
             chart_col: None,
             chart_measure: None,

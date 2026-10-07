@@ -555,10 +555,16 @@ mod tests {
     #[tokio::test]
     async fn a_program_that_is_not_there_says_so() {
         let e = probe("exec /nonexistent-driver-program").await.unwrap_err().to_string();
+        // Which of the three it is depends on how far the shell got before it
+        // gave up, and all three are true sentences about the same situation.
+        // What matters is that NONE of them is the name of a system call.
         assert!(
-            e.contains("closed its output") || e.contains("could not start"),
+            e.contains("closed its output")
+                || e.contains("could not start")
+                || e.contains("exited before it could be asked"),
             "{e}"
         );
+        assert!(!e.contains("os error"), "it should not name a system call: {e}");
     }
 
     #[tokio::test]

@@ -1425,7 +1425,11 @@ impl Workspace {
                 let reason = v.get("reason").and_then(|r| r.as_str()).map(str::to_string);
                 if let Some(t) = self.tabs.iter_mut().find(|t| t.id == tab) {
                     t.pending_write = Some(PendingWrite { statement, reason, key, set, delete, row });
+                    // The boxes close once the engine has described the write:
+                    // what is on screen from here is the PLAN and the question
+                    // about it, not the typing that produced it.
                     t.editing = None;
+                    t.editing_doc = None;
                 }
             }
             Pending::RowApply { tab } => {
@@ -1567,6 +1571,7 @@ impl Workspace {
                 if let Some(t) = self.tabs.iter_mut().find(|t| t.id == tab) {
                     t.pending_write = None;
                     t.editing = None;
+                    t.editing_doc = None;
                 }
                 // A refused write is the most important thing on the screen: it
                 // is both the reason nothing happened and, usually, the reason
@@ -3114,6 +3119,85 @@ impl Workspace {
             return;
         }
         self.propose_write(tab_id, row, vec![(name, value)], false, cx);
+    }
+
+    /// Open one document for editing, as a whole.
+    ///
+    /// Every writable top-level field gets a box, filled in. The alternative —
+    /// a JSON text editor — would mean building a multi-line text widget inside
+    /// the same component that masks passwords, and a parse error would become
+    /// a new way to lose an edit. A document is a set of fields; this edits the
+    /// set, and sends it as one write.
+    fn begin_doc_edit(&mut self, tab_id: u64, row: usize, cx: &mut Context<Self>) {
+        let Some(idx) = self.tabs.iter().position(|t| t.id == tab_id) else { return };
+        if !self.meta(&self.tabs[idx].driver).map_or(false, |m| m.caps.edit) {
+            let d = self.tabs[idx].driver.clone();
+            self.toast(format!("the {d} driver does not edit rows"), true);
+            return;
+        }
+        if let Err(why) = row_key(&self.tabs[idx], row) {
+            self.toast(why, true);
+            return;
+        }
+        let colors = input_colors(&self.theme);
+        let cols: Vec<(usize, String)> = self.tabs[idx]
+            .columns
+            .iter()
+            .enumerate()
+            .map(|(i, c)| (i, c.name.clone()))
+            .collect();
+        for (ci, name) in cols {
+            if !column_editable(&self.tabs[idx], ci) {
+                continue;
+            }
+            let now = self.tabs[idx]
+                .rows
+                .get(row)
+                .and_then(|r| r.get(ci))
+                .map(|v| cell_text(v).unwrap_or_default())
+                .unwrap_or_default();
+            let input = cx.new(|cx| {
+                let mut i = TextInput::new(cx, "", colors);
+                i.set_text(now, cx);
+                i
+            });
+            self.inputs.insert((tab_id, format!("doc-{name}")), input);
+        }
+        self.tabs[idx].editing_doc = Some(row);
+        cx.notify();
+    }
+
+    /// Send every field that CHANGED, as one write.
+    ///
+    /// Unchanged fields are left out rather than rewritten with what they
+    /// already hold: a write that touches a column somebody did not edit is a
+    /// write they did not ask for, and it would show up in the audit log as one.
+    fn commit_doc_edit(&mut self, tab_id: u64, cx: &mut Context<Self>) {
+        let Some(idx) = self.tabs.iter().position(|t| t.id == tab_id) else { return };
+        let Some(row) = self.tabs[idx].editing_doc else { return };
+        let cols: Vec<(usize, String)> = self.tabs[idx]
+            .columns
+            .iter()
+            .enumerate()
+            .map(|(i, c)| (i, c.name.clone()))
+            .collect();
+        let mut set: Vec<(String, Value)> = Vec::new();
+        for (ci, name) in cols {
+            let Some(input) = self.inputs.get(&(tab_id, format!("doc-{name}"))) else { continue };
+            let typed = input.read(cx).text().to_string();
+            let was = self.tabs[idx].rows.get(row).and_then(|r| r.get(ci)).cloned();
+            let value = parse_cell(&typed, was.as_ref());
+            if Some(&value) != was.as_ref() {
+                set.push((name, value));
+            }
+        }
+        if set.is_empty() {
+            self.tabs[idx].editing_doc = None;
+            self.toast("nothing changed".to_string(), false);
+            cx.notify();
+            return;
+        }
+        self.propose_write(tab_id, row, set, false, cx);
     }
 
     fn cancel_active(&mut self) {
@@ -4865,7 +4949,7 @@ impl Workspace {
         let view = match tab.view {
             ResultView::Table => self.table_el(tab, cx),
             ResultView::Tree => self.tree_el(tab, cx),
-            ResultView::Json => self.json_el(tab),
+            ResultView::Json => self.json_el(tab, cx),
             ResultView::Chart => self.chart_el(tab, cx),
         };
         // The detail panel sits BESIDE the grid, not over it: the row it is
@@ -6833,36 +6917,160 @@ impl Workspace {
         out.into_any_element()
     }
 
-    fn json_el(&self, tab: &Tab) -> gpui::AnyElement {
-        let t = self.t();
-        let ms = self.scale;
-        let docs: Vec<Value> = (0..tab.rows.len().min(200)).map(|i| tab.document(i)).collect();
+    fn json_el(&self, tab: &Tab, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let (t, ms) = (self.t(), self.scale);
+        let tab_id = tab.id;
+        let can_edit = self.meta(&tab.driver).map_or(false, |m| m.caps.edit)
+            && tab.object.is_some();
         // `to_string_pretty` is fixed at two spaces, so the indent is chosen by
         // handing the formatter the exact run of spaces to use.
         let pad = " ".repeat(self.json_indent as usize);
-        let mut buf = Vec::new();
-        let fmt = serde_json::ser::PrettyFormatter::with_indent(pad.as_bytes());
-        let mut ser = serde_json::Serializer::with_formatter(&mut buf, fmt);
-        let text = match serde::Serialize::serialize(&docs, &mut ser) {
-            Ok(()) => String::from_utf8(buf).unwrap_or_else(|_| "[]".into()),
-            Err(_) => "[]".into(),
+        let render = |v: &Value| -> String {
+            let mut buf = Vec::new();
+            let fmt = serde_json::ser::PrettyFormatter::with_indent(pad.as_bytes());
+            let mut ser = serde_json::Serializer::with_formatter(&mut buf, fmt);
+            match serde::Serialize::serialize(v, &mut ser) {
+                Ok(()) => String::from_utf8(buf).unwrap_or_else(|_| "{}".into()),
+                Err(_) => "{}".into(),
+            }
         };
-        // A long line is scrolled to, not wrapped: a JSON document rewrapped at
-        // the window's edge stops lining up, and lining up is what reading it
-        // as a tree depends on.
-        div()
-            .id("json-view")
-            .size_full()
-            .overflow_x_scroll()
-            .p_2()
-            .child(
-                div()
-                    .whitespace_nowrap()
-                    .text_size(ms.small())
-                    .text_color(t.fg())
-                    .child(SharedString::from(text)),
-            )
-            .into_any_element()
+
+        let mut out = div().id("json-view").size_full().overflow_y_scroll().p_2();
+        // One block per DOCUMENT rather than one blob for all of them. A blob
+        // can be read and nothing in it can be pointed at; a document that can
+        // be pointed at is a document that can be edited.
+        for i in 0..tab.rows.len().min(200) {
+            let doc = tab.document(i);
+            let editing = tab.editing_doc == Some(i);
+            let mut block = div()
+                .flex()
+                .flex_col()
+                .w_full()
+                .py_1()
+                .border_b_1()
+                .border_color(t.border());
+            let mut head = div()
+                .flex()
+                .items_center()
+                .gap_2()
+                .child(self.small(format!("{}", i + 1), t.line_nr()));
+            if can_edit && !editing {
+                head = head.child(
+                    div()
+                        .id(SharedString::from(format!("jedit-{tab_id}-{i}")))
+                        .px_1()
+                        .cursor_pointer()
+                        .hover(|d| d.bg(t.hover()))
+                        .text_size(ms.tiny())
+                        .text_color(t.accent())
+                        .child("edit")
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.begin_doc_edit(tab_id, i, cx);
+                        })),
+                );
+            }
+            block = block.child(head);
+
+            if editing {
+                // Every writable field at once. Saving sends only what CHANGED,
+                // as a single `row.write` — one classification, one
+                // confirmation, one audit row for one document.
+                for (ci, col) in tab.columns.iter().enumerate() {
+                    let Some(input) = self.inputs.get(&(tab_id, format!("doc-{}", col.name)))
+                    else {
+                        // Not editable: shown, so the document still reads whole.
+                        let shown = tab
+                            .rows
+                            .get(i)
+                            .and_then(|r| r.get(ci))
+                            .map(|v| preview(v))
+                            .unwrap_or_default();
+                        block = block.child(
+                            div()
+                                .flex()
+                                .gap_2()
+                                .py(px(1.0))
+                                .child(div().w(px(ms.base() * 9.0)).child(
+                                    self.small(col.name.clone(), t.muted()),
+                                ))
+                                .child(self.small(shown, t.muted())),
+                        );
+                        continue;
+                    };
+                    block = block.child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .py(px(1.0))
+                            .child(
+                                div()
+                                    .w(px(ms.base() * 9.0))
+                                    .flex_none()
+                                    .child(self.small(col.name.clone(), t.fg())),
+                            )
+                            .child(div().flex_1().child(self.field(ms.small(), input.clone()))),
+                    );
+                }
+                block = block.child(
+                    div()
+                        .flex()
+                        .gap_2()
+                        .py_1()
+                        .child(
+                            div()
+                                .id(SharedString::from(format!("jsave-{tab_id}-{i}")))
+                                .px_2()
+                                .cursor_pointer()
+                                .border_1()
+                                .border_color(t.accent())
+                                .text_size(ms.small())
+                                .text_color(t.fg())
+                                .child("save this document")
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.commit_doc_edit(tab_id, cx);
+                                    cx.notify();
+                                })),
+                        )
+                        .child(
+                            div()
+                                .id(SharedString::from(format!("jcancel-{tab_id}-{i}")))
+                                .px_2()
+                                .cursor_pointer()
+                                .text_size(ms.small())
+                                .text_color(t.muted())
+                                .child("cancel")
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    if let Some(tb) =
+                                        this.tabs.iter_mut().find(|x| x.id == tab_id)
+                                    {
+                                        tb.editing_doc = None;
+                                    }
+                                    cx.notify();
+                                })),
+                        ),
+                );
+            } else {
+                // A long line is scrolled to, not wrapped: a JSON document
+                // rewrapped at the window's edge stops lining up, and lining up
+                // is what reading it as a tree depends on.
+                block = block.child(
+                    div()
+                        .id(SharedString::from(format!("jdoc-{tab_id}-{i}")))
+                        .w_full()
+                        .overflow_x_scroll()
+                        .child(
+                            div()
+                                .whitespace_nowrap()
+                                .text_size(ms.small())
+                                .text_color(t.fg())
+                                .child(SharedString::from(render(&doc))),
+                        ),
+                );
+            }
+            out = out.child(block);
+        }
+        out.into_any_element()
     }
 
     fn tasks_el(&self, cx: &mut Context<Self>) -> impl IntoElement {
