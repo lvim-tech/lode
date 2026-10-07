@@ -344,17 +344,30 @@ mod tunnel {
             let authed = match &spec.auth {
                 TunnelAuth::Password { password } => {
                     let pw = password.resolve().await?;
-                    session
-                        .authenticate_password(&spec.user, pw)
-                        .await
-                        .map_err(|e| anyhow::anyhow!("ssh password auth failed: {e}"))?
-                        .success()
+                    // The resolved value is alive only here, so this is where a
+                    // failure that quotes it can be cleaned. It dies at the end
+                    // of this arm, as it always did.
+                    crate::audit::scrubbing(
+                        &pw,
+                        session
+                            .authenticate_password(&spec.user, pw.clone())
+                            .await
+                            .map_err(|e| anyhow::anyhow!("ssh password auth failed: {e}")),
+                    )?
+                    .success()
                 }
                 TunnelAuth::Key { path, passphrase } => {
                     let pass = passphrase.resolve().await?;
                     let pass_opt = if pass.is_empty() { None } else { Some(pass.as_str()) };
-                    let key = russh::keys::load_secret_key(path, pass_opt)
-                        .map_err(|e| anyhow::anyhow!("cannot load ssh key '{path}': {e}"))?;
+                    // Both the passphrase and the path come out of this message.
+                    // The path because the engine cannot tell a path from a
+                    // passphrase typed where a path goes — which is the mistake
+                    // that put a credential in somebody's audit log.
+                    let key = crate::audit::scrubbing(
+                        &pass,
+                        russh::keys::load_secret_key(path, pass_opt)
+                            .map_err(|e| anyhow::anyhow!("cannot load ssh key '{path}': {e}")),
+                    )?;
                     let with_hash = russh::keys::PrivateKeyWithHashAlg::new(Arc::new(key), None);
                     session
                         .authenticate_publickey(&spec.user, with_hash)

@@ -3919,21 +3919,14 @@ impl Workspace {
                                 }
                             })),
                     )
-                    .on_click(cx.listener(move |this, ev: &gpui::ClickEvent, _, cx| {
-                        // Twice opens the connection's settings. The pencil is
-                        // the visible way; this is the one people try first.
-                        if ev.click_count() >= 2 {
-                            let found = this
-                                .saved
-                                .iter()
-                                .find(|c| c.name == name)
-                                .map(|c| (c.name.clone(), c.driver.clone(), c.spec.clone()));
-                            if let Some(found) = found {
-                                this.open_form(Some(found), cx);
-                                cx.notify();
-                            }
-                            return;
-                        }
+                    // A double click was tried here and taken out again. The
+                    // first click of a double click has already fired by the
+                    // time the second arrives, so "open the settings" also
+                    // connected or disconnected on the way — somebody reaching
+                    // for the form got their connection toggled instead. A
+                    // shortcut that does something else first is worse than no
+                    // shortcut. The pencil and the palette are the two ways in.
+                    .on_click(cx.listener(move |this, _, _, cx| {
                         if this.conns.iter().any(|l| l.name == name) {
                             this.disconnect(&name);
                         } else {

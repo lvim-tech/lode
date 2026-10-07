@@ -36,8 +36,15 @@ fn main() {
     Application::new().run(move |cx: &mut gpui::App| {
         if check_icons {
             app::report_icons(cx);
-            cx.quit();
-            return;
+            // `cx.quit()` asks the run loop to stop, and with no window open it
+            // did not — the process sat there. Down a terminal that looks fine,
+            // because the lines are already on screen; down a PIPE it looks like
+            // a hang, because the reader waits for an end that never comes. A
+            // diagnostic that hangs in a pipeline is a diagnostic nobody puts in
+            // a test, so it ends itself: flush what was printed, then go.
+            use std::io::Write;
+            let _ = std::io::stdout().flush();
+            std::process::exit(0);
         }
         // The field needs its keys before any window exists.
         input::bind_keys(cx);

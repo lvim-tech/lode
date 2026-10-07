@@ -573,6 +573,30 @@ A connection's own secrets never reach the log at all: a `conn.connect` line is
 assembled from the non-secret fields of the spec — driver, host, port, file,
 TLS mode, tunnel hop — and the credential fields are never read.
 
+A failure is the other half, and it is not ours to word. A driver, an SSH
+library and a database each assemble their own error, and they quote back the
+value they choked on. So a failed `conn.connect` or `conn.test` is scrubbed with
+the spec's own credential values before it is written **or returned to the
+client** — a clean log while the window shows the value in a toast is one place
+fixed out of two. The SSH key **path** counts as a credential field here: not
+because a path is secret, but because the engine cannot tell a path from a
+passphrase typed where a path goes, and the one time it cannot tell is the one
+time it matters.
+
+A credential that arrives through `{{ env }}`, `{{ cmd }}` or the keyring is
+resolved, used and dropped. While it is in scope — between the resolve and the
+call that consumes it — a failure raised there is scrubbed with it. This covers
+the SSH tunnel's password and key passphrase and the proxy's password.
+
+> **Known limitation.** A resolved credential is NOT scrubbed from a message
+> that arrives outside that scope. If a database echoes a password back in an
+> error of its own, after the driver has the connection, that value can appear
+> in the message and therefore in the log. Closing this would mean keeping every
+> resolved secret in a process-wide register so any later message could be
+> cleaned — which means plaintext passwords held for the lifetime of a daemon
+> that runs for hours, ready-made for the next leak. The narrower leak is the
+> better trade, so it is written down here rather than closed.
+
 What this does **not** do is remove every value that happens to be sensitive. A
 token written through `INSERT INTO t (tok) VALUES ('…')` is an ordinary value in
 an ordinary place, and no pattern can tell it from a product name. So there is a

@@ -178,6 +178,33 @@ impl Record {
     }
 }
 
+/// Scrub one value out of an error, for as long as that value is in scope.
+///
+/// The companion to [`scrub`] for a credential the engine resolved rather than
+/// read: between `resolve()` and the call that uses it, the plaintext exists
+/// here and nowhere else, so this is the one place it can be taken out of a
+/// failure without keeping it alive to do so. After the call it dies as it
+/// always did.
+///
+/// Deliberately NOT a process-wide register of resolved secrets. That would
+/// make every message scrubbable, at the price of holding plaintext passwords
+/// in a daemon that runs for hours — a worse thing than the leak it closes,
+/// because then any later leak carries them ready-made.
+pub fn scrubbing<T>(value: &str, r: anyhow::Result<T>) -> anyhow::Result<T> {
+    match r {
+        Ok(v) => Ok(v),
+        Err(e) => {
+            let said = e.to_string();
+            let clean = scrub(&said, std::slice::from_ref(&value.to_string()));
+            if clean == said {
+                Err(e)
+            } else {
+                Err(anyhow::anyhow!("{clean}"))
+            }
+        }
+    }
+}
+
 /// Replace each known credential value wherever it appears.
 ///
 /// This is the guarantee the pattern matching alone cannot give: whatever
@@ -620,6 +647,28 @@ pub fn redact_with(statement: &str) -> (String, Vec<String>) {
 
 #[cfg(test)]
 mod tests {
+
+    /// A resolved credential is taken out of the failure raised while it is in
+    /// scope — and the value is not kept anywhere to do it.
+    #[test]
+    fn a_resolved_value_is_scrubbed_from_the_error_it_appears_in() {
+        let resolved = "s3cret-phrase-with-punctuation!";
+        let r: anyhow::Result<()> = Err(anyhow::anyhow!(
+            "cannot load ssh key '{resolved}': No such file or directory"
+        ));
+        let out = scrubbing(resolved, r).unwrap_err().to_string();
+        assert!(!out.contains(resolved), "the value is still there: {out}");
+        assert!(out.contains("cannot load ssh key"), "and it still says what failed: {out}");
+
+        // A message that never held it is passed through untouched, so an
+        // unrelated error keeps its own wording.
+        let r2: anyhow::Result<()> = Err(anyhow::anyhow!("connection refused"));
+        assert_eq!(scrubbing(resolved, r2).unwrap_err().to_string(), "connection refused");
+
+        // And success is success.
+        let ok: anyhow::Result<u8> = Ok(7);
+        assert_eq!(scrubbing(resolved, ok).unwrap(), 7);
+    }
     use super::*;
 
     // ── the shape ────────────────────────────────────────────────────────────

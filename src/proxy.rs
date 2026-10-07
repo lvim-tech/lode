@@ -35,9 +35,16 @@ pub async fn dial(spec: &ProxySpec, host: &str, port: u16) -> anyhow::Result<Tcp
         Some(a) => (a.user.clone(), a.password.resolve().await?),
         None => (String::new(), String::new()),
     };
+    // Same scope rule as the tunnel's: the resolved proxy password is alive
+    // between here and the handshake, and a handshake that fails can quote what
+    // it was given.
     match spec.kind {
-        ProxyKind::Socks5 => socks5(&mut s, host, port, &user, &pass).await?,
-        ProxyKind::HttpConnect => http_connect(&mut s, host, port, &user, &pass).await?,
+        ProxyKind::Socks5 => {
+            crate::audit::scrubbing(&pass, socks5(&mut s, host, port, &user, &pass).await)?
+        }
+        ProxyKind::HttpConnect => {
+            crate::audit::scrubbing(&pass, http_connect(&mut s, host, port, &user, &pass).await)?
+        }
     }
     Ok(s)
 }
