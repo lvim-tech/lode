@@ -22,7 +22,7 @@
 
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 LIMIT=${LODE_TEST_TIMEOUT:-180}
-SUITES=${*:-"smoke row dash hook tunnel profile"}
+SUITES=${*:-"smoke row dash hook tunnel profile access"}
 LOGS=$(mktemp -d)
 BAD=0
 

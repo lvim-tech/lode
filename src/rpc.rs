@@ -93,7 +93,18 @@ use serde_json::json;
 ///      interpreter rather than embedded: `mlua` is not in this lock file and
 ///      cannot be fetched here, and the difference (no sandbox, no API onto the
 ///      open connection) is real. Additive.
-pub const PROTO: u32 = 10;
+/// 11 — added ACCESS PROVIDERS: `access.{list,test,import}` and a third profile
+///      kind, `access`. The engine reads `~/.aws/config` and
+///      `~/.aws/credentials` and offers what it finds, saying of each entry what
+///      KIND it is and whether it can actually be used — so a client shows the
+///      whole list and marks the ones that will not work, rather than offering
+///      eight of which three fail only when picked. Static keys, session tokens,
+///      `credential_process` and `source_profile` chains resolve; SSO and
+///      AssumeRole are REFUSED by name with what would have to happen instead,
+///      because they need to talk to AWS and this engine does not. An import
+///      stores the profile's NAME, never its key: the credential stays where
+///      the AWS tools rotate it. Additive.
+pub const PROTO: u32 = 11;
 
 /// One decoded incoming request.
 #[derive(Debug, Deserialize)]

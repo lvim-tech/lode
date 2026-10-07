@@ -82,7 +82,7 @@ notification   {"method":"…","params":{…}}
 
 `proto` grows **additively**: a client accepts any engine reporting
 `proto >= its minimum`, so a newer engine keeps working with an older client.
-The current protocol is **10**. What each version added is listed in
+The current protocol is **11**. What each version added is listed in
 `src/rpc.rs` beside the constant.
 
 ### Handshake
@@ -193,6 +193,55 @@ time. The source file is only read.
 
 The database lives at `$LODE_DATA_DIR/lode.db`, else
 `$XDG_DATA_HOME/lode/lode.db`, else `~/.local/share/lode/lode.db`.
+
+### Access providers (`proto >= 11`)
+
+The AWS drivers all need the same thing, and nobody wants to paste an access key
+into a connection form when the machine already has `~/.aws/config` with eight
+profiles in it. The engine reads those files and offers what it finds.
+
+| method | params | result |
+|---|---|---|
+| `access.list` | `{ config?, credentials? }` | `{ profiles, config, credentials }` |
+| `access.test` | `{ profile, … }` | `{ ok, key_ends_with, has_session_token, region }` |
+| `access.import` | `{ profile, as_name?, … }` | `{ saved, name, kind }` |
+
+`$AWS_CONFIG_FILE` and `$AWS_SHARED_CREDENTIALS_FILE` are honoured, because the
+AWS tools honour them and two answers to "where are the credentials" is one too
+many. The reply says which files were read, so an empty list is a fact rather
+than a mystery.
+
+Each entry says what KIND it is and whether this engine can use it:
+
+| kind | what it is | usable |
+|---|---|---|
+| `static` | keys in the file | yes |
+| `process` | `credential_process` | yes |
+| `inherited` | `source_profile` with no role | yes |
+| `assume_role` | `role_arn` + `source_profile` | **no** |
+| `sso` | `sso_session` / `sso_start_url` | **no** |
+
+So a client can show the whole list and mark the ones that will not work, rather
+than offering eight profiles of which three fail only when somebody picks them.
+
+**The last two are refused by name, with what would have to happen instead** —
+they need to talk to AWS and this engine does not. A silent "no credentials"
+would read as a missing profile rather than an unsupported one. Nothing here is
+verified against the real AWS: the parsing is verified against files, and the
+network half does not exist rather than existing untested.
+
+`access.test` answers with the access key id's **last four characters** and
+nothing more. Enough to tell two profiles apart, not enough to be a credential —
+the whole id is half of one, and a test button has no business handing it back
+to be screenshotted.
+
+An import stores the AWS profile's **NAME**, never its key. The credential stays
+in the AWS files, where the AWS tools rotate it; copying it here would mean a key
+that works today and a connection that fails next month for a reason nobody
+connects to the rotation. Importing an unusable profile is refused on the way in.
+
+The drivers that consume this arrive with the AWS drivers in stage 7; what is
+here is the credential source and nothing claims otherwise.
 
 ### Hooks and scripts (`proto >= 10`)
 

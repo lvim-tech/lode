@@ -66,9 +66,9 @@ struct ConnEntry {
 /// typo makes an empty list instead of a silent new namespace nobody can find.
 fn check_profile_kind(kind: &str) -> anyhow::Result<()> {
     match kind {
-        "tunnel" | "proxy" => Ok(()),
+        "tunnel" | "proxy" | "access" => Ok(()),
         other => Err(anyhow::anyhow!(
-            "unknown profile kind '{other}' — there are 'tunnel' and 'proxy'"
+            "unknown profile kind '{other}' — there are 'tunnel', 'proxy' and 'access'"
         )),
     }
 }
@@ -380,6 +380,9 @@ impl Server {
             "store.profiles.get" => self.store_profile_get(params).await,
             "store.profiles.save" => self.store_profile_save(params).await,
             "store.profiles.remove" => self.store_profile_remove(params).await,
+            "access.list" => self.access_list(params).await,
+            "access.test" => self.access_test(params).await,
+            "access.import" => self.access_import(params).await,
             "store.scripts.list" => self.store_script_list(params).await,
             "store.scripts.save" => self.store_script_save(params).await,
             "store.scripts.remove" => self.store_script_remove(params).await,
@@ -1377,6 +1380,135 @@ impl Server {
         Ok(json!({ "saved": true }))
     }
 
+    // ── access providers ─────────────────────────────────────────────────────
+
+    /// Everything `~/.aws/config` and `~/.aws/credentials` describe.
+    ///
+    /// Each entry says WHAT IT IS (`static`, `process`, `sso`, `assume_role`,
+    /// `inherited`) and whether this engine can use it, so a client can show the
+    /// whole list and mark the ones that will not work — rather than offering
+    /// eight profiles of which three fail only when somebody picks them.
+    ///
+    /// No credential is read here. Listing is reading section names.
+    async fn access_list(&self, params: Json) -> anyhow::Result<Json> {
+        #[derive(Deserialize)]
+        struct P {
+            #[serde(default)]
+            config: Option<String>,
+            #[serde(default)]
+            credentials: Option<String>,
+        }
+        let p: P = serde_json::from_value(params)?;
+        let (cfg, creds) = Self::access_paths(&p.config, &p.credentials);
+        let found = crate::access::profiles_from(cfg.as_deref(), creds.as_deref());
+        let rows: Vec<Json> = found
+            .iter()
+            .map(|x| {
+                json!({
+                    "name": x.name,
+                    "source": x.source,
+                    "kind": x.kind(),
+                    "usable": x.usable(),
+                    "region": x.get("region"),
+                })
+            })
+            .collect();
+        Ok(json!({
+            "profiles": rows,
+            // Where it looked, so an empty list is a fact rather than a mystery.
+            "config": cfg.map(|p| p.display().to_string()),
+            "credentials": creds.map(|p| p.display().to_string()),
+        }))
+    }
+
+    fn access_paths(
+        config: &Option<String>,
+        credentials: &Option<String>,
+    ) -> (Option<std::path::PathBuf>, Option<std::path::PathBuf>) {
+        (
+            config
+                .as_ref()
+                .map(|s| std::path::PathBuf::from(crate::spec::expand_tilde(s)))
+                .or_else(crate::access::config_path),
+            credentials
+                .as_ref()
+                .map(|s| std::path::PathBuf::from(crate::spec::expand_tilde(s)))
+                .or_else(crate::access::credentials_path),
+        )
+    }
+
+    /// Resolve one profile and say WHETHER it worked — never what it produced.
+    ///
+    /// The answer is the access key id's last four characters and nothing else.
+    /// Enough to tell two profiles apart, not enough to be a credential; the
+    /// whole id is half of one, and a test button has no business handing it
+    /// back to be screenshotted.
+    async fn access_test(&self, params: Json) -> anyhow::Result<Json> {
+        #[derive(Deserialize)]
+        struct P {
+            profile: String,
+            #[serde(default)]
+            config: Option<String>,
+            #[serde(default)]
+            credentials: Option<String>,
+        }
+        let p: P = serde_json::from_value(params)?;
+        let (cfg, creds) = Self::access_paths(&p.config, &p.credentials);
+        let found = crate::access::profiles_from(cfg.as_deref(), creds.as_deref());
+        let c = crate::access::resolve(&found, &p.profile, 0).await?;
+        let tail: String = c.access_key_id.chars().rev().take(4).collect::<Vec<_>>().into_iter().rev().collect();
+        Ok(json!({
+            "ok": true,
+            "key_ends_with": tail,
+            "has_session_token": c.session_token.is_some(),
+            "region": c.region,
+        }))
+    }
+
+    /// Save an AWS profile as a lode access profile, BY NAME.
+    ///
+    /// By name, not by value: the credential stays in the AWS files, where the
+    /// AWS tools rotate it. Copying it here would mean a key that works today
+    /// and a connection that fails next month for a reason nobody connects to
+    /// the rotation.
+    async fn access_import(&self, params: Json) -> anyhow::Result<Json> {
+        #[derive(Deserialize)]
+        struct P {
+            /// The AWS profile's name, and the lode profile's unless `as_name`
+            /// says otherwise.
+            profile: String,
+            #[serde(default)]
+            as_name: Option<String>,
+            #[serde(default)]
+            config: Option<String>,
+            #[serde(default)]
+            credentials: Option<String>,
+        }
+        let p: P = serde_json::from_value(params)?;
+        let (cfg, creds) = Self::access_paths(&p.config, &p.credentials);
+        let found = crate::access::profiles_from(cfg.as_deref(), creds.as_deref());
+        let aws = found
+            .iter()
+            .find(|x| x.name == p.profile)
+            .ok_or_else(|| anyhow::anyhow!("there is no AWS profile called '{}'", p.profile))?;
+        // Refused on the way IN, with what it is. Importing a profile that
+        // cannot produce credentials would make a lode profile that fails at
+        // every connect for a reason stored somewhere else.
+        if !aws.usable() {
+            anyhow::bail!(
+                "the AWS profile '{}' is a '{}' profile and this engine cannot get credentials from it —                  importing it would make something that fails at every connect",
+                p.profile,
+                aws.kind()
+            );
+        }
+        let name = p.as_name.unwrap_or_else(|| p.profile.clone());
+        let spec = json!({ "provider": "aws", "profile": p.profile, "region": aws.get("region") });
+        self.store()?
+            .save_profile("access".into(), name.clone(), serde_json::to_string(&spec)?)
+            .await?;
+        Ok(json!({ "saved": true, "name": name, "kind": aws.kind() }))
+    }
+
     // ── scripts and hooks ────────────────────────────────────────────────────
 
     /// What a hook or a script is told about the connection it runs around.
@@ -1800,6 +1932,11 @@ impl Server {
             return Err(anyhow::anyhow!("a profile needs a name"));
         }
         let canonical = match p.kind.as_str() {
+            // An access profile is a REFERENCE — `{ provider, profile }` — and
+            // the thing it refers to lives in the AWS files. There is no
+            // struct to parse it into here, and inventing one would be a second
+            // model of somebody else's format.
+            "access" => serde_json::to_string(&p.spec)?,
             "tunnel" => {
                 let t: crate::spec::TunnelSpec = serde_json::from_value(p.spec)
                     .map_err(|e| anyhow::anyhow!("that is not a tunnel: {e}"))?;
