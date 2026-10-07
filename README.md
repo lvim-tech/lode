@@ -194,6 +194,27 @@ time. The source file is only read.
 The database lives at `$LODE_DATA_DIR/lode.db`, else
 `$XDG_DATA_HOME/lode/lode.db`, else `~/.local/share/lode/lode.db`.
 
+### More than one language
+
+The client's chrome — panels, buttons, headings — is translated. English and
+Bulgarian today; `$LODE_LANG`, else `$LC_ALL` / `$LANG` read as a prefix, else
+English, and a choice in Settings is remembered.
+
+**The engine is not translated, and that is deliberate rather than unfinished.**
+An engine message is a RECORD: "this connection is read only" goes into the
+audit log, into a bug report, into a shell test, and into whatever somebody
+pastes to somebody else. A log whose meaning depends on the locale of whoever
+happened to run it cannot be read by the person who did not. Refusals, driver
+errors and the audit log stay in English for the same reason SQL does: they are
+the record, not the interface. The settings panel says so, so that a Bulgarian
+window showing an English refusal reads as a decision rather than a gap.
+
+A missing translation is caught by a test, not by a fallback:
+`every_language_has_every_key` asserts each catalogue has exactly the keys
+English has. A key added without a translation fails there rather than appearing
+as a blank label three weeks later. Keys English does not have are failed too — a
+translation for a key nothing uses is a line somebody maintains for ever.
+
 ### The MCP server (`proto >= 12`)
 
 ```

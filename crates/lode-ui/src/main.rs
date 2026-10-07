@@ -19,6 +19,7 @@ mod app;
 mod board;
 mod export;
 mod form;
+mod i18n;
 mod input;
 mod metrics;
 mod session;

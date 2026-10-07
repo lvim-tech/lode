@@ -32,6 +32,7 @@ use serde_json::{json, Value};
 use crate::export::{self, Format};
 use crate::form::ConnectionForm;
 use crate::board::{self, Board, DragMode, Pane};
+use crate::i18n::Lang;
 use crate::input::{InputColors, InputEvent, TextInput};
 use crate::metrics::Metrics;
 use crate::session::{self, Session, SessionTab};
@@ -259,6 +260,20 @@ impl Rail {
             Rail::Settings => "\u{f013}",
         }
     }
+    /// The key its name is under. Not the name itself: a `&'static str` here
+    /// would be the English one, and this is read in whatever language the
+    /// window is drawn in.
+    fn key(self) -> &'static str {
+        match self {
+            Rail::Connections => "rail.connections",
+            Rail::Instance => "rail.instance",
+            Rail::History => "rail.history",
+            Rail::Audit => "rail.audit",
+            Rail::Tasks => "rail.tasks",
+            Rail::Settings => "rail.settings",
+        }
+    }
+
     fn label(self) -> &'static str {
         match self {
             Rail::Connections => "Connections",
@@ -444,6 +459,10 @@ pub struct Workspace {
     /// because `table_el` takes `&self`, and the alternative is threading a
     /// width back out of a render function.
     grid_overflow: std::cell::Cell<f32>,
+    /// The language the chrome is drawn in. The ENGINE is not translated —
+    /// its refusals and its audit log are the record, and a record whose
+    /// meaning depends on who ran it cannot be read by anybody else.
+    lang: Lang,
     /// How many spaces the JSON view indents by. Two, three or four: the
     /// argument about which is right is older than this program, so it is a
     /// setting rather than a decision.
@@ -569,6 +588,12 @@ impl Workspace {
             resizing: None,
             grid_scroll: gpui::ScrollHandle::new(),
             grid_overflow: std::cell::Cell::new(0.0),
+            lang: restore
+                .lang
+                .as_deref()
+                .and_then(Lang::from_tag)
+                .or_else(Lang::from_env)
+                .unwrap_or_default(),
             json_indent: restore.json_indent.unwrap_or(4).clamp(2, 4),
             themes: theme::discover(),
             font_family: pick_font(cx),
@@ -579,6 +604,10 @@ impl Workspace {
             form_window: None,
             confirm: None,
         };
+
+        // The placeholders too, at startup: the language comes out of the
+        // session AFTER the fields were built.
+        w.relabel_inputs(cx);
 
         w.rail = match w.restore.rail.as_str() {
             "history" => Rail::History,
@@ -1563,6 +1592,7 @@ impl Workspace {
             active: self.active,
             theme: Some(self.theme_name.clone()),
             json_indent: Some(self.json_indent),
+            lang: Some(self.lang.tag().into()),
             font_size: Some(self.scale.base()),
             rail: match self.rail {
                 Rail::Connections => "connections",
@@ -1941,7 +1971,7 @@ impl Workspace {
         }
         for r in [Rail::Connections, Rail::Instance, Rail::History, Rail::Audit, Rail::Tasks, Rail::Settings] {
             out.push(PaletteItem {
-                label: format!("Show {}", r.label()),
+                label: format!("{} {}", self.lang.tr("panel.look_again").split(' ').next().unwrap_or("Show"), self.lang.tr(r.key())),
                 hint: "panel".into(),
                 act: PaletteAct::Rail(r),
             });
@@ -2680,6 +2710,23 @@ impl Workspace {
         }
     }
 
+    /// Put every placeholder in the chosen language.
+    ///
+    /// A placeholder is set when the field is BUILT, so it does not follow a
+    /// language change on its own — the filter box stayed in English while the
+    /// panel around it turned Bulgarian, which reads as a half-finished
+    /// translation rather than as a field nobody re-labelled.
+    fn relabel_inputs(&self, cx: &mut Context<Self>) {
+        for (field, key) in [
+            (&self.filter, "panel.filter"),
+            (&self.history_filter, "panel.search_history"),
+            (&self.audit_filter, "panel.search_audit"),
+        ] {
+            let text = self.lang.tr(key);
+            field.update(cx, |i, cx| i.set_placeholder(text, cx));
+        }
+    }
+
     /// Every text field in the window, so a theme change reaches all of them.
     fn all_inputs(&self) -> Vec<Entity<TextInput>> {
         let mut out = vec![
@@ -2697,6 +2744,11 @@ impl Workspace {
         ];
         out.extend(self.inputs.values().cloned());
         out
+    }
+
+    /// One phrase of the interface, in the chosen language.
+    fn tr(&self, key: &str) -> SharedString {
+        SharedString::from(self.lang.tr(key))
     }
 
     fn t(&self) -> &Theme {
@@ -2858,7 +2910,7 @@ impl Workspace {
         match self.rail {
             Rail::Settings => {
                 let mut list = self.panel_list("settings-list");
-                list = list.child(self.section(&format!("Theme ({})", self.themes.len())));
+                list = list.child(self.section(&format!("{} ({})", self.lang.tr("settings.theme"), self.themes.len())));
                 list = list.child(
                     div()
                         .id("theme-rescan")
@@ -2868,7 +2920,7 @@ impl Workspace {
                         .hover(|d| d.bg(t.hover()))
                         .text_size(ms.small())
                         .text_color(t.accent())
-                        .child("\u{f021}  Look again")
+                        .child(SharedString::from(format!("{}  {}", "\u{f021}", self.lang.tr("panel.look_again"))))
                         .on_click(cx.listener(|this, _, _, cx| {
                             this.themes = theme::discover();
                             cx.notify();
@@ -2878,7 +2930,7 @@ impl Workspace {
                     // WHICH directories were searched. "No themes" on its own is
                     // a message somebody can do nothing with.
                     list = list.child(div().px_2().child(self.small(
-                        "no theme files found — looked in:",
+                        self.lang.tr("settings.no_themes"),
                         t.warning(),
                     )));
                     for d in theme::theme_dirs() {
@@ -2928,7 +2980,7 @@ impl Workspace {
                     );
                 }
 
-                list = list.child(self.section("JSON indent"));
+                list = list.child(self.section(self.lang.tr("settings.json_indent")));
                 let mut row = div().flex().items_center().gap_2().px_2().py_1();
                 for n in [2u8, 3, 4] {
                     let on = self.json_indent == n;
@@ -2951,7 +3003,40 @@ impl Workspace {
                 }
                 list = list.child(row);
 
-                list = list.child(self.section("Text"));
+                list = list.child(self.section(self.lang.tr("settings.language")));
+                let mut langs = div().flex().items_center().gap_2().px_2().py_1();
+                for l in Lang::ALL.iter().copied() {
+                    let on = self.lang == l;
+                    langs = langs.child(
+                        div()
+                            .id(SharedString::from(format!("lang-{}", l.tag())))
+                            .px_2()
+                            .cursor_pointer()
+                            .text_size(ms.body())
+                            .text_color(if on { t.inverted() } else { t.fg() })
+                            .when(on, |d| d.bg(t.accent()))
+                            .hover(|d| d.bg(t.hover()))
+                            // Its own name, not its English one: somebody
+                            // looking for their language looks for the word
+                            // they would write.
+                            .child(SharedString::from(l.label()))
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.lang = l;
+                                this.relabel_inputs(cx);
+                                this.remember();
+                                cx.notify();
+                            })),
+                    );
+                }
+                list = list.child(langs);
+                list = list.child(div().px_2().child(self.small(
+                    // Said, not left to be discovered: a window in Bulgarian
+                    // showing an English refusal looks half-finished unless it
+                    // is explained.
+                    "the engine's refusals and the audit log stay in English — they are the record, not the interface",
+                    t.muted(),
+                )));
+                list = list.child(self.section(self.lang.tr("settings.text")));
                 list = list.child(div().px_2().child(self.line(
                     format!("font: {}", self.font_family),
                     ms.small(),
@@ -2959,7 +3044,7 @@ impl Workspace {
                     ms.line_w(),
                 )));
                 panel = panel.child(list);
-                panel = panel.child(self.section("Text size"));
+                panel = panel.child(self.section(self.lang.tr("settings.text_size")));
                 // One number, and it moves everything: the steps, the grid row
                 // height, the rail. Here rather than only in an environment
                 // variable because "a bit bigger" is a thing somebody adjusts
@@ -3008,7 +3093,7 @@ impl Workspace {
                                 .hover(|d| d.bg(t.hover()))
                                 .text_size(ms.small())
                                 .text_color(t.muted())
-                                .child("reset")
+                                .child(self.tr("settings.reset"))
                                 .on_click(cx.listener(|this, _, _, cx| {
                                     this.scale = Metrics::new(crate::metrics::DEFAULT_BASE);
                                     this.remember();
@@ -3122,7 +3207,7 @@ impl Workspace {
                         .hover(|d| d.bg(t.hover()))
                         .text_size(ms.small())
                         .text_color(t.accent())
-                        .child("\u{f021}  Reload history")
+                        .child(SharedString::from(format!("{}  {}", "\u{f021}", self.lang.tr("panel.reload_history"))))
                         .on_click(cx.listener(|this, _, _, cx| {
                             this.ask(Pending::History, "store.history.list", json!({ "limit": 200 }));
                             cx.notify();
@@ -3210,7 +3295,7 @@ impl Workspace {
                         .hover(|d| d.bg(t.hover()))
                         .text_size(ms.small())
                         .text_color(t.accent())
-                        .child("\u{f021}  Reload audit")
+                        .child(SharedString::from(format!("{}  {}", "\u{f021}", self.lang.tr("panel.reload_audit"))))
                         .on_click(cx.listener(|this, _, _, cx| {
                             this.ask(Pending::Audit, "store.audit.list", json!({ "limit": 300 }));
                             cx.notify();
@@ -3413,7 +3498,7 @@ impl Workspace {
                 .hover(|d| d.bg(t.hover()))
                 .text_size(ms.small())
                 .text_color(t.accent())
-                .child("\u{f067}  New connection")
+                .child(SharedString::from(format!("{}  {}", "\u{f067}", self.lang.tr("panel.new_connection"))))
                 .on_click(cx.listener(|this, _, _, cx| {
                     this.open_form(None, cx);
                     cx.notify();
@@ -3426,8 +3511,11 @@ impl Workspace {
         // top of a panel that is not scrolling.
         let mut list = self.panel_list("connections-list");
         list = list.child(self.section(&format!(
-            "Connections ({connected} connected · {} idle)",
-            self.saved.len().saturating_sub(connected)
+            "{} ({connected} {} · {} {})",
+            self.lang.tr("panel.connections"),
+            self.lang.tr("panel.connected"),
+            self.saved.len().saturating_sub(connected),
+            self.lang.tr("panel.idle")
         )));
 
         for c in self
@@ -3502,7 +3590,7 @@ impl Workspace {
                 list = list.child(div().px_2().child(self.small("loading…", t.muted())));
             }
             if !live.charts.is_empty() {
-                list = list.child(self.section("Saved charts"));
+                list = list.child(self.section(self.lang.tr("panel.saved_charts")));
                 for c in &live.charts {
                     list = list.child(
                         div()
@@ -3530,7 +3618,7 @@ impl Workspace {
             }
             // Dashboards come before the saved charts, because a board is what
             // somebody opens and a chart is what a board is made of.
-            list = list.child(self.section("Dashboards"));
+            list = list.child(self.section(self.lang.tr("panel.dashboards")));
             list = list.child(
                 div()
                     .id(SharedString::from(format!("nb-{}", live.name)))
@@ -3543,7 +3631,7 @@ impl Workspace {
                     .cursor_pointer()
                     .hover(|d| d.bg(t.hover()))
                     .child(div().flex_none().text_size(ms.tiny()).text_color(t.accent()).child("\u{f067}"))
-                    .child(self.line_in("New dashboard", ms.small(), t.accent(), ms.line_w() - ms.base() - 14.0))
+                    .child(self.line_in(self.tr("panel.new_dashboard"), ms.small(), t.accent(), ms.line_w() - ms.base() - 14.0))
                     .on_click(cx.listener({
                         let cn = live.name.clone();
                         move |this, _, _, cx| {
@@ -3574,7 +3662,7 @@ impl Workspace {
                 );
             }
             if !live.queries.is_empty() {
-                list = list.child(self.section("Saved queries"));
+                list = list.child(self.section(self.lang.tr("panel.saved_queries")));
                 for q in &live.queries {
                     list = list.child(
                         div()
@@ -3598,7 +3686,7 @@ impl Workspace {
                             })),
                     );
                 }
-                list = list.child(self.section("Schema"));
+                list = list.child(self.section(self.lang.tr("panel.schema")));
             }
             for node in live
                 .nodes
@@ -3777,9 +3865,9 @@ impl Workspace {
                 .items_center()
                 .justify_center()
                 .gap_2()
-                .child(div().text_color(t.muted()).child("Click a table or a collection to open it."))
+                .child(div().text_color(t.muted()).child(self.tr("result.empty_title")))
                 .child(self.small(
-                    "Its rows appear here — the statement comes from the driver, not from you.",
+                    self.lang.tr("result.empty_hint"),
                     t.muted(),
                 ))
                 .into_any_element();
@@ -6123,7 +6211,7 @@ impl Workspace {
 
         let mut list = div().flex().flex_col().max_h(px(420.0)).overflow_hidden();
         if matches.is_empty() {
-            list = list.child(div().px_3().py_1().child(self.small("nothing matches", t.muted())));
+            list = list.child(div().px_3().py_1().child(self.small(self.lang.tr("panel.nothing_matches"), t.muted())));
         }
         for (n, (idx, it)) in matches.iter().enumerate().take(14) {
             let on = n == sel;
