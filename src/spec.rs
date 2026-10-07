@@ -86,6 +86,19 @@ pub enum ParamType {
     Bool,
     File,
     Enum,
+    /// The name of a profile in `~/.aws/config`.
+    ///
+    /// A TYPE rather than a client recognising the key `aws_profile`, because a
+    /// client that matches on a parameter's name is a client that has to be
+    /// edited whenever a driver names something differently — and the next
+    /// driver to want this would have to be guessed at. The driver declares what
+    /// the field IS; the client decides how to draw it.
+    ///
+    /// Additive: `access.list` already reports what is in those files, so this
+    /// needs no new protocol call. A client that does not know this variant
+    /// draws the field as it draws any other string, which is what it did
+    /// before.
+    AwsProfile,
 }
 
 /// Static, driver-declared metadata. Serialized to Lua verbatim by `rpc.hello`,
@@ -1028,6 +1041,54 @@ impl Serialize for Value {
 
 #[cfg(test)]
 mod tests {
+
+    /// A field is drawn from what the driver DECLARES, not from its key.
+    ///
+    /// The client offers the names out of `~/.aws/config` for any parameter
+    /// typed `aws_profile`. If it matched the key instead, the next driver to
+    /// want one would have to be named in the client — and the client would be
+    /// guessing at a meaning rather than reading one.
+    #[test]
+    fn a_parameter_that_wants_an_aws_profile_says_so_in_its_type() {
+        let reg = crate::registry::Registry::new();
+        let mut declared = 0usize;
+        for m in reg.metas() {
+            for p in m.params {
+                if p.key == "aws_profile" {
+                    declared += 1;
+                    assert!(
+                        matches!(p.kind, ParamType::AwsProfile),
+                        "{}: the {} parameter is typed {:?}, so no client can know what it is",
+                        m.kind,
+                        p.key,
+                        p.kind
+                    );
+                }
+                // And nothing else claims the type by accident.
+                if matches!(p.kind, ParamType::AwsProfile) {
+                    assert_eq!(
+                        p.key, "aws_profile",
+                        "{}: {} is typed as an AWS profile",
+                        m.kind, p.key
+                    );
+                }
+            }
+        }
+        assert!(declared >= 3, "expected s3, dynamodb and cloudwatch; found {declared}");
+
+        // It must survive the wire as a word a client can match on, since that
+        // is the whole mechanism.
+        let json = serde_json::to_value(ParamSpec {
+            key: "aws_profile",
+            label: "…or an AWS profile",
+            kind: ParamType::AwsProfile,
+            required: false,
+            secret: false,
+            default: None,
+        })
+        .expect("serializes");
+        assert_eq!(json["type"], "aws_profile");
+    }
 
     /// The reported leak, as a test.
     ///

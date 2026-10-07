@@ -112,6 +112,14 @@ map keyed by the driver's own `ParamSpec` keys; `auth` is one of `none`,
 `password`, `client_cert`, `provider`, `kerberos`; secret-bearing fields hold
 templates, never values.
 
+A parameter's `type` is how a client knows what to draw: `string`, `int`,
+`bool`, `file`, `enum`, or `aws_profile` — the name of a profile in
+`~/.aws/config`, which the client offers from `access.list` rather than asking
+somebody to remember it. A client matching the KEY `aws_profile` instead would
+need editing for the next driver that wants one, so the driver declares what the
+field is and the client decides how to draw it. An older client that does not
+know a type draws the field as a string, which is what it did before.
+
 `conn.test` dry-runs ONE layer so a failure is attributed to the layer that
 caused it: `endpoint` (stat the file, or reach the server), `tunnel` (stand the
 SSH forward up alone), `tls` and `auth` (a real connect, closed again).

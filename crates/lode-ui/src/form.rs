@@ -216,6 +216,9 @@ pub struct ConnectionForm {
     tunnel_profile: Option<String>,
     /// The names the workspace knows about, handed over when the window opens.
     tunnel_profiles: Vec<String>,
+    /// The AWS profile names the engine read out of `~/.aws/config`, offered for
+    /// any parameter a driver declares as `ParamType::AwsProfile`.
+    aws_profiles: Vec<String>,
 
     /// The name to save the fields above under.
     profile_name: Entity<TextInput>,
@@ -250,6 +253,7 @@ impl ConnectionForm {
         scale: Metrics,
         drivers: Vec<DriverMeta>,
         tunnel_profiles: Vec<String>,
+        aws_profiles: Vec<String>,
         existing: Option<(String, String, Value)>,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -351,6 +355,7 @@ impl ConnectionForm {
                 .and_then(Value::as_str)
                 .map(str::to_string),
             tunnel_profiles,
+            aws_profiles,
             profile_name: mk(cx, "name this tunnel", ""),
             tunnel_host: mk(cx, "bastion.example", &get(&tunnel, "host")),
             tunnel_port: mk(
@@ -1076,7 +1081,9 @@ impl Render for ConnectionForm {
         let mut body = div().flex().flex_col().flex_1().p_3().gap_1().overflow_hidden();
         match self.tab {
             FormTab::Main => {
-                let keys: Vec<(String, String)> = self
+                // The TYPE comes along, because how a field is drawn is the
+                // driver's declaration and not the client's guess at its name.
+                let keys: Vec<(String, String, String)> = self
                     .meta()
                     .map(|m| {
                         m.params
@@ -1089,6 +1096,7 @@ impl Render for ConnectionForm {
                                     } else {
                                         p.label.clone()
                                     },
+                                    p.kind.clone(),
                                 )
                             })
                             .collect()
@@ -1122,18 +1130,70 @@ impl Render for ConnectionForm {
                 }
                 body = body.child(picker);
 
-                for (key, label) in keys {
-                    if let Some(f) = self.params.get(&key) {
-                        let (input, source, secret) = (f.input.clone(), f.source, f.secret);
-                        body = body.child(self.row(
-                            &label,
-                            &input,
-                            source,
-                            secret,
-                            SharedString::from(key.clone()),
-                            cx,
-                        ));
+                for (key, label, kind) in keys {
+                    let Some(f) = self.params.get(&key) else { continue };
+                    let (input, source, secret) = (f.input.clone(), f.source, f.secret);
+                    // A parameter the driver declares as an AWS profile gets the
+                    // names the engine read out of `~/.aws/config`. Chosen by
+                    // TYPE: a client that matched the key `aws_profile` would
+                    // need editing for the next driver that wants one, and would
+                    // be guessing at a name instead of reading a declaration.
+                    if kind == "aws_profile" {
+                        let mut pick = div().flex().flex_wrap().items_center().gap_1().py_1().child(
+                            div().w(px(ms.label_w())).child(self.small(label.clone(), t.muted())),
+                        );
+                        let current = input.read(cx).text().trim().to_string();
+                        for name in self.aws_profiles.clone() {
+                            let on = current == name;
+                            let (pick_name, target) = (name.clone(), input.clone());
+                            pick = pick.child(
+                                div()
+                                    .id(SharedString::from(format!("awsp-{name}")))
+                                    .px_1()
+                                    .cursor_pointer()
+                                    .text_size(ms.tiny())
+                                    .text_color(if on { t.inverted() } else { t.muted() })
+                                    .when(on, |d| d.bg(t.accent()))
+                                    .child(SharedString::from(name.clone()))
+                                    .on_click(cx.listener(move |_, _, _, cx| {
+                                        target.update(cx, |i, cx| {
+                                            i.set_text(pick_name.clone(), cx)
+                                        });
+                                        cx.notify();
+                                    })),
+                            );
+                        }
+                        body = body.child(pick);
+                        // Still typable. The file may not be there, or may be
+                        // somewhere this engine was not told to look, and a
+                        // picker that is the ONLY way in would make a working
+                        // profile unreachable.
+                        body = body.child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap_2()
+                                .py(px(2.0))
+                                .child(div().w(px(ms.label_w())))
+                                .child(div().flex_1().text_size(ms.body()).child(input.clone())),
+                        );
+                        if self.aws_profiles.is_empty() {
+                            body = body.child(self.small(
+                                "No AWS profiles were found — type a name, or check that \
+                                 ~/.aws/config is where this engine looks.",
+                                t.muted(),
+                            ));
+                        }
+                        continue;
                     }
+                    body = body.child(self.row(
+                        &label,
+                        &input,
+                        source,
+                        secret,
+                        SharedString::from(key.clone()),
+                        cx,
+                    ));
                 }
 
                 let auths: Vec<String> = self.meta().map(|m| m.auth.clone()).unwrap_or_default();

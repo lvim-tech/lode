@@ -62,7 +62,7 @@ const PARAMS: &[ParamSpec] = &[
     ParamSpec {
         key: "aws_profile",
         label: "…or an AWS profile",
-        kind: ParamType::String,
+        kind: ParamType::AwsProfile,
         required: false,
         secret: false,
         default: None,

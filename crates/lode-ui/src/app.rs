@@ -570,6 +570,8 @@ enum Pending {
     FormTest { stage: &'static str, form: WeakEntity<ConnectionForm> },
     /// The saved tunnel or proxy profiles, by kind.
     Profiles { kind: &'static str },
+    /// The AWS profile names the engine found in `~/.aws/config`.
+    AwsProfiles,
     /// A profile was stored; the list is asked for again.
     ProfileSaved { kind: &'static str },
     /// A profile was removed, and the engine says which connections used it.
@@ -741,6 +743,9 @@ pub struct Workspace {
     /// argument about which is right is older than this program, so it is a
     /// setting rather than a decision.
     json_indent: u8,
+    /// The AWS profile names out of `~/.aws/config`, for a parameter that a
+    /// driver declares as `ParamType::AwsProfile`.
+    aws_profiles: Vec<String>,
     /// The saved tunnel and proxy profiles, by kind.
     ///
     /// A bastion is one machine and twenty connections go through it. The engine
@@ -900,6 +905,7 @@ impl Workspace {
                 .collect(),
             theme_filter,
             profiles: std::collections::BTreeMap::new(),
+            aws_profiles: Vec::new(),
             missing_glyphs: missing_in(cx, &icon_family),
             icon_family,
             font_family,
@@ -1425,6 +1431,21 @@ impl Workspace {
                 // a column with a default, a trigger or a type coercion means
                 // the stored row is not always the row that was asked for.
                 self.run_tab(tab);
+            }
+            Pending::AwsProfiles => {
+                // Names only. Which of them is usable, and why, is the engine's
+                // to answer at connect time; a client repeating it here would be
+                // a second opinion about somebody else's file.
+                self.aws_profiles = v
+                    .get("profiles")
+                    .and_then(Value::as_array)
+                    .map(|rows| {
+                        rows.iter()
+                            .filter_map(|r| r.get("name").and_then(Value::as_str))
+                            .map(str::to_string)
+                            .collect()
+                    })
+                    .unwrap_or_default();
             }
             Pending::Profiles { kind } => {
                 let rows: Vec<ProfileRow> =
@@ -2073,6 +2094,10 @@ impl Workspace {
         let theme = self.theme.clone();
         let drivers = self.hello.as_ref().map(|h| h.drivers.clone()).unwrap_or_default();
         let tunnel_profiles = self.profile_names("tunnel");
+        let aws_profiles = self.aws_profiles.clone();
+        // Asked on the way in, so a profile added to the file since the last
+        // window is offered by this one.
+        self.ask(Pending::AwsProfiles, "access.list", json!({}));
         // Asked again on the way in, so a window opened right after one was
         // saved elsewhere still lists it.
         self.ask_profiles();
@@ -2091,7 +2116,7 @@ impl Workspace {
                 }),
                 ..Default::default()
             },
-            |_window, cx| cx.new(|cx| ConnectionForm::new(me, theme, self.scale, drivers, tunnel_profiles, existing, cx)),
+            |_window, cx| cx.new(|cx| ConnectionForm::new(me, theme, self.scale, drivers, tunnel_profiles, aws_profiles, existing, cx)),
         );
         match opened {
             Ok(h) => self.form_window = Some(h),

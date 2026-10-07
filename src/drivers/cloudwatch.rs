@@ -23,7 +23,7 @@ const PARAMS: &[ParamSpec] = &[
     ParamSpec { key: "region", label: "Region", kind: ParamType::String, required: true, secret: false, default: Some("us-east-1") },
     ParamSpec { key: "access_key_id", label: "Access key id", kind: ParamType::String, required: false, secret: false, default: None },
     ParamSpec { key: "secret_access_key", label: "Secret access key", kind: ParamType::String, required: false, secret: true, default: None },
-    ParamSpec { key: "aws_profile", label: "…or an AWS profile", kind: ParamType::String, required: false, secret: false, default: None },
+    ParamSpec { key: "aws_profile", label: "…or an AWS profile", kind: ParamType::AwsProfile, required: false, secret: false, default: None },
 ];
 
 const META: DriverMeta = DriverMeta {
