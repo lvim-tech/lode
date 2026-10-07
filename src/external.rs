@@ -225,9 +225,27 @@ impl Pipe {
         let id = self.next_id;
         self.next_id += 1;
         let line = json!({ "id": id, "method": method, "params": params }).to_string();
-        self.stdin.write_all(line.as_bytes()).await?;
-        self.stdin.write_all(b"\n").await?;
-        self.stdin.flush().await?;
+        // A program that has already exited gives EPIPE here, and `Broken pipe
+        // (os error 32)` names the system call rather than the situation —
+        // somebody reading it learns nothing about their driver. It is a normal
+        // thing for a child to have done, so it gets a sentence that says what
+        // happened and which request it happened on.
+        //
+        // This also made the suite flaky: a one-shot program racing its own
+        // exit against the engine's write failed one run in several, with a
+        // message that was never about what the test was checking.
+        let sent: std::io::Result<()> = async {
+            self.stdin.write_all(line.as_bytes()).await?;
+            self.stdin.write_all(b"\n").await?;
+            self.stdin.flush().await
+        }
+        .await;
+        if let Err(e) = sent {
+            if e.kind() == std::io::ErrorKind::BrokenPipe {
+                anyhow::bail!("the driver program exited before it could be asked '{method}'");
+            }
+            return Err(anyhow::anyhow!("could not send '{method}' to the driver program: {e}"));
+        }
 
         let mut buf = String::new();
         let n = tokio::time::timeout(timeout, self.stdout.read_line(&mut buf))
@@ -549,13 +567,33 @@ mod tests {
         assert!(e.contains("not JSON"), "{e}");
     }
 
+    /// A program that answers without saying what it drives is refused.
+    ///
+    /// It reads its input first, so the engine's write cannot lose a race with
+    /// its exit. That race made this test fail about one run in five with
+    /// `Broken pipe (os error 32)` — a message about neither the driver nor the
+    /// thing being tested. The engine now says what actually happened when a
+    /// program has gone, and the test no longer has to win a race to check what
+    /// it is for.
     #[tokio::test]
     async fn a_program_that_describes_nothing_is_not_a_driver() {
-        let e = probe(r#"printf '{"id":1,"ok":true,"result":{"display":"x"}}'"#)
+        let e = probe(r#"read -r _ ; printf '{"id":1,"ok":true,"result":{"display":"x"}}'"#)
             .await
             .unwrap_err()
             .to_string();
         assert!(e.contains("not a driver"), "{e}");
+    }
+
+    /// And a program that has ALREADY gone says so in words, rather than
+    /// handing back the name of a system call.
+    #[tokio::test]
+    async fn a_program_that_has_already_exited_says_so() {
+        let e = probe("exit 0").await.unwrap_err().to_string();
+        assert!(
+            e.contains("exited before it could be asked") || e.contains("closed its output"),
+            "{e}"
+        );
+        assert!(!e.contains("os error"), "it should not name a system call: {e}");
     }
 
     /// A child answering a question nobody asked must not have its answer used:
