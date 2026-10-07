@@ -15,12 +15,26 @@
 
 use std::fmt;
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize, Serializer};
 
 /// A credential template. Deserialized from a plain JSON string; redacted on
 /// Debug so it is safe to include a whole ConnSpec in an error/log.
 #[derive(Clone, Default, Deserialize)]
 pub struct Secret(String);
+
+/// Serializes as the TEMPLATE it holds, never as a value.
+///
+/// Written out rather than derived so that this comment is attached to it: a
+/// `Secret` goes back to the store and back to a client as `{{ vault "db/x" }}`,
+/// which is what came in. `resolve()` is the only thing that produces the actual
+/// credential, it is called at connect time, and what it returns never passes
+/// through here. Deriving `Serialize` would do the same thing today and would
+/// not say so.
+impl Serialize for Secret {
+    fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(&self.0)
+    }
+}
 
 impl Secret {
     #[allow(dead_code)] // used by tests / driver specs as they land

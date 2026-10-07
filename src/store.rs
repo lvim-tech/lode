@@ -150,6 +150,29 @@ impl Store {
                 updated_at INTEGER
             );
             CREATE UNIQUE INDEX IF NOT EXISTS dashboards_conn_name ON dashboards (conn, name);
+            -- Reusable pieces of NETWORK, by name: an SSH tunnel, a proxy.
+            --
+            -- A bastion is one machine and twenty connections go through it.
+            -- Written into twenty specs, rotating its key means editing twenty
+            -- of them and finding the one that was missed by its failing. A
+            -- profile is edited once.
+            --
+            -- NOT scoped to a connection, unlike queries and charts: the whole
+            -- point is that several connections share one. `kind` keeps the
+            -- namespaces apart, so a tunnel and a proxy may both be called
+            -- "office" without meaning each other.
+            --
+            -- `spec` holds the TEMPLATE for every credential, exactly as the
+            -- connections table does. Nothing resolved is ever stored.
+            CREATE TABLE IF NOT EXISTS profiles (
+                id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                -- "tunnel" | "proxy"
+                kind       TEXT NOT NULL,
+                name       TEXT NOT NULL,
+                spec       TEXT NOT NULL,
+                updated_at INTEGER
+            );
+            CREATE UNIQUE INDEX IF NOT EXISTS profiles_kind_name ON profiles (kind, name);
             -- Every attempt to CHANGE something, and every connection opened or
             -- closed — including the attempts that were REFUSED. A log of what
             -- succeeded answers "what happened"; a log that also holds what was
@@ -473,6 +496,98 @@ impl Store {
                 .query_map(params![conn_name], |r| r.get::<_, String>(0))?
                 .collect::<Result<Vec<_>, _>>()?;
             Ok(rows)
+        })
+        .await
+    }
+
+    // ── profiles ─────────────────────────────────────────────────────────────
+
+    pub async fn list_profiles(&self, kind: String) -> anyhow::Result<Vec<Json>> {
+        self.with(move |c| {
+            let mut st = c.prepare(
+                "SELECT name, spec, updated_at FROM profiles WHERE kind = ?1 ORDER BY name",
+            )?;
+            let rows = st
+                .query_map(params![kind], |r| {
+                    let raw: String = r.get(1)?;
+                    Ok(serde_json::json!({
+                        "name": r.get::<_, String>(0)?,
+                        // Parsed back into an object rather than handed over as
+                        // a string: a client that had to parse it would be a
+                        // second parser of the same shape.
+                        "spec": serde_json::from_str::<Json>(&raw).unwrap_or(Json::Null),
+                        "updated_at": r.get::<_, Option<i64>>(2)?,
+                    }))
+                })?
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(rows)
+        })
+        .await
+    }
+
+    pub async fn get_profile(&self, kind: String, name: String) -> anyhow::Result<Option<String>> {
+        self.with(move |c| {
+            Ok(c.query_row(
+                "SELECT spec FROM profiles WHERE kind = ?1 AND name = ?2",
+                params![kind, name],
+                |r| r.get::<_, String>(0),
+            )
+            .optional()?)
+        })
+        .await
+    }
+
+    pub async fn save_profile(&self, kind: String, name: String, spec: String) -> anyhow::Result<()> {
+        self.with(move |c| {
+            c.execute(
+                "INSERT INTO profiles (kind, name, spec, updated_at) VALUES (?1, ?2, ?3, ?4) \
+                 ON CONFLICT(kind, name) DO UPDATE SET spec = excluded.spec, \
+                 updated_at = excluded.updated_at",
+                params![kind, name, spec, now()],
+            )?;
+            Ok(())
+        })
+        .await
+    }
+
+    pub async fn remove_profile(&self, kind: String, name: String) -> anyhow::Result<bool> {
+        self.with(move |c| {
+            let n = c.execute(
+                "DELETE FROM profiles WHERE kind = ?1 AND name = ?2",
+                params![kind, name],
+            )?;
+            Ok(n > 0)
+        })
+        .await
+    }
+
+    /// Which saved connections name a given profile.
+    ///
+    /// Asked before a profile is removed. Deleting a profile twenty connections
+    /// depend on is allowed — it is the person's data — but doing it without
+    /// being told which twenty is not a choice, it is a surprise.
+    pub async fn profile_users(&self, kind: String, name: String) -> anyhow::Result<Vec<String>> {
+        let field = match kind.as_str() {
+            "tunnel" => "tunnel_profile",
+            "proxy" => "proxy_profile",
+            other => anyhow::bail!("unknown profile kind '{other}'"),
+        };
+        self.with(move |c| {
+            let mut st = c.prepare("SELECT name, spec FROM connections")?;
+            let rows = st
+                .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(rows
+                .into_iter()
+                .filter(|(_, spec)| {
+                    serde_json::from_str::<Json>(spec)
+                        .ok()
+                        .and_then(|v| v.get(field).and_then(|p| p.as_str().map(str::to_string)))
+                        .as_deref()
+                        == Some(name.as_str())
+                })
+                .map(|(n, _)| n)
+                .collect())
         })
         .await
     }

@@ -1,4 +1,4 @@
-// lode/net: the network seam a driver dials through — plain or SSH.
+// lode/net: the network seam a driver dials through — plain, proxied, or SSH.
 //
 // Every TCP driver asks the NetContext for the address to connect to. With no
 // tunnel it returns the server's own host:port. With an SSH tunnel it stands up
@@ -14,7 +14,23 @@
 #[cfg(feature = "tunnel")]
 use std::sync::Arc;
 
-use crate::spec::TunnelSpec;
+use crate::spec::{ProxySpec, TunnelSpec};
+
+/// What a dial really went through, as a sentence for the audit log and the
+/// test stages. Assembled here because this is the only place that knows.
+fn path_words(proxy: Option<&ProxySpec>, tunnelled: bool) -> String {
+    match (proxy, tunnelled) {
+        (None, false) => "plain TCP".into(),
+        (None, true) => "an SSH tunnel".into(),
+        (Some(p), false) => format!("a {} proxy at {}:{}", p.kind.label(), p.host, p.port),
+        (Some(p), true) => format!(
+            "a {} proxy at {}:{} and then an SSH tunnel",
+            p.kind.label(),
+            p.host,
+            p.port
+        ),
+    }
+}
 
 /// Resolves the address a driver should dial, applying an SSH tunnel when one is
 /// configured. Cheap to clone/pass by value; the established tunnel (if any) is
@@ -23,16 +39,51 @@ use crate::spec::TunnelSpec;
 #[derive(Clone, Default)]
 pub struct NetContext {
     tunnel: Option<TunnelSpec>,
+    /// A proxy UNDER everything: the database's dial and the SSH server's dial
+    /// both go through it. A connection may have both, and the order is the
+    /// only one the two things can mean — a proxy is how this machine reaches
+    /// anything at all, and a tunnel is what rides on a reachable SSH server.
+    proxy: Option<ProxySpec>,
     #[cfg(feature = "tunnel")]
     established: Arc<tokio::sync::Mutex<Option<tunnel::TunnelGuard>>>,
+    /// The local forwarder for a PROXIED, untunnelled connection.
+    ///
+    /// A proxy cannot be expressed as a host:port for a driver to dial, so the
+    /// same answer the tunnel already uses applies: bind a loopback port and
+    /// bridge each accepted connection through the proxy. Zero per-driver code,
+    /// which is the whole point of this file.
+    forwarded: Arc<tokio::sync::Mutex<Option<ProxyGuard>>>,
 }
 
 impl NetContext {
     pub fn new(tunnel: Option<TunnelSpec>) -> Self {
+        Self::with_proxy(tunnel, None)
+    }
+
+    pub fn with_proxy(tunnel: Option<TunnelSpec>, proxy: Option<ProxySpec>) -> Self {
         Self {
             tunnel,
+            proxy,
             #[cfg(feature = "tunnel")]
             established: Arc::new(tokio::sync::Mutex::new(None)),
+            forwarded: Arc::new(tokio::sync::Mutex::new(None)),
+        }
+    }
+
+    pub fn proxy(&self) -> Option<&ProxySpec> {
+        self.proxy.as_ref()
+    }
+
+    /// Open one TCP stream to `host:port`, through the proxy when there is one.
+    ///
+    /// Everything in this file that reaches the network goes through here, so
+    /// "is there a proxy" is answered once rather than at each call site.
+    pub async fn dial(&self, host: &str, port: u16) -> anyhow::Result<tokio::net::TcpStream> {
+        match &self.proxy {
+            Some(p) => crate::proxy::dial(p, host, port).await,
+            None => tokio::net::TcpStream::connect(format!("{host}:{port}"))
+                .await
+                .map_err(|e| anyhow::anyhow!("cannot reach {host}:{port}: {e}")),
         }
     }
 
@@ -41,12 +92,21 @@ impl NetContext {
     /// SSH tunnel is configured (established lazily on first use, then reused).
     pub async fn resolve(&self, host: &str, port: u16) -> anyhow::Result<String> {
         match &self.tunnel {
+            // No tunnel, but a proxy: the driver still gets a plain address, it
+            // is just a loopback one with the proxy behind it.
+            None if self.proxy.is_some() => {
+                let mut guard = self.forwarded.lock().await;
+                if guard.is_none() {
+                    *guard = Some(ProxyGuard::open(self.proxy.clone().unwrap(), host, port).await?);
+                }
+                Ok(guard.as_ref().unwrap().local_addr().to_string())
+            }
             None => Ok(format!("{host}:{port}")),
             #[cfg(feature = "tunnel")]
             Some(spec) => {
                 let mut guard = self.established.lock().await;
                 if guard.is_none() {
-                    *guard = Some(tunnel::TunnelGuard::open(spec, host, port).await?);
+                    *guard = Some(tunnel::TunnelGuard::open(spec, self.proxy.as_ref(), host, port).await?);
                 }
                 Ok(guard.as_ref().unwrap().local_addr().to_string())
             }
@@ -82,19 +142,24 @@ impl NetContext {
         match &self.tunnel {
             None => {
                 let addr = format!("{host}:{port}");
-                tokio::time::timeout(timeout, tokio::net::TcpStream::connect(&addr))
+                // Through a proxy this is a REAL end-to-end proof and not a
+                // local one: the proxy answers the CONNECT only when it has
+                // reached the far side, so a refusal here is the far side's.
+                tokio::time::timeout(timeout, self.dial(host, port))
                     .await
                     .map_err(|_| {
                         anyhow::anyhow!("timed out dialling {addr} after {}s", timeout.as_secs())
-                    })?
-                    .map_err(|e| anyhow::anyhow!("cannot reach {addr}: {e}"))?;
-                Ok(format!("{addr} reachable (plain TCP)"))
+                    })??;
+                Ok(format!(
+                    "{addr} reachable through {}",
+                    path_words(self.proxy.as_ref(), false)
+                ))
             }
             #[cfg(feature = "tunnel")]
             Some(spec) => {
                 let mut guard = self.established.lock().await;
                 if guard.is_none() {
-                    *guard = Some(tunnel::TunnelGuard::open(spec, host, port).await?);
+                    *guard = Some(tunnel::TunnelGuard::open(spec, self.proxy.as_ref(), host, port).await?);
                 }
                 let g = guard.as_ref().unwrap();
                 tokio::time::timeout(timeout, g.probe())
@@ -122,6 +187,67 @@ impl NetContext {
     pub fn tunneled(&self) -> bool {
         self.tunnel.is_some()
     }
+
+    /// How a dial on this context actually travels, in words.
+    pub fn path(&self) -> String {
+        path_words(self.proxy.as_ref(), self.tunnel.is_some())
+    }
+}
+
+/// A loopback listener that bridges every accepted connection through a proxy
+/// to one endpoint.
+///
+/// The same shape as the SSH forwarder above, and for the same reason: a driver
+/// knows how to dial a `host:port` and nothing else, so anything that is not a
+/// `host:port` is turned into one here rather than in fourteen drivers.
+pub struct ProxyGuard {
+    local_addr: String,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl Drop for ProxyGuard {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+impl ProxyGuard {
+    pub fn local_addr(&self) -> &str {
+        &self.local_addr
+    }
+
+    pub async fn open(spec: ProxySpec, host: &str, port: u16) -> anyhow::Result<ProxyGuard> {
+        // Prove the proxy works BEFORE handing a driver a port that looks fine.
+        // The first dial is the proof and is then thrown away: a listener that
+        // accepts and fails on every connection is exactly the shape of bug the
+        // tunnel's endpoint stage was written to stop telling.
+        crate::proxy::dial(&spec, host, port).await?;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .map_err(|e| anyhow::anyhow!("cannot bind a local port for the proxy: {e}"))?;
+        let local_addr = listener.local_addr()?.to_string();
+        let host = host.to_string();
+        let task = tokio::spawn(async move {
+            loop {
+                let Ok((mut inbound, _)) = listener.accept().await else { break };
+                let spec = spec.clone();
+                let host = host.clone();
+                tokio::spawn(async move {
+                    let Ok(mut out) = crate::proxy::dial(&spec, &host, port).await else {
+                        // Dropping `inbound` closes the driver's socket, so it
+                        // reports a connection failure rather than hanging. The
+                        // proxy's reason is lost HERE, which is why `probe`
+                        // dials the proxy itself rather than inferring anything
+                        // from this path.
+                        return;
+                    };
+                    let _ = tokio::io::copy_bidirectional(&mut inbound, &mut out).await;
+                });
+            }
+        });
+        Ok(ProxyGuard { local_addr, task })
+    }
 }
 
 #[cfg(feature = "tunnel")]
@@ -132,7 +258,7 @@ mod tunnel {
     use russh::keys::PublicKey;
     use tokio::net::TcpListener;
 
-    use crate::spec::{TunnelAuth, TunnelSpec};
+    use crate::spec::{ProxySpec, TunnelAuth, TunnelSpec};
 
     /// A running SSH local-forward. Holds the SSH session + the accept task; on
     /// drop the task is aborted and the session closes.
@@ -182,11 +308,37 @@ mod tunnel {
 
         /// Establish the SSH session, authenticate, and start forwarding a fresh
         /// local port to `(db_host, db_port)` over the tunnel.
-        pub async fn open(spec: &TunnelSpec, db_host: &str, db_port: u16) -> anyhow::Result<Self> {
+        pub async fn open(
+            spec: &TunnelSpec,
+            proxy: Option<&ProxySpec>,
+            db_host: &str,
+            db_port: u16,
+        ) -> anyhow::Result<Self> {
             let config = Arc::new(client::Config::default());
-            let mut session = client::connect(config, (spec.host.as_str(), spec.port), ClientHandler)
-                .await
-                .map_err(|e| anyhow::anyhow!("ssh connect to {}:{} failed: {e}", spec.host, spec.port))?;
+            // The SSH SERVER is dialled through the proxy too, when there is
+            // one. A proxy that fronted the database but not the bastion would
+            // be a proxy that is sometimes bypassed, and "sometimes bypassed"
+            // is the one thing a network rule must never be.
+            let mut session = match proxy {
+                Some(p) => {
+                    let stream = crate::proxy::dial(p, &spec.host, spec.port).await.map_err(|e| {
+                        anyhow::anyhow!(
+                            "reaching the SSH server {}:{} through the {} proxy failed: {e}",
+                            spec.host,
+                            spec.port,
+                            p.kind.label()
+                        )
+                    })?;
+                    client::connect_stream(config, stream, ClientHandler)
+                        .await
+                        .map_err(|e| {
+                            anyhow::anyhow!("ssh handshake with {}:{} failed: {e}", spec.host, spec.port)
+                        })?
+                }
+                None => client::connect(config, (spec.host.as_str(), spec.port), ClientHandler)
+                    .await
+                    .map_err(|e| anyhow::anyhow!("ssh connect to {}:{} failed: {e}", spec.host, spec.port))?,
+            };
 
             // Authenticate with the chosen method.
             let authed = match &spec.auth {

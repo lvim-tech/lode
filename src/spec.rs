@@ -285,6 +285,26 @@ pub struct ConnSpec {
     pub tls: TlsSpec,
     #[serde(default)]
     pub tunnel: Option<TunnelSpec>,
+    /// A SAVED tunnel, by name, instead of one spelled out here.
+    ///
+    /// A bastion is one machine and twenty connections go through it; writing
+    /// its host, user and key into twenty specs means changing twenty of them
+    /// when the key rotates, and finding out which one was missed by its
+    /// failing. The engine resolves the name at connect time, so a profile
+    /// edited once is edited everywhere.
+    ///
+    /// Naming a profile AND spelling a tunnel out is refused rather than
+    /// resolved by precedence: a connection with two tunnels is a connection
+    /// whose author believed something that is not true about it.
+    #[serde(default)]
+    pub tunnel_profile: Option<String>,
+    /// A proxy every TCP dial goes through — the database's, and the SSH
+    /// server's.
+    #[serde(default)]
+    pub proxy: Option<ProxySpec>,
+    /// A saved proxy, by name. Same rule as `tunnel_profile`.
+    #[serde(default)]
+    pub proxy_profile: Option<String>,
     /// What this connection is ALLOWED to do, enforced by the engine.
     ///
     /// On the connection rather than on a client, because a client is a thing
@@ -324,6 +344,28 @@ impl Policy {
 }
 
 impl ConnSpec {
+    /// The two ways a tunnel and a proxy can be ambiguous, refused with the
+    /// name of the one that is ambiguous.
+    ///
+    /// Checked before a profile is looked up, so "you named a profile AND wrote
+    /// a tunnel" is the answer rather than "no such profile".
+    pub fn check_profiles(&self) -> anyhow::Result<()> {
+        if self.tunnel.is_some() && self.tunnel_profile.is_some() {
+            anyhow::bail!(
+                "this connection both names the tunnel profile '{}' and spells a tunnel out — \
+                 pick one, because two tunnels is not a thing a connection can have",
+                self.tunnel_profile.as_deref().unwrap_or("")
+            );
+        }
+        if self.proxy.is_some() && self.proxy_profile.is_some() {
+            anyhow::bail!(
+                "this connection both names the proxy profile '{}' and spells a proxy out — pick one",
+                self.proxy_profile.as_deref().unwrap_or("")
+            );
+        }
+        Ok(())
+    }
+
     /// One line naming WHAT this connection points at, for the audit log.
     ///
     /// Built from the fields the engine itself reads generically — the `host`
@@ -346,6 +388,11 @@ impl ConnSpec {
         out.push_str(&format!(" tls={}", self.tls.mode.label()));
         if let Some(t) = &self.tunnel {
             out.push_str(&format!(" via ssh {}@{}:{}", t.user, t.host, t.port));
+        }
+        // Which machine the traffic actually left through belongs in the record
+        // as much as which database it reached.
+        if let Some(p) = &self.proxy {
+            out.push_str(&format!(" through {} {}:{}", p.kind.label(), p.host, p.port));
         }
         out
     }
@@ -486,10 +533,49 @@ impl TlsMode {
     }
 }
 
+/// A proxy every TCP dial goes through: the DB's, and the SSH server's.
+///
+/// Orthogonal to the tunnel, and UNDERNEATH it. A connection may have both, and
+/// then the order is proxy → SSH server → direct-tcpip → database, because that
+/// is what the two things mean: a proxy is how this machine reaches anything at
+/// all, and a tunnel is what rides on top of a reachable SSH server.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct ProxySpec {
+    pub kind: ProxyKind,
+    pub host: String,
+    pub port: u16,
+    #[serde(default)]
+    pub auth: Option<ProxyAuth>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProxyKind {
+    Socks5,
+    HttpConnect,
+}
+
+impl ProxyKind {
+    pub fn label(self) -> &'static str {
+        match self {
+            ProxyKind::Socks5 => "SOCKS5",
+            ProxyKind::HttpConnect => "HTTP CONNECT",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct ProxyAuth {
+    #[serde(default)]
+    pub user: String,
+    #[serde(default)]
+    pub password: Secret,
+}
+
 /// An SSH tunnel fronting the DB's TCP endpoint — orthogonal to both auth and
 /// TLS, applied by the net layer before the driver dials. Wired with russh in
 /// the remote/auth phase.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct TunnelSpec {
     pub host: String,
     #[serde(default = "default_ssh_port")]
@@ -502,7 +588,7 @@ fn default_ssh_port() -> u16 {
     22
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum TunnelAuth {
     Agent,

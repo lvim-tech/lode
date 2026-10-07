@@ -70,7 +70,18 @@ use serde_json::json;
 ///     as a template over `{col}`, `{from}` and `{to}`; empty where there is no
 ///     such thing (Redis). Additive: a client that never asks for a dashboard
 ///     is unaffected, and an older client simply sees a field it ignores.
-pub const PROTO: u32 = 8;
+/// 9 — added PROFILES and PROXIES: `store.profiles.{list,get,save,remove}`,
+///     `ConnSpec.{tunnel_profile, proxy, proxy_profile}`, and a `proxy` stage
+///     for `conn.test`. A profile is a reusable piece of network, by name — a
+///     bastion is one machine and twenty connections go through it, and written
+///     into twenty specs, rotating its key means editing twenty of them. A
+///     connection that names a profile which is missing FAILS; it never falls
+///     back to a direct link, because a connection whose author asked for a
+///     bastion and got a direct link is the one outcome that must not happen.
+///     A proxy (SOCKS5 or HTTP CONNECT) sits UNDER everything: the database's
+///     dial and the SSH server's dial both go through it, since a proxy that is
+///     sometimes bypassed is not a rule. Additive.
+pub const PROTO: u32 = 9;
 
 /// One decoded incoming request.
 #[derive(Debug, Deserialize)]

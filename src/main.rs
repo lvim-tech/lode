@@ -17,6 +17,7 @@ mod dashboard;
 mod driver;
 mod drivers;
 mod net;
+mod proxy;
 mod registry;
 mod rpc;
 mod secret;

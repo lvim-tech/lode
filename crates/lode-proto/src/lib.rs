@@ -624,6 +624,20 @@ pub fn apply_time(statement: &str, meta: &DriverMeta, time: Option<&TimeRange>) 
     (statement.replace(TIME_MARKER, &fragment), TimeFit::Applied)
 }
 
+/// A saved piece of network, by name.
+#[derive(Debug, Clone, Deserialize)]
+pub struct Profile {
+    pub name: String,
+    /// The spec as stored, with every credential still a TEMPLATE. Left as
+    /// `Value` because the two kinds have different shapes and the client shows
+    /// whichever fields are there — the engine is the one that parses it as a
+    /// tunnel or a proxy, and it does so on the way in.
+    #[serde(default)]
+    pub spec: Value,
+    #[serde(default)]
+    pub updated_at: Option<i64>,
+}
+
 /// One audit row.
 ///
 /// The engine's record of something that CHANGED the database, or of a
@@ -1052,6 +1066,36 @@ impl Engine {
                 .unwrap_or("full")
                 .to_string(),
         })
+    }
+
+    /// The saved profiles of one kind — `"tunnel"` or `"proxy"`.
+    ///
+    /// A profile is a reusable piece of network, by name, and is NOT scoped to
+    /// a connection: the whole point is that several share one.
+    pub fn profiles(&self, kind: &str, timeout: Duration) -> anyhow::Result<Vec<Profile>> {
+        let v = self.call("store.profiles.list", json!({ "kind": kind }), timeout)?;
+        Ok(serde_json::from_value(
+            v.get("profiles").cloned().unwrap_or_else(|| json!([])),
+        )?)
+    }
+
+    pub fn save_profile(&self, kind: &str, name: &str, spec: &Value, timeout: Duration) -> anyhow::Result<()> {
+        self.call(
+            "store.profiles.save",
+            json!({ "kind": kind, "name": name, "spec": spec }),
+            timeout,
+        )?;
+        Ok(())
+    }
+
+    /// Remove a profile. The connections that were USING it come back, because
+    /// a removal that takes several connections down silently is a surprise
+    /// rather than a choice.
+    pub fn remove_profile(&self, kind: &str, name: &str, timeout: Duration) -> anyhow::Result<Vec<String>> {
+        let v = self.call("store.profiles.remove", json!({ "kind": kind, "name": name }), timeout)?;
+        Ok(serde_json::from_value(
+            v.get("was_used_by").cloned().unwrap_or_else(|| json!([])),
+        )?)
     }
 
     pub fn dashboards(&self, conn: &str, timeout: Duration) -> anyhow::Result<Vec<Value>> {

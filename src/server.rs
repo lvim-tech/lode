@@ -57,6 +57,17 @@ struct ConnEntry {
     _net: NetContext,
 }
 
+/// The two namespaces of profile there are. Checked rather than accepted, so a
+/// typo makes an empty list instead of a silent new namespace nobody can find.
+fn check_profile_kind(kind: &str) -> anyhow::Result<()> {
+    match kind {
+        "tunnel" | "proxy" => Ok(()),
+        other => Err(anyhow::anyhow!(
+            "unknown profile kind '{other}' — there are 'tunnel' and 'proxy'"
+        )),
+    }
+}
+
 /// The lifecycle of one executed statement.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum CallStatus {
@@ -354,6 +365,10 @@ impl Server {
             "store.dashboards.get" => self.store_dashboard_get(params).await,
             "store.dashboards.save" => self.store_dashboard_save(params).await,
             "store.dashboards.remove" => self.store_dashboard_remove(params).await,
+            "store.profiles.list" => self.store_profile_list(params).await,
+            "store.profiles.get" => self.store_profile_get(params).await,
+            "store.profiles.save" => self.store_profile_save(params).await,
+            "store.profiles.remove" => self.store_profile_remove(params).await,
             "store.history.record" => self.store_history_record(params).await,
             "store.history.list" => self.store_history_list(params).await,
             "store.import" => self.store_import(params).await,
@@ -379,7 +394,11 @@ impl Server {
     // ── connections ──────────────────────────────────────────────────────────
 
     async fn connect(&self, params: Json) -> anyhow::Result<Json> {
-        let spec: ConnSpec = serde_json::from_value(params)?;
+        let mut spec: ConnSpec = serde_json::from_value(params)?;
+        // A named tunnel or proxy becomes the real thing BEFORE anything is
+        // dialled. A missing profile fails the connect; it never silently
+        // becomes a direct link.
+        self.resolve_profiles(&mut spec).await?;
         let driver = self.inner.registry.get(&spec.driver)?;
         let meta = driver.meta();
         // WHAT this connection points at, in words with no credential in them
@@ -388,7 +407,7 @@ impl Server {
         // is the shape of something worth seeing, and only the successes being
         // in the log is how it stays invisible.
         let target = spec.target(meta);
-        let net = NetContext::new(spec.tunnel.clone());
+        let net = NetContext::with_proxy(spec.tunnel.clone(), spec.proxy.clone());
         let started = Instant::now();
         let conn = match driver.connect(&spec, net.clone()).await {
             Ok(c) => c,
@@ -458,7 +477,10 @@ impl Server {
             stage: String,
             spec: ConnSpec,
         }
-        let p: P = serde_json::from_value(params)?;
+        let mut p: P = serde_json::from_value(params)?;
+        // The same resolution the real connect does, so a stage tests the spec
+        // that would actually be used rather than the one that was typed.
+        self.resolve_profiles(&mut p.spec).await?;
         let meta = self
             .inner
             .registry
@@ -469,6 +491,7 @@ impl Server {
 
         let started = Instant::now();
         let detail = match p.stage.as_str() {
+            "proxy" => Self::test_proxy(&p.spec).await?,
             "endpoint" => Self::test_endpoint(&p.spec, meta).await?,
             "tunnel" => Self::test_tunnel(&p.spec, meta).await?,
             "tls" | "auth" => self.test_connect(&p.spec, &p.stage).await?,
@@ -479,6 +502,47 @@ impl Server {
             "ms": started.elapsed().as_millis() as u64,
             "detail": detail,
         }))
+    }
+
+    /// Proxy stage — is the proxy there, and does it speak what it was told to?
+    ///
+    /// Deliberately dials the proxy and asks it for a KNOWN-UNREACHABLE
+    /// endpoint rather than for the database. The question of this stage is
+    /// "does the proxy work", and asking it for the database would fold two
+    /// answers into one: a refusal would then mean either a broken proxy or a
+    /// database that is down, which is the blame-sharing the staged tests exist
+    /// to prevent. A proxy that answers "host unreachable" has WORKED — it
+    /// completed its handshake and gave a verdict.
+    async fn test_proxy(spec: &ConnSpec) -> anyhow::Result<String> {
+        let Some(p) = &spec.proxy else {
+            return Err(anyhow::anyhow!("no proxy is configured on this connection"));
+        };
+        // RFC 6761 reserves .invalid, and it never resolves anywhere.
+        match crate::proxy::dial(p, "lode-proxy-probe.invalid", 1).await {
+            // It connected to a name that cannot exist. That is not a working
+            // proxy, it is a proxy that lies, and it is worth saying so.
+            Ok(_) => Ok(format!(
+                "the {} proxy at {}:{} answered — but it CONNECTED to a name that cannot exist, \
+                 so whatever it is doing, it is not resolving names honestly",
+                p.kind.label(),
+                p.host,
+                p.port
+            )),
+            Err(e) => {
+                let text = e.to_string();
+                // The handshake got as far as a verdict: the proxy works.
+                if text.contains("refused to connect") || text.contains("the proxy wants authentication") {
+                    Ok(format!(
+                        "the {} proxy at {}:{} is reachable and answered a request ({text})",
+                        p.kind.label(),
+                        p.host,
+                        p.port
+                    ))
+                } else {
+                    Err(e)
+                }
+            }
+        }
     }
 
     /// Endpoint stage — is the thing we would dial actually THERE? A file-backed
@@ -516,7 +580,7 @@ impl Server {
         if port == 0 {
             return Err(anyhow::anyhow!("no port set and '{}' declares no default", meta.kind));
         }
-        let net = NetContext::new(spec.tunnel.clone());
+        let net = NetContext::with_proxy(spec.tunnel.clone(), spec.proxy.clone());
         net.probe(host, port, DIAL_TIMEOUT).await
     }
 
@@ -538,10 +602,11 @@ impl Server {
         }
         let user = t.user.clone();
         let (shost, sport) = (t.host.clone(), t.port);
-        let net = NetContext::new(Some(t));
+        let net = NetContext::with_proxy(Some(t), spec.proxy.clone());
         let addr = net.resolve(host, port).await?;
         Ok(format!(
-            "ssh {user}@{shost}:{sport} authenticated — forwarding {addr} → {host}:{port}"
+            "ssh {user}@{shost}:{sport} authenticated over {} — forwarding {addr} → {host}:{port}",
+            net.path()
         ))
     }
 
@@ -551,7 +616,7 @@ impl Server {
     /// accepted identity.
     async fn test_connect(&self, spec: &ConnSpec, stage: &str) -> anyhow::Result<String> {
         let driver = self.inner.registry.get(&spec.driver)?;
-        let net = NetContext::new(spec.tunnel.clone());
+        let net = NetContext::with_proxy(spec.tunnel.clone(), spec.proxy.clone());
         let conn = driver.connect(spec, net.clone()).await?;
         let native = conn.encrypted();
         let tunneled = net.tunneled();
@@ -1259,6 +1324,128 @@ impl Server {
         }
         self.store()?.save_chart(p.conn, p.name, p.sql, p.measure).await?;
         Ok(json!({ "saved": true }))
+    }
+
+    // ── profiles ─────────────────────────────────────────────────────────────
+
+    /// Resolve the profiles a spec NAMES into the spec itself.
+    ///
+    /// Done here, in the engine, every time a connection is opened or tested —
+    /// so a profile edited once is edited for every connection that names it,
+    /// including the ones in the other client, including the ones that are open
+    /// right now and will pick it up on their next connect.
+    ///
+    /// A named profile that is missing is an error with the NAME in it. The
+    /// alternative — carrying on without the tunnel — is the one outcome that
+    /// must never happen: a connection whose author asked for a bastion and got
+    /// a direct link instead.
+    async fn resolve_profiles(&self, spec: &mut ConnSpec) -> anyhow::Result<()> {
+        spec.check_profiles()?;
+        if spec.tunnel_profile.is_none() && spec.proxy_profile.is_none() {
+            return Ok(());
+        }
+        let store = self.store().map_err(|e| {
+            anyhow::anyhow!("this connection names a saved profile, and {e}")
+        })?;
+        if let Some(name) = spec.tunnel_profile.clone() {
+            let raw = store.get_profile("tunnel".into(), name.clone()).await?.ok_or_else(|| {
+                anyhow::anyhow!(
+                    "there is no saved tunnel profile called '{name}' — this connection will NOT \
+                     fall back to a direct link"
+                )
+            })?;
+            spec.tunnel = Some(serde_json::from_str(&raw).map_err(|e| {
+                anyhow::anyhow!("the saved tunnel profile '{name}' cannot be read: {e}")
+            })?);
+        }
+        if let Some(name) = spec.proxy_profile.clone() {
+            let raw = store.get_profile("proxy".into(), name.clone()).await?.ok_or_else(|| {
+                anyhow::anyhow!(
+                    "there is no saved proxy profile called '{name}' — this connection will NOT \
+                     fall back to a direct link"
+                )
+            })?;
+            spec.proxy = Some(serde_json::from_str(&raw).map_err(|e| {
+                anyhow::anyhow!("the saved proxy profile '{name}' cannot be read: {e}")
+            })?);
+        }
+        Ok(())
+    }
+
+    async fn store_profile_list(&self, params: Json) -> anyhow::Result<Json> {
+        #[derive(Deserialize)]
+        struct P {
+            kind: String,
+        }
+        let p: P = serde_json::from_value(params)?;
+        check_profile_kind(&p.kind)?;
+        Ok(json!({ "profiles": self.store()?.list_profiles(p.kind).await? }))
+    }
+
+    async fn store_profile_get(&self, params: Json) -> anyhow::Result<Json> {
+        #[derive(Deserialize)]
+        struct P {
+            kind: String,
+            name: String,
+        }
+        let p: P = serde_json::from_value(params)?;
+        check_profile_kind(&p.kind)?;
+        let raw = self.store()?.get_profile(p.kind, p.name).await?;
+        Ok(json!({ "spec": raw.and_then(|r| serde_json::from_str::<Json>(&r).ok()) }))
+    }
+
+    /// Save a profile, after PARSING it as the thing it claims to be.
+    ///
+    /// Parsed rather than stored as opaque JSON, so a malformed tunnel is
+    /// refused here and not at three in the morning when a connection that
+    /// names it will not open. The parse is the check: `TunnelSpec` has
+    /// required fields, and a document missing one does not become a tunnel.
+    async fn store_profile_save(&self, params: Json) -> anyhow::Result<Json> {
+        #[derive(Deserialize)]
+        struct P {
+            kind: String,
+            name: String,
+            spec: Json,
+        }
+        let p: P = serde_json::from_value(params)?;
+        check_profile_kind(&p.kind)?;
+        if p.name.trim().is_empty() {
+            return Err(anyhow::anyhow!("a profile needs a name"));
+        }
+        let canonical = match p.kind.as_str() {
+            "tunnel" => {
+                let t: crate::spec::TunnelSpec = serde_json::from_value(p.spec)
+                    .map_err(|e| anyhow::anyhow!("that is not a tunnel: {e}"))?;
+                serde_json::to_string(&t)?
+            }
+            _ => {
+                let x: crate::spec::ProxySpec = serde_json::from_value(p.spec)
+                    .map_err(|e| anyhow::anyhow!("that is not a proxy: {e}"))?;
+                serde_json::to_string(&x)?
+            }
+        };
+        self.store()?.save_profile(p.kind, p.name, canonical).await?;
+        Ok(json!({ "saved": true }))
+    }
+
+    /// Remove a profile, and SAY which connections were using it.
+    ///
+    /// It is removed either way — it is the person's data, and refusing would
+    /// leave them unable to clean up. But a removal that takes twenty
+    /// connections down silently is a surprise, not a choice, so the names come
+    /// back with the answer.
+    async fn store_profile_remove(&self, params: Json) -> anyhow::Result<Json> {
+        #[derive(Deserialize)]
+        struct P {
+            kind: String,
+            name: String,
+        }
+        let p: P = serde_json::from_value(params)?;
+        check_profile_kind(&p.kind)?;
+        let store = self.store()?;
+        let users = store.profile_users(p.kind.clone(), p.name.clone()).await?;
+        let removed = store.remove_profile(p.kind, p.name).await?;
+        Ok(json!({ "removed": removed, "was_used_by": users }))
     }
 
     // ── dashboards ───────────────────────────────────────────────────────────

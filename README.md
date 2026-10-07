@@ -82,7 +82,7 @@ notification   {"method":"…","params":{…}}
 
 `proto` grows **additively**: a client accepts any engine reporting
 `proto >= its minimum`, so a newer engine keeps working with an older client.
-The current protocol is **8**. What each version added is listed in
+The current protocol is **9**. What each version added is listed in
 `src/rpc.rs` beside the constant.
 
 ### Handshake
@@ -193,6 +193,64 @@ time. The source file is only read.
 
 The database lives at `$LODE_DATA_DIR/lode.db`, else
 `$XDG_DATA_HOME/lode/lode.db`, else `~/.local/share/lode/lode.db`.
+
+### Profiles and proxies (`proto >= 9`)
+
+A **profile** is a reusable piece of network, by name. A bastion is one machine
+and twenty connections go through it; written into twenty specs, rotating its
+key means editing twenty of them and finding out which one was missed by its
+failing.
+
+| method | params | result |
+|---|---|---|
+| `store.profiles.list` | `{ kind }` | `{ profiles }` |
+| `store.profiles.get` | `{ kind, name }` | `{ spec }` or `null` |
+| `store.profiles.save` | `{ kind, name, spec }` | `{ saved }` |
+| `store.profiles.remove` | `{ kind, name }` | `{ removed, was_used_by }` |
+
+`kind` is `tunnel` or `proxy`. Profiles are NOT scoped to a connection — the
+point is that several share one — and the two kinds are separate namespaces, so
+a tunnel and a proxy may both be called `office`.
+
+A spec is **parsed as the thing it claims to be** on the way in, so a malformed
+tunnel is refused now rather than at three in the morning when a connection that
+names it will not open. Credentials stay templates, exactly as in a connection.
+
+A connection names one with `tunnel_profile` / `proxy_profile`. **A named
+profile that is missing fails the connect.** It never falls back to a direct
+link: a connection whose author asked for a bastion and silently got a plain
+connection to the database is the one outcome that must not happen. Naming a
+profile *and* spelling one out is refused rather than resolved by precedence —
+precedence means one of the two silently losing, and a connection with two
+tunnels is one whose author believed something untrue about it.
+
+Removing a profile answers with `was_used_by`: it IS removed, because it is the
+person's data, but a removal that takes several connections down without saying
+so is a surprise rather than a choice.
+
+#### Proxies
+
+`proxy` is `{ kind, host, port, auth? }` with `kind` of `socks5` or
+`http_connect`. It sits **under** everything: the database's dial and the SSH
+server's dial both go through it, because a proxy that is sometimes bypassed is
+not a rule. With both a proxy and a tunnel the order is
+proxy → SSH server → direct-tcpip → database.
+
+The host NAME goes over the wire, not an address. On the far side of a proxy the
+client's DNS is usually the wrong DNS.
+
+A proxy cannot be expressed as a `host:port` for a driver to dial, so an
+untunnelled proxied connection gets a loopback forwarder — the same answer the
+SSH tunnel already uses, and for the same reason: zero per-driver code. The first
+dial happens before the port is handed over, so a listener that accepts and fails
+on every connection is not what a driver is given.
+
+`conn.test` gains a **`proxy`** stage. It asks the proxy for a name that cannot
+exist (RFC 6761 `.invalid`), deliberately, because the question of the stage is
+"does the proxy work": asking it for the database would make a refusal mean
+either a broken proxy or a database that is down, which is exactly the
+blame-sharing the staged tests exist to prevent. A proxy that answers *host
+unreachable* has worked — it completed its handshake and gave a verdict.
 
 ### The audit log (`proto >= 7`)
 
