@@ -46,7 +46,18 @@ use serde_json::json;
 ///     client's file, for the same reason saved queries are: a chart somebody
 ///     made is something they will want from the editor too. Additive — the
 ///     store's schema version is unchanged for the tables the Lua side knows.
-pub const PROTO: u32 = 6;
+/// 7 — added the AUDIT LOG: `store.audit.list`, and an optional `name` on a
+///     ConnSpec so a record can say WHICH connection a statement ran on in the
+///     word a person would search for. The log is written by the engine on the
+///     paths that change data and on connect/disconnect, so a client cannot
+///     leave itself out of it, and there is no method to delete from it. Each
+///     row carries a fingerprint of the statement's shape and the statement
+///     itself with the credential grammars redacted; `LODE_AUDIT_STATEMENTS`
+///     turns the statement column down to the shape alone, or off. Additive: a
+///     client that does not send `name` gets rows that name the driver and
+///     leave the name empty, and a client that never asks for the log is
+///     unaffected — the log is still written.
+pub const PROTO: u32 = 7;
 
 /// One decoded incoming request.
 #[derive(Debug, Deserialize)]

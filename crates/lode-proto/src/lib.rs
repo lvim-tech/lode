@@ -484,6 +484,68 @@ pub struct HistoryRow {
     pub ts: Option<i64>,
 }
 
+/// One audit row.
+///
+/// The engine's record of something that CHANGED the database, or of a
+/// connection opened or closed — including the attempts it refused. A client
+/// cannot write to this and cannot delete from it; it can only ask.
+#[derive(Debug, Clone, Deserialize)]
+pub struct AuditRow {
+    #[serde(default)]
+    pub id: i64,
+    #[serde(default)]
+    pub ts: Option<i64>,
+    /// The saved connection's name, when the client that ran it sent one.
+    #[serde(default)]
+    pub conn: Option<String>,
+    #[serde(default)]
+    pub driver: Option<String>,
+    /// `execute` | `row.write` | `conn.connect` | `conn.disconnect`.
+    pub path: String,
+    /// A stable name for the statement's shape — same shape, same fingerprint,
+    /// whatever the values were.
+    #[serde(default)]
+    pub fingerprint: Option<String>,
+    /// Already redacted by the engine, and empty when the engine is running
+    /// with the statement column turned down (see `AuditLog::mode`).
+    pub statement: String,
+    /// The connection's policy at the time this ran.
+    #[serde(default)]
+    pub policy: Option<String>,
+    #[serde(default)]
+    pub confirmed: bool,
+    /// `applied` | `refused` | `failed` | `cancelled` | `connected` |
+    /// `disconnected`.
+    pub outcome: String,
+    #[serde(default)]
+    pub affected: Option<i64>,
+    #[serde(default)]
+    pub ms: Option<i64>,
+    #[serde(default)]
+    pub reason: Option<String>,
+}
+
+impl AuditRow {
+    /// Whether this row is something that did NOT happen — a refusal or a
+    /// failure. The client paints these differently, because they are the rows
+    /// somebody opened the log to find.
+    pub fn stopped(&self) -> bool {
+        matches!(self.outcome.as_str(), "refused" | "failed" | "cancelled")
+    }
+}
+
+/// The audit log as the engine hands it over: the rows, and how much of a
+/// statement this engine is keeping.
+///
+/// `mode` travels with the rows so a client can SAY why a statement is blank.
+/// A blank statement with no explanation reads as a bug; this one is a setting,
+/// and the difference matters to whoever is reading the log.
+#[derive(Debug, Clone, Default)]
+pub struct AuditLog {
+    pub rows: Vec<AuditRow>,
+    pub mode: String,
+}
+
 /// The lifecycle of one executed statement, from a `query.state` notification.
 #[derive(Debug, Clone, Deserialize)]
 pub struct QueryState {
@@ -833,6 +895,25 @@ impl Engine {
         Ok(())
     }
 
+    /// The audit log, newest first. `conn` narrows it to one connection by name.
+    ///
+    /// There is no `clear_audit` to match, and that is deliberate: a log a
+    /// client can delete from is a log of what that client chose to keep.
+    pub fn audit(&self, limit: i64, conn: Option<&str>, timeout: Duration) -> anyhow::Result<AuditLog> {
+        let v = self.call("store.audit.list", json!({ "limit": limit, "conn": conn }), timeout)?;
+        Ok(AuditLog {
+            rows: serde_json::from_value(v.get("audit").cloned().unwrap_or_else(|| json!([])))?,
+            // An engine from before this existed answers without a mode; the
+            // honest reading of that is "nothing is being withheld", which is
+            // what `full` means.
+            mode: v
+                .get("mode")
+                .and_then(|m| m.as_str())
+                .unwrap_or("full")
+                .to_string(),
+        })
+    }
+
     pub fn structure(&self, conn_id: u64, timeout: Duration) -> anyhow::Result<Vec<Node>> {
         let v = self.call("schema.structure", json!({ "conn_id": conn_id }), timeout)?;
         Ok(serde_json::from_value(
@@ -872,6 +953,43 @@ mod tests {
 
     fn meta_from(json: Value) -> DriverMeta {
         serde_json::from_value(json).unwrap()
+    }
+
+    /// An audit row parses field for field, and `stopped()` divides the rows
+    /// the way the panel colours them: the ones that did NOT happen are the
+    /// ones somebody opened the log to find.
+    #[test]
+    fn an_audit_row_parses_and_knows_whether_it_happened() {
+        let rows: Vec<AuditRow> = serde_json::from_value(json!([
+            {
+                "id": 3, "ts": 1700000000, "conn": "prod", "driver": "postgres",
+                "path": "execute", "fingerprint": "a1b2c3d4e5f6a7b8",
+                "statement": "DELETE FROM people", "policy": "read only",
+                "confirmed": true, "outcome": "refused", "affected": null,
+                "ms": null, "reason": "this connection is read only"
+            },
+            {
+                "id": 2, "path": "row.write", "statement": "UPDATE t SET a = ?1 WHERE id = ?2",
+                "outcome": "applied", "affected": 1, "ms": 4
+            },
+            {
+                "id": 1, "path": "conn.connect", "statement": "sqlite /tmp/x tls=prefer encrypted=false",
+                "outcome": "connected"
+            }
+        ]))
+        .unwrap();
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0].policy.as_deref(), Some("read only"));
+        assert_eq!(rows[0].reason.as_deref(), Some("this connection is read only"));
+        assert_eq!(rows[0].fingerprint.as_deref(), Some("a1b2c3d4e5f6a7b8"));
+        assert!(rows[0].stopped(), "a refusal is the row somebody is looking for");
+        // The sparse rows: everything absent defaults rather than failing, so a
+        // row an older engine wrote still reads.
+        assert_eq!(rows[1].affected, Some(1));
+        assert!(!rows[1].stopped());
+        assert!(rows[2].conn.is_none());
+        assert!(!rows[2].confirmed, "an absent confirm is not a confirm");
+        assert!(!rows[2].stopped());
     }
 
     /// The statement a click on a table produces is the ENGINE's template with

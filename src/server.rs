@@ -18,6 +18,7 @@ use serde_json::{json, Value as Json};
 use tokio::sync::mpsc::UnboundedSender;
 use tokio::sync::Mutex as AsyncMutex;
 
+use crate::audit;
 use crate::driver::{CancelHandle, Connection, ResultStream};
 use crate::net::NetContext;
 use crate::registry::Registry;
@@ -38,6 +39,14 @@ const DIAL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 /// tunnel stays up as long as this entry lives, and is torn down on disconnect.
 struct ConnEntry {
     conn: Conn,
+    /// The SAVED connection's name, when the client sent one.
+    ///
+    /// Recorded for the audit log: a conn_id is a handle that means nothing an
+    /// hour later, and `name` is what somebody will search the log by. Optional
+    /// because a connection does not have to be a saved one — a client may open
+    /// an ad-hoc spec, and the log then says which driver and leaves the name
+    /// empty rather than inventing one.
+    name: Option<String>,
     /// What this connection is allowed to do.
     policy: Policy,
     /// Which driver this connection IS. Recorded rather than taken from a
@@ -120,6 +129,10 @@ struct Inner {
     /// method works without it. Only the saved connections, saved queries and
     /// history are unavailable, which is exactly what the clients degrade to.
     store: Result<Store, String>,
+    /// How much of a statement the audit log keeps. Read ONCE at startup, not
+    /// per call: an audit mode that could change between two statements is an
+    /// audit mode a running process could be talked out of.
+    audit_mode: audit::Mode,
 }
 
 impl Server {
@@ -143,6 +156,7 @@ impl Server {
                 next_call: AtomicU64::new(1),
                 out,
                 store,
+                audit_mode: audit::Mode::from_env(),
             }),
         }
     }
@@ -170,7 +184,64 @@ impl Server {
             .ok_or_else(|| anyhow::anyhow!("no such connection {id}"))
     }
 
-    /// Hold a statement against the connection's policy.
+    /// Start an audit record for a statement on a live connection: the
+    /// connection's name, driver and policy as they are RIGHT NOW, the shape of
+    /// the statement, and the statement itself through whatever `Mode` the
+    /// engine was started with.
+    ///
+    /// Built here rather than at each call site so none of the doors can produce
+    /// a half-filled row, and so the only place a raw statement turns into a
+    /// stored one is this function.
+    fn audit_for(&self, conn_id: u64, path: &str, statement: &str, confirmed: bool, outcome: &str) -> audit::Record {
+        let (name, driver, policy) = self
+            .inner
+            .conns
+            .lock()
+            .unwrap()
+            .get(&conn_id)
+            .map(|e| (e.name.clone(), Some(e.driver.clone()), Some(e.policy.label().to_string())))
+            .unwrap_or((None, None, None));
+        let mut r = audit::Record::new(path, outcome);
+        r.conn = name;
+        r.driver = driver;
+        r.policy = policy;
+        r.confirmed = confirmed;
+        // `about` fingerprints the ORIGINAL text — so `shape` and `off` modes
+        // still group runs of the same statement — renders the column through
+        // the mode, and keeps the credentials it removed so `because` can take
+        // them out of the engine's error message too.
+        r.about(self.inner.audit_mode, statement);
+        r
+    }
+
+    /// Append one audit row.
+    ///
+    /// Never fails the operation it is describing: a failure to LOG is reported
+    /// and does not become a failure to work, because refusing to run something
+    /// on the grounds that the record could not be written is a worse outcome
+    /// than a gap in the record that says, loudly, that it is a gap. The
+    /// complaint goes out on `daemon.log` at `error` level, which is the channel
+    /// both clients already show.
+    async fn audit(&self, r: audit::Record) {
+        let store = match self.inner.store.as_ref() {
+            Ok(s) => s,
+            // No store means no log, and `store.status` already says why. The
+            // engine warned about that once at startup; warning again per
+            // statement would bury the one message that mattered.
+            Err(_) => return,
+        };
+        if let Err(e) = store.record_audit(r).await {
+            self.send(rpc::notification(
+                "daemon.log",
+                json!({
+                    "level": "error",
+                    "message": format!("the audit record could not be written: {e} — this operation is NOT in the log"),
+                }),
+            ));
+        }
+    }
+
+    /// Hold a statement against the connection\u{2019}s policy.
     ///
     /// Returns the reason to refuse, or `None` to go ahead. This runs on EVERY
     /// path that can change data — the console, a tab, the builder, a row
@@ -274,6 +345,7 @@ impl Server {
             "store.queries.get" => self.store_query_get(params).await,
             "store.queries.save" => self.store_query_save(params).await,
             "store.queries.remove" => self.store_query_remove(params).await,
+            "store.audit.list" => self.store_audit_list(params).await,
             "store.charts.list" => self.store_chart_list(params).await,
             "store.charts.save" => self.store_chart_save(params).await,
             "store.charts.remove" => self.store_chart_remove(params).await,
@@ -304,8 +376,32 @@ impl Server {
     async fn connect(&self, params: Json) -> anyhow::Result<Json> {
         let spec: ConnSpec = serde_json::from_value(params)?;
         let driver = self.inner.registry.get(&spec.driver)?;
+        let meta = driver.meta();
+        // WHAT this connection points at, in words with no credential in them
+        // (see `ConnSpec::target`). Computed before the dial so the FAILED
+        // attempt can be logged too — a run of refused connections to a host
+        // is the shape of something worth seeing, and only the successes being
+        // in the log is how it stays invisible.
+        let target = spec.target(meta);
         let net = NetContext::new(spec.tunnel.clone());
-        let conn = driver.connect(&spec, net.clone()).await?;
+        let started = Instant::now();
+        let conn = match driver.connect(&spec, net.clone()).await {
+            Ok(c) => c,
+            Err(e) => {
+                let mut r = audit::Record::new("conn.connect", "failed");
+                r.conn = spec.name.clone();
+                r.driver = Some(spec.driver.clone());
+                r.policy = Some(spec.policy.label().to_string());
+                // The target is not a statement and has no shape worth
+                // fingerprinting; it goes in whole, in every mode, because it
+                // holds nothing a mode is there to withhold.
+                r.statement = target.clone();
+                r.ms = Some(started.elapsed().as_millis() as i64);
+                r.because(e.to_string());
+                self.audit(r).await;
+                return Err(e);
+            }
+        };
         // Encryption status: native TLS negotiated OR the link rides an SSH tunnel.
         let encrypted = conn.encrypted() || net.tunneled();
         let tunneled = net.tunneled();
@@ -314,11 +410,22 @@ impl Server {
             id,
             ConnEntry {
                 conn: Arc::new(AsyncMutex::new(conn)),
+                name: spec.name.clone(),
                 policy: spec.policy,
                 driver: spec.driver.clone(),
                 _net: net,
             },
         );
+        let mut r = audit::Record::new("conn.connect", "connected");
+        r.conn = spec.name.clone();
+        r.driver = Some(spec.driver.clone());
+        r.policy = Some(spec.policy.label().to_string());
+        // Whether the link ended up encrypted belongs in the record: it is a
+        // fact about this session that cannot be read back off the spec, since
+        // `prefer` can go either way.
+        r.statement = format!("{target} encrypted={encrypted}");
+        r.ms = Some(started.elapsed().as_millis() as i64);
+        self.audit(r).await;
         // Surface a clear warning when a network link ended up UNENCRYPTED (never
         // silent): the client shows it and health flags it.
         if !encrypted {
@@ -487,6 +594,11 @@ impl Server {
         let p: P = serde_json::from_value(params)?;
         let entry = self.inner.conns.lock().unwrap().remove(&p.conn_id);
         if let Some(entry) = entry {
+            let mut r = audit::Record::new("conn.disconnect", "disconnected");
+            r.conn = entry.name.clone();
+            r.driver = Some(entry.driver.clone());
+            r.policy = Some(entry.policy.label().to_string());
+            self.audit(r).await;
             // Reclaim the Box out of the Arc<Mutex> to call the by-value close().
             // Dropping `entry._net` afterwards tears down any SSH tunnel.
             if let Ok(mutex) = Arc::try_unwrap(entry.conn) {
@@ -597,14 +709,43 @@ impl Server {
         // The policy is held HERE, not in whatever is calling. A client that
         // skips its own confirmation dialog still cannot get a dangerous
         // statement past this.
+        // WHETHER THIS CHANGES THE DATABASE is what decides whether it is
+        // audited. The same question `Policy::ReadOnly` asks, and the same
+        // answer: a SELECT has no business in a log of changes, and an unknown
+        // verb counts as a write (see `Driver::writes`), because an unlogged
+        // change is worse than a logged read.
+        let writes = self
+            .conn_driver(p.conn_id)
+            .and_then(|k| self.inner.registry.get(&k))
+            .map(|d| d.writes(&p.statement))
+            .unwrap_or(false);
         match self
             .conn_driver(p.conn_id)
             .and_then(|k| self.inner.registry.get(&k))
             .and_then(|d| self.allowed(p.conn_id, d.as_ref(), &p.statement, p.confirm))
         {
             Ok(()) => {}
-            Err(e) => return self.send(rpc::response_err(id, &e.to_string())),
+            Err(e) => {
+                // A REFUSED write is the most important thing in the log: it is
+                // the record of what somebody TRIED, which is the question
+                // asked after something goes wrong.
+                if writes {
+                    let mut r = self.audit_for(p.conn_id, "execute", &p.statement, p.confirm, "refused");
+                    r.because(e.to_string());
+                    self.audit(r).await;
+                }
+                return self.send(rpc::response_err(id, &e.to_string()));
+            }
         }
+        // The row for a statement that was ALLOWED is written when it is OVER,
+        // from the task below. Writing it here would be a log of what the engine
+        // set out to do: "applied" stamped before the statement had reached the
+        // database, with no way to tell apart the ones that failed on the way.
+        let pending = if writes {
+            Some(self.audit_for(p.conn_id, "execute", &p.statement, p.confirm, "applied"))
+        } else {
+            None
+        };
 
         let call_id = self.inner.next_call.fetch_add(1, Ordering::Relaxed);
         let call = Arc::new(AsyncMutex::new(Call::new()));
@@ -632,6 +773,16 @@ impl Server {
             c.cancel = None;
             if c.status == CallStatus::Cancelled {
                 server.notify_state(call_id, CallStatus::Cancelled, ms, None, None);
+                drop(c);
+                // A cancelled write still reached the database and may have
+                // changed something before it was stopped — "cancelled" is the
+                // honest outcome, and either "applied" or "refused" would be a
+                // guess about data nobody has read back.
+                if let Some(mut r) = pending {
+                    r.outcome = "cancelled".into();
+                    r.ms = Some(ms as i64);
+                    server.audit(r).await;
+                }
                 return;
             }
             match outcome {
@@ -642,11 +793,27 @@ impl Server {
                     c.status = CallStatus::Done;
                     let affected = c.affected;
                     server.notify_state(call_id, CallStatus::Done, ms, None, affected);
+                    drop(c);
+                    if let Some(mut r) = pending {
+                        r.affected = affected.map(|a| a as i64);
+                        r.ms = Some(ms as i64);
+                        server.audit(r).await;
+                    }
                 }
                 Err(e) => {
                     c.status = CallStatus::Failed;
                     c.error = Some(e.to_string());
                     server.notify_state(call_id, CallStatus::Failed, ms, Some(e.to_string()), None);
+                    drop(c);
+                    // A write that was allowed and then FAILED belongs in the log
+                    // as much as one that went through: it is the record of an
+                    // attempt, and the reason it failed is the useful half.
+                    if let Some(mut r) = pending {
+                        r.outcome = "failed".into();
+                        r.ms = Some(ms as i64);
+                        r.because(e.to_string());
+                        server.audit(r).await;
+                    }
                 }
             }
         });
@@ -876,7 +1043,12 @@ impl Server {
         let statement = conn.lock().await.plan_row(&p.plan).await?;
         // A read-only connection refuses here as well, and before the plan is
         // ever offered — the same rule, reached by a different door.
-        self.allowed(p.conn_id, driver.as_ref(), &statement, p.confirm)?;
+        if let Err(e) = self.allowed(p.conn_id, driver.as_ref(), &statement, p.confirm) {
+            let mut r = self.audit_for(p.conn_id, "row.write", &statement, p.confirm, "refused");
+            r.because(e.to_string());
+            self.audit(r).await;
+            return Err(e);
+        }
         let reason = driver.classify(&statement);
         if !p.confirm {
             return Ok(json!({
@@ -886,7 +1058,29 @@ impl Server {
                 "reason": reason,
             }));
         }
-        let out = conn.lock().await.write_row(&p.plan).await?;
+        let started = Instant::now();
+        let out = match conn.lock().await.write_row(&p.plan).await {
+            Ok(o) => o,
+            Err(e) => {
+                // A write that was ALLOWED and then failed — the key matched
+                // three rows, the column refused the value — is as much part of
+                // the record as one that went through.
+                let mut r = self.audit_for(p.conn_id, "row.write", &statement, p.confirm, "failed");
+                r.ms = Some(started.elapsed().as_millis() as i64);
+                r.because(e.to_string());
+                self.audit(r).await;
+                return Err(e);
+            }
+        };
+        // `out.statement` is the driver's own parameterised statement, so what
+        // lands in the log is `… SET name = ?1 WHERE id = ?2` — the shape of the
+        // write without the values written. That is the driver's doing, not the
+        // redactor's, and it is why a row edit is the one path whose log line
+        // carries nothing to redact.
+        let mut r = self.audit_for(p.conn_id, "row.write", &out.statement, p.confirm, "applied");
+        r.affected = Some(out.affected as i64);
+        r.ms = Some(started.elapsed().as_millis() as i64);
+        self.audit(r).await;
         Ok(json!({
             "applied": true,
             "statement": out.statement,
@@ -1013,6 +1207,25 @@ impl Server {
         }
         let p: P = serde_json::from_value(params)?;
         Ok(json!({ "query": self.store()?.get_query(p.conn, p.name).await? }))
+    }
+
+    /// The audit log, newest first. `conn` narrows it to one connection by name.
+    ///
+    /// There is no matching remove: a log a client can delete from is a log of
+    /// what that client chose to keep. `mode` comes back with the rows so a
+    /// client can SAY why a statement column is empty — a blank statement with
+    /// no explanation reads as a bug, and this one is a setting.
+    async fn store_audit_list(&self, params: Json) -> anyhow::Result<Json> {
+        #[derive(Deserialize)]
+        struct P {
+            #[serde(default)]
+            limit: Option<i64>,
+            #[serde(default)]
+            conn: Option<String>,
+        }
+        let p: P = serde_json::from_value(params)?;
+        let audit = self.store()?.list_audit(p.limit.unwrap_or(200), p.conn).await?;
+        Ok(json!({ "audit": audit, "mode": self.inner.audit_mode.label() }))
     }
 
     // ── charts ───────────────────────────────────────────────────────────────

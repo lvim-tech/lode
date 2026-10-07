@@ -1,5 +1,5 @@
-// lode/store: the engine's OWN persistence — saved connections, saved queries
-// and the statement history.
+// lode/store: the engine's OWN persistence — saved connections, saved queries,
+// saved charts and dashboards, the statement history, and the audit log.
 //
 // This used to live in the client (lvim-db kept it in a Lua-side SQLite file),
 // and that was the one thing stopping two clients from seeing the same state:
@@ -82,9 +82,10 @@ impl Store {
         &self.path
     }
 
-    /// Create the three tables if they are absent and stamp the version. Every
+    /// Create the tables if they are absent and stamp the version. Every
     /// statement is `IF NOT EXISTS`, so this is safe on a database an older
-    /// client already wrote.
+    /// client already wrote, and a table added in a later version appears on
+    /// the next open without a migration step.
     fn apply_schema(conn: &Connection) -> anyhow::Result<()> {
         conn.execute_batch(
             r#"
@@ -130,6 +131,49 @@ impl Store {
                 updated_at INTEGER
             );
             CREATE UNIQUE INDEX IF NOT EXISTS charts_conn_name ON charts (conn, name);
+            -- Every attempt to CHANGE something, and every connection opened or
+            -- closed — including the attempts that were REFUSED. A log of what
+            -- succeeded answers "what happened"; a log that also holds what was
+            -- stopped answers "what was tried", and the second question is the
+            -- one asked after something goes wrong.
+            --
+            -- Written by the ENGINE on the path that does the work, so a client
+            -- that would rather not be logged cannot leave itself out. There is
+            -- deliberately no method to delete from it: a log a client can wipe
+            -- is a log of what that client chose to keep. Pruning it is the
+            -- person's business, with sqlite3 against their own file.
+            CREATE TABLE IF NOT EXISTS audit (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                ts          INTEGER,
+                -- The saved connection's NAME, when the client sent one. A live
+                -- conn_id means nothing an hour later.
+                conn        TEXT,
+                driver      TEXT,
+                -- "execute" | "row.write" | "conn.connect" | "conn.disconnect",
+                -- and the hook/script paths when those land. Text, not a CHECK:
+                -- a new door must be able to open without a migration.
+                path        TEXT NOT NULL,
+                -- A stable name for the statement's SHAPE (audit::fingerprint),
+                -- computed BEFORE redaction — so turning the statement column
+                -- down does not break grouping.
+                fingerprint TEXT,
+                -- The statement as the log keeps it: redacted, or only its
+                -- shape, or empty. See audit::Mode and LODE_AUDIT_STATEMENTS.
+                statement   TEXT NOT NULL,
+                -- The connection's policy AT THE TIME. A policy changed later
+                -- must not rewrite what the rules were when this ran.
+                policy      TEXT,
+                confirmed   INTEGER,
+                -- "applied" | "refused" | "failed" | "connected" | "disconnected"
+                outcome     TEXT NOT NULL,
+                affected    INTEGER,
+                ms          INTEGER,
+                -- Why it was refused, or why it failed. Empty when it went
+                -- through.
+                reason      TEXT
+            );
+            CREATE INDEX IF NOT EXISTS audit_ts ON audit (ts);
+            CREATE INDEX IF NOT EXISTS audit_fp ON audit (fingerprint);
             "#,
         )?;
         conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
@@ -279,6 +323,83 @@ impl Store {
                 params![conn_name, name, sql, now()],
             )?;
             Ok(())
+        })
+        .await
+    }
+
+    // ── audit ────────────────────────────────────────────────────────────────
+
+    /// Append one row. Takes the whole record rather than twelve positional
+    /// arguments: four of those would be adjacent `Option`s of the same type,
+    /// which is exactly the shape in which a caller swaps two and nothing
+    /// complains.
+    pub async fn record_audit(&self, r: crate::audit::Record) -> anyhow::Result<()> {
+        self.with(move |c| {
+            c.execute(
+                "INSERT INTO audit (ts, conn, driver, path, fingerprint, statement, policy, \
+                 confirmed, outcome, affected, ms, reason) \
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)",
+                params![
+                    now(),
+                    r.conn,
+                    r.driver,
+                    r.path,
+                    r.fingerprint,
+                    r.statement,
+                    r.policy,
+                    r.confirmed as i64,
+                    r.outcome,
+                    r.affected,
+                    r.ms,
+                    r.reason
+                ],
+            )?;
+            Ok(())
+        })
+        .await
+    }
+
+    /// The newest rows first, optionally narrowed to one connection by name.
+    ///
+    /// Newest first because the question is nearly always "what just happened";
+    /// `id DESC` rather than `ts DESC` because two rows inside the same second
+    /// still have an order and it is the order they were written in.
+    pub async fn list_audit(&self, limit: i64, conn_name: Option<String>) -> anyhow::Result<Vec<Json>> {
+        self.with(move |c| {
+            let cols = "id, ts, conn, driver, path, fingerprint, statement, policy, confirmed, \
+                        outcome, affected, ms, reason";
+            let read = |r: &rusqlite::Row| -> rusqlite::Result<Json> {
+                Ok(serde_json::json!({
+                    "id": r.get::<_, i64>(0)?,
+                    "ts": r.get::<_, Option<i64>>(1)?,
+                    "conn": r.get::<_, Option<String>>(2)?,
+                    "driver": r.get::<_, Option<String>>(3)?,
+                    "path": r.get::<_, String>(4)?,
+                    "fingerprint": r.get::<_, Option<String>>(5)?,
+                    "statement": r.get::<_, String>(6)?,
+                    "policy": r.get::<_, Option<String>>(7)?,
+                    "confirmed": r.get::<_, i64>(8)? != 0,
+                    "outcome": r.get::<_, String>(9)?,
+                    "affected": r.get::<_, Option<i64>>(10)?,
+                    "ms": r.get::<_, Option<i64>>(11)?,
+                    "reason": r.get::<_, Option<String>>(12)?,
+                }))
+            };
+            let rows = match conn_name {
+                Some(name) => {
+                    let sql = format!("SELECT {cols} FROM audit WHERE conn = ?1 ORDER BY id DESC LIMIT ?2");
+                    let mut st = c.prepare(&sql)?;
+                    let out = st.query_map(params![name, limit], read)?.collect::<Result<Vec<_>, _>>()?;
+                    out
+                }
+                None => {
+                    let sql = format!("SELECT {cols} FROM audit ORDER BY id DESC LIMIT ?1");
+                    let mut st = c.prepare(&sql)?;
+                    let out = st.query_map(params![limit], read)?.collect::<Result<Vec<_>, _>>()?;
+                    out
+                }
+            };
+            Ok(rows)
         })
         .await
     }
@@ -555,6 +676,54 @@ mod tests {
             },
             dir,
         )
+    }
+
+    /// A record goes in whole and comes back whole, newest first, and the
+    /// per-connection filter really filters. Checked field by field rather than
+    /// by counting rows: a row whose `policy` landed in `outcome` would pass a
+    /// count and be useless as a record.
+    #[tokio::test]
+    async fn audit_rows_round_trip_and_the_newest_is_first() {
+        let (s, _dir) = temp_store("audit");
+        let mut a = crate::audit::Record::new("execute", "refused");
+        a.conn = Some("prod".into());
+        a.driver = Some("postgres".into());
+        a.policy = Some("read only".into());
+        a.statement = "DELETE FROM people".into();
+        a.fingerprint = Some("ff00".into());
+        a.reason = Some("this connection is read only".into());
+        s.record_audit(a).await.unwrap();
+
+        let mut b = crate::audit::Record::new("row.write", "applied");
+        b.conn = Some("scratch".into());
+        b.driver = Some("sqlite".into());
+        b.policy = Some("asks first".into());
+        b.statement = "UPDATE people SET name = ?1 WHERE id = ?2".into();
+        b.fingerprint = Some("ff01".into());
+        b.confirmed = true;
+        b.affected = Some(1);
+        b.ms = Some(7);
+        s.record_audit(b).await.unwrap();
+
+        let all = s.list_audit(10, None).await.unwrap();
+        assert_eq!(all.len(), 2);
+        // Newest first.
+        assert_eq!(all[0]["path"], "row.write");
+        assert_eq!(all[0]["outcome"], "applied");
+        assert_eq!(all[0]["conn"], "scratch");
+        assert_eq!(all[0]["confirmed"], true);
+        assert_eq!(all[0]["affected"], 1);
+        assert_eq!(all[0]["ms"], 7);
+        assert_eq!(all[0]["fingerprint"], "ff01");
+        assert_eq!(all[1]["outcome"], "refused");
+        assert_eq!(all[1]["policy"], "read only");
+        assert_eq!(all[1]["reason"], "this connection is read only");
+        assert_eq!(all[1]["confirmed"], false);
+        assert!(all[1]["affected"].is_null(), "an affected count nobody measured must stay null");
+
+        let prod = s.list_audit(10, Some("prod".into())).await.unwrap();
+        assert_eq!(prod.len(), 1);
+        assert_eq!(prod[0]["conn"], "prod");
     }
 
     #[tokio::test]

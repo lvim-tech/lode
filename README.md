@@ -82,7 +82,8 @@ notification   {"method":"…","params":{…}}
 
 `proto` grows **additively**: a client accepts any engine reporting
 `proto >= its minimum`, so a newer engine keeps working with an older client.
-The current protocol is **2**.
+The current protocol is **7**. What each version added is listed in
+`src/rpc.rs` beside the constant.
 
 ### Handshake
 
@@ -175,6 +176,10 @@ own SQLite database — so two clients share them.
 | `store.queries.remove` | `{ conn, name }` | `{ removed }` |
 | `store.history.record` | `{ conn, driver, statement, state, ms, rows }` | `{ recorded }` |
 | `store.history.list` | `{ limit }` | `{ history }` |
+| `store.charts.list` | `{ conn }` | `{ charts }` |
+| `store.charts.save` | `{ conn, name, sql, measure }` | `{ saved }` |
+| `store.charts.remove` | `{ conn, name }` | `{ removed }` |
+| `store.audit.list` | `{ limit, conn? }` | `{ audit, mode }` |
 | `store.import` | `{ path }` | `{ connections, queries, history }` |
 
 A saved connection keeps only the **template**: `spec` is the
@@ -188,6 +193,68 @@ time. The source file is only read.
 
 The database lives at `$LODE_DATA_DIR/lode.db`, else
 `$XDG_DATA_HOME/lode/lode.db`, else `~/.local/share/lode/lode.db`.
+
+### The audit log (`proto >= 7`)
+
+`store.audit.list` returns, newest first, every operation that CHANGED a
+database and every connection opened or closed — **including the attempts the
+engine refused**. A log of what succeeded answers "what happened"; a log that
+also holds what was stopped answers "what was tried", and the second question is
+the one asked after something goes wrong.
+
+The engine writes it, on the paths that do the work:
+
+| `path` | written when |
+|---|---|
+| `execute` | a statement that `Driver::writes` calls a write — refused, applied, failed or cancelled |
+| `row.write` | a single-row edit or delete |
+| `conn.connect` | a connection opened, or an attempt that failed |
+| `conn.disconnect` | a connection closed |
+
+A read is never in it. Each row carries the connection's **policy as it was**,
+whether the caller passed `confirm`, the outcome, the row count, the duration,
+and the reason it was refused or failed.
+
+There is deliberately **no method to delete from it**: a log a client can wipe
+is a log of what that client chose to keep. Pruning it is the person's business,
+with `sqlite3` against their own file.
+
+**`fingerprint`** is a short stable name for the statement's SHAPE — literals
+replaced, comments dropped, whitespace collapsed, identifiers kept. Two runs
+that differ only in their values share one fingerprint, so "this same statement
+ran four hundred times" is one group. It is not a seal: it is an identity for
+grouping, and a hash written by the process that can also write the row would
+look like integrity and be none.
+
+**Credentials.** `statement` has the credential grammars redacted —
+`PASSWORD '…'`, `IDENTIFIED BY '…'`, redis `AUTH` and `CONFIG SET requirepass`
+all become `<redacted>`. Whatever the redactor removes is then removed from
+every other field of the same row, which is what catches an engine that quotes
+the failing statement back inside its error message (SQLite does, verbatim).
+A connection's own secrets never reach the log at all: a `conn.connect` line is
+assembled from the non-secret fields of the spec — driver, host, port, file,
+TLS mode, tunnel hop — and the credential fields are never read.
+
+What this does **not** do is remove every value that happens to be sensitive. A
+token written through `INSERT INTO t (tok) VALUES ('…')` is an ordinary value in
+an ordinary place, and no pattern can tell it from a product name. So there is a
+real switch rather than a promise:
+
+| `LODE_AUDIT_STATEMENTS` | `statement` holds |
+|---|---|
+| unset / `full` | the statement, redacted (the default) |
+| `shape` | only the shape — `insert into people (name) values ('?')` |
+| `off` | nothing; the fingerprint alone |
+
+The fingerprint is computed before any of this, so turning the column down does
+not break grouping. The mode comes back with the rows, so a client can say *why*
+a statement is blank — a blank with no explanation reads as a bug, and this one
+is a setting.
+
+A failure to write an audit row never fails the operation it describes: it is
+reported on `daemon.log` at `error` level, because refusing to run something on
+the grounds that the record could not be written is worse than a gap in the
+record that says loudly that it is a gap.
 
 ### Notifications
 

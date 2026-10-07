@@ -242,6 +242,16 @@ impl DriverMeta {
 #[derive(Debug, Clone, Deserialize)]
 pub struct ConnSpec {
     pub driver: String,
+    /// The SAVED connection's name, when this spec came from one.
+    ///
+    /// The engine does not use it to connect — it is here so the audit log can
+    /// say WHICH connection a statement ran on, in the word a person would
+    /// search for, instead of a conn_id that means nothing once the process
+    /// restarts. Additive and optional: a client that does not send it gets a
+    /// log that names the driver and leaves the name empty, which is a gap that
+    /// reads as a gap rather than a wrong answer.
+    #[serde(default)]
+    pub name: Option<String>,
     #[serde(default)]
     pub params: std::collections::BTreeMap<String, String>,
     #[serde(default)]
@@ -289,6 +299,32 @@ impl Policy {
 }
 
 impl ConnSpec {
+    /// One line naming WHAT this connection points at, for the audit log.
+    ///
+    /// Built from the fields the engine itself reads generically — the `host`
+    /// and `port` params, the `File` param the driver's meta declares, the TLS
+    /// mode and the tunnel's hop. Deliberately NOT the whole `params` map: that
+    /// map is free-form and driver-interpreted, and a log line assembled from
+    /// keys nobody has looked at is how something nobody meant to keep ends up
+    /// kept. Deliberately not `auth` either — those fields are `Secret`, and the
+    /// honest way to keep a credential out of a log is to never read it.
+    pub fn target(&self, meta: &DriverMeta) -> String {
+        let mut out = String::from(&self.driver);
+        if let Some(fp) = meta.params.iter().find(|p| matches!(p.kind, ParamType::File)) {
+            if let Some(path) = self.param_opt(fp.key) {
+                out.push(' ');
+                out.push_str(path);
+            }
+        } else if let Some(host) = self.param_opt("host") {
+            out.push_str(&format!(" {host}:{}", self.port(meta.default_port.unwrap_or(0))));
+        }
+        out.push_str(&format!(" tls={}", self.tls.mode.label()));
+        if let Some(t) = &self.tunnel {
+            out.push_str(&format!(" via ssh {}@{}:{}", t.user, t.host, t.port));
+        }
+        out
+    }
+
     /// A required string param, or an error naming the missing key.
     pub fn param(&self, key: &str) -> anyhow::Result<&str> {
         self.params
@@ -410,6 +446,19 @@ pub enum TlsMode {
     VerifyCa,
     /// Encryption required + chain AND hostname verified (the strictest).
     VerifyFull,
+}
+
+impl TlsMode {
+    /// The spelling a person chose in the form — the same word in the log.
+    pub fn label(self) -> &'static str {
+        match self {
+            TlsMode::Disable => "disable",
+            TlsMode::Prefer => "prefer",
+            TlsMode::Require => "require",
+            TlsMode::VerifyCa => "verify_ca",
+            TlsMode::VerifyFull => "verify_full",
+        }
+    }
 }
 
 /// An SSH tunnel fronting the DB's TCP endpoint — orthogonal to both auth and

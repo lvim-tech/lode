@@ -49,7 +49,9 @@ sqlite3 "$DB" "
 
 mkfifo "$IN"
 : > "$OUT"
-"$BIN" < "$IN" > "$OUT" 2>"$WORK/err" &
+# LODE_DATA_DIR in the throwaway directory, ALWAYS: this test makes the engine
+# write audit rows, and an audit row from a test belongs in a test's database.
+LODE_DATA_DIR=$WORK/data "$BIN" < "$IN" > "$OUT" 2>"$WORK/err" &
 PID=$!
 exec 3>"$IN"
 
@@ -102,7 +104,7 @@ check "sqlite claims edit" \
 check "duckdb does not claim edit" \
     "$(printf '%s' "$HELLO" | jq '[.result.drivers[] | select(.kind=="duckdb")][0].caps.edit')" "false"
 
-send "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"conn.connect\",\"params\":{\"driver\":\"sqlite\",\"params\":{\"file\":\"$DB\"},\"auth\":{\"kind\":\"none\"}}}"
+send "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"conn.connect\",\"params\":{\"driver\":\"sqlite\",\"name\":\"rowtest\",\"params\":{\"file\":\"$DB\"},\"auth\":{\"kind\":\"none\"}}}"
 CID=$(await '.id == 2' | jq '.result.conn_id')
 check "connected" "$([ -n "$CID" ] && echo yes)" "yes"
 
@@ -182,7 +184,7 @@ sqlite3 "$DB" "CREATE TABLE pol(id INTEGER PRIMARY KEY, a TEXT); INSERT INTO pol
 
 connect_with() {
     pid=$1; policy=$2
-    send "{\"jsonrpc\":\"2.0\",\"id\":$pid,\"method\":\"conn.connect\",\"params\":{\"driver\":\"sqlite\",\"params\":{\"file\":\"$DB\"},\"auth\":{\"kind\":\"none\"},\"policy\":\"$policy\"}}"
+    send "{\"jsonrpc\":\"2.0\",\"id\":$pid,\"method\":\"conn.connect\",\"params\":{\"driver\":\"sqlite\",\"name\":\"pol-$policy\",\"params\":{\"file\":\"$DB\"},\"auth\":{\"kind\":\"none\"},\"policy\":\"$policy\"}}"
     await ".id == $pid" | jq '.result.conn_id'
 }
 
@@ -223,6 +225,104 @@ OP=$(connect_with 48 open)
 send "{\"jsonrpc\":\"2.0\",\"id\":49,\"method\":\"query.execute\",\"params\":{\"conn_id\":$OP,\"statement\":\"DELETE FROM pol WHERE id=99\"}}"
 L=$(await '.id == 49')
 check "unrestricted: runs without asking" "$(printf '%s' "$L" | jq '.result.call_id != null')" "true"
+
+# ── the audit log ────────────────────────────────────────────────────────────
+# What was TRIED, not only what happened. The refusals have to be in here, or
+# the log answers the easy question and not the one asked after something goes
+# wrong. It is written by the engine on the path that does the work, so a client
+# cannot leave itself out of it.
+#
+# Two statements that differ only in their VALUES first, so the fingerprint has
+# something to group.
+send "{\"jsonrpc\":\"2.0\",\"id\":50,\"method\":\"query.execute\",\"params\":{\"conn_id\":$OP,\"statement\":\"DELETE FROM pol WHERE id=771\"}}"
+await '.id == 50' >/dev/null
+send "{\"jsonrpc\":\"2.0\",\"id\":51,\"method\":\"query.execute\",\"params\":{\"conn_id\":$OP,\"statement\":\"DELETE FROM pol WHERE id=772\"}}"
+await '.id == 51' >/dev/null
+
+# A statement with a CREDENTIAL in it. SQLite has no ALTER USER, so this fails —
+# which is the point twice over: it proves a FAILED write is recorded, and it
+# proves the password is not in the record.
+send "{\"jsonrpc\":\"2.0\",\"id\":52,\"method\":\"query.execute\",\"params\":{\"conn_id\":$OP,\"statement\":\"ALTER USER app PASSWORD 'hunter2'\"}}"
+await '.id == 52' >/dev/null
+# query.execute answers with a call_id and finishes in the background, so wait
+# for the state notification before asking the log about it.
+await '.method == "query.state" and .params.state == "failed"' >/dev/null
+
+# A connection CLOSED is part of the record of a connection opened.
+send "{\"jsonrpc\":\"2.0\",\"id\":53,\"method\":\"conn.disconnect\",\"params\":{\"conn_id\":$OP}}"
+await '.id == 53' >/dev/null
+
+send '{"jsonrpc":"2.0","id":60,"method":"store.audit.list","params":{"limit":500}}'
+A=$(await '.id == 60')
+aq() { printf '%s' "$A" | jq "$@"; }
+
+check "audit has rows" "$(aq '.result.audit | length > 0')" "true"
+check "the statement mode is reported" "$(aq -r '.result.mode')" "full"
+check "a refusal is recorded" \
+    "$(aq '[.result.audit[] | select(.outcome=="refused")] | length > 0')" "true"
+check "an applied write is recorded" \
+    "$(aq '[.result.audit[] | select(.outcome=="applied")] | length > 0')" "true"
+# The read-only refusal in particular: it is the one somebody will go looking for.
+check "the read-only refusal is in it" \
+    "$(aq '[.result.audit[] | select(.reason != null and (.reason | test("read only")))] | length > 0')" "true"
+# The policy is recorded AS IT WAS. Changing a policy later must not rewrite what
+# the rules were when something ran.
+check "the policy at the time is kept" \
+    "$(aq '[.result.audit[] | select(.policy=="read only")] | length > 0')" "true"
+check "a row write names its path" \
+    "$(aq '[.result.audit[] | select(.path=="row.write")] | length > 0')" "true"
+# A SELECT is not a change and has no business in a log of changes.
+check "reads are not in the audit" \
+    "$(aq '[.result.audit[] | select(.statement | test("^SELECT"))] | length')" "0"
+
+# ── which connection ─────────────────────────────────────────────────────────
+# By NAME, not by conn_id: a handle means nothing once the process restarts, and
+# the name is what somebody will search by.
+check "the connection name is recorded" \
+    "$(aq '[.result.audit[] | select(.conn=="rowtest")] | length > 0')" "true"
+send '{"jsonrpc":"2.0","id":61,"method":"store.audit.list","params":{"limit":500,"conn":"pol-read_only"}}'
+B=$(await '.id == 61')
+check "narrowed to one connection" \
+    "$(printf '%s' "$B" | jq '[.result.audit[] | select(.conn != "pol-read_only")] | length')" "0"
+check "and that connection has rows" \
+    "$(printf '%s' "$B" | jq '.result.audit | length > 0')" "true"
+
+# ── the fingerprint ──────────────────────────────────────────────────────────
+# The point of it: two runs differing only in a value are ONE thing in the log.
+FP=$(aq -r '[.result.audit[] | select(.statement | test("DELETE FROM pol WHERE id=77"))] | map(.fingerprint) | unique | length')
+check "same shape, different values, one fingerprint" "$FP" "1"
+check "the two runs are both there" \
+    "$(aq '[.result.audit[] | select(.statement | test("DELETE FROM pol WHERE id=77"))] | length')" "2"
+# And the other half: a different statement is a different fingerprint.
+check "a different statement is a different fingerprint" \
+    "$(aq '[.result.audit[] | select(.path=="execute") | .fingerprint] | unique | length > 1')" "true"
+
+# ── the secret ───────────────────────────────────────────────────────────────
+# The whole log, as a single string: the password must not be in it ANYWHERE —
+# not in the statement, not in the reason the engine gave back.
+# Phrased so it cannot pass on an EMPTY log: the first clause is that there is
+# a log at all. `null | tostring | test(...)` is false, and a green that means
+# "there was nothing to find" is worse than no check.
+check "the password is nowhere in the log" \
+    "$(aq '(.result.audit | length > 0) and ((.result.audit | tostring | test("hunter2")) | not)')" "true"
+check "but the statement that carried it IS" \
+    "$(aq '[.result.audit[] | select(.statement | test("ALTER USER app PASSWORD"))] | length > 0')" "true"
+check "and it is marked redacted" \
+    "$(aq '[.result.audit[] | select(.statement | test("PASSWORD .<redacted>."))] | length > 0')" "true"
+check "a write that FAILED is recorded as failed" \
+    "$(aq '[.result.audit[] | select(.statement | test("ALTER USER")) | .outcome] | unique | .[0]')" '"failed"'
+
+# ── connections ──────────────────────────────────────────────────────────────
+check "opening a connection is recorded" \
+    "$(aq '[.result.audit[] | select(.path=="conn.connect" and .outcome=="connected")] | length > 0')" "true"
+check "closing one is recorded" \
+    "$(aq '[.result.audit[] | select(.path=="conn.disconnect")] | length > 0')" "true"
+check "the connect line says what it reached" \
+    "$(aq '[.result.audit[] | select(.path=="conn.connect") | select(.statement | test("tls=prefer"))] | length > 0')" "true"
+# A connect line is assembled from non-secret fields only, so there is nothing
+# in it to redact — and nothing that looks like a credential either.
+check "no credential field leaked into a connect line" \
+    "$(aq '[.result.audit[] | select(.path=="conn.connect") | select(.statement | test("(?i)secret|password|token"))] | length')" "0"
 
 # ── mongodb, when there is one to talk to ────────────────────────────────────
 # The write path for mongo is WRITTEN but `caps.edit` is false, because nothing

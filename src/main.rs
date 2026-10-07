@@ -12,6 +12,7 @@
 // C-dependency abort takes down this process, not the editor — the client
 // notices the pipe close, reports it, and can respawn.
 
+mod audit;
 mod driver;
 mod drivers;
 mod net;
