@@ -5944,46 +5944,9 @@ impl Workspace {
                 .when(key_col, |d| d.child(self.small("key", t.accent())));
 
             let value: gpui::AnyElement = if editing_this {
-                match self.inputs.get(&(tab_id, "edit".to_string())) {
-                    Some(input) => div()
-                        .flex()
-                        .items_center()
-                        .gap_2()
-                        .child(div().flex_1().child(self.field(ms.small(), input.clone())))
-                        .child(
-                            div()
-                                .id("edit-ok")
-                                .px_1()
-                                .cursor_pointer()
-                                .text_size(ms.small())
-                                .text_color(t.accent())
-                                .child("\u{f00c}")
-                                .on_click(cx.listener(move |this, _, _, cx| {
-                                    this.commit_edit(tab_id, cx);
-                                    cx.notify();
-                                })),
-                        )
-                        .child(
-                            div()
-                                .id("edit-no")
-                                .tooltip(self.tip("tip.cancel_edit", Some("esc")))
-                                .px_1()
-                                .cursor_pointer()
-                                .text_size(ms.small())
-                                .text_color(t.muted())
-                                .child("\u{f00d}")
-                                .on_click(cx.listener(move |this, _, _, cx| {
-                                    if let Some(tb) =
-                                        this.tabs.iter_mut().find(|x| x.id == tab_id)
-                                    {
-                                        tb.editing = None;
-                                    }
-                                    cx.notify();
-                                })),
-                        )
-                        .into_any_element(),
-                    None => div().into_any_element(),
-                }
+                // The same editor the tree uses — one definition, so the two
+                // cannot come to disagree about what committing means.
+                self.editor_el(tab_id, cx)
             } else {
                 div()
                     .id(SharedString::from(format!("val-{tab_id}-{ci}")))
@@ -6710,17 +6673,77 @@ impl Workspace {
                     })),
             );
             if open {
-                out = out.child(self.value_el(&doc, tab, 1));
+                out = out.child(self.value_el(&doc, tab, 1, Some(i), cx));
             }
         }
         out.into_any_element()
     }
 
+    /// The in-place editor: the field, a tick and a cross.
+    ///
+    /// One definition, used wherever a value is edited. The tree edits through
+    /// exactly this, so a document's field and a table's cell take the same
+    /// road out — `commit_edit`, `propose_write`, the engine's `row.write`, the
+    /// same classification, the same confirmation and the same audit row. There
+    /// is no second, softer path, which is the only way the promise about
+    /// writing means anything.
+    fn editor_el(&self, tab_id: u64, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let (t, ms) = (self.t(), self.scale);
+        let Some(input) = self.inputs.get(&(tab_id, "edit".to_string())) else {
+            return div().into_any_element();
+        };
+        div()
+            .flex()
+            .items_center()
+            .gap_2()
+            .child(div().flex_1().child(self.field(ms.small(), input.clone())))
+            .child(
+                div()
+                    .id("edit-ok")
+                    .px_1()
+                    .cursor_pointer()
+                    .text_size(ms.small())
+                    .text_color(t.accent())
+                    .child("\u{f00c}")
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.commit_edit(tab_id, cx);
+                        cx.notify();
+                    })),
+            )
+            .child(
+                div()
+                    .id("edit-no")
+                    .tooltip(self.tip("tip.cancel_edit", Some("esc")))
+                    .px_1()
+                    .cursor_pointer()
+                    .text_size(ms.small())
+                    .text_color(t.muted())
+                    .child("\u{f00d}")
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        if let Some(tb) = this.tabs.iter_mut().find(|x| x.id == tab_id) {
+                            tb.editing = None;
+                        }
+                        cx.notify();
+                    })),
+            )
+            .into_any_element()
+    }
+
     /// One value inside a document, with its type beside it.
-    fn value_el(&self, v: &Value, tab: &Tab, depth: usize) -> gpui::AnyElement {
+    fn value_el(
+        &self,
+        v: &Value,
+        tab: &Tab,
+        depth: usize,
+        // Which result ROW this document is, when it is one. Without it a field
+        // cannot be addressed and so cannot be written.
+        row: Option<usize>,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
         let t = self.t();
         let ms = self.scale;
         let mut out = div().flex().flex_col();
+        let tab_id_for_edit = tab.id;
         match v {
             Value::Object(m) => {
                 for (k, val) in m {
@@ -6743,12 +6766,43 @@ impl Workspace {
                                     .text_color(t.muted())
                                     .child(SharedString::from(k.clone())),
                             )
-                            .child(
-                                div()
-                                    .text_size(ms.small())
-                                    .text_color(t.fg())
-                                    .child(SharedString::from(preview(val))),
-                            )
+                            .child({
+                                // A TOP-LEVEL field of a document that is a
+                                // result row can be written, so it is editable
+                                // here exactly as a cell is in the grid.
+                                let col = tab.columns.iter().position(|c| &c.name == k);
+                                match (row, col) {
+                                    (Some(r), Some(ci)) if tab.editing == Some((r, ci)) => {
+                                        self.editor_el(tab.id, cx)
+                                    }
+                                    (Some(r), Some(ci)) => div()
+                                        .id(SharedString::from(format!("tv-{}-{r}-{ci}", tab.id)))
+                                        .flex_1()
+                                        .cursor_pointer()
+                                        .hover(|d| d.bg(t.hover()))
+                                        .text_size(ms.small())
+                                        .text_color(t.fg())
+                                        .child(SharedString::from(preview(val)))
+                                        .on_click(cx.listener(move |this, _, _, cx| {
+                                            let id = this
+                                                .tabs
+                                                .iter()
+                                                .find(|x| x.id == tab_id_for_edit)
+                                                .map(|x| x.id);
+                                            if let Some(id) = id {
+                                                this.begin_edit(id, r, ci, cx);
+                                            }
+                                            cx.notify();
+                                        }))
+                                        .into_any_element(),
+                                    _ => div()
+                                        .flex_1()
+                                        .text_size(ms.small())
+                                        .text_color(t.fg())
+                                        .child(SharedString::from(preview(val)))
+                                        .into_any_element(),
+                                }
+                            })
                             .child(
                                 // The badge, in the colour its type maps to.
                                 div()
@@ -6758,7 +6812,11 @@ impl Workspace {
                             ),
                     );
                     if matches!(val, Value::Object(_)) && depth < 4 {
-                        out = out.child(self.value_el(val, tab, depth + 1));
+                        // A nested object's fields are NOT offered for editing:
+                        // `row.write` sets a top-level field, and pretending to
+                        // write `a.b.c` by sending `c` would write the wrong
+                        // thing. Shown, not editable, is the honest pairing.
+                        out = out.child(self.value_el(val, tab, depth + 1, None, cx));
                     }
                 }
             }
