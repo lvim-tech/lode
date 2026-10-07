@@ -307,11 +307,22 @@ pub fn load(path: &std::path::Path) -> anyhow::Result<Theme> {
 
 /// The theme to start with: `$LODE_THEME`, else the first found, else built in.
 pub fn pick() -> (String, Theme) {
+    pick_named(None)
+}
+
+/// The theme to start with, preferring one by name.
+///
+/// `want` is what the session remembered. It comes FIRST because it is the most
+/// recent thing the person actually chose; `$LODE_THEME` is next because it is
+/// deliberate too but set once; and the first file found is a fallback rather
+/// than a choice. The session's theme was being saved and never read — a picker
+/// that forgets is a picker that has to be used every morning.
+pub fn pick_named(want: Option<&str>) -> (String, Theme) {
     let themes = discover();
-    if let Ok(want) = std::env::var("LODE_THEME") {
-        if let Some(p) = themes.get(&want) {
+    for name in want.map(str::to_string).into_iter().chain(std::env::var("LODE_THEME").ok()) {
+        if let Some(p) = themes.get(&name) {
             if let Ok(t) = load(p) {
-                return (want, t);
+                return (name, t);
             }
         }
     }

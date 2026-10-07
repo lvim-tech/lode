@@ -37,7 +37,7 @@ use crate::metrics::Metrics;
 use crate::session::{self, Session, SessionTab};
 use crate::theme::{self, Theme};
 use crate::workspace::{
-    bar_label, bar_label_of, column_editable, copy_as_insert, copy_as_select, fuzzy_score, row_key,
+    bar_label, bar_label_of, clamped_scroll, column_editable, copy_as_insert, copy_as_select, fuzzy_score, row_key,
     value_range, ChartShape, Cond,
     PendingWrite, Toast,
     fmt_duration, preview, type_badge, Live, ResultView, RunState, SubTab, Tab, Task,
@@ -54,6 +54,11 @@ gpui::actions!(
         /// and moving between results is what this window is for.
         PrevTab,
         NextTab,
+        /// The grid sideways. Shift-H and Shift-L, because plain h and l are
+        /// already the tabs and taking them would be swapping one unreachable
+        /// thing for another.
+        ScrollLeft,
+        ScrollRight,
         /// Page down and up, ctrl-f and ctrl-b.
         PageDown,
         PageUp,
@@ -90,6 +95,8 @@ pub fn bind_workspace_keys(cx: &mut gpui::App) {
         KeyBinding::new("up", PrevRow, OUTSIDE),
         KeyBinding::new("h", PrevTab, OUTSIDE),
         KeyBinding::new("l", NextTab, OUTSIDE),
+        KeyBinding::new("shift-h", ScrollLeft, OUTSIDE),
+        KeyBinding::new("shift-l", ScrollRight, OUTSIDE),
         KeyBinding::new("ctrl-f", PageDown, OUTSIDE),
         KeyBinding::new("ctrl-b", PageUp, OUTSIDE),
         KeyBinding::new("g", FirstRow, OUTSIDE),
@@ -105,6 +112,50 @@ pub fn bind_workspace_keys(cx: &mut gpui::App) {
         KeyBinding::new("ctrl-k", PaletteUp, Some("Palette")),
         KeyBinding::new("ctrl-y", PaletteAccept, Some("Palette")),
     ]);
+}
+
+/// The font to draw in: the first of a short list the text system reports as
+/// installed.
+///
+/// Asked rather than assumed. The literal this replaces was a font that exists
+/// on one machine, and on any other the window fell back silently — which looks
+/// like a window whose icons are empty boxes for no visible reason. `$LODE_FONT`
+/// wins outright, because somebody who sets it has already decided.
+fn pick_font(cx: &gpui::App) -> String {
+    let installed = cx.text_system().all_font_names();
+    let has = |n: &str| installed.iter().any(|f| f == n);
+    if let Ok(want) = std::env::var("LODE_FONT") {
+        if has(&want) {
+            return want;
+        }
+    }
+    // Nerd Fonts first: the interface uses glyphs from the Font Awesome block,
+    // and a font without them draws a row of empty boxes.
+    for name in [
+        "CodeNerdFont",
+        "CodeNerdFontMono",
+        "FiraCode Nerd Font",
+        "JetBrainsMono Nerd Font",
+        "Hack Nerd Font",
+        "DejaVuSansM Nerd Font",
+        "Symbols Nerd Font",
+        "FiraCode Nerd Font Mono",
+    ] {
+        if has(name) {
+            return name.to_string();
+        }
+    }
+    // Anything with "Nerd" in it, then any monospace-looking name, then
+    // whatever the system hands back for an unknown family.
+    if let Some(any_nerd) = installed.iter().find(|f| f.contains("Nerd")) {
+        return any_nerd.clone();
+    }
+    for name in ["DejaVu Sans Mono", "Liberation Mono", "monospace"] {
+        if has(name) {
+            return name.to_string();
+        }
+    }
+    "monospace".to_string()
 }
 
 /// One line in the command palette.
@@ -128,6 +179,8 @@ pub enum PaletteAct {
     SaveQuery,
     ToggleConsole,
     NewConnection,
+    /// A column's width sideways, signed.
+    ScrollGrid(f32),
 }
 
 /// Read a typed cell back into a JSON value.
@@ -380,6 +433,33 @@ pub struct Workspace {
     /// width it had then).
     resizing: Option<(u64, usize, f32, f32)>,
 
+    /// Where the result grid is scrolled to, sideways.
+    grid_scroll: gpui::ScrollHandle,
+    /// How much wider than the window the grid is, in pixels.
+    ///
+    /// DERIVED from the column widths rather than read from the scroll handle.
+    /// `ScrollHandle::max_offset` is filled during PAINT, so the first render
+    /// reads zero — and since nothing redraws afterwards, the scrollbar never
+    /// appeared and the first keypress clamped the scroll to nothing. A `Cell`
+    /// because `table_el` takes `&self`, and the alternative is threading a
+    /// width back out of a render function.
+    grid_overflow: std::cell::Cell<f32>,
+    /// How many spaces the JSON view indents by. Two, three or four: the
+    /// argument about which is right is older than this program, so it is a
+    /// setting rather than a decision.
+    json_indent: u8,
+    /// The font family the window is actually drawing in.
+    ///
+    /// Was the literal `"CodeNerdFont"`, which is a font on ONE machine. It is
+    /// now the first of a short list that the text system reports as installed,
+    /// and the Settings panel says which one won — a window that silently fell
+    /// back to a default is a window whose icons are empty boxes for a reason
+    /// nobody can see.
+    font_family: String,
+    /// Every theme file found, by name. Read at start and on demand, because a
+    /// theme installed while the window is open should be findable without
+    /// restarting it.
+    themes: std::collections::BTreeMap<String, std::path::PathBuf>,
     /// The window's own focus, so the vim keys know whether a field has it.
     focus: FocusHandle,
     /// The export row, while it is open, and where it would write.
@@ -396,7 +476,12 @@ pub struct Workspace {
 
 impl Workspace {
     pub fn new(cx: &mut Context<Self>) -> Self {
-        let (theme_name, theme) = theme::pick();
+        // Read ONCE, and FIRST: the theme, the type scale and the window's
+        // fields all come out of it.
+        let restore = session::load();
+        // The session's theme before anything else. It was being saved and
+        // never read, so the choice survived to the file and no further.
+        let (theme_name, theme) = theme::pick_named(restore.theme.as_deref());
         let colors = input_colors(&theme);
         let filter = cx.new(|cx| TextInput::new(cx, "Filter connections and schema…", colors));
         cx.subscribe(&filter, |_this, _input, _ev: &InputEvent, cx| {
@@ -405,8 +490,6 @@ impl Workspace {
             cx.notify();
         })
         .detach();
-        // Read ONCE: the window's fields and the type scale both come out of it.
-        let restore = session::load();
         let export_path = cx.new(|cx| TextInput::new(cx, "result.csv", colors));
         let history_filter = cx.new(|cx| TextInput::new(cx, "Search history…", colors));
         let audit_filter = cx.new(|cx| TextInput::new(cx, "Search the audit log…", colors));
@@ -484,6 +567,11 @@ impl Workspace {
             toasts: Vec::new(),
             next_toast: 1,
             resizing: None,
+            grid_scroll: gpui::ScrollHandle::new(),
+            grid_overflow: std::cell::Cell::new(0.0),
+            json_indent: restore.json_indent.unwrap_or(4).clamp(2, 4),
+            themes: theme::discover(),
+            font_family: pick_font(cx),
             focus: cx.focus_handle(),
             export_open: false,
             export_format: Format::Csv,
@@ -1474,6 +1562,7 @@ impl Workspace {
                 .collect(),
             active: self.active,
             theme: Some(self.theme_name.clone()),
+            json_indent: Some(self.json_indent),
             font_size: Some(self.scale.base()),
             rail: match self.rail {
                 Rail::Connections => "connections",
@@ -1857,6 +1946,8 @@ impl Workspace {
                 act: PaletteAct::Rail(r),
             });
         }
+        out.push(PaletteItem { label: "Scroll the grid left".into(), hint: "shift-h".into(), act: PaletteAct::ScrollGrid(1.0) });
+        out.push(PaletteItem { label: "Scroll the grid right".into(), hint: "shift-l".into(), act: PaletteAct::ScrollGrid(-1.0) });
         out.push(PaletteItem { label: "Run this tab".into(), hint: "r".into(), act: PaletteAct::RunActive });
         out.push(PaletteItem { label: "Export loaded rows".into(), hint: "result".into(), act: PaletteAct::ToggleExport });
         out.push(PaletteItem { label: "Save this query".into(), hint: "result".into(), act: PaletteAct::SaveQuery });
@@ -1917,6 +2008,9 @@ impl Workspace {
                     self.ask(Pending::Audit, "store.audit.list", json!({ "limit": 300 }));
                 }
                 self.remember();
+            }
+            PaletteAct::ScrollGrid(dir) => {
+                self.scroll_grid(dir * self.scale.col_w());
             }
             PaletteAct::View(v) => {
                 if let Some(tab) = self.tabs.get_mut(self.active) {
@@ -2557,6 +2651,54 @@ impl Workspace {
 
     // ── painting ─────────────────────────────────────────────────────────────
 
+    /// Switch theme now, and remember it.
+    ///
+    /// Everything is drawn from `self.theme` each frame, so there is nothing to
+    /// repaint by hand: one assignment and the next frame is the new theme. The
+    /// input fields are the exception — they cache their colours — so they are
+    /// handed the new ones here.
+    fn use_theme(&mut self, name: &str, cx: &mut Context<Self>) {
+        let Some(path) = self.themes.get(name).cloned() else { return };
+        match theme::load(&path) {
+            Ok(t) => {
+                self.theme = t;
+                self.theme_name = name.to_string();
+                let colors = input_colors(&self.theme);
+                for input in self.all_inputs() {
+                    input.update(cx, |i, cx| i.set_colors(colors, cx));
+                }
+                self.remember();
+                self.toast(format!("theme: {name}"), false);
+                cx.notify();
+            }
+            // A theme file that will not parse says WHICH file and why, rather
+            // than leaving the old one up with no explanation.
+            Err(e) => {
+                self.toast(format!("{name}: {e}"), true);
+                self.log.push(("error".into(), format!("{name}: {e}")));
+            }
+        }
+    }
+
+    /// Every text field in the window, so a theme change reaches all of them.
+    fn all_inputs(&self) -> Vec<Entity<TextInput>> {
+        let mut out = vec![
+            self.filter.clone(),
+            self.console.clone(),
+            self.export_path.clone(),
+            self.history_filter.clone(),
+            self.audit_filter.clone(),
+            self.palette_input.clone(),
+            self.board_name.clone(),
+            self.tile_text.clone(),
+            self.board_time_col.clone(),
+            self.board_time_from.clone(),
+            self.board_time_to.clone(),
+        ];
+        out.extend(self.inputs.values().cloned());
+        out
+    }
+
     fn t(&self) -> &Theme {
         &self.theme
     }
@@ -2715,13 +2857,108 @@ impl Workspace {
 
         match self.rail {
             Rail::Settings => {
-                panel = panel.child(self.section("Theme")).child(
+                let mut list = self.panel_list("settings-list");
+                list = list.child(self.section(&format!("Theme ({})", self.themes.len())));
+                list = list.child(
                     div()
+                        .id("theme-rescan")
                         .px_2()
-                        .text_size(ms.body())
-                        .text_color(t.fg())
-                        .child(SharedString::from(self.theme_name.clone())),
+                        .py_1()
+                        .cursor_pointer()
+                        .hover(|d| d.bg(t.hover()))
+                        .text_size(ms.small())
+                        .text_color(t.accent())
+                        .child("\u{f021}  Look again")
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.themes = theme::discover();
+                            cx.notify();
+                        })),
                 );
+                if self.themes.is_empty() {
+                    // WHICH directories were searched. "No themes" on its own is
+                    // a message somebody can do nothing with.
+                    list = list.child(div().px_2().child(self.small(
+                        "no theme files found — looked in:",
+                        t.warning(),
+                    )));
+                    for d in theme::theme_dirs() {
+                        list = list.child(div().px_2().child(self.line(
+                            d.display().to_string(),
+                            ms.small(),
+                            t.muted(),
+                            ms.line_w(),
+                        )));
+                    }
+                    list = list.child(div().px_2().child(self.small(
+                        "the built-in theme is the generated LvimBase_dark",
+                        t.muted(),
+                    )));
+                }
+                for name in self.themes.keys() {
+                    let on = *name == self.theme_name;
+                    let pick = name.clone();
+                    list = list.child(
+                        div()
+                            .id(SharedString::from(format!("theme-{name}")))
+                            .flex()
+                            .items_center()
+                            .gap_1()
+                            .px_2()
+                            .py(px(2.0))
+                            .cursor_pointer()
+                            .hover(|d| d.bg(t.hover()))
+                            .when(on, |d| d.bg(t.selected()))
+                            .child(
+                                div()
+                                    .w(px(ms.base()))
+                                    .flex_none()
+                                    .text_size(ms.tiny())
+                                    .text_color(t.accent())
+                                    .child(if on { "\u{f00c}" } else { " " }),
+                            )
+                            .child(self.line_in(
+                                name.clone(),
+                                ms.small(),
+                                if on { t.fg() } else { t.muted() },
+                                ms.line_w() - ms.base() - 14.0,
+                            ))
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.use_theme(&pick, cx);
+                            })),
+                    );
+                }
+
+                list = list.child(self.section("JSON indent"));
+                let mut row = div().flex().items_center().gap_2().px_2().py_1();
+                for n in [2u8, 3, 4] {
+                    let on = self.json_indent == n;
+                    row = row.child(
+                        div()
+                            .id(SharedString::from(format!("jsonind-{n}")))
+                            .px_2()
+                            .cursor_pointer()
+                            .text_size(ms.body())
+                            .text_color(if on { t.inverted() } else { t.fg() })
+                            .when(on, |d| d.bg(t.accent()))
+                            .hover(|d| d.bg(t.hover()))
+                            .child(SharedString::from(n.to_string()))
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.json_indent = n;
+                                this.remember();
+                                cx.notify();
+                            })),
+                    );
+                }
+                list = list.child(row);
+
+                list = list.child(self.section("Text"));
+                list = list.child(div().px_2().child(self.line(
+                    format!("font: {}", self.font_family),
+                    ms.small(),
+                    t.muted(),
+                    ms.line_w(),
+                )));
+                panel = panel.child(list);
                 panel = panel.child(self.section("Text size"));
                 // One number, and it moves everything: the steps, the grid row
                 // height, the rail. Here rather than only in an environment
@@ -2779,7 +3016,7 @@ impl Workspace {
                                 })),
                         ),
                 );
-                panel = panel.child(div().px_2().child(self.small(
+                panel = panel.child(div().px_2().child(self.line(
                     format!(
                         "every size comes off this one — headings {}, body {}, small {}, a grid row {}",
                         f32::from(ms.heading()),
@@ -2787,7 +3024,9 @@ impl Workspace {
                         f32::from(ms.small()),
                         ms.row_h()
                     ),
+                    ms.small(),
                     t.muted(),
+                    ms.line_w(),
                 )));
                 return panel;
             }
@@ -4709,13 +4948,21 @@ impl Workspace {
 
         if let Some(ddl) = &tab.ddl {
             body = body.child(self.section("CREATE"));
+            // Scrolled to, not clipped. A CREATE statement with a wide column
+            // list ran off the edge and the rest of it was simply unreachable —
+            // the same loss as a grid column you cannot scroll to.
             body = body.child(
                 div()
+                    .id("schema-ddl")
                     .flex_1()
-                    .overflow_hidden()
-                    .text_size(ms.small())
-                    .text_color(t.fg())
-                    .child(SharedString::from(ddl.clone())),
+                    .overflow_scroll()
+                    .child(
+                        div()
+                            .whitespace_nowrap()
+                            .text_size(ms.small())
+                            .text_color(t.fg())
+                            .child(SharedString::from(ddl.clone())),
+                    ),
             );
         }
         body.into_any_element()
@@ -5202,13 +5449,30 @@ impl Workspace {
 
         let sort = tab.sort;
         let tab_id = tab.id;
+        // The grid's REAL width. A scrolling container needs content wider than
+        // itself or there is nothing to scroll, and the width has to be exact:
+        // one pixel short and the last column is unreachable, which is the bug
+        // this is fixing.
+        let total_w: f32 = NUM_W
+            + cols
+                .iter()
+                .map(|(ci, _)| tab.widths.get(ci).copied().unwrap_or(ms.col_w()) + 3.0)
+                .sum::<f32>();
         let mut header = div()
             .flex()
             .w_full()
             .bg(t.header_bg())
             .border_b_1()
             .border_color(t.border())
-            .child(div().w(px(NUM_W)).px(px(ms.cell_pad())).child(self.small("#", t.header_fg())));
+            .flex_none()
+            .overflow_hidden()
+            .child(
+                div()
+                    .w(px(NUM_W))
+                    .flex_none()
+                    .px(px(ms.cell_pad()))
+                    .child(self.small("#", t.header_fg())),
+            );
         for (ci, name) in &cols {
             let (ci, name) = (*ci, name.clone());
             let arrow = match sort {
@@ -5225,12 +5489,22 @@ impl Workspace {
                 div()
                     .id(SharedString::from(format!("hdr-{tab_id}-{ci}")))
                     .w(px(tab.widths.get(&ci).copied().unwrap_or(ms.col_w())))
-                    .px(px(ms.cell_pad()))
+                    // A long column name is cut like a long value: a header that
+                    // wrapped would make the header taller than the rows and
+                    // every row would be drawn at the wrong offset.
+                    .flex_none()
+                    .overflow_hidden()
                     .cursor_pointer()
-                    .text_size(ms.small())
-                    .text_color(t.header_fg())
                     .hover(|d| d.bg(t.hover()))
-                    .child(SharedString::from(format!("{name}{arrow}")))
+                    .child(
+                        div()
+                            .w(px(tab.widths.get(&ci).copied().unwrap_or(ms.col_w())))
+                            .truncate()
+                            .px(px(ms.cell_pad()))
+                            .text_size(ms.small())
+                            .text_color(t.header_fg())
+                            .child(SharedString::from(format!("{name}{arrow}"))),
+                    )
                     .on_click(cx.listener(move |this, _, _, cx| {
                         this.sort_by(tab_id, ci);
                         cx.notify();
@@ -5273,12 +5547,23 @@ impl Workspace {
                         .flex()
                         .w_full()
                         .h(px(ms.row_h()))
+                        // ONE ROW TALL, whatever is in it. `uniform_list` puts
+                        // every row at a fixed offset, so a cell that grows
+                        // taller than its row does not push the next one down —
+                        // it paints OVER it. A MongoDB document with a nested
+                        // array in a column turned rows two to twelve into one
+                        // unreadable stack, and the last row poured a column of
+                        // text hundreds of pixels into the empty space below.
+                        .flex_none()
+                        .overflow_hidden()
                         // Alternating rows: the stripe is a surface from the
                         // theme, not a computed shade.
                         .when(i % 2 == 1, |d| d.bg(row_alt))
                         .child(
                             div()
                                 .w(px(NUM_W))
+                                .flex_none()
+                                .truncate()
                                 .px(px(ms.cell_pad()))
                                 .text_size(ms.tiny())
                                 .text_color(muted)
@@ -5292,14 +5577,36 @@ impl Workspace {
                         };
                         line = line
                             .child(
+                                // ONE LINE, cut at the column's edge with an
+                                // ellipsis. A grid is for scanning; the whole
+                                // value is read in the detail panel and in the
+                                // JSON view, which exist for exactly that.
+                                // Making a row as tall as its tallest cell
+                                // would mean measuring every row before laying
+                                // out any, which is what `uniform_list` exists
+                                // not to do — and it would buy a worse grid.
+                                // A block inside the flex slot, both with the
+                                // same real width. A flex ITEM is measured by
+                                // the flex algorithm before its own width is
+                                // settled, and GPUI draws the ellipsis only
+                                // against a width known at measure time — so
+                                // the slot alone cut the text off mid-glyph
+                                // with no `…` to say it had.
                                 div()
                                     .w(px(widths.get(ci).copied().unwrap_or(ms.col_w())))
-                                    .px(px(ms.cell_pad()))
-                                    .text_size(ms.body())
-                                    .text_color(colour)
-                                    .child(SharedString::from(text)),
+                                    .flex_none()
+                                    .overflow_hidden()
+                                    .child(
+                                        div()
+                                            .w(px(widths.get(ci).copied().unwrap_or(ms.col_w())))
+                                            .truncate()
+                                            .px(px(ms.cell_pad()))
+                                            .text_size(ms.body())
+                                            .text_color(colour)
+                                            .child(SharedString::from(text)),
+                                    ),
                             )
-                            .child(div().w(px(3.0)));
+                            .child(div().w(px(3.0)).flex_none());
                     }
                     out.push(line);
                 }
@@ -5308,13 +5615,81 @@ impl Workspace {
         )
         .h_full();
 
-        div()
-            .flex()
-            .flex_col()
-            .size_full()
-            .child(header)
-            .child(div().flex_1().child(list))
-            .into_any_element()
+        // Header and rows share ONE horizontally scrolling parent, so the
+        // headings move with their columns for free. Headings that stay put
+        // while the data slides under them are worse than no headings: every
+        // value would be read under the wrong name.
+        //
+        // The row-number column is NOT pinned. Pinning it means a second column
+        // outside the scroller, which means a second virtualised list, which
+        // means two lists sharing one vertical scroll position — real work for
+        // a small gain, and this grid already numbers its rows in order. Said
+        // here rather than left to be wondered about.
+        let body = div()
+            .id("grid-h")
+            .flex_1()
+            .overflow_x_scroll()
+            .track_scroll(&self.grid_scroll)
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .w(px(total_w))
+                    .h_full()
+                    .child(header)
+                    .child(div().flex_1().child(list)),
+            )
+            // Shift and the wheel, which is what a mouse with one wheel has.
+            .on_scroll_wheel(cx.listener(move |this, ev: &gpui::ScrollWheelEvent, _, cx| {
+                if !ev.modifiers.shift {
+                    return;
+                }
+                let d = ev.delta.pixel_delta(px(ms.row_h()));
+                this.scroll_grid(f32::from(d.y) - f32::from(d.x));
+                cx.notify();
+            }));
+
+        let mut out = div().flex().flex_col().size_full().child(body);
+        // A visible bar. GPUI draws none for a scrolling div, and a grid that
+        // scrolls with no sign that it scrolls is a grid whose extra columns
+        // are still invisible — which was the whole complaint.
+        let shown = self.canvas_w.max(1.0);
+        let max = (total_w - shown).max(0.0);
+        self.grid_overflow.set(max);
+        if max > 1.0 {
+            let frac = (shown / total_w).clamp(0.05, 1.0);
+            let at = (-f32::from(self.grid_scroll.offset().x) / total_w).clamp(0.0, 1.0 - frac);
+            // A flex row with a spacer, not an absolutely positioned thumb.
+            // The absolute version drew nothing: a percentage width inside a
+            // six-pixel absolutely positioned box is the kind of thing that
+            // resolves to zero without complaining, and a scrollbar that is
+            // invisible is the bug it was added to fix.
+            out = out.child(
+                div()
+                    .flex()
+                    .w_full()
+                    .h(px(7.0))
+                    .flex_none()
+                    .bg(t.status())
+                    .child(div().w(gpui::relative(at)).h_full())
+                    .child(div().w(gpui::relative(frac)).h_full().bg(t.accent())),
+            );
+        }
+        out.into_any_element()
+    }
+
+    /// Move the grid sideways by `dx` pixels, clamped to what there is.
+    ///
+    /// One handle on the workspace rather than one per tab: only one grid is
+    /// being looked at, and a per-tab handle would be state that outlives the
+    /// thing it describes.
+    fn scroll_grid(&self, dx: f32) {
+        // The derived overflow, not the handle's — see `grid_overflow`.
+        let max = self.grid_overflow.get();
+        let now = f32::from(self.grid_scroll.offset().x);
+        let next = clamped_scroll(now, dx, max);
+        self.grid_scroll
+            .set_offset(gpui::point(px(next), self.grid_scroll.offset().y));
     }
 
     /// The document view: one expandable record per row, with a type badge on
@@ -5420,13 +5795,31 @@ impl Workspace {
         let t = self.t();
         let ms = self.scale;
         let docs: Vec<Value> = (0..tab.rows.len().min(200)).map(|i| tab.document(i)).collect();
-        let text = serde_json::to_string_pretty(&docs).unwrap_or_else(|_| "[]".into());
+        // `to_string_pretty` is fixed at two spaces, so the indent is chosen by
+        // handing the formatter the exact run of spaces to use.
+        let pad = " ".repeat(self.json_indent as usize);
+        let mut buf = Vec::new();
+        let fmt = serde_json::ser::PrettyFormatter::with_indent(pad.as_bytes());
+        let mut ser = serde_json::Serializer::with_formatter(&mut buf, fmt);
+        let text = match serde::Serialize::serialize(&docs, &mut ser) {
+            Ok(()) => String::from_utf8(buf).unwrap_or_else(|_| "[]".into()),
+            Err(_) => "[]".into(),
+        };
+        // A long line is scrolled to, not wrapped: a JSON document rewrapped at
+        // the window's edge stops lining up, and lining up is what reading it
+        // as a tree depends on.
         div()
+            .id("json-view")
             .size_full()
+            .overflow_x_scroll()
             .p_2()
-            .text_size(ms.small())
-            .text_color(t.fg())
-            .child(SharedString::from(text))
+            .child(
+                div()
+                    .whitespace_nowrap()
+                    .text_size(ms.small())
+                    .text_color(t.fg())
+                    .child(SharedString::from(text)),
+            )
             .into_any_element()
     }
 
@@ -5829,6 +6222,15 @@ impl Render for Workspace {
             .on_action(cx.listener(|this, _: &FirstRow, _, cx| this.move_row(isize::MIN, cx)))
             .on_action(cx.listener(|this, _: &LastRow, _, cx| this.move_row(isize::MAX, cx)))
             .on_action(cx.listener(|this, _: &NextTab, _, cx| this.step_tab(1, cx)))
+            // A column's width at a time, so a press moves something visible.
+            .on_action(cx.listener(|this, _: &ScrollLeft, _, cx| {
+                this.scroll_grid(this.scale.col_w());
+                cx.notify();
+            }))
+            .on_action(cx.listener(|this, _: &ScrollRight, _, cx| {
+                this.scroll_grid(-this.scale.col_w());
+                cx.notify();
+            }))
             .on_action(cx.listener(|this, _: &PrevTab, _, cx| this.step_tab(-1, cx)))
             .on_action(cx.listener(|this, _: &RunActive, _, cx| {
                 if let Some(id) = this.tabs.get(this.active).map(|x| x.id) {
@@ -5923,7 +6325,7 @@ impl Render for Workspace {
             .size_full()
             .bg(t.base())
             .text_color(t.fg())
-            .font_family("CodeNerdFont")
+            .font_family(SharedString::from(self.font_family.clone()))
             .text_size(ms.heading());
 
         if let Some(fatal) = self.fatal.clone() {

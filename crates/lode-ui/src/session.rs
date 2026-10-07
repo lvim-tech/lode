@@ -35,6 +35,9 @@ pub struct Session {
     /// reads as a person would write it.
     #[serde(default)]
     pub rail: String,
+    /// How many spaces the JSON view indents by. `None` is the default.
+    #[serde(default)]
+    pub json_indent: Option<u8>,
     /// The base of the type scale, in pixels, when somebody has set one.
     ///
     /// `None` means "whatever the application's default is", so raising the
@@ -142,6 +145,7 @@ mod tests {
             theme: Some("LvimBase_dark".into()),
             rail: "history".into(),
             font_size: Some(16.0),
+            json_indent: Some(4),
         };
         let text = serde_json::to_string(&s).unwrap();
         let back: Session = serde_json::from_str(&text).unwrap();
@@ -154,6 +158,7 @@ mod tests {
         assert_eq!(back.tabs[0].sub, "schema");
         assert_eq!(back.tabs[0].detail, Some(2));
         assert_eq!(back.font_size, Some(16.0), "a chosen text size comes back");
+        assert_eq!(back.json_indent, Some(4));
 
         // A tab with no object is a typed one, and its words come back.
         let typed = Session {
@@ -173,6 +178,7 @@ mod tests {
             theme: None,
             rail: String::new(),
             font_size: None,
+            json_indent: None,
         };
         let round: Session = serde_json::from_str(&serde_json::to_string(&typed).unwrap()).unwrap();
         assert_eq!(round.tabs[0].draft, "SELECT 1 WHERE", "half a statement is still someone's work");

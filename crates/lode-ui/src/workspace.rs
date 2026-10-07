@@ -289,6 +289,18 @@ impl Toast {
     }
 }
 
+/// Where a sideways scroll lands, clamped to what there is.
+///
+/// GPUI's scroll offset is NEGATIVE as the content moves left, so the range is
+/// `-max ..= 0` and not the other way round — which is the kind of thing that
+/// looks right, compiles, and scrolls nowhere.
+pub fn clamped_scroll(now: f32, dx: f32, max: f32) -> f32 {
+    if max <= 0.0 {
+        return 0.0;
+    }
+    (now + dx).clamp(-max, 0.0)
+}
+
 /// Score `text` against a typed `needle`, letters in order but not adjacent.
 ///
 /// `None` means it does not match at all. A lower score is a better match: a
@@ -812,6 +824,23 @@ pub fn node_matches(node: &Node, filter: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    /// The offset is negative as the content moves LEFT. Getting the sign wrong
+    /// here compiles and scrolls nowhere, which is why it is a function with a
+    /// test rather than three lines inside a click handler.
+    #[test]
+    fn a_sideways_scroll_stays_inside_what_there_is() {
+        // Right by one column, from the start.
+        assert_eq!(clamped_scroll(0.0, -154.0, 1748.0), -154.0);
+        // And back again, no further than the start.
+        assert_eq!(clamped_scroll(-154.0, 154.0, 1748.0), 0.0);
+        assert_eq!(clamped_scroll(0.0, 1000.0, 1748.0), 0.0);
+        // Never past the last column.
+        assert_eq!(clamped_scroll(-1700.0, -1000.0, 1748.0), -1748.0);
+        // A grid that fits does not move at all, whichever way it is pushed.
+        assert_eq!(clamped_scroll(0.0, -500.0, 0.0), 0.0);
+        assert_eq!(clamped_scroll(0.0, 500.0, 0.0), 0.0);
+    }
+
     use super::*;
     use serde_json::json;
 
