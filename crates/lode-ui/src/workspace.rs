@@ -409,6 +409,44 @@ pub fn settings_rows(stored: &std::collections::BTreeSet<String>) -> Vec<GroupRo
         .collect()
 }
 
+/// The horizontal scrollbar's arithmetic, as one function.
+///
+/// The thumb was coming out nearly full while columns were cut off the right —
+/// which is one fault with two faces: if the visible width is believed to be
+/// larger than it is, the thumb (visible ÷ total) is too long AND the furthest
+/// offset (total − visible) is too small, so the last columns cannot be reached.
+/// Both symptoms, one number.
+///
+/// So the number is passed in and the arithmetic is here, where it can be
+/// checked without a window.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Hbar {
+    /// The thumb's share of the track, 0..1.
+    pub frac: f32,
+    /// Where the thumb starts, 0..1.
+    pub at: f32,
+    /// The furthest the content can be moved left, in pixels.
+    pub max: f32,
+}
+
+/// `None` when there is nothing to scroll — and then there must be no bar
+/// either, because a bar that cannot move is a control that lies.
+pub fn hbar(total: f32, shown: f32, offset_x: f32) -> Option<Hbar> {
+    if !(total > 0.0) || !(shown > 0.0) {
+        return None;
+    }
+    let max = total - shown;
+    if max <= 1.0 {
+        return None;
+    }
+    // A thumb is never allowed to vanish: below a few percent it stops being
+    // grabbable, and an ungrabbable thumb is the bar not working again.
+    let frac = (shown / total).clamp(0.05, 1.0);
+    // `offset_x` is GPUI's, so it is negative or zero.
+    let at = ((-offset_x) / total).clamp(0.0, 1.0 - frac);
+    Some(Hbar { frac, at, max })
+}
+
 /// Where the grid should sit when the bar is dragged to window position `x`.
 ///
 /// The offset GPUI wants is NEGATIVE — it is how far the content has been moved
@@ -1160,6 +1198,82 @@ mod tests {
             rows.iter().filter(|r| r.open).map(|r| r.id).collect::<Vec<_>>(),
             vec!["profiles"]
         );
+    }
+
+    /// A tooltip appears where text is CUT and nowhere else.
+    ///
+    /// A tip on every row is noise, and noise is worse than a gap — so the
+    /// comparison leans toward "it fits" and a borderline line gets no tip
+    /// rather than a wrong one.
+    #[test]
+    fn only_a_cut_line_offers_the_rest_of_itself() {
+        // The arithmetic the window uses, with a monospaced ratio.
+        let cut = |text: &str, size: f32, w: f32| -> bool {
+            text.chars().count() as f32 * 0.6 * size > w * 1.02
+        };
+
+        // Comfortably inside: no tip.
+        assert!(!cut("short", 13.0, 400.0));
+        // Comfortably over: a tip.
+        assert!(cut(&"x".repeat(200), 13.0, 400.0));
+
+        // The two the user actually saw cut, at the width that cut them.
+        assert!(cut("LvimBase_light", 12.0, 90.0), "the theme name was cut");
+        assert!(cut("14 / 28 px", 12.0, 40.0), "the sizes were cut");
+
+        // Exactly at the edge counts as fitting: the margin exists so that a
+        // line which just fits is never given a tip it does not need.
+        let w = 10.0 * 0.6 * 13.0;
+        assert!(!cut(&"x".repeat(10), 13.0, w));
+
+        // A character count, not a byte count — otherwise every Cyrillic row
+        // would claim to be cut.
+        let bg = "Размер на иконите";
+        assert_eq!(bg.chars().count(), 17);
+        assert!(bg.len() > 17, "it is longer in bytes, which is the trap");
+        assert!(!cut(bg, 12.0, 200.0), "17 characters fit in 200px");
+    }
+
+    /// The three cases that mean anything, and the one that was wrong.
+    #[test]
+    fn the_scrollbar_describes_what_there_is_to_scroll() {
+        // 1. Content NARROWER than the window: no scrolling, and so no bar.
+        //    A bar that cannot move is a control that lies.
+        assert_eq!(hbar(800.0, 1200.0, 0.0), None);
+        assert_eq!(hbar(1200.0, 1200.0, 0.0), None);
+
+        // 2. Slightly wider: the thumb is nearly full, and it still scrolls.
+        //    This is the case that was indistinguishable from the bug — the
+        //    difference is that `max` is small but REAL.
+        let b = hbar(1300.0, 1200.0, 0.0).expect("there is something to scroll");
+        assert!(b.frac > 0.9 && b.frac < 1.0, "frac {}", b.frac);
+        assert_eq!(b.max, 100.0);
+
+        // 3. Twice as wide: the thumb is half the track.
+        let b = hbar(2400.0, 1200.0, 0.0).expect("scrolls");
+        assert!((b.frac - 0.5).abs() < 0.001, "frac {}", b.frac);
+        assert_eq!(b.max, 1200.0);
+        assert_eq!(b.at, 0.0);
+
+        // Scrolled to the far end, the thumb sits at the far end.
+        let b = hbar(2400.0, 1200.0, -1200.0).expect("scrolls");
+        assert!((b.at + b.frac - 1.0).abs() < 0.001, "at {} frac {}", b.at, b.frac);
+
+        // THE BUG: believing the window is wider than it is gives a thumb that
+        // is nearly full AND a `max` too small to reach the last columns. Both
+        // faces of one wrong number.
+        let truth = hbar(2400.0, 1200.0, 0.0).unwrap();
+        let lie = hbar(2400.0, 2200.0, 0.0).unwrap();
+        assert!(lie.frac > truth.frac, "the thumb grows as the lie grows");
+        assert!(lie.max < truth.max, "and the reach shrinks at the same time");
+
+        // A thumb never vanishes: a huge result still leaves something to grab.
+        let b = hbar(100_000.0, 500.0, 0.0).expect("scrolls");
+        assert!(b.frac >= 0.05, "frac {}", b.frac);
+
+        // Nonsense in, nothing out — rather than a division by zero.
+        assert_eq!(hbar(0.0, 100.0, 0.0), None);
+        assert_eq!(hbar(100.0, 0.0, 0.0), None);
     }
 
     /// Dragging the bar lands somewhere sensible and never past the ends.

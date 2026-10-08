@@ -195,6 +195,30 @@ const GLYPHS: &[(&str, &str)] = &[
     ("\u{f0dd}", "v"),
 ];
 
+/// The advance of one character per pixel of text size, in this font.
+///
+/// `0` rather than `m` or `x`: a digit is the same width as the rest in a
+/// monospaced face and close to the average in a proportional one, and the
+/// strings being measured here are full of them.
+fn char_ratio(cx: &gpui::App, family: &str) -> f32 {
+    let font = gpui::Font {
+        family: family.to_string().into(),
+        features: Default::default(),
+        fallbacks: None,
+        weight: Default::default(),
+        style: Default::default(),
+    };
+    let id = cx.text_system().resolve_font(&font);
+    const REF: f32 = 16.0;
+    cx.text_system()
+        .advance(id, px(REF), '0')
+        .map(|a| f32::from(a.width) / REF)
+        // A font that will not measure gets a ratio that errs WIDE, so the
+        // comparison errs toward no tooltip rather than toward one on
+        // every row.
+        .unwrap_or(0.62)
+}
+
 /// Does this family have every glyph the interface draws?
 ///
 /// Measured, not assumed from the name. `typographic_bounds` errors when the
@@ -852,6 +876,15 @@ pub struct Workspace {
     /// The filter over the theme list, because there are 48 of them and their
     /// names are long.
     theme_filter: Entity<TextInput>,
+    /// How wide one character is, per pixel of text size.
+    ///
+    /// Measured once at startup from the font actually resolved, so "does this
+    /// line fit" is arithmetic rather than a guess. The text font here is
+    /// monospaced, which makes it exact; for a proportional one it is an
+    /// average, and the comparison is deliberately biased so that a tooltip is
+    /// MISSED rather than shown on a line that was never cut — a tip on every
+    /// row is noise, and noise is worse than a gap.
+    char_ratio: f32,
     /// The glyphs the ICON font does not have, worked out once at startup.
     missing_glyphs: std::collections::HashSet<char>,
     /// The font the icons are drawn in — not the font the text is drawn in.
@@ -1019,6 +1052,7 @@ impl Workspace {
             profile_users: std::collections::BTreeMap::new(),
             confirm_profile_rm: None,
             aws_profiles: Vec::new(),
+            char_ratio: char_ratio(cx, &font_family),
             missing_glyphs: missing_in(cx, &icon_family),
             icon_family,
             font_family,
@@ -3834,6 +3868,40 @@ impl Workspace {
     /// gets clipped at the slot's edge with no ellipsis, while the same `line`
     /// as a block child of a block truncates correctly. The wrapper is the
     /// block.
+    /// Would this text be CUT at this width?
+    ///
+    /// The whole point of the tooltip is that it appears where something is
+    /// hidden and nowhere else. The margin leans toward "it fits", because a
+    /// tip on a line that was never truncated is noise on every row.
+    fn cut(&self, text: &str, size: gpui::Pixels, w: f32) -> bool {
+        let chars = text.chars().count() as f32;
+        chars * self.char_ratio * f32::from(size) > w * 1.02
+    }
+
+    /// `line_in`, with the full text on hover WHEN it is cut.
+    fn line_tip(
+        &self,
+        text: impl Into<SharedString>,
+        size: gpui::Pixels,
+        colour: Rgba,
+        w: f32,
+        id: impl Into<SharedString>,
+    ) -> gpui::AnyElement {
+        let text: SharedString = text.into();
+        if !self.cut(&text, size, w) {
+            return self.line_in(text, size, colour, w).into_any_element();
+        }
+        let full = text.to_string();
+        div()
+            .id(id.into())
+            .flex_none()
+            .w(px(w))
+            .overflow_hidden()
+            .tooltip(crate::tip::Tip::build(full, None, self.theme.clone(), self.scale))
+            .child(self.line(text, size, colour, w))
+            .into_any_element()
+    }
+
     fn line_in(&self, text: impl Into<SharedString>, size: gpui::Pixels, colour: Rgba, w: f32) -> impl IntoElement {
         div()
             .flex_none()
@@ -3912,13 +3980,14 @@ impl Workspace {
                 t.title(),
                 ms.line_w() - ms.base() * 6.0,
             ))
-            .child(
-                div()
-                    .flex_none()
-                    .text_size(ms.tiny())
-                    .text_color(t.muted())
-                    .child(value.into()),
-            )
+            .child({
+                // Cut with an ellipsis and offered in full on hover, instead of
+                // running off the panel's edge mid-glyph — `LvimBase_` and
+                // `14 / 28 p` were the two that showed it.
+                let v: SharedString = value.into();
+                let w = ms.line_w() * 0.42;
+                self.line_tip(v, ms.tiny(), t.muted(), w, format!("gv-{}", g.id()))
+            })
             .on_click(cx.listener(move |this, _, _, cx| {
                 if !this.open_groups.remove(g.id()) {
                     this.open_groups.insert(g.id().to_string());
@@ -4756,7 +4825,13 @@ impl Workspace {
                             .py(px(2.0))
                             .cursor_pointer()
                             .hover(|d| d.bg(t.hover()))
-                            .child(self.line(one, ms.small(), if failed { t.error() } else { t.fg() }, ms.line_w()))
+                            .child(self.line_tip(
+                                one,
+                                ms.small(),
+                                if failed { t.error() } else { t.fg() },
+                                ms.line_w(),
+                                format!("hist-s-{}", h.id),
+                            ))
                             .child(self.line(
                                 format!(
                                     "{} · {} ms{}",
@@ -4915,21 +4990,23 @@ impl Workspace {
                                                 .text_color(colour)
                                                 .child(SharedString::from(outcome)),
                                         )
-                                        .child(self.line_in(
+                                        .child(self.line_tip(
                                             p.text,
                                             ms.small(),
                                             t.fg(),
                                             ms.line_w() - ms.outcome_w() - 8.0,
+                                            format!("aud-s-{}", a.id),
                                         )),
                                 );
                             }
                             None => {
                                 row = row.child(
-                                    div().flex_none().h(px(line_h)).child(self.line(
+                                    div().flex_none().h(px(line_h)).child(self.line_tip(
                                         p.text,
                                         ms.small(),
                                         t.muted(),
                                         ms.line_w(),
+                                        format!("aud-m-{}", a.id),
                                     )),
                                 );
                             }
@@ -5026,11 +5103,12 @@ impl Workspace {
                         div()
                             .flex_1()
                             .min_w_0()
-                            .child(self.line_in(
+                            .child(self.line_tip(
                             c.name.clone(),
                             ms.body(),
                             if is_live { t.fg() } else { t.muted() },
                             ms.line_w() - ms.base() * 7.5,
+                            format!("cn-{}", c.name),
                         )),
                     )
                     .child(div().flex_none().child(self.small(c.driver.clone(), t.muted())))
@@ -5249,11 +5327,12 @@ impl Workspace {
             // A node is indented by its depth, so the room it has shrinks as
             // the tree goes deeper — the width has to say so, or a deep leaf
             // would be cut without an ellipsis again.
-            .child(self.line_in(
+            .child(self.line_tip(
                 node.name.clone(),
                 ms.body(),
                 t.fg(),
                 (ms.line_w() - 8.0 - depth as f32 * 12.0 - ms.base() * 2.2).max(ms.base() * 3.0),
+                format!("nd-{conn}-{}-{}", node.kind, node.name),
             ))
             .on_mouse_down(
                 MouseButton::Left,
@@ -7336,12 +7415,25 @@ impl Workspace {
         // A visible bar. GPUI draws none for a scrolling div, and a grid that
         // scrolls with no sign that it scrolls is a grid whose extra columns
         // are still invisible — which was the whole complaint.
-        let shown = self.canvas_w.max(1.0);
-        let max = (total_w - shown).max(0.0);
-        self.grid_overflow.set(max);
-        if max > 1.0 {
-            let frac = (shown / total_w).clamp(0.05, 1.0);
-            let at = (-f32::from(self.grid_scroll.offset().x) / total_w).clamp(0.0, 1.0 - frac);
+        // The MEASURED width of the scroller, not a width derived from the
+        // window. The derivation subtracts the rail, the panel and a padding,
+        // and every one of those is a chance to be wrong by a few pixels — and
+        // being wrong HIGH gives a thumb that is nearly full while the last
+        // columns cannot be reached, which is one fault wearing two faces.
+        //
+        // `bounds()` is only filled once the element has been painted, so the
+        // first frame falls back to the derivation and every frame after uses
+        // the truth.
+        let measured = f32::from(self.grid_scroll.bounds().size.width);
+        let shown = if measured > 1.0 { measured } else { self.canvas_w.max(1.0) };
+        let bar = crate::workspace::hbar(
+            total_w,
+            shown,
+            f32::from(self.grid_scroll.offset().x),
+        );
+        self.grid_overflow.set(bar.map(|b| b.max).unwrap_or(0.0));
+        if let Some(b) = bar {
+            let (frac, at) = (b.frac, b.at);
             // A flex row with a spacer, not an absolutely positioned thumb.
             // The absolute version drew nothing: a percentage width inside a
             // six-pixel absolutely positioned box is the kind of thing that
@@ -7415,10 +7507,17 @@ impl Workspace {
     /// Put the grid where a pointer at `x` says, treating the bar as a map of
     /// the whole width.
     fn drag_hbar_to(&self, x: f32, total_w: f32) {
+        // The same measured width and the same left edge the BAR was drawn
+        // from. Drawing from one number and dragging from another is how a
+        // thumb ends up not following the pointer.
+        let b = self.grid_scroll.bounds();
+        let measured = f32::from(b.size.width);
+        let shown = if measured > 1.0 { measured } else { self.canvas_w.max(1.0) };
+        let left = if measured > 1.0 { f32::from(b.origin.x) } else { self.grid_left() };
         let next = crate::workspace::hbar_offset(
             x,
-            self.grid_left(),
-            self.canvas_w.max(1.0),
+            left,
+            shown,
             total_w,
             self.grid_overflow.get(),
         );
