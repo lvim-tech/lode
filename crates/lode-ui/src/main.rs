@@ -23,6 +23,7 @@ mod i18n;
 mod input;
 mod metrics;
 mod session;
+mod settings;
 mod theme;
 mod profile;
 mod tip;

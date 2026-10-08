@@ -832,6 +832,10 @@ pub struct Workspace {
     aws_profiles: Vec<String>,
     /// The open tunnel window, if there is one.
     profile_window: Option<gpui::WindowHandle<crate::profile::ProfileForm>>,
+    /// The settings window. A WINDOW, because almost everything in settings is
+    /// a list beside the detail of what is picked in it, and a panel is a
+    /// column.
+    settings_window: Option<gpui::WindowHandle<crate::settings::SettingsWindow>>,
     /// A profile somebody has pressed delete on, waiting to be confirmed.
     confirm_profile_rm: Option<(&'static str, String)>,
     /// Which connections point at each profile, by profile name. Asked before
@@ -1011,6 +1015,7 @@ impl Workspace {
             theme_filter,
             profiles: std::collections::BTreeMap::new(),
             profile_window: None,
+            settings_window: None,
             profile_users: std::collections::BTreeMap::new(),
             confirm_profile_rm: None,
             aws_profiles: Vec::new(),
@@ -1034,7 +1039,10 @@ impl Workspace {
             "audit" => Rail::Audit,
             "instance" => Rail::Instance,
             "tasks" => Rail::Tasks,
-            "settings" => Rail::Settings,
+            // "settings" is no longer a panel — the gear opens a window. A
+            // session saved while it WAS a panel would otherwise restore to a
+            // view that nothing can leave, because the rail no longer has a
+            // button that selects it.
             _ => Rail::Connections,
         };
         // The history panel is empty until it is asked for, and if that is the
@@ -2338,6 +2346,70 @@ impl Workspace {
             Ok(h) => self.profile_window = Some(h),
             Err(e) => self.log.push(("error".into(), format!("could not open the window: {e}"))),
         }
+    }
+
+    /// Open the settings WINDOW.
+    ///
+    /// Everything it needs is handed over, so the window has no engine of its
+    /// own — the same arrangement as the connection and tunnel windows.
+    pub fn open_settings(&mut self, cx: &mut Context<Self>) {
+        if self.settings_window.is_some() {
+            return;
+        }
+        self.ask_profiles();
+        let drivers = self.hello.as_ref().map(|h| h.drivers.clone()).unwrap_or_default();
+        let prof = |kind: &str| -> Vec<(String, Value)> {
+            self.profiles
+                .get(kind)
+                .map(|v| v.iter().map(|p| (p.name.clone(), p.spec.clone())).collect())
+                .unwrap_or_default()
+        };
+        let about: Vec<(String, String)> = self
+            .hello
+            .as_ref()
+            .map(|h| {
+                vec![
+                    ("Protocol".into(), h.proto.to_string()),
+                    ("Drivers".into(), h.drivers.len().to_string()),
+                    ("Theme".into(), self.theme_name.clone()),
+                    ("Themes found".into(), self.themes.len().to_string()),
+                    ("Text font".into(), self.font_family.clone()),
+                    ("Icon font".into(), self.icon_family.clone()),
+                ]
+            })
+            .unwrap_or_default();
+        let (theme, scale) = (self.theme.clone(), self.scale);
+        let me = cx.entity().downgrade();
+        let (tun, prx) = (prof("tunnel"), prof("proxy"));
+        let bounds = Bounds::centered(None, size(px(900.0), px(620.0)), cx);
+        let opened = cx.open_window(
+            WindowOptions {
+                window_bounds: Some(WindowBounds::Windowed(bounds)),
+                titlebar: Some(TitlebarOptions {
+                    title: Some("lode — Settings".into()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+            |_window, cx| {
+                cx.new(|cx| {
+                    crate::settings::SettingsWindow::new(
+                        me, theme, scale, drivers, tun, prx, about, cx,
+                    )
+                })
+            },
+        );
+        match opened {
+            Ok(h) => self.settings_window = Some(h),
+            Err(e) => self.log.push(("error".into(), format!("could not open the window: {e}"))),
+        }
+    }
+
+    pub fn close_settings(&mut self, cx: &mut Context<Self>) {
+        if let Some(h) = self.settings_window.take() {
+            let _ = h.update(cx, |_, window, _| window.remove_window());
+        }
+        cx.notify();
     }
 
     pub fn close_profile(&mut self, cx: &mut Context<Self>) {
@@ -3876,7 +3948,11 @@ impl Workspace {
             // Spaced, so six of them read as six BUTTONS. Touching vertically,
             // they read as one column of marks.
             .gap(px(ms.rail_gap()));
-        for mode in [Rail::Connections, Rail::Instance, Rail::History, Rail::Audit, Rail::Tasks, Rail::Settings] {
+        // The settings are NOT in this run. The other five change what the
+        // panel shows; settings is not a view onto data, and putting it in the
+        // same column says it is. It goes to the bottom, after a gap and a
+        // rule, and it opens a window rather than taking the panel over.
+        for mode in [Rail::Connections, Rail::Instance, Rail::History, Rail::Audit, Rail::Tasks] {
             let on = self.rail == mode;
             col = col.child(
                 div()
@@ -3928,7 +4004,38 @@ impl Workspace {
                     })),
             );
         }
-        col
+        // Pushed to the bottom, with a rule above it. It opens the settings
+        // WINDOW: a panel is a narrow column, and the things that belong in
+        // settings — tunnels, proxies, hooks, drivers, MCP policies — are lists
+        // beside detail, which is a shape a column cannot hold. That narrowness
+        // is what the whole of today's trouble was about.
+        col = col.child(div().flex_1());
+        col = col.child(
+            div()
+                .w_full()
+                .h(px(1.0))
+                .flex_none()
+                .bg(t.border()),
+        );
+        col.child(
+            div()
+                .id("rail-settings")
+                .flex()
+                .items_center()
+                .justify_center()
+                .w_full()
+                .h(px(ms.rail_h()))
+                .flex_none()
+                .border_l_3()
+                .border_color(t.status())
+                .hover(|d| d.bg(t.hover()))
+                .cursor_pointer()
+                .tooltip(self.tip("rail.settings", None))
+                .child(self.icon_el(Rail::Settings.glyph(), t.muted()))
+                .on_click(cx.listener(|this, _, _, cx| {
+                    this.open_settings(cx);
+                })),
+        )
     }
 
     fn panel_el(&self, cx: &mut Context<Self>) -> impl IntoElement {
