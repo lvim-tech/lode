@@ -503,6 +503,24 @@ impl ConnectionForm {
         cx.notify();
     }
 
+    /// The saved tunnels arrived after this window opened.
+    ///
+    /// They are asked for as the window opens, and the answer comes back after
+    /// it is already on screen — so the first open showed an empty list and
+    /// "no saved tunnels yet" to somebody who HAS one. A window that is wrong
+    /// until it is closed and opened again is a window that teaches people the
+    /// feature does not work.
+    pub fn profiles_arrived(
+        &mut self,
+        names: Vec<String>,
+        specs: std::collections::BTreeMap<String, Value>,
+        cx: &mut Context<Self>,
+    ) {
+        self.tunnel_profiles = names;
+        self.tunnel_profile_specs = specs;
+        cx.notify();
+    }
+
     /// The engine refused the save. The window stays, with the reason in it.
     ///
     /// The worst outcome for a failed save is a window that closes anyway:
@@ -1567,6 +1585,20 @@ impl Render for ConnectionForm {
                             cx.notify();
                         })),
                 );
+                // Said even when the box is UNTICKED. The picker lives inside
+                // the tunnel section, so with the tunnel off there was nothing
+                // anywhere to say saved tunnels exist at all — and a feature
+                // somebody cannot discover is a feature they do not have.
+                if !self.tunnel_on && !self.tunnel_profiles.is_empty() {
+                    body = body.child(self.small(
+                        format!(
+                            "{} saved tunnel(s) to choose from: {} \u{2014} tick SSH tunnel above.",
+                            self.tunnel_profiles.len(),
+                            self.tunnel_profiles.join(", ")
+                        ),
+                        t.accent(),
+                    ));
+                }
                 if self.tunnel_on {
                     // Its own tunnel, or one of the saved ones. The engine
                     // refuses a spec that names a profile AND spells a tunnel
