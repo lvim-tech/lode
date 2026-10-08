@@ -3945,6 +3945,9 @@ impl Workspace {
                     .ok()
                     .and_then(|v| v.parse().ok())
                     .unwrap_or(4);
+                // 41..45 open ONE group's real content and leave the rest as
+                // level 3 did, so the group that blanks the panel names itself.
+                let full = |n: u8| layer == 4 || layer == n;
                 if layer == 0 {
                     let mut plain = panel;
                     plain = plain.child(
@@ -3998,22 +4001,28 @@ impl Workspace {
                     }
                     return panel.child(l);
                 }
-                let mut list = self.panel_list("settings-list");
                 let g_theme = self.group_open(SettingsGroup::Theme);
+                // ABOVE the list, not inside it — exactly where history and
+                // audit put theirs. A `TextInput` is a custom element that
+                // measures text and installs an input handler, and it was the
+                // only one of those living INSIDE a panel's scrolling list.
+                // That is the second thing only settings did; the first was the
+                // nested scroller.
+                if g_theme {
+                    panel = panel.child(
+                        div()
+                            .px_2()
+                            .py_1()
+                            .child(self.field(ms.small(), self.theme_filter.clone())),
+                    );
+                }
+                let mut list = self.panel_list("settings-list");
                 list = list.child(self.group_header(
                     SettingsGroup::Theme,
                     self.theme_name.clone(),
                     cx,
                 ));
-                if g_theme {
-                // 48 names, most of them long: a filter is the only way to get
-                // to one without reading the lot.
-                list = list.child(
-                    div()
-                        .px_2()
-                        .py_1()
-                        .child(self.field(ms.small(), self.theme_filter.clone())),
-                );
+                if g_theme && full(41) {
                 list = list.child(
                     div()
                         .id("theme-rescan")
@@ -4133,7 +4142,7 @@ impl Workspace {
                     format!("{} spaces", self.json_indent),
                     cx,
                 ));
-                if g_view {
+                if g_view && full(43) {
                 list = list.child(self.section(self.lang.tr("settings.json_indent")));
                 let mut row = div().flex().items_center().gap_2().px_2().py_1();
                 for n in [2u8, 3, 4] {
@@ -4165,7 +4174,7 @@ impl Workspace {
                     self.lang.label(),
                     cx,
                 ));
-                if g_lang {
+                if g_lang && full(44) {
                 list = list.child(self.section(self.lang.tr("settings.language")));
                 let mut langs = div().flex().items_center().gap_2().px_2().py_1();
                 for l in Lang::ALL.iter().copied() {
@@ -4207,7 +4216,7 @@ impl Workspace {
                     format!("{} / {} px", self.scale.base(), self.scale.icon_size()),
                     cx,
                 ));
-                if g_type {
+                if g_type && full(42) {
                 list = list.child(self.section(self.lang.tr("settings.text")));
                 list = list.child(div().px_2().child(self.line(
                     format!("text: {} · icons: {}", self.font_family, self.icon_family),
@@ -4346,7 +4355,7 @@ impl Workspace {
                     format!("{n_prof}"),
                     cx,
                 ));
-                if g_prof {
+                if g_prof && full(45) {
                     for kind in ["tunnel", "proxy"] {
                         list = list.child(self.section(kind));
                         let rows = self.profiles.get(kind).cloned().unwrap_or_default();
