@@ -164,6 +164,36 @@ impl ProfileForm {
     }
 }
 
+impl ProfileForm {
+    /// Every live field in this window.
+    pub fn all_inputs(&self) -> Vec<Entity<TextInput>> {
+        vec![
+            self.name.clone(),
+            self.host.clone(),
+            self.port.clone(),
+            self.user.clone(),
+            self.key_path.clone(),
+            self.passphrase.input.clone(),
+            self.password.input.clone(),
+        ]
+    }
+
+    /// Wear the new theme, fields included.
+    ///
+    /// A window is given a theme when it opens and nothing ever told it about a
+    /// change, so one left open across a theme switch kept the old palette —
+    /// and its fields kept it twice over, since they are handed their colours
+    /// at construction.
+    pub fn set_theme(&mut self, theme: Theme, cx: &mut Context<Self>) {
+        self.theme = theme;
+        let colors = crate::form::colors_of(&self.theme);
+        for input in self.all_inputs() {
+            input.update(cx, |i, cx| i.set_colors(colors, cx));
+        }
+        cx.notify();
+    }
+}
+
 impl Render for ProfileForm {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let t = self.theme.clone();

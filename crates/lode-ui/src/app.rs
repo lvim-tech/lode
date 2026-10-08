@@ -346,7 +346,8 @@ pub fn report_panels(cx: &gpui::App) {
     // fell through to the connections path and ended up with two scrolling
     // lists sharing one height.
     println!("panels that return their own list: connections, instance, history, audit, tasks, settings");
-    println!("to see what actually DRAWS, step LODE_SETTINGS_LAYER=0..4 (0 is plainest).");
+    println!("to see what actually DRAWS, step LODE_SETTINGS_LAYER=0..4 (0 is plainest),");
+    println!("  41..45 for one settings group at a time, 421..424 inside the size group.");
     let _ = cx;
 }
 
@@ -3462,6 +3463,17 @@ impl Workspace {
                 for input in self.all_inputs() {
                     input.update(cx, |i, cx| i.set_colors(colors, cx));
                 }
+                // The SEPARATE WINDOWS too. They are handed a theme when they
+                // open and were never told about a change, so a connection or
+                // tunnel window left open through one kept the old palette
+                // entirely — not just its fields.
+                let th = self.theme.clone();
+                if let Some(h) = self.form_window.clone() {
+                    let _ = h.update(cx, |f, _, cx| f.set_theme(th.clone(), cx));
+                }
+                if let Some(h) = self.profile_window.clone() {
+                    let _ = h.update(cx, |f, _, cx| f.set_theme(th.clone(), cx));
+                }
                 self.remember();
                 self.toast(format!("theme: {name}"), false);
                 cx.notify();
@@ -3493,8 +3505,25 @@ impl Workspace {
     }
 
     /// Every text field in the window, so a theme change reaches all of them.
+    /// How many live fields there are, for the diagnostic.
+    ///
+    /// A number instead of a description: the list below is kept by hand, and
+    /// the one time a field was left out of it that field wore the old palette
+    /// on a light theme while everything around it changed.
+    pub fn input_count(&self) -> usize {
+        self.all_inputs().len()
+    }
+
+    /// Every live field, so a theme change reaches all of them.
+    ///
+    /// This list is kept BY HAND and that is its weakness: `theme_filter` was
+    /// added and not added here, so on a light theme it stayed dark — the one
+    /// field in the window still wearing the old palette. Anything added below
+    /// must be added here, and `--check-panels` prints the count so a
+    /// disagreement shows up as a number rather than as somebody noticing.
     fn all_inputs(&self) -> Vec<Entity<TextInput>> {
         let mut out = vec![
+            self.theme_filter.clone(),
             self.filter.clone(),
             self.console.clone(),
             self.export_path.clone(),
@@ -3941,13 +3970,18 @@ impl Workspace {
                 //
                 // Delete this ladder once the answer is in: it is an instrument,
                 // not a feature.
-                let layer: u8 = std::env::var("LODE_SETTINGS_LAYER")
+                let layer: u16 = std::env::var("LODE_SETTINGS_LAYER")
                     .ok()
                     .and_then(|v| v.parse().ok())
                     .unwrap_or(4);
                 // 41..45 open ONE group's real content and leave the rest as
                 // level 3 did, so the group that blanks the panel names itself.
-                let full = |n: u8| layer == 4 || layer == n;
+                let full = |n: u16| layer == 4 || layer == n || (layer > 400 && n == 42);
+                // Inside the size group, which is the one that blanks: 421 the
+                // fonts line, 422 plus the icon stepper, 423 plus the previews,
+                // 424 the lot. Guessing has been wrong twice; this is the thing
+                // that has not been.
+                let upto = |n: u16| layer == 4 || layer == 42 || layer >= n;
                 if layer == 0 {
                     let mut plain = panel;
                     plain = plain.child(
@@ -4002,20 +4036,31 @@ impl Workspace {
                     return panel.child(l);
                 }
                 let g_theme = self.group_open(SettingsGroup::Theme);
-                // ABOVE the list, not inside it — exactly where history and
-                // audit put theirs. A `TextInput` is a custom element that
-                // measures text and installs an input handler, and it was the
-                // only one of those living INSIDE a panel's scrolling list.
-                // That is the second thing only settings did; the first was the
-                // nested scroller.
-                if g_theme {
-                    panel = panel.child(
-                        div()
-                            .px_2()
-                            .py_1()
-                            .child(self.field(ms.small(), self.theme_filter.clone())),
-                    );
-                }
+                // ── WHERE A TEXT FIELD GOES IN THIS PANEL, DECIDED ONCE ─────
+                //
+                // ABOVE the scrolling list. Never inside it. A `TextInput` is
+                // not a div: it is a custom element that shapes its own line,
+                // measures it, and installs an `EntityInputHandler` during
+                // paint, and inside a scrolling list it takes the whole panel
+                // down with it. History and audit have always put their search
+                // fields here, which is why neither has ever shown this.
+                //
+                // That rules out making the field LOOK like part of its group:
+                // the group's heading and content both live in the list, and
+                // the field cannot. So it stays put instead — always present,
+                // in one predictable place, like the other two panels' — rather
+                // than appearing and vanishing as a group is opened and closed,
+                // which is a field flickering in a strip that belongs to no
+                // group at all.
+                //
+                // Typing in it opens the theme group, so it still does
+                // something when that group is shut.
+                panel = panel.child(
+                    div()
+                        .px_2()
+                        .py_1()
+                        .child(self.field(ms.small(), self.theme_filter.clone())),
+                );
                 let mut list = self.panel_list("settings-list");
                 list = list.child(self.group_header(
                     SettingsGroup::Theme,
@@ -4217,6 +4262,7 @@ impl Workspace {
                     cx,
                 ));
                 if g_type && full(42) {
+                if upto(421) {
                 list = list.child(self.section(self.lang.tr("settings.text")));
                 list = list.child(div().px_2().child(self.line(
                     format!("text: {} · icons: {}", self.font_family, self.icon_family),
@@ -4224,6 +4270,8 @@ impl Workspace {
                     t.muted(),
                     ms.line_w(),
                 )));
+                }
+                if upto(422) {
                 list = list.child(self.section(self.lang.tr("settings.icon_size")));
                 // Its own row, beside its own stepper: the rail is navigation
                 // and the text is content, and enlarging one is not a request
@@ -4269,13 +4317,17 @@ impl Workspace {
                         .child(self.icon_el("\u{f1c0}", t.muted()))
                         .child(self.icon_el("\u{f013}", t.accent())),
                 );
+                }
+                if upto(423) {
                 list = list.child(div().px_2().child(self.line(
                     format!("the rail is {} px wide, which comes off this", ms.rail_w()),
                     ms.small(),
                     t.muted(),
                     ms.line_w(),
                 )));
+                }
 
+                if upto(424) {
                 list = list.child(self.section(self.lang.tr("settings.text_size")));
                 // One number, and it moves everything: the steps, the grid row
                 // height, the rail. Here rather than only in an environment
@@ -4346,6 +4398,7 @@ impl Workspace {
                     ms.line_w(),
                 )));
                 return panel;
+                }
                 }
 
                 let g_prof = self.group_open(SettingsGroup::Profiles);

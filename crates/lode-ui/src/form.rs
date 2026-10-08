@@ -503,6 +503,29 @@ impl ConnectionForm {
         cx.notify();
     }
 
+    /// Every live field in this window.
+    pub fn all_inputs(&self) -> Vec<Entity<TextInput>> {
+        let mut out = vec![
+            self.name.clone(),
+            self.auth_user.clone(),
+            self.auth_password.input.clone(),
+            self.auth_cert.clone(),
+            self.auth_key.clone(),
+            self.auth_key_password.input.clone(),
+            self.auth_token.input.clone(),
+            self.auth_principal.clone(),
+            self.tunnel_host.clone(),
+            self.tunnel_port.clone(),
+            self.tunnel_user.clone(),
+            self.tunnel_key_path.clone(),
+            self.tunnel_passphrase.input.clone(),
+            self.tunnel_password.input.clone(),
+            self.profile_name.clone(),
+        ];
+        out.extend(self.params.values().map(|f| f.input.clone()));
+        out
+    }
+
     /// The saved tunnels arrived after this window opened.
     ///
     /// They are asked for as the window opens, and the answer comes back after
@@ -1186,6 +1209,23 @@ impl ConnectionForm {
             None => row,
         };
         row
+    }
+}
+
+impl ConnectionForm {
+    /// Wear the new theme, fields included.
+    ///
+    /// A window is given a theme when it opens and nothing ever told it about a
+    /// change, so one left open across a theme switch kept the old palette —
+    /// and its fields kept it twice over, since they are handed their colours
+    /// at construction.
+    pub fn set_theme(&mut self, theme: Theme, cx: &mut Context<Self>) {
+        self.theme = theme;
+        let colors = crate::form::colors_of(&self.theme);
+        for input in self.all_inputs() {
+            input.update(cx, |i, cx| i.set_colors(colors, cx));
+        }
+        cx.notify();
     }
 }
 
