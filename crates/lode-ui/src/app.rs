@@ -1248,6 +1248,14 @@ impl Workspace {
         match what {
             Pending::StoreStatus => {
                 self.store_ok = v.get("available").and_then(Value::as_bool).unwrap_or(false);
+                // Warm the saved tunnels as soon as the store answers, so the
+                // FIRST connection window already knows about them. Asking when
+                // the window opens is too late: the answer arrives after it is
+                // drawn, and it drew "no saved tunnels yet" at somebody who has
+                // one.
+                if self.store_ok {
+                    self.ask_profiles();
+                }
             }
             Pending::Connections => {
                 self.saved =
@@ -1559,6 +1567,23 @@ impl Workspace {
                     );
                 }
                 self.profiles.insert(kind, rows);
+                // A connection window already open was built from whatever was
+                // cached when it opened — which on a first run is nothing. Hand
+                // it the real list now rather than leaving it wrong until it is
+                // closed and opened again.
+                if kind == "tunnel" {
+                    let names = self.profile_names("tunnel");
+                    let specs: std::collections::BTreeMap<String, Value> = self
+                        .profiles
+                        .get("tunnel")
+                        .map(|v| v.iter().map(|p| (p.name.clone(), p.spec.clone())).collect())
+                        .unwrap_or_default();
+                    if let Some(h) = self.form_window.clone() {
+                        let _ = h.update(cx, |form, _, cx| {
+                            form.profiles_arrived(names, specs, cx);
+                        });
+                    }
+                }
             }
             Pending::ProfileUsers { name } => {
                 let users: Vec<String> =
@@ -3884,6 +3909,48 @@ impl Workspace {
 
         match self.rail {
             Rail::Settings => {
+                // ── A BISECT, ON PURPOSE, AND TEMPORARY ──────────────────────
+                //
+                // The settings panel comes up empty and three fixes aimed at
+                // guesses have not moved it. `--check-panels` says the DATA is
+                // right — five groups, every width positive — so what is wrong
+                // is the drawing, and no amount of reading has found it.
+                //
+                // So: the simplest thing that could possibly appear. Five plain
+                // rows of text, straight onto `panel`. No scrolling list, no
+                // folding, no `line_in`, no truncation, no overflow — every
+                // layer that could be eating the content is gone.
+                //
+                //   * If these five appear, the fault is in a layer removed
+                //     here, and it goes back one at a time until it breaks.
+                //   * If they do NOT appear, the panel never reaches drawing at
+                //     all, and the question moves to who chooses it and what
+                //     `self.rail` is at PAINT time rather than at click time.
+                //
+                // `LODE_FULL_SETTINGS=1` runs the real one, so a single build
+                // answers both halves without waiting for me.
+                if std::env::var("LODE_FULL_SETTINGS").is_err() {
+                    let mut plain = panel;
+                    plain = plain.child(
+                        div()
+                            .px_2()
+                            .py_1()
+                            .text_size(ms.body())
+                            .text_color(t.fg())
+                            .child("SETTINGS (plain)"),
+                    );
+                    for g in crate::workspace::SETTINGS_GROUPS {
+                        plain = plain.child(
+                            div()
+                                .px_2()
+                                .py_1()
+                                .text_size(ms.body())
+                                .text_color(t.fg())
+                                .child(SharedString::from(g)),
+                        );
+                    }
+                    return plain;
+                }
                 let mut list = self.panel_list("settings-list");
                 let g_theme = self.group_open(SettingsGroup::Theme);
                 list = list.child(self.group_header(
