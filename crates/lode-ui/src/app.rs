@@ -346,8 +346,13 @@ pub fn report_panels(cx: &gpui::App) {
     // fell through to the connections path and ended up with two scrolling
     // lists sharing one height.
     println!("panels that return their own list: connections, instance, history, audit, tasks, settings");
-    println!("it cannot see the layout. The ladder that found the last fault is gone;");
-    println!("cut the panel down again if a new one needs locating.");
+    println!("it cannot see the layout.");
+    println!("LODE_THEMES picks how the theme list is laid out (default: flat):");
+    println!("  outer   [A] panel does NOT scroll; the theme box does — side by side");
+    println!("  flat    [B] every theme in the panel's own list, no box, no cap");
+    println!("  closed  [C] as B, but the theme group starts shut");
+    println!("  nested  [D] panel scrolls AND the box scrolls — the real request");
+    println!("  uniform [E] a uniform_list of fixed height — manages its own window");
     let _ = cx;
 }
 
@@ -3711,6 +3716,12 @@ impl Workspace {
     /// `min_h_0` is the half that is easy to leave out: without it a flex child
     /// refuses to shrink below its content, so a long list pushes the heading
     /// and the search box off the top instead of scrolling beneath them.
+    /// A panel body that does NOT scroll, for the case where something inside
+    /// it does instead.
+    fn panel_column(&self, id: &'static str) -> gpui::Stateful<gpui::Div> {
+        div().id(id).flex().flex_col().flex_1().min_h_0().w_full().overflow_hidden()
+    }
+
     fn panel_list(&self, id: &'static str) -> gpui::Stateful<gpui::Div> {
         div()
             .id(id)
@@ -3947,7 +3958,10 @@ impl Workspace {
 
         match self.rail {
             Rail::Settings => {
-                let g_theme = self.group_open(SettingsGroup::Theme);
+                // `closed` is variant C: the theme group starts shut whatever
+                // the session remembers, so the filter is the way in.
+                let g_theme = self.group_open(SettingsGroup::Theme)
+                    && std::env::var("LODE_THEMES").as_deref() != Ok("closed");
                 // ── WHERE A TEXT FIELD GOES IN THIS PANEL, DECIDED ONCE ─────
                 //
                 // ABOVE the scrolling list. Never inside it. A `TextInput` is
@@ -3973,7 +3987,13 @@ impl Workspace {
                         .py_1()
                         .child(self.field(ms.small(), self.theme_filter.clone())),
                 );
-                let mut list = self.panel_list("settings-list");
+                let mut list = if std::env::var("LODE_THEMES").as_deref() == Ok("outer") {
+                    // One scroller in the panel, and it is the theme box — so
+                    // the outer column is a plain one.
+                    self.panel_column("settings-list")
+                } else {
+                    self.panel_list("settings-list")
+                };
                 list = list.child(self.group_header(
                     SettingsGroup::Theme,
                     self.theme_name.clone(),
@@ -3989,12 +4009,33 @@ impl Workspace {
                         .hover(|d| d.bg(t.hover()))
                         .text_size(ms.small())
                         .text_color(t.accent())
-                        .child(SharedString::from(format!("{}  {}", "\u{f021}", self.lang.tr("panel.look_again"))))
+                        .child(SharedString::from(format!(
+                            "{}  {}",
+                            "\u{f021}",
+                            self.lang.tr("panel.rescan")
+                        )))
                         .on_click(cx.listener(|this, _, _, cx| {
+                            let before = this.themes.len();
                             this.themes = theme::discover();
+                            let now = this.themes.len();
+                            this.toast(
+                                format!("{now} theme(s) found, was {before}"),
+                                false,
+                            );
                             cx.notify();
                         })),
                 );
+                // WHICH folders. "Look again" said nothing about where it would
+                // look, so a list that did not change left nobody any wiser —
+                // the same reason the empty case already names them.
+                for d in theme::theme_dirs() {
+                    list = list.child(div().px_2().child(self.line(
+                        d.display().to_string(),
+                        ms.tiny(),
+                        t.muted(),
+                        ms.line_w(),
+                    )));
+                }
                 if self.themes.is_empty() {
                     // WHICH directories were searched. "No themes" on its own is
                     // a message somebody can do nothing with.
@@ -4020,30 +4061,116 @@ impl Workspace {
                 // the bottom — which is what it did, and is why nobody found the
                 // settings under it.
                 let filter = self.theme_filter.read(cx).text().trim().to_lowercase();
+                // ── HOW A LONG LIST LIVES IN THIS PANEL ─────────────────────
+                //
+                // An honest correction first: the inner scrolling box was
+                // removed on a guess that it blanked the panel. It did not —
+                // `return panel;` did. So the box was never shown to be guilty,
+                // and the right thing is to measure rather than to keep acting
+                // on a hypothesis that has already been wrong once.
+                //
+                //   outer   [A]  the panel's list does NOT scroll; the theme
+                //                 box does — two scrollers side by side, never
+                //                 one inside the other
+                //   flat    [B]  every theme in the panel's own list, no inner
+                //                 box and no cap            (the default here)
+                //   closed  [C]  as B, but the group starts shut
+                //   nested  [D]  the panel scrolls AND the theme box is capped
+                //                 with its own scrolling — the real request,
+                //                 and the nesting that may or may not be fatal
+                //   uniform [E]  a `uniform_list` of fixed height: not a box
+                //                 that scrolls inside a box, but an element
+                //                 that manages its own visible window. If this
+                //                 works it answers profiles and every long list
+                //                 after them.
+                //
+                // `LODE_THEMES` picks one. B is the default because it is the
+                // one nobody has seen fail — a default that might blank the
+                // panel is a bad default while this is being settled.
+                //
+                // Whatever survives is written here as the rule.
+                let mode = std::env::var("LODE_THEMES").unwrap_or_else(|_| "flat".into());
+                let names: Vec<String> = self
+                    .themes
+                    .keys()
+                    .filter(|n| filter.is_empty() || n.to_lowercase().contains(&filter))
+                    .cloned()
+                    .collect();
+                if mode == "uniform" {
+                    let (fg, muted, sel, hov) = (t.fg(), t.muted(), t.selected(), t.hover());
+                    let (current, rh) = (self.theme_name.clone(), ms.panel_row_h());
+                    let picks = names.clone();
+                    let lw = ms.line_w();
+                    let small = ms.small();
+                    let tiny = ms.tiny();
+                    let acc = t.accent();
+                    list = list.child(
+                        uniform_list(
+                            "theme-uniform",
+                            picks.len(),
+                            cx.processor(move |_this, range: std::ops::Range<usize>, _w, cx2| {
+                                let mut out = Vec::new();
+                                for i in range {
+                                    let Some(name) = picks.get(i).cloned() else { continue };
+                                    let on = name == current;
+                                    let pick = name.clone();
+                                    out.push(
+                                        div()
+                                            .id(SharedString::from(format!("tu-{i}")))
+                                            .flex()
+                                            .items_center()
+                                            .gap_1()
+                                            .h(px(rh))
+                                            .px_2()
+                                            .cursor_pointer()
+                                            .hover(move |d| d.bg(hov))
+                                            .when(on, move |d| d.bg(sel))
+                                            .child(
+                                                div()
+                                                    .w(px(14.0))
+                                                    .flex_none()
+                                                    .text_size(tiny)
+                                                    .text_color(acc)
+                                                    .child(if on { "\u{f00c}" } else { " " }),
+                                            )
+                                            .child(
+                                                div()
+                                                    .w(px(lw - 30.0))
+                                                    .flex_none()
+                                                    .truncate()
+                                                    .text_size(small)
+                                                    .text_color(if on { fg } else { muted })
+                                                    .child(SharedString::from(name)),
+                                            )
+                                            .on_click(cx2.listener(move |this, _, _, cx| {
+                                                this.use_theme(&pick, cx);
+                                            })),
+                                    );
+                                }
+                                out
+                            }),
+                        )
+                        .h(px(ms.base() * 18.0)),
+                    );
+                }
                 let mut themes = div()
-                    // NO nested scroller. A scrolling box inside the panel's
-                    // own scrolling list is the one thing settings does that
-                    // history and audit do not — and the theme group is open by
-                    // default, so it is there on every first look. The filter
-                    // plus a cap on the number of rows does the job the inner
-                    // scroller was there for, without asking two scroll
-                    // containers to agree about a height.
+                    .id("theme-list")
+                    .when(mode == "nested" || mode == "outer", |d| {
+                        // About a third of the panel, with its own scrolling.
+                        d.max_h(px(ms.base() * 18.0)).overflow_y_scroll()
+                    })
                     .flex()
                     .flex_col();
                 let mut shown = 0usize;
-                // A cap, so an unfiltered list of 48 does not push the other
-                // groups off the bottom — which is what the folding was for.
-                const THEMES_SHOWN: usize = 12;
-                let mut hidden = 0usize;
-                for name in self.themes.keys() {
-                    if !filter.is_empty() && !name.to_lowercase().contains(&filter) {
-                        continue;
-                    }
+                // ALL of them, in the panel's own scrolling list. No cap and no
+                // inner scroller: the first blanked the panel, and the second
+                // hid thirty-six themes behind a line of text, which is a
+                // worse answer to "there are a lot of these" than scrolling is.
+                // The group folds, so somebody who wants the other groups near
+                // the top closes this one — that is their decision to make, and
+                // truncating the list made it for them.
+                for name in names.iter().filter(|_| mode != "uniform") {
                     shown += 1;
-                    if shown > THEMES_SHOWN {
-                        hidden += 1;
-                        continue;
-                    }
                     let on = *name == self.theme_name;
                     let pick = name.clone();
                     themes = themes.child(
@@ -4077,12 +4204,6 @@ impl Workspace {
                     );
                 }
                 list = list.child(themes);
-                if hidden > 0 {
-                    list = list.child(div().px_2().child(self.small(
-                        format!("{hidden} more \u{2014} type in the filter above to narrow them"),
-                        t.muted(),
-                    )));
-                }
                 // A filter that matches nothing says so, rather than showing an
                 // empty space that looks like a missing list.
                 if shown == 0 && !self.themes.is_empty() {
