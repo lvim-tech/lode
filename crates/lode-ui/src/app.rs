@@ -290,6 +290,14 @@ fn f_save_failed(form: &mut crate::form::ConnectionForm, why: String, cx: &mut C
 /// on a workspace tag that is not displayed, so neither end of this
 /// conversation has eyes on it — this is the substitute.
 pub fn report_panels(cx: &gpui::App) {
+    // READ THIS AS "THE DATA IS RIGHT", NOT "THE PANEL IS VISIBLE".
+    //
+    // It measures what a panel is built FROM — widths, heights, group counts —
+    // and it reported all of that correct while the settings panel was drawing
+    // nothing at all. It cannot see the layout, so a green line here narrows the
+    // search to the drawing; it never closes it.
+    println!("NOTE: these are the INPUTS to the layout, not what reached the screen.");
+    println!("      Everything here can be right while a panel still draws nothing.");
     let ms = Metrics::default();
     println!("base {} px, icon {} px", ms.base(), ms.icon_size());
     println!("rail      {:>6.0} px wide", ms.rail_w());
@@ -338,6 +346,7 @@ pub fn report_panels(cx: &gpui::App) {
     // fell through to the connections path and ended up with two scrolling
     // lists sharing one height.
     println!("panels that return their own list: connections, instance, history, audit, tasks, settings");
+    println!("to see what actually DRAWS, step LODE_SETTINGS_LAYER=0..4 (0 is plainest).");
     let _ = cx;
 }
 
@@ -3909,47 +3918,85 @@ impl Workspace {
 
         match self.rail {
             Rail::Settings => {
-                // ── A BISECT, ON PURPOSE, AND TEMPORARY ──────────────────────
+                // ── A LADDER, ON PURPOSE, AND TEMPORARY ─────────────────────
                 //
-                // The settings panel comes up empty and three fixes aimed at
-                // guesses have not moved it. `--check-panels` says the DATA is
-                // right — five groups, every width positive — so what is wrong
-                // is the drawing, and no amount of reading has found it.
+                // The cut answered its question: five plain rows drawn straight
+                // onto `panel` DO appear. So the panel reaches drawing, `self.rail`
+                // is right at paint time, and the width is fine. What eats the
+                // content is one of the layers the cut removed.
                 //
-                // So: the simplest thing that could possibly appear. Five plain
-                // rows of text, straight onto `panel`. No scrolling list, no
-                // folding, no `line_in`, no truncation, no overflow — every
-                // layer that could be eating the content is gone.
+                // Rather than four rounds of one layer each, the layers are put
+                // back one at a time under `LODE_SETTINGS_LAYER`:
                 //
-                //   * If these five appear, the fault is in a layer removed
-                //     here, and it goes back one at a time until it breaks.
-                //   * If they do NOT appear, the panel never reaches drawing at
-                //     all, and the question moves to who chooses it and what
-                //     `self.rail` is at PAINT time rather than at click time.
+                //   0  plain text straight onto `panel`      (known to work)
+                //   1  the same text, inside `panel_list`
+                //   2  `group_header` instead of plain text
+                //   3  plus the folding — content under an open group
+                //   4  the whole thing                       (the default)
                 //
-                // `LODE_FULL_SETTINGS=1` runs the real one, so a single build
-                // answers both halves without waiting for me.
-                if std::env::var("LODE_FULL_SETTINGS").is_err() {
+                // One build, one run per rung, and the number where it goes
+                // blank names the layer exactly. `panel_list` is shared with
+                // history and audit, which both draw — so if it survives rung 1,
+                // the fault is something only settings does.
+                //
+                // Delete this ladder once the answer is in: it is an instrument,
+                // not a feature.
+                let layer: u8 = std::env::var("LODE_SETTINGS_LAYER")
+                    .ok()
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(4);
+                if layer == 0 {
                     let mut plain = panel;
                     plain = plain.child(
-                        div()
-                            .px_2()
-                            .py_1()
-                            .text_size(ms.body())
-                            .text_color(t.fg())
-                            .child("SETTINGS (plain)"),
+                        div().px_2().py_1().text_size(ms.body()).text_color(t.fg())
+                            .child("SETTINGS layer 0 — plain, on the panel"),
                     );
                     for g in crate::workspace::SETTINGS_GROUPS {
                         plain = plain.child(
-                            div()
-                                .px_2()
-                                .py_1()
-                                .text_size(ms.body())
-                                .text_color(t.fg())
+                            div().px_2().py_1().text_size(ms.body()).text_color(t.fg())
                                 .child(SharedString::from(g)),
                         );
                     }
                     return plain;
+                }
+                if layer == 1 {
+                    // The SAME text, now inside the scrolling list every other
+                    // panel uses.
+                    let mut l = self.panel_list("settings-list");
+                    l = l.child(
+                        div().px_2().py_1().text_size(ms.body()).text_color(t.fg())
+                            .child("SETTINGS layer 1 — plain, inside panel_list"),
+                    );
+                    for g in crate::workspace::SETTINGS_GROUPS {
+                        l = l.child(
+                            div().px_2().py_1().text_size(ms.body()).text_color(t.fg())
+                                .child(SharedString::from(g)),
+                        );
+                    }
+                    return panel.child(l);
+                }
+                if layer == 2 {
+                    // Plus the real heading, which brings `line_in`, the icon
+                    // and the click target with it.
+                    let mut l = self.panel_list("settings-list");
+                    for g in SettingsGroup::all() {
+                        l = l.child(self.group_header(g, "—", cx));
+                    }
+                    return panel.child(l);
+                }
+                if layer == 3 {
+                    // Plus the folding: one group's content shown under it.
+                    let mut l = self.panel_list("settings-list");
+                    for g in SettingsGroup::all() {
+                        l = l.child(self.group_header(g, "—", cx));
+                        if self.group_open(g) {
+                            l = l.child(
+                                div().px_2().py_1().text_size(ms.small()).text_color(t.muted())
+                                    .child("(this group is open)"),
+                            );
+                        }
+                    }
+                    return panel.child(l);
                 }
                 let mut list = self.panel_list("settings-list");
                 let g_theme = self.group_open(SettingsGroup::Theme);
@@ -4008,17 +4055,29 @@ impl Workspace {
                 // settings under it.
                 let filter = self.theme_filter.read(cx).text().trim().to_lowercase();
                 let mut themes = div()
-                    .id("theme-list")
+                    // NO nested scroller. A scrolling box inside the panel's
+                    // own scrolling list is the one thing settings does that
+                    // history and audit do not — and the theme group is open by
+                    // default, so it is there on every first look. The filter
+                    // plus a cap on the number of rows does the job the inner
+                    // scroller was there for, without asking two scroll
+                    // containers to agree about a height.
                     .flex()
-                    .flex_col()
-                    .max_h(px(ms.base() * 16.0))
-                    .overflow_y_scroll();
+                    .flex_col();
                 let mut shown = 0usize;
+                // A cap, so an unfiltered list of 48 does not push the other
+                // groups off the bottom — which is what the folding was for.
+                const THEMES_SHOWN: usize = 12;
+                let mut hidden = 0usize;
                 for name in self.themes.keys() {
                     if !filter.is_empty() && !name.to_lowercase().contains(&filter) {
                         continue;
                     }
                     shown += 1;
+                    if shown > THEMES_SHOWN {
+                        hidden += 1;
+                        continue;
+                    }
                     let on = *name == self.theme_name;
                     let pick = name.clone();
                     themes = themes.child(
@@ -4052,6 +4111,12 @@ impl Workspace {
                     );
                 }
                 list = list.child(themes);
+                if hidden > 0 {
+                    list = list.child(div().px_2().child(self.small(
+                        format!("{hidden} more \u{2014} type in the filter above to narrow them"),
+                        t.muted(),
+                    )));
+                }
                 // A filter that matches nothing says so, rather than showing an
                 // empty space that looks like a missing list.
                 if shown == 0 && !self.themes.is_empty() {
