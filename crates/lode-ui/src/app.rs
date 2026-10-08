@@ -346,8 +346,8 @@ pub fn report_panels(cx: &gpui::App) {
     // fell through to the connections path and ended up with two scrolling
     // lists sharing one height.
     println!("panels that return their own list: connections, instance, history, audit, tasks, settings");
-    println!("to see what actually DRAWS, step LODE_SETTINGS_LAYER=0..4 (0 is plainest),");
-    println!("  41..45 for one settings group at a time, 421..424 inside the size group.");
+    println!("it cannot see the layout. The ladder that found the last fault is gone;");
+    println!("cut the panel down again if a new one needs locating.");
     let _ = cx;
 }
 
@@ -3947,94 +3947,6 @@ impl Workspace {
 
         match self.rail {
             Rail::Settings => {
-                // ── A LADDER, ON PURPOSE, AND TEMPORARY ─────────────────────
-                //
-                // The cut answered its question: five plain rows drawn straight
-                // onto `panel` DO appear. So the panel reaches drawing, `self.rail`
-                // is right at paint time, and the width is fine. What eats the
-                // content is one of the layers the cut removed.
-                //
-                // Rather than four rounds of one layer each, the layers are put
-                // back one at a time under `LODE_SETTINGS_LAYER`:
-                //
-                //   0  plain text straight onto `panel`      (known to work)
-                //   1  the same text, inside `panel_list`
-                //   2  `group_header` instead of plain text
-                //   3  plus the folding — content under an open group
-                //   4  the whole thing                       (the default)
-                //
-                // One build, one run per rung, and the number where it goes
-                // blank names the layer exactly. `panel_list` is shared with
-                // history and audit, which both draw — so if it survives rung 1,
-                // the fault is something only settings does.
-                //
-                // Delete this ladder once the answer is in: it is an instrument,
-                // not a feature.
-                let layer: u16 = std::env::var("LODE_SETTINGS_LAYER")
-                    .ok()
-                    .and_then(|v| v.parse().ok())
-                    .unwrap_or(4);
-                // 41..45 open ONE group's real content and leave the rest as
-                // level 3 did, so the group that blanks the panel names itself.
-                let full = |n: u16| layer == 4 || layer == n || (layer > 400 && n == 42);
-                // Inside the size group, which is the one that blanks: 421 the
-                // fonts line, 422 plus the icon stepper, 423 plus the previews,
-                // 424 the lot. Guessing has been wrong twice; this is the thing
-                // that has not been.
-                let upto = |n: u16| layer == 4 || layer == 42 || layer >= n;
-                if layer == 0 {
-                    let mut plain = panel;
-                    plain = plain.child(
-                        div().px_2().py_1().text_size(ms.body()).text_color(t.fg())
-                            .child("SETTINGS layer 0 — plain, on the panel"),
-                    );
-                    for g in crate::workspace::SETTINGS_GROUPS {
-                        plain = plain.child(
-                            div().px_2().py_1().text_size(ms.body()).text_color(t.fg())
-                                .child(SharedString::from(g)),
-                        );
-                    }
-                    return plain;
-                }
-                if layer == 1 {
-                    // The SAME text, now inside the scrolling list every other
-                    // panel uses.
-                    let mut l = self.panel_list("settings-list");
-                    l = l.child(
-                        div().px_2().py_1().text_size(ms.body()).text_color(t.fg())
-                            .child("SETTINGS layer 1 — plain, inside panel_list"),
-                    );
-                    for g in crate::workspace::SETTINGS_GROUPS {
-                        l = l.child(
-                            div().px_2().py_1().text_size(ms.body()).text_color(t.fg())
-                                .child(SharedString::from(g)),
-                        );
-                    }
-                    return panel.child(l);
-                }
-                if layer == 2 {
-                    // Plus the real heading, which brings `line_in`, the icon
-                    // and the click target with it.
-                    let mut l = self.panel_list("settings-list");
-                    for g in SettingsGroup::all() {
-                        l = l.child(self.group_header(g, "—", cx));
-                    }
-                    return panel.child(l);
-                }
-                if layer == 3 {
-                    // Plus the folding: one group's content shown under it.
-                    let mut l = self.panel_list("settings-list");
-                    for g in SettingsGroup::all() {
-                        l = l.child(self.group_header(g, "—", cx));
-                        if self.group_open(g) {
-                            l = l.child(
-                                div().px_2().py_1().text_size(ms.small()).text_color(t.muted())
-                                    .child("(this group is open)"),
-                            );
-                        }
-                    }
-                    return panel.child(l);
-                }
                 let g_theme = self.group_open(SettingsGroup::Theme);
                 // ── WHERE A TEXT FIELD GOES IN THIS PANEL, DECIDED ONCE ─────
                 //
@@ -4067,7 +3979,7 @@ impl Workspace {
                     self.theme_name.clone(),
                     cx,
                 ));
-                if g_theme && full(41) {
+                if g_theme {
                 list = list.child(
                     div()
                         .id("theme-rescan")
@@ -4187,7 +4099,7 @@ impl Workspace {
                     format!("{} spaces", self.json_indent),
                     cx,
                 ));
-                if g_view && full(43) {
+                if g_view {
                 list = list.child(self.section(self.lang.tr("settings.json_indent")));
                 let mut row = div().flex().items_center().gap_2().px_2().py_1();
                 for n in [2u8, 3, 4] {
@@ -4219,7 +4131,7 @@ impl Workspace {
                     self.lang.label(),
                     cx,
                 ));
-                if g_lang && full(44) {
+                if g_lang {
                 list = list.child(self.section(self.lang.tr("settings.language")));
                 let mut langs = div().flex().items_center().gap_2().px_2().py_1();
                 for l in Lang::ALL.iter().copied() {
@@ -4261,8 +4173,7 @@ impl Workspace {
                     format!("{} / {} px", self.scale.base(), self.scale.icon_size()),
                     cx,
                 ));
-                if g_type && full(42) {
-                if upto(421) {
+                if g_type {
                 list = list.child(self.section(self.lang.tr("settings.text")));
                 list = list.child(div().px_2().child(self.line(
                     format!("text: {} · icons: {}", self.font_family, self.icon_family),
@@ -4270,8 +4181,6 @@ impl Workspace {
                     t.muted(),
                     ms.line_w(),
                 )));
-                }
-                if upto(422) {
                 list = list.child(self.section(self.lang.tr("settings.icon_size")));
                 // Its own row, beside its own stepper: the rail is navigation
                 // and the text is content, and enlarging one is not a request
@@ -4317,17 +4226,13 @@ impl Workspace {
                         .child(self.icon_el("\u{f1c0}", t.muted()))
                         .child(self.icon_el("\u{f013}", t.accent())),
                 );
-                }
-                if upto(423) {
                 list = list.child(div().px_2().child(self.line(
                     format!("the rail is {} px wide, which comes off this", ms.rail_w()),
                     ms.small(),
                     t.muted(),
                     ms.line_w(),
                 )));
-                }
 
-                if upto(424) {
                 list = list.child(self.section(self.lang.tr("settings.text_size")));
                 // One number, and it moves everything: the steps, the grid row
                 // height, the rail. Here rather than only in an environment
@@ -4397,8 +4302,6 @@ impl Workspace {
                     t.muted(),
                     ms.line_w(),
                 )));
-                return panel;
-                }
                 }
 
                 let g_prof = self.group_open(SettingsGroup::Profiles);
@@ -4408,7 +4311,7 @@ impl Workspace {
                     format!("{n_prof}"),
                     cx,
                 ));
-                if g_prof && full(45) {
+                if g_prof {
                     for kind in ["tunnel", "proxy"] {
                         list = list.child(self.section(kind));
                         let rows = self.profiles.get(kind).cloned().unwrap_or_default();
