@@ -3960,8 +3960,7 @@ impl Workspace {
             Rail::Settings => {
                 // `closed` is variant C: the theme group starts shut whatever
                 // the session remembers, so the filter is the way in.
-                let g_theme = self.group_open(SettingsGroup::Theme)
-                    && std::env::var("LODE_THEMES").as_deref() != Ok("closed");
+                let g_theme = self.group_open(SettingsGroup::Theme);
                 // ── WHERE A TEXT FIELD GOES IN THIS PANEL, DECIDED ONCE ─────
                 //
                 // ABOVE the scrolling list. Never inside it. A `TextInput` is
@@ -3987,13 +3986,7 @@ impl Workspace {
                         .py_1()
                         .child(self.field(ms.small(), self.theme_filter.clone())),
                 );
-                let mut list = if std::env::var("LODE_THEMES").as_deref() == Ok("outer") {
-                    // One scroller in the panel, and it is the theme box — so
-                    // the outer column is a plain one.
-                    self.panel_column("settings-list")
-                } else {
-                    self.panel_list("settings-list")
-                };
+                let mut list = self.panel_list("settings-list");
                 list = list.child(self.group_header(
                     SettingsGroup::Theme,
                     self.theme_name.clone(),
@@ -4061,104 +4054,28 @@ impl Workspace {
                 // the bottom — which is what it did, and is why nobody found the
                 // settings under it.
                 let filter = self.theme_filter.read(cx).text().trim().to_lowercase();
-                // ── HOW A LONG LIST LIVES IN THIS PANEL ─────────────────────
+                // ── HOW A LONG LIST LIVES IN THIS PANEL — SETTLED ───────────
                 //
-                // An honest correction first: the inner scrolling box was
-                // removed on a guess that it blanked the panel. It did not —
-                // `return panel;` did. So the box was never shown to be guilty,
-                // and the right thing is to measure rather than to keep acting
-                // on a hypothesis that has already been wrong once.
+                // A capped box with its own scrolling, INSIDE the panel's
+                // scrolling list. Nesting one scroller in another is fine and
+                // always was: this box was removed on my guess that it blanked
+                // the panel, and it did not — `return panel;` did. Measured
+                // across five arrangements and this one draws, so it is the
+                // rule for every long list this panel grows, the profiles
+                // included.
                 //
-                //   outer   [A]  the panel's list does NOT scroll; the theme
-                //                 box does — two scrollers side by side, never
-                //                 one inside the other
-                //   flat    [B]  every theme in the panel's own list, no inner
-                //                 box and no cap            (the default here)
-                //   closed  [C]  as B, but the group starts shut
-                //   nested  [D]  the panel scrolls AND the theme box is capped
-                //                 with its own scrolling — the real request,
-                //                 and the nesting that may or may not be fatal
-                //   uniform [E]  a `uniform_list` of fixed height: not a box
-                //                 that scrolls inside a box, but an element
-                //                 that manages its own visible window. If this
-                //                 works it answers profiles and every long list
-                //                 after them.
-                //
-                // `LODE_THEMES` picks one. B is the default because it is the
-                // one nobody has seen fail — a default that might blank the
-                // panel is a bad default while this is being settled.
-                //
-                // Whatever survives is written here as the rule.
-                let mode = std::env::var("LODE_THEMES").unwrap_or_else(|_| "flat".into());
+                // About a third of the panel's height, so the groups below stay
+                // reachable, and the panel still scrolls to them.
                 let names: Vec<String> = self
                     .themes
                     .keys()
                     .filter(|n| filter.is_empty() || n.to_lowercase().contains(&filter))
                     .cloned()
                     .collect();
-                if mode == "uniform" {
-                    let (fg, muted, sel, hov) = (t.fg(), t.muted(), t.selected(), t.hover());
-                    let (current, rh) = (self.theme_name.clone(), ms.panel_row_h());
-                    let picks = names.clone();
-                    let lw = ms.line_w();
-                    let small = ms.small();
-                    let tiny = ms.tiny();
-                    let acc = t.accent();
-                    list = list.child(
-                        uniform_list(
-                            "theme-uniform",
-                            picks.len(),
-                            cx.processor(move |_this, range: std::ops::Range<usize>, _w, cx2| {
-                                let mut out = Vec::new();
-                                for i in range {
-                                    let Some(name) = picks.get(i).cloned() else { continue };
-                                    let on = name == current;
-                                    let pick = name.clone();
-                                    out.push(
-                                        div()
-                                            .id(SharedString::from(format!("tu-{i}")))
-                                            .flex()
-                                            .items_center()
-                                            .gap_1()
-                                            .h(px(rh))
-                                            .px_2()
-                                            .cursor_pointer()
-                                            .hover(move |d| d.bg(hov))
-                                            .when(on, move |d| d.bg(sel))
-                                            .child(
-                                                div()
-                                                    .w(px(14.0))
-                                                    .flex_none()
-                                                    .text_size(tiny)
-                                                    .text_color(acc)
-                                                    .child(if on { "\u{f00c}" } else { " " }),
-                                            )
-                                            .child(
-                                                div()
-                                                    .w(px(lw - 30.0))
-                                                    .flex_none()
-                                                    .truncate()
-                                                    .text_size(small)
-                                                    .text_color(if on { fg } else { muted })
-                                                    .child(SharedString::from(name)),
-                                            )
-                                            .on_click(cx2.listener(move |this, _, _, cx| {
-                                                this.use_theme(&pick, cx);
-                                            })),
-                                    );
-                                }
-                                out
-                            }),
-                        )
-                        .h(px(ms.base() * 18.0)),
-                    );
-                }
                 let mut themes = div()
                     .id("theme-list")
-                    .when(mode == "nested" || mode == "outer", |d| {
-                        // About a third of the panel, with its own scrolling.
-                        d.max_h(px(ms.base() * 18.0)).overflow_y_scroll()
-                    })
+                    .max_h(px(ms.base() * 18.0))
+                    .overflow_y_scroll()
                     .flex()
                     .flex_col();
                 let mut shown = 0usize;
@@ -4169,7 +4086,7 @@ impl Workspace {
                 // The group folds, so somebody who wants the other groups near
                 // the top closes this one — that is their decision to make, and
                 // truncating the list made it for them.
-                for name in names.iter().filter(|_| mode != "uniform") {
+                for name in names.iter() {
                     shown += 1;
                     let on = *name == self.theme_name;
                     let pick = name.clone();
