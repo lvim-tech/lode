@@ -7039,15 +7039,89 @@ impl Workspace {
                     .overflow_hidden()
                     .cursor_pointer()
                     .hover(|d| d.bg(t.hover()))
-                    .child(
-                        div()
-                            .w(px(tab.widths.get(&ci).copied().unwrap_or(ms.col_w())))
-                            .truncate()
-                            .px(px(ms.cell_pad()))
-                            .text_size(ms.small())
-                            .text_color(t.header_fg())
-                            .child(SharedString::from(format!("{name}{arrow}"))),
-                    )
+                    .child({
+                        // The NAME with its type, and under it how much of the
+                        // page actually has the field. A document store
+                        // declares no column types, so the only honest source
+                        // is the page in hand — which is why the count it is
+                        // out of is shown beside the percentage and never on
+                        // its own.
+                        let w = tab.widths.get(&ci).copied().unwrap_or(ms.col_w());
+                        let declared = tab
+                            .columns
+                            .get(ci)
+                            .map(|c| c.type_name.clone())
+                            .filter(|s| !s.trim().is_empty());
+                        let sum = crate::workspace::column_summary(
+                            &tab.rows,
+                            ci,
+                            declared.as_deref(),
+                        );
+                        let mut head = div().flex().flex_col().w(px(w)).overflow_hidden();
+                        head = head.child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap_1()
+                                .w(px(w))
+                                .overflow_hidden()
+                                .px(px(ms.cell_pad()))
+                                .child(
+                                    div()
+                                        .flex_1()
+                                        .truncate()
+                                        .text_size(ms.small())
+                                        .text_color(t.header_fg())
+                                        .child(SharedString::from(format!("{name}{arrow}"))),
+                                )
+                                .child(
+                                    div()
+                                        .flex_none()
+                                        .text_size(ms.tiny())
+                                        .text_color(t.badge(sum.kind))
+                                        .child(sum.kind),
+                                ),
+                        );
+                        if sum.total > 0 {
+                            let frac = (sum.present as f32 / sum.total as f32).clamp(0.0, 1.0);
+                            head = head
+                                .child(
+                                    // The bar, then the number. A bar alone is a
+                                    // feeling; a number alone is read without
+                                    // noticing. Both is how it is scanned.
+                                    div()
+                                        .flex()
+                                        .w(px(w))
+                                        .h(px(2.0))
+                                        .flex_none()
+                                        .bg(t.border())
+                                        .child(
+                                            div()
+                                                .w(gpui::relative(frac))
+                                                .h_full()
+                                                .bg(if sum.present == sum.total {
+                                                    t.success()
+                                                } else {
+                                                    t.warning()
+                                                }),
+                                        ),
+                                )
+                                .child(
+                                    div()
+                                        .w(px(w))
+                                        .truncate()
+                                        .px(px(ms.cell_pad()))
+                                        .text_size(ms.tiny())
+                                        .text_color(t.muted())
+                                        .child(SharedString::from(format!(
+                                            "{}% of {}",
+                                            sum.percent(),
+                                            sum.total
+                                        ))),
+                                );
+                        }
+                        head
+                    })
                     .on_click(cx.listener(move |this, _, _, cx| {
                         this.sort_by(tab_id, ci);
                         cx.notify();

@@ -920,9 +920,95 @@ pub fn type_badge(v: &Value, declared: Option<&str>) -> &'static str {
                 "int"
             }
         }
-        Value::String(_) => "string",
+        Value::String(_) => "str",
         Value::Array(_) => "array",
-        Value::Object(_) => "object",
+        // A TAGGED value is not an ordinary object. The engine sends an
+        // ObjectId as `{"__oid": …}` and a date as `{"$date": …}` precisely so
+        // a client can name them, and calling either one "object" throws away
+        // the thing the tagging was for — and shows somebody `{"$date": …}`
+        // where a date belongs.
+        Value::Object(m) => {
+            if m.contains_key("__oid") || m.contains_key("$oid") {
+                "oid"
+            } else if m.contains_key("$date") {
+                "date"
+            } else if m.contains_key("$numberDecimal") || m.contains_key("$numberDouble") {
+                "num"
+            } else if m.contains_key("$numberLong") || m.contains_key("$numberInt") {
+                "int"
+            } else if m.contains_key("$binary") {
+                "bin"
+            } else {
+                "object"
+            }
+        }
+    }
+}
+
+/// What a COLUMN holds, and in how many of the rows that came back.
+///
+/// A document store declares no column types, so the only honest source is the
+/// page in hand — and because it is the page and not the collection, the count
+/// it is out of has to be carried with it and said. A bare "92%" with no
+/// denominator invites somebody to believe it is about the whole collection.
+///
+/// The type is the one that is not `null` and not missing; when a column holds
+/// more than one, `mixed` is the truthful answer rather than whichever came
+/// first.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ColumnSummary {
+    /// The word for what this column holds — the same vocabulary the Tree
+    /// view's badges use, because one dictionary for three places is the whole
+    /// point.
+    pub kind: &'static str,
+    /// How many rows of the page have this field at all.
+    pub present: usize,
+    /// Out of how many. Carried so the percentage can never be shown bare.
+    pub total: usize,
+}
+
+impl ColumnSummary {
+    /// Rounded, and only meaningful beside `total`.
+    pub fn percent(&self) -> u32 {
+        if self.total == 0 {
+            return 0;
+        }
+        ((self.present as f64 / self.total as f64) * 100.0).round() as u32
+    }
+}
+
+/// Summarise one column across the rows that came back.
+///
+/// `declared` is whatever the engine said the column is; a driver that knows
+/// beats a guess from values every time, which is why it is asked first.
+pub fn column_summary(
+    rows: &[Vec<Value>],
+    col: usize,
+    declared: Option<&str>,
+) -> ColumnSummary {
+    let total = rows.len();
+    let mut present = 0usize;
+    let mut kind: Option<&'static str> = None;
+    let mut mixed = false;
+    for r in rows {
+        let Some(v) = r.get(col) else { continue };
+        // A missing field and a field that is there holding null are different
+        // things, and for a document store the difference is the point.
+        if v.is_null() {
+            continue;
+        }
+        present += 1;
+        let k = type_badge(v, declared);
+        match kind {
+            None => kind = Some(k),
+            Some(prev) if prev != k => mixed = true,
+            _ => {}
+        }
+    }
+    ColumnSummary {
+        kind: if mixed { "mixed" } else { kind.unwrap_or("null") },
+        present,
+        total,
     }
 }
 
@@ -1489,13 +1575,78 @@ mod tests {
         assert_eq!(t.widths.get(&0), Some(&300.0), "a width the user dragged is theirs to keep");
     }
 
+    /// A tagged value is named, not called "object".
+    ///
+    /// The engine sends an ObjectId as `{"__oid": …}` and a date as
+    /// `{"$date": …}` so a client can name them. Calling either one "object"
+    /// throws away exactly what the tagging was for, and puts `{"$date": …}`
+    /// on screen where a date belongs.
+    #[test]
+    fn a_tagged_value_is_named_by_what_it_is() {
+        assert_eq!(type_badge(&json!({"__oid": "6a91cd1cea4393beaf983"}), None), "oid");
+        assert_eq!(type_badge(&json!({"$date": "2026-09-15T08:00:00Z"}), None), "date");
+        assert_eq!(type_badge(&json!({"$numberLong": "12"}), None), "int");
+        assert_eq!(type_badge(&json!({"$binary": {}}), None), "bin");
+        // An ordinary document is still an object.
+        assert_eq!(type_badge(&json!({"a": 1}), None), "object");
+    }
+
+    /// A column's type and how much of the page actually has it.
+    ///
+    /// For a document store this is the most useful thing in the whole header:
+    /// which fields are everywhere and which are not. It is computed from the
+    /// PAGE, so the count it is out of travels with it — a bare "92%" invites
+    /// somebody to read it as a fact about the collection.
+    #[test]
+    fn a_column_says_what_it_holds_and_in_how_many_rows() {
+        let rows: Vec<Vec<Value>> = vec![
+            vec![json!({"__oid": "a"}), json!("bg"), json!(null)],
+            vec![json!({"__oid": "b"}), json!("de"), json!(7)],
+            vec![json!({"__oid": "c"}), json!(null), json!(9)],
+        ];
+
+        let id = column_summary(&rows, 0, None);
+        assert_eq!(id.kind, "oid");
+        assert_eq!((id.present, id.total), (3, 3));
+        assert_eq!(id.percent(), 100);
+
+        // A null is NOT the field being present: for a document store the
+        // difference between "missing" and "there and empty" is the point.
+        let country = column_summary(&rows, 1, None);
+        assert_eq!(country.kind, "str");
+        assert_eq!((country.present, country.total), (2, 3));
+        assert_eq!(country.percent(), 67);
+
+        let note = column_summary(&rows, 2, None);
+        assert_eq!(note.kind, "int");
+        assert_eq!((note.present, note.total), (2, 3));
+
+        // More than one type is "mixed", not whichever came first — that is the
+        // answer somebody needs to see, since it is the surprising one.
+        let messy: Vec<Vec<Value>> = vec![vec![json!(1)], vec![json!("x")]];
+        assert_eq!(column_summary(&messy, 0, None).kind, "mixed");
+
+        // What the driver declares beats a guess from values.
+        let declared: Vec<Vec<Value>> = vec![vec![json!("2026-01-01")]];
+        assert_eq!(column_summary(&declared, 0, Some("timestamp")).kind, "date");
+
+        // Nothing at all does not divide by zero, and says nothing rather than
+        // inventing a type.
+        let empty: Vec<Vec<Value>> = vec![];
+        let s = column_summary(&empty, 0, None);
+        assert_eq!((s.kind, s.present, s.total, s.percent()), ("null", 0, 0, 0));
+    }
+
     #[test]
     fn type_badges_prefer_what_the_driver_said() {
         assert_eq!(type_badge(&json!("x"), Some("ObjectId")), "oid");
         assert_eq!(type_badge(&json!("x"), Some("timestamp")), "date");
         assert_eq!(type_badge(&json!(1), Some("int8")), "field", "an unmapped declared type is still a field");
         // Nothing declared, or the catch-all document type: fall back to JSON.
-        assert_eq!(type_badge(&json!("x"), None), "string");
+        // "str", not "string": these words sit in a column header and beside
+        // every field in the schema tree, where a long word costs room that the
+        // name needs. One vocabulary, used in all three places.
+        assert_eq!(type_badge(&json!("x"), None), "str");
         assert_eq!(type_badge(&json!(1.5), Some("json")), "num");
         assert_eq!(type_badge(&Value::Null, Some("")), "null");
         assert_eq!(type_badge(&json!([1]), None), "array");
