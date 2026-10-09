@@ -7550,8 +7550,38 @@ impl Workspace {
     /// previous client could not show at all.
     fn tree_el(&self, tab: &Tab, cx: &mut Context<Self>) -> gpui::AnyElement {
         let t = self.t();
-        let _ = self.scale;
+        let ms = self.scale;
         let mut out = div().flex().flex_col().size_full().overflow_hidden();
+        // Everything on screen, in one go — the answer to "I want this
+        // somewhere else" when the something else is the whole result.
+        if !tab.rows.is_empty() {
+            let docs: Vec<Value> = (0..tab.rows.len().min(200)).map(|i| tab.document(i)).collect();
+            let all = serde_json::to_string_pretty(&docs).unwrap_or_else(|_| "[]".into());
+            out = out.child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .px_2()
+                    .py_1()
+                    .child(self.small(format!("{} document(s)", tab.rows.len()), t.muted()))
+                    .child(
+                        div()
+                            .id("tree-copy-all")
+                            .px_1()
+                            .cursor_pointer()
+                            .hover(|d| d.bg(t.hover()))
+                            .text_size(ms.tiny())
+                            .text_color(t.accent())
+                            .child("copy all")
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                cx.write_to_clipboard(gpui::ClipboardItem::new_string(all.clone()));
+                                this.toast("copied".to_string(), false);
+                                cx.notify();
+                            })),
+                    ),
+            );
+        }
         for i in 0..tab.rows.len().min(200) {
             let doc = tab.document(i);
             let open = tab.expanded.contains(&i);
@@ -7568,7 +7598,38 @@ impl Workspace {
                     .hover(|d| d.bg(t.hover()))
                     .child(self.small(format!("{}", i + 1), t.line_nr()))
                     .child(self.small(if open { "\u{f0d7}" } else { "\u{f0da}" }, t.muted()))
-                    .child(self.small(preview(&doc), t.fg()))
+                    // The first few fields, not `{6}`. Thirty rows of `{6}`,
+                    // `{5}`, `{7}` cannot be told apart without opening every
+                    // one, which is the opposite of what a list is for.
+                    .child(self.line_tip(
+                        crate::workspace::doc_preview(&doc, 120),
+                        ms.small(),
+                        t.fg(),
+                        (self.canvas_w - ms.base() * 6.0).max(ms.base() * 10.0),
+                        format!("dp-{tab_id}-{i}"),
+                    ))
+                    .child(
+                        div()
+                            .id(SharedString::from(format!("dcopy-{tab_id}-{i}")))
+                            .flex_none()
+                            .px_1()
+                            .cursor_pointer()
+                            .hover(|d| d.bg(t.hover()))
+                            .text_size(ms.tiny())
+                            .text_color(t.accent())
+                            .child("copy")
+                            .on_click(cx.listener({
+                                let text = serde_json::to_string_pretty(&doc)
+                                    .unwrap_or_else(|_| "{}".into());
+                                move |this, _, _, cx| {
+                                    cx.write_to_clipboard(gpui::ClipboardItem::new_string(
+                                        text.clone(),
+                                    ));
+                                    this.toast("copied".to_string(), false);
+                                    cx.notify();
+                                }
+                            })),
+                    )
                     .on_click(cx.listener(move |this, _, _, cx| {
                         if let Some(tb) = this.tabs.iter_mut().find(|t| t.id == tab_id) {
                             if !tb.expanded.remove(&i) {
@@ -7668,9 +7729,21 @@ impl Workspace {
                             .py(px(1.0))
                             .child(
                                 div()
+                                    .flex_none()
                                     .text_size(ms.small())
                                     .text_color(t.muted())
                                     .child(SharedString::from(k.clone())),
+                            )
+                            // BEFORE the value, not after it. On the right it
+                            // was the last thing in the row and the first thing
+                            // the edge cut off, so the one word saying what the
+                            // value IS was the one word that went missing.
+                            .child(
+                                div()
+                                    .flex_none()
+                                    .text_size(ms.tiny())
+                                    .text_color(t.badge(badge))
+                                    .child(SharedString::from(badge)),
                             )
                             .child({
                                 // A TOP-LEVEL field of a document that is a
@@ -7718,13 +7791,35 @@ impl Workspace {
                                         .into_any_element(),
                                 }
                             })
-                            .child(
-                                // The badge, in the colour its type maps to.
+                            // A value that can be seen and not taken is half
+                            // useless, and GPUI has no selectable text.
+                            .child({
+                                let raw = match val {
+                                    Value::String(s) => s.clone(),
+                                    other => serde_json::to_string_pretty(other)
+                                        .unwrap_or_else(|_| other.to_string()),
+                                };
                                 div()
+                                    .id(SharedString::from(format!(
+                                        "fcopy-{}-{}-{k}",
+                                        tab_id_for_edit,
+                                        row.unwrap_or(0)
+                                    )))
+                                    .flex_none()
+                                    .px_1()
+                                    .cursor_pointer()
+                                    .hover(|d| d.bg(t.hover()))
                                     .text_size(ms.tiny())
-                                    .text_color(t.badge(badge))
-                                    .child(SharedString::from(badge)),
-                            ),
+                                    .text_color(t.muted())
+                                    .child("copy")
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        cx.write_to_clipboard(gpui::ClipboardItem::new_string(
+                                            raw.clone(),
+                                        ));
+                                        this.toast("copied".to_string(), false);
+                                        cx.notify();
+                                    }))
+                            }),
                     );
                     // Not while this field is being edited: the expansion
                     // under an open editor is what made the two read as one

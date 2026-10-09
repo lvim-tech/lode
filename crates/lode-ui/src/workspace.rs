@@ -1053,6 +1053,21 @@ pub fn column_summary(
 /// A one-line preview of a value, for a collapsed tree node.
 pub fn preview(v: &Value) -> String {
     match v {
+        // A tagged value is NAMED, not counted: `{"$date": …}` has one key and
+        // calling it `{1}` tells somebody nothing at all.
+        Value::Object(m) if type_badge(v, None) != "object" => match type_badge(v, None) {
+            "oid" => m
+                .get("__oid")
+                .or_else(|| m.get("$oid"))
+                .and_then(Value::as_str)
+                .unwrap_or("oid")
+                .to_string(),
+            "date" => m
+                .get("$date")
+                .and_then(|d| d.as_str().map(str::to_string).or_else(|| Some(d.to_string())))
+                .unwrap_or_else(|| "date".into()),
+            other => other.to_string(),
+        },
         Value::Object(m) => format!("{{{}}}", m.len()),
         Value::Array(a) => format!("[{}]", a.len()),
         Value::Null => "null".into(),
@@ -1066,6 +1081,54 @@ pub fn preview(v: &Value) -> String {
         }
         other => other.to_string(),
     }
+}
+
+/// One document, as a line somebody can tell apart from the next one.
+///
+/// `{6}` is the number of fields and nothing else: thirty documents in a row
+/// all say `{6}`, `{5}`, `{7}` and none of them can be told from another
+/// without being opened. The first few fields, named and valued, is what makes
+/// the list a list of THINGS.
+///
+/// Cut by characters at the end rather than by a count of fields, so the line
+/// fills the row it has instead of stopping short or running over.
+pub fn doc_preview(v: &Value, budget: usize) -> String {
+    let Value::Object(m) = v else { return preview(v) };
+    if m.is_empty() {
+        return "{}".into();
+    }
+    let mut out = String::from("{ ");
+    let mut first = true;
+    for (k, val) in m {
+        if out.chars().count() >= budget {
+            break;
+        }
+        if !first {
+            out.push_str(", ");
+        }
+        first = false;
+        let shown = preview(val);
+        // A long string inside a preview is cut hard: the point of this line is
+        // to tell documents apart, and one field filling it defeats that.
+        let shown: String = if shown.chars().count() > 28 {
+            format!("{}\u{2026}", shown.chars().take(28).collect::<String>())
+        } else {
+            shown
+        };
+        let shown = if matches!(val, Value::String(_)) {
+            format!("\"{shown}\"")
+        } else {
+            shown
+        };
+        out.push_str(&format!("{k}: {shown}"));
+    }
+    if out.chars().count() > budget {
+        out = out.chars().take(budget).collect();
+        out.push('\u{2026}');
+    } else {
+        out.push_str(" }");
+    }
+    out
 }
 
 /// Whether a tree/list entry survives the sidebar filter. Case-insensitive
@@ -1687,6 +1750,45 @@ mod tests {
         t.reset_result();
         assert!(t.sort.is_none());
         assert_eq!(t.widths.get(&0), Some(&300.0), "a width the user dragged is theirs to keep");
+    }
+
+    /// A document reads as a thing, not as a count of fields.
+    ///
+    /// Thirty rows of `{6}`, `{5}`, `{7}` cannot be told apart without opening
+    /// every one, which is the opposite of what a list is for.
+    #[test]
+    fn a_document_preview_says_which_document_it_is() {
+        let doc = json!({
+            "country": "BG",
+            "lang": "bg",
+            "year_start": {"$date": "2026-09-15T08:00:00Z"},
+        });
+        let p = doc_preview(&doc, 120);
+        assert!(p.contains("country"), "{p}");
+        assert!(p.contains("BG"), "{p}");
+        // A tagged value is NAMED in the preview, not counted: `{"$date": …}`
+        // has one key and `{1}` says nothing.
+        assert!(p.contains("2026-09-15"), "a date must read as a date: {p}");
+        assert!(!p.contains("{1}"), "{p}");
+
+        // Two documents that differ are distinguishable, which is the point.
+        let other = json!({"country": "DE", "lang": "de"});
+        assert_ne!(doc_preview(&doc, 120), doc_preview(&other, 120));
+
+        // It fills its budget and stops, rather than running over.
+        let big = json!({
+            "a": "x".repeat(200), "b": "y".repeat(200), "c": "z".repeat(200),
+        });
+        let p = doc_preview(&big, 60);
+        assert!(p.chars().count() <= 61, "{} chars", p.chars().count());
+        assert!(p.ends_with('\u{2026}'), "a cut preview says it was cut: {p}");
+
+        // An empty document is empty, not "{0}".
+        assert_eq!(doc_preview(&json!({}), 120), "{}");
+
+        // An ObjectId reads as its hex, which is how somebody recognises a row.
+        let with_id = json!({"_id": {"__oid": "6a91cd1cea4393beaf983"}});
+        assert!(doc_preview(&with_id, 120).contains("6a91cd1cea4393beaf983"));
     }
 
     /// A tagged value is named, not called "object".
