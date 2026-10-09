@@ -225,6 +225,15 @@ fn return_plain(d: gpui::Div) -> gpui::AnyElement {
     d.into_any_element()
 }
 
+/// How many documents the tree reads to say what a field holds.
+///
+/// Small on purpose. A document store declares no column types, so the only
+/// source is the documents themselves — and twenty is enough to tell a date from
+/// a string while staying a single cheap request. The number is SHOWN beside
+/// the count, because a type derived from a sample and a type the server
+/// declared are different claims and should not look alike.
+const NODE_SAMPLE: usize = 20;
+
 /// Does this family have every glyph the interface draws?
 ///
 /// Measured, not assumed from the name. `typographic_bounds` errors when the
@@ -685,6 +694,10 @@ enum Pending {
     /// A tree node's fields and indexes, asked when it was expanded.
     NodeColumns { key: String },
     NodeIndexes { key: String },
+    /// The small sample a document store needs before it can say what a field
+    /// holds. Two steps, because a result is run and then paged.
+    NodeSample { key: String },
+    NodeSamplePage { key: String },
     /// A profile was removed, and the engine says which connections used it.
     ProfileRemoved { kind: &'static str, name: String },
     /// A connection saved from that window.
@@ -738,6 +751,12 @@ pub struct Workspace {
     node_indexes: HashMap<String, Vec<Index>>,
     /// Keys already asked for, so re-opening a node does not ask again.
     node_asked: HashSet<String>,
+    /// A small sample of documents per node, for drivers that declare no column
+    /// types — which is every document store. The derived type is SAID to be
+    /// derived; see `NODE_SAMPLE`.
+    node_sample: HashMap<String, Vec<Vec<Value>>>,
+    /// The column order of that sample, so a value can be matched to a field.
+    node_sample_cols: HashMap<String, Vec<String>>,
 
     tabs: Vec<Tab>,
     active: usize,
@@ -990,6 +1009,8 @@ impl Workspace {
             node_fields: HashMap::new(),
             node_indexes: HashMap::new(),
             node_asked: HashSet::new(),
+            node_sample: HashMap::new(),
+            node_sample_cols: HashMap::new(),
             tabs: Vec::new(),
             active: 0,
             next_tab: 1,
@@ -1680,6 +1701,32 @@ impl Workspace {
                         .unwrap_or_default();
                 self.node_indexes.insert(key, idx);
             }
+            Pending::NodeSample { key } => {
+                if let Some(call_id) = v.get("call_id").and_then(Value::as_u64) {
+                    self.ask(
+                        Pending::NodeSamplePage { key },
+                        "query.page",
+                        json!({ "call_id": call_id, "offset": 0, "limit": NODE_SAMPLE }),
+                    );
+                }
+            }
+            Pending::NodeSamplePage { key } => {
+                let cols: Vec<String> = v
+                    .get("columns")
+                    .and_then(Value::as_array)
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(|c| c.get("name").and_then(Value::as_str))
+                            .map(str::to_string)
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                let rows: Vec<Vec<Value>> =
+                    serde_json::from_value(v.get("rows").cloned().unwrap_or(json!([])))
+                        .unwrap_or_default();
+                self.node_sample_cols.insert(key.clone(), cols);
+                self.node_sample.insert(key, rows);
+            }
             Pending::ProfileUsers { name } => {
                 let users: Vec<String> =
                     serde_json::from_value(v.get("users").cloned().unwrap_or(json!([])))
@@ -1982,7 +2029,14 @@ impl Workspace {
     /// On EXPAND, not on connect. He has thirty-nine collections, and asking
     /// for the fields and the indexes of every one when a connection opens
     /// would be seventy-eight requests before anything has been looked at.
-    fn toggle_inside(&mut self, key: &str, conn: &str, name: &str, schema: Option<&str>) {
+    fn toggle_inside(
+        &mut self,
+        key: &str,
+        conn: &str,
+        name: &str,
+        schema: Option<&str>,
+        kind: &str,
+    ) {
         if self.open_nodes.contains(key) {
             self.open_nodes.remove(key);
             return;
@@ -2012,6 +2066,29 @@ impl Workspace {
             );
         } else {
             self.node_indexes.insert(key.to_string(), Vec::new());
+        }
+        // A driver that declares no column types has only the documents to go
+        // on, so a small sample is read — once, on expand, and remembered.
+        let declares = self
+            .live(conn)
+            .and_then(|l| self.meta(&l.driver))
+            .map_or(true, |m| m.is_structured() || m.caps.sql);
+        if !declares {
+            let Some(meta) = self.live(conn).and_then(|l| self.meta(&l.driver)) else { return };
+            let sql = lode_proto::render_full(
+                meta.browse_for(kind),
+                name,
+                schema,
+                NODE_SAMPLE,
+                &[],
+                &[],
+                "",
+            );
+            self.ask(
+                Pending::NodeSample { key: key.to_string() },
+                "query.execute",
+                json!({ "conn_id": conn_id, "statement": sql }),
+            );
         }
     }
 
@@ -5444,11 +5521,12 @@ impl Workspace {
                 if !is_object {
                     return_plain(plain)
                 } else {
-                    let (k, c, n, sc) = (
+                    let (k, c, n, sc, kd) = (
                         key.clone(),
                         conn.to_string(),
                         node.name.clone(),
                         node.schema.clone(),
+                        node.kind.clone(),
                     );
                     plain
                         .id(SharedString::from(format!("ar-{key}")))
@@ -5462,7 +5540,7 @@ impl Workspace {
                         .on_mouse_down(
                             MouseButton::Left,
                             cx.listener(move |this, _, _, cx| {
-                                this.toggle_inside(&k, &c, &n, sc.as_deref());
+                                this.toggle_inside(&k, &c, &n, sc.as_deref(), &kd);
                                 cx.notify();
                             }),
                         )
@@ -5540,11 +5618,19 @@ impl Workspace {
         }
 
         if let Some(cols) = fields {
+            // WHERE the types came from, said on the heading. A type the server
+            // declared and a type worked out from twenty documents are
+            // different claims and must not look alike — the same rule as the
+            // column headers' "67% of 3".
+            let sample = self.node_sample.get(key);
+            let basis = match sample {
+                Some(rows) if !rows.is_empty() => {
+                    format!("Fields ({}) \u{b7} types from a sample of {}", cols.len(), rows.len())
+                }
+                _ => format!("Fields ({})", cols.len()),
+            };
             out = out.child(
-                div()
-                    .pl(px(pad))
-                    .py(px(1.0))
-                    .child(self.small(format!("Fields ({})", cols.len()), t.title())),
+                div().pl(px(pad)).py(px(1.0)).child(self.small(basis, t.title())),
             );
             for c in cols {
                 // The declared type, when the driver declares one. A document
@@ -5555,10 +5641,22 @@ impl Workspace {
                 // print `null` beside all fourteen fields, which is not a gap
                 // but a wrong answer.
                 let declared = c.type_name.trim();
-                let shown: Option<&'static str> = if declared.is_empty() {
-                    None
-                } else {
+                let shown: Option<&'static str> = if !declared.is_empty() {
+                    // The driver says. Relational drivers do.
                     Some(crate::workspace::type_badge(&Value::Null, Some(declared)))
+                } else {
+                    // It does not, so the documents are asked. `column_summary`
+                    // is the same function the grid's headers use, so `mixed`
+                    // means the same thing in both places and a field that is
+                    // sometimes a string and sometimes a number says so.
+                    self.node_sample
+                        .get(key)
+                        .zip(self.node_sample_cols.get(key))
+                        .and_then(|(rows, names)| {
+                            let i = names.iter().position(|n| n == &c.name)?;
+                            let sum = crate::workspace::column_summary(rows, i, None);
+                            (sum.present > 0).then_some(sum.kind)
+                        })
                 };
                 let name = c.name.clone();
                 out = out.child(

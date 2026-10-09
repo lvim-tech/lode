@@ -966,7 +966,27 @@ pub fn type_badge(v: &Value, declared: Option<&str>) -> &'static str {
         // the thing the tagging was for — and shows somebody `{"$date": …}`
         // where a date belongs.
         Value::Object(m) => {
-            if m.contains_key("__oid") || m.contains_key("$oid") {
+            // THE ENGINE'S OWN TAGGING, which is `{"__oid": hex}` and
+            // `{"__ext": "$date", "v": text}` — checked against what it
+            // actually sends rather than taken from another client's
+            // screenshot, which is where the first guess at this came from and
+            // why `{"$date": …}` was the wrong key to look for.
+            if m.contains_key("__oid") {
+                return "oid";
+            }
+            if let Some(ext) = m.get("__ext").and_then(Value::as_str) {
+                return match ext {
+                    "$date" => "date",
+                    "$numberDecimal" | "$numberDouble" => "num",
+                    "$numberLong" | "$numberInt" => "int",
+                    "$binary" => "bin",
+                    "$timestamp" => "ts",
+                    _ => "ext",
+                };
+            }
+            // The plain extended-JSON forms too, since another engine or an
+            // external driver may send those instead.
+            if m.contains_key("$oid") {
                 "oid"
             } else if m.contains_key("$date") {
                 "date"
@@ -1055,19 +1075,24 @@ pub fn preview(v: &Value) -> String {
     match v {
         // A tagged value is NAMED, not counted: `{"$date": …}` has one key and
         // calling it `{1}` tells somebody nothing at all.
-        Value::Object(m) if type_badge(v, None) != "object" => match type_badge(v, None) {
-            "oid" => m
-                .get("__oid")
-                .or_else(|| m.get("$oid"))
-                .and_then(Value::as_str)
-                .unwrap_or("oid")
-                .to_string(),
-            "date" => m
-                .get("$date")
-                .and_then(|d| d.as_str().map(str::to_string).or_else(|| Some(d.to_string())))
-                .unwrap_or_else(|| "date".into()),
-            other => other.to_string(),
-        },
+        Value::Object(m) if type_badge(v, None) != "object" => {
+            // The VALUE inside the tag, which is the whole reason for tagging:
+            // `{"__ext": "$date", "v": "2026-09-15T08:00:00Z"}` is a date and
+            // reads as one.
+            if let Some(hex) = m.get("__oid").or_else(|| m.get("$oid")).and_then(Value::as_str) {
+                return hex.to_string();
+            }
+            if let Some(inner) = m.get("v") {
+                return match inner {
+                    Value::String(s) => s.clone(),
+                    other => other.to_string(),
+                };
+            }
+            if let Some(d) = m.get("$date") {
+                return d.as_str().map(str::to_string).unwrap_or_else(|| d.to_string());
+            }
+            type_badge(v, None).to_string()
+        }
         Value::Object(m) => format!("{{{}}}", m.len()),
         Value::Array(a) => format!("[{}]", a.len()),
         Value::Null => "null".into(),
@@ -1761,7 +1786,7 @@ mod tests {
         let doc = json!({
             "country": "BG",
             "lang": "bg",
-            "year_start": {"$date": "2026-09-15T08:00:00Z"},
+            "year_start": {"__ext": "$date", "v": "2026-09-15T08:00:00Z"},
         });
         let p = doc_preview(&doc, 120);
         assert!(p.contains("country"), "{p}");
@@ -1799,10 +1824,29 @@ mod tests {
     /// on screen where a date belongs.
     #[test]
     fn a_tagged_value_is_named_by_what_it_is() {
+        // THE ENGINE'S OWN SHAPES, read off what it actually sends. The first
+        // version of this looked for `{"$date": …}` — taken from another
+        // client's screenshot — and missed every date this engine produces.
         assert_eq!(type_badge(&json!({"__oid": "6a91cd1cea4393beaf983"}), None), "oid");
+        assert_eq!(
+            type_badge(&json!({"__ext": "$date", "v": "2026-09-15T08:00:00Z"}), None),
+            "date"
+        );
+        assert_eq!(type_badge(&json!({"__ext": "$numberLong", "v": "12"}), None), "int");
+        assert_eq!(type_badge(&json!({"__ext": "$binary", "v": "AA=="}), None), "bin");
+        // A tag this client does not know is still a tagged thing, not an
+        // object: saying `ext` is a gap, saying `object` would be wrong.
+        assert_eq!(type_badge(&json!({"__ext": "$whatever", "v": "x"}), None), "ext");
+        // And the plain extended-JSON forms, in case another engine sends those.
         assert_eq!(type_badge(&json!({"$date": "2026-09-15T08:00:00Z"}), None), "date");
         assert_eq!(type_badge(&json!({"$numberLong": "12"}), None), "int");
         assert_eq!(type_badge(&json!({"$binary": {}}), None), "bin");
+        // The VALUE comes out of the tag, which is what tagging is for.
+        assert_eq!(
+            preview(&json!({"__ext": "$date", "v": "2026-09-15T08:00:00Z"})),
+            "2026-09-15T08:00:00Z"
+        );
+        assert_eq!(preview(&json!({"__oid": "6a91cd1c"})), "6a91cd1c");
         // An ordinary document is still an object.
         assert_eq!(type_badge(&json!({"a": 1}), None), "object");
     }
