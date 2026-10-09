@@ -219,6 +219,12 @@ fn char_ratio(cx: &gpui::App, family: &str) -> f32 {
         .unwrap_or(0.62)
 }
 
+/// `AnyElement` from a plain div, so a branch that adds an id and a branch that
+/// does not can both be the value of one expression.
+fn return_plain(d: gpui::Div) -> gpui::AnyElement {
+    d.into_any_element()
+}
+
 /// Does this family have every glyph the interface draws?
 ///
 /// Measured, not assumed from the name. `typographic_bounds` errors when the
@@ -676,6 +682,9 @@ enum Pending {
     ProfileSaved { kind: &'static str },
     /// Which connections point at one profile, asked before touching it.
     ProfileUsers { name: String },
+    /// A tree node's fields and indexes, asked when it was expanded.
+    NodeColumns { key: String },
+    NodeIndexes { key: String },
     /// A profile was removed, and the engine says which connections used it.
     ProfileRemoved { kind: &'static str, name: String },
     /// A connection saved from that window.
@@ -720,6 +729,15 @@ pub struct Workspace {
     conns: Vec<Live>,
     /// Which schema branches are open, keyed by connection + path.
     open_nodes: HashSet<String>,
+    /// A table's or collection's fields and indexes, by the node's key.
+    ///
+    /// Asked when the node is EXPANDED, not when the connection opens: he has
+    /// thirty-nine collections, and asking for both up front would be
+    /// seventy-eight requests before anything is looked at.
+    node_fields: HashMap<String, Vec<TableColumn>>,
+    node_indexes: HashMap<String, Vec<Index>>,
+    /// Keys already asked for, so re-opening a node does not ask again.
+    node_asked: HashSet<String>,
 
     tabs: Vec<Tab>,
     active: usize,
@@ -969,6 +987,9 @@ impl Workspace {
             saved: Vec::new(),
             conns: Vec::new(),
             open_nodes: HashSet::new(),
+            node_fields: HashMap::new(),
+            node_indexes: HashMap::new(),
+            node_asked: HashSet::new(),
             tabs: Vec::new(),
             active: 0,
             next_tab: 1,
@@ -1647,6 +1668,18 @@ impl Workspace {
                     }
                 }
             }
+            Pending::NodeColumns { key } => {
+                let cols: Vec<TableColumn> =
+                    serde_json::from_value(v.get("columns").cloned().unwrap_or(json!([])))
+                        .unwrap_or_default();
+                self.node_fields.insert(key, cols);
+            }
+            Pending::NodeIndexes { key } => {
+                let idx: Vec<Index> =
+                    serde_json::from_value(v.get("indexes").cloned().unwrap_or(json!([])))
+                        .unwrap_or_default();
+                self.node_indexes.insert(key, idx);
+            }
             Pending::ProfileUsers { name } => {
                 let users: Vec<String> =
                     serde_json::from_value(v.get("users").cloned().unwrap_or(json!([])))
@@ -1942,6 +1975,80 @@ impl Workspace {
             self.subscribe_run(&input, tab_id, cx);
             self.inputs.insert((tab_id, String::new()), input);
         }
+    }
+
+    /// Open or shut a table's insides, asking for them the first time only.
+    ///
+    /// On EXPAND, not on connect. He has thirty-nine collections, and asking
+    /// for the fields and the indexes of every one when a connection opens
+    /// would be seventy-eight requests before anything has been looked at.
+    fn toggle_inside(&mut self, key: &str, conn: &str, name: &str, schema: Option<&str>) {
+        if self.open_nodes.contains(key) {
+            self.open_nodes.remove(key);
+            return;
+        }
+        self.open_nodes.insert(key.to_string());
+        if !self.node_asked.insert(key.to_string()) {
+            return;
+        }
+        let Some(conn_id) = self.live(conn).map(|l| l.conn_id) else { return };
+        let objref = json!({ "name": name, "schema": schema });
+        self.ask(
+            Pending::NodeColumns { key: key.to_string() },
+            "schema.columns",
+            json!({ "conn_id": conn_id, "object": objref }),
+        );
+        // Only when the driver says it can. Asking a driver that cannot is a
+        // refusal in the log for something nobody requested.
+        let has = self
+            .live(conn)
+            .and_then(|l| self.meta(&l.driver))
+            .map_or(false, |m| m.caps.indexes);
+        if has {
+            self.ask(
+                Pending::NodeIndexes { key: key.to_string() },
+                "schema.indexes",
+                json!({ "conn_id": conn_id, "object": objref }),
+            );
+        } else {
+            self.node_indexes.insert(key.to_string(), Vec::new());
+        }
+    }
+
+    /// Put a name where text is being written.
+    ///
+    /// Clicking a field in the schema tree inserts its NAME into the active
+    /// tab's statement, rather than opening a panel about it. The details — the
+    /// type, whether it is a key — belong on the row where they can be read
+    /// without a click; the name is the thing somebody is about to type, and it
+    /// is the one thing a click can save them. It is also what clicking a saved
+    /// query or a history line already does: it puts text where text goes.
+    fn insert_into_editor(&mut self, name: &str, cx: &mut Context<Self>) {
+        let Some(tab) = self.tabs.get(self.active) else {
+            self.toast(format!("{name} — no tab to put it in"), true);
+            return;
+        };
+        let tab_id = tab.id;
+        // The free-text statement field. A structured driver has named boxes
+        // instead, and guessing which of them a column name belongs in would be
+        // a guess about somebody's query.
+        let Some(input) = self.inputs.get(&(tab_id, String::new())).cloned() else {
+            self.toast(format!("{name} — this tab has no statement to add to"), true);
+            return;
+        };
+        let add = name.to_string();
+        input.update(cx, |i, cx| {
+            let now = i.text().to_string();
+            let joined = if now.trim().is_empty() {
+                add.clone()
+            } else if now.ends_with(' ') || now.ends_with('(') || now.ends_with(',') {
+                format!("{now}{add}")
+            } else {
+                format!("{now} {add}")
+            };
+            i.set_text(joined, cx);
+        });
+        cx.notify();
     }
 
     /// Enter in any field of a tab's bar runs that tab.
@@ -5287,6 +5394,10 @@ impl Workspace {
         let ms = self.scale;
         let key = format!("{conn}/{}/{}", node.kind, node.name);
         let is_branch = !node.children.is_empty();
+        // A table or a collection is a LEAF of the schema and still has an
+        // inside: its fields and its indexes. The engine has answered both all
+        // along and the tree stopped here.
+        let is_object = matches!(node.kind.as_str(), "table" | "view" | "collection");
         let open = self.open_nodes.contains(&key);
         let glyph = match node.kind.as_str() {
             "database" => "\u{f1c0}",
@@ -5315,20 +5426,49 @@ impl Workspace {
             .py(px(2.0))
             .cursor_pointer()
             .hover(|d| d.bg(t.hover()))
-            .child(
-                div()
+            .child({
+                // A table has TWO things to do: open it, and look inside it.
+                // The row keeps the common one; the arrow is its own target for
+                // the other, so neither can be mistaken for the other.
+                let mark = if is_branch || is_object {
+                    if open { "\u{f0d7}" } else { "\u{f0da}" }
+                } else {
+                    " "
+                };
+                let plain = div()
+                    .w(px(ms.base()))
+                    .flex_none()
                     .text_size(ms.tiny())
                     .text_color(t.muted())
-                    .child(SharedString::from(if is_branch {
-                        if open {
-                            "\u{f0d7}"
-                        } else {
-                            "\u{f0da}"
-                        }
-                    } else {
-                        " "
-                    })),
-            )
+                    .child(SharedString::from(mark));
+                if !is_object {
+                    return_plain(plain)
+                } else {
+                    let (k, c, n, sc) = (
+                        key.clone(),
+                        conn.to_string(),
+                        node.name.clone(),
+                        node.schema.clone(),
+                    );
+                    plain
+                        .id(SharedString::from(format!("ar-{key}")))
+                        .cursor_pointer()
+                        .tooltip(crate::tip::Tip::build(
+                            "Fields and indexes",
+                            None,
+                            self.theme.clone(),
+                            self.scale,
+                        ))
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(move |this, _, _, cx| {
+                                this.toggle_inside(&k, &c, &n, sc.as_deref());
+                                cx.notify();
+                            }),
+                        )
+                        .into_any_element()
+                }
+            })
             .child(self.icon_inline(glyph, t.accent()))
             // A node is indented by its depth, so the room it has shrinks as
             // the tree goes deeper — the width has to say so, or a deep leaf
@@ -5349,9 +5489,14 @@ impl Workspace {
                         } else {
                             this.open_nodes.insert(key_s.clone());
                         }
-                    } else {
-                        this.open_object(&conn_s, &name_s, schema_s.as_deref(), &kind_s, cx);
+                        cx.notify();
+                        return;
                     }
+                    // The row OPENS the object. Looking inside it is the arrow
+                    // at the left, which has its own handler — guessing from
+                    // the pointer's x would be the window making assumptions
+                    // about its own layout.
+                    this.open_object(&conn_s, &name_s, schema_s.as_deref(), &kind_s, cx);
                     cx.notify();
                 }),
             );
@@ -5360,6 +5505,150 @@ impl Workspace {
         if is_branch && open {
             for child in &node.children {
                 out = out.child(self.node_el(conn, child, depth + 1, cx));
+            }
+        }
+        if is_object && open {
+            out = out.child(self.node_inside(&key, depth + 1, cx));
+        }
+        out.into_any_element()
+    }
+
+    /// What is INSIDE a table or a collection: its fields and its indexes.
+    ///
+    /// Both come straight from the engine — `schema.columns` and
+    /// `schema.indexes` — and neither has ever been shown. The type beside each
+    /// field is the same word the grid's headers and the Tree's badges use,
+    /// because one dictionary serving three places is the whole point of having
+    /// written it.
+    fn node_inside(&self, key: &str, depth: usize, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let (t, ms) = (self.t(), self.scale);
+        let pad = 16.0 + depth as f32 * 12.0;
+        let w = (ms.line_w() - pad - ms.base() * 3.0).max(ms.base() * 4.0);
+        let mut out = div().flex().flex_col();
+
+        let fields = self.node_fields.get(key);
+        let indexes = self.node_indexes.get(key);
+        if fields.is_none() && indexes.is_none() {
+            return out
+                .child(
+                    div()
+                        .pl(px(pad))
+                        .py(px(1.0))
+                        .child(self.small("reading…", t.muted())),
+                )
+                .into_any_element();
+        }
+
+        if let Some(cols) = fields {
+            out = out.child(
+                div()
+                    .pl(px(pad))
+                    .py(px(1.0))
+                    .child(self.small(format!("Fields ({})", cols.len()), t.title())),
+            );
+            for c in cols {
+                // The declared type, when the driver declares one. A document
+                // store does NOT — `schema.columns` comes back with an empty
+                // type for every field of a collection — and there are no
+                // values here to derive one from, so the honest answer is to
+                // say nothing. Running it through the dictionary anyway would
+                // print `null` beside all fourteen fields, which is not a gap
+                // but a wrong answer.
+                let declared = c.type_name.trim();
+                let shown: Option<&'static str> = if declared.is_empty() {
+                    None
+                } else {
+                    Some(crate::workspace::type_badge(&Value::Null, Some(declared)))
+                };
+                let name = c.name.clone();
+                out = out.child(
+                    div()
+                        .id(SharedString::from(format!("fld-{key}-{}", c.name)))
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .pl(px(pad + 12.0))
+                        .py(px(1.0))
+                        .cursor_pointer()
+                        .hover(|d| d.bg(t.hover()))
+                        // A click puts the NAME where text is being written.
+                        // Details belong on the row, not behind a click, and
+                        // the name is the thing somebody is about to type.
+                        .tooltip(crate::tip::Tip::build(
+                            match shown {
+                                Some(ty) => format!(
+                                    "{} · {ty}{}",
+                                    c.name,
+                                    if c.primary { " · key" } else { "" }
+                                ),
+                                None => format!(
+                                    "{}{}",
+                                    c.name,
+                                    if c.primary { " · key" } else { "" }
+                                ),
+                            },
+                            None,
+                            self.theme.clone(),
+                            self.scale,
+                        ))
+                        .child(self.line_in(c.name.clone(), ms.small(), t.fg(), w))
+                        .when_some(shown, |d, ty| {
+                            d.child(
+                                div()
+                                    .flex_none()
+                                    .text_size(ms.tiny())
+                                    .text_color(t.badge(ty))
+                                    .child(ty),
+                            )
+                        })
+                        .when(c.primary, |d| {
+                            d.child(
+                                div()
+                                    .flex_none()
+                                    .text_size(ms.tiny())
+                                    .text_color(t.accent())
+                                    .child("key"),
+                            )
+                        })
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.insert_into_editor(&name, cx);
+                        })),
+                );
+            }
+        }
+
+        if let Some(idx) = indexes {
+            out = out.child(
+                div()
+                    .pl(px(pad))
+                    .py(px(1.0))
+                    .child(self.small(format!("Indexes ({})", idx.len()), t.title())),
+            );
+            for i in idx {
+                out = out.child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .pl(px(pad + 12.0))
+                        .py(px(1.0))
+                        .child(self.line_tip(
+                            format!("{} ({})", i.name, i.columns.join(", ")),
+                            ms.small(),
+                            t.muted(),
+                            w,
+                            format!("idx-{key}-{}", i.name),
+                        ))
+                        .when(i.unique, |d| {
+                            d.child(
+                                div()
+                                    .flex_none()
+                                    .text_size(ms.tiny())
+                                    .text_color(t.accent())
+                                    .child("unique"),
+                            )
+                        }),
+                );
             }
         }
         out.into_any_element()
