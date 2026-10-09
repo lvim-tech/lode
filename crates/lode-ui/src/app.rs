@@ -825,6 +825,9 @@ pub struct Workspace {
     /// A column being dragged wider: (tab, column, where the drag began, the
     /// width it had then).
     resizing: Option<(u64, usize, f32, f32)>,
+    /// Dragging the panel's edge: where the pointer started and how wide the
+    /// panel was then.
+    panel_drag: Option<(f32, f32)>,
 
     /// Where the result grid is scrolled to, sideways.
     grid_scroll: gpui::ScrollHandle,
@@ -1012,7 +1015,8 @@ impl Workspace {
                     }
                     Some(v) => v,
                     None => crate::metrics::DEFAULT_ICON,
-                }),
+                })
+                .with_panel(restore.panel_w),
             metrics: Vec::new(),
             metrics_conn: None,
             metrics_error: None,
@@ -1025,6 +1029,7 @@ impl Workspace {
             toasts: Vec::new(),
             next_toast: 1,
             resizing: None,
+            panel_drag: None,
             grid_scroll: gpui::ScrollHandle::new(),
             grid_overflow: std::cell::Cell::new(0.0),
             hbar_drag: std::cell::Cell::new(false),
@@ -2171,6 +2176,7 @@ impl Workspace {
             font_size: Some(self.scale.base()).filter(|v| *v != crate::metrics::DEFAULT_BASE),
             icon_size: Some(self.scale.icon_size())
                 .filter(|v| *v != crate::metrics::DEFAULT_ICON),
+            panel_w: self.scale.panel_set(),
             settings_open: Some(self.open_groups.iter().cloned().collect()),
             rail: match self.rail {
                 Rail::Connections => "connections",
@@ -8381,6 +8387,11 @@ impl Render for Workspace {
                     this.board_drag_to((f32::from(ev.position.x), f32::from(ev.position.y)));
                     cx.notify();
                 }
+                if let Some((from, was)) = this.panel_drag {
+                    let w = was + (f32::from(ev.position.x) - from);
+                    this.scale = this.scale.with_panel(Some(w));
+                    cx.notify();
+                }
                 if let Some((tab_id, col, from, was)) = this.resizing {
                     let w = (was + (f32::from(ev.position.x) - from)).clamp(40.0, 900.0);
                     if let Some(tab) = this.tabs.iter_mut().find(|x| x.id == tab_id) {
@@ -8398,7 +8409,7 @@ impl Render for Workspace {
                         }
                         cx.notify();
                     }
-                    if this.resizing.take().is_some() {
+                    if this.resizing.take().is_some() || this.panel_drag.take().is_some() {
                         this.remember();
                         cx.notify();
                     }
@@ -8438,6 +8449,39 @@ impl Render for Workspace {
                 .overflow_hidden()
                 .child(self.rail_el(cx))
                 .child(self.panel_el(cx))
+                // The handle between the panel and the work. Its own strip, so
+                // a drag never lands on whatever is beneath it; the move and
+                // the release are on the ROOT, because the pointer leaves a
+                // three-pixel strip immediately and a drag that ended there
+                // would be a drag nobody could finish.
+                .child(
+                    div()
+                        .id("panel-grip")
+                        .w(px(3.0))
+                        .h_full()
+                        .flex_none()
+                        .bg(t.border())
+                        .cursor_col_resize()
+                        .hover(|d| d.bg(t.accent()))
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|this, ev: &gpui::MouseDownEvent, _, cx| {
+                                // Two clicks puts it back to the width the type
+                                // scale gives. A width somebody dragged is a
+                                // decision, and this is how the decision is
+                                // taken back without hunting for a reset.
+                                if ev.click_count >= 2 {
+                                    this.scale = this.scale.with_panel(None);
+                                    this.panel_drag = None;
+                                    this.remember();
+                                } else {
+                                    this.panel_drag =
+                                        Some((f32::from(ev.position.x), this.scale.panel_w()));
+                                }
+                                cx.notify();
+                            }),
+                        ),
+                )
                 .child(
                     div()
                         .flex()

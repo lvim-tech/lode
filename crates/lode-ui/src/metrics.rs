@@ -68,6 +68,8 @@ pub const MAX_ICON: f32 = 40.0;
 pub struct Metrics {
     base: f32,
     icon: f32,
+    /// The panel's width when somebody has dragged one, else derived.
+    panel: Option<f32>,
 }
 
 impl Default for Metrics {
@@ -75,6 +77,7 @@ impl Default for Metrics {
         Metrics {
             base: DEFAULT_BASE,
             icon: DEFAULT_ICON,
+            panel: None,
         }
     }
 }
@@ -258,7 +261,35 @@ impl Metrics {
     /// The side panel's width. Grows with the type, because a panel that stayed
     /// 280 px while the text in it grew would simply hold fewer words.
     pub fn panel_w(self) -> f32 {
-        (self.base * 20.0).round()
+        match self.panel {
+            // A width somebody dragged is a DECISION, and re-deriving it from
+            // the text size would undo that decision every time the font moved
+            // — the same rule the grid's dragged columns already follow.
+            Some(w) => w.clamp(self.panel_min(), self.panel_max()),
+            None => (self.base * 20.0).round(),
+        }
+    }
+
+    /// Narrow enough to be out of the way, never narrow enough to be useless:
+    /// a panel too thin to show a connection's name is a panel nobody can read.
+    pub fn panel_min(self) -> f32 {
+        (self.base * 11.0).round()
+    }
+
+    /// Wide enough for an audit line, not so wide the result has nowhere left.
+    pub fn panel_max(self) -> f32 {
+        (self.base * 48.0).round()
+    }
+
+    pub fn with_panel(self, w: Option<f32>) -> Metrics {
+        Metrics {
+            panel: w.map(|w| Self::ok(w, self.panel_min(), self.panel_max(), self.base * 20.0)),
+            ..self
+        }
+    }
+
+    pub fn panel_set(self) -> Option<f32> {
+        self.panel
     }
 
     /// How wide one line of free text in a panel may be.
@@ -461,6 +492,38 @@ mod tests {
             }
             b += 1.0;
         }
+    }
+
+    /// A dragged panel width is a decision: kept as given, bounded so it can
+    /// never become useless, and NOT re-derived when the text size moves.
+    #[test]
+    fn a_dragged_panel_width_is_kept_and_bounded() {
+        let m = Metrics::default();
+        let derived = m.panel_w();
+        assert_eq!(m.panel_set(), None, "nothing dragged yet");
+
+        // Dragged: kept exactly.
+        let d = m.with_panel(Some(360.0));
+        assert_eq!(d.panel_w(), 360.0);
+        assert_eq!(d.panel_set(), Some(360.0));
+
+        // And NOT re-derived when the text grows — the same rule the grid's
+        // dragged columns follow.
+        assert_eq!(d.with_base(22.0).panel_w(), 360.0);
+        assert!(m.with_base(22.0).panel_w() > derived, "an underived one still follows");
+
+        // Bounded at both ends: too thin to read a connection's name, or so
+        // wide the result has nowhere left, are both refused.
+        assert_eq!(m.with_panel(Some(1.0)).panel_w(), m.panel_min());
+        assert_eq!(m.with_panel(Some(9_000.0)).panel_w(), m.panel_max());
+        assert!(m.panel_min() < derived && derived < m.panel_max());
+
+        // NaN goes to the derived width rather than through.
+        assert!(m.with_panel(Some(f32::NAN)).panel_w() > 0.0);
+
+        // Two clicks put it back to derived.
+        assert_eq!(d.with_panel(None).panel_w(), derived);
+        assert_eq!(d.with_panel(None).panel_set(), None);
     }
 
     #[test]

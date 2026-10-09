@@ -43,6 +43,10 @@ pub struct Session {
     /// How many spaces the JSON view indents by. `None` is the default.
     #[serde(default)]
     pub json_indent: Option<u8>,
+    /// The panel's width, when somebody has dragged one. `None` means derived
+    /// from the text size, so it follows the scale until it is overridden.
+    #[serde(default)]
+    pub panel_w: Option<f32>,
     /// Which settings groups were left open.
     ///
     /// By NAME, not by index: a group inserted in the middle of the list would
@@ -185,6 +189,7 @@ mod tests {
             lang: Some("bg".into()),
             icon_size: Some(24.0),
             settings_open: Some(vec!["theme".into()]),
+            panel_w: Some(320.0),
         };
         let text = serde_json::to_string(&s).unwrap();
         let back: Session = serde_json::from_str(&text).unwrap();
@@ -201,6 +206,7 @@ mod tests {
         assert_eq!(back.lang.as_deref(), Some("bg"));
         assert_eq!(back.icon_size, Some(24.0));
         assert_eq!(back.settings_open.as_deref(), Some(&["theme".to_string()][..]));
+        assert_eq!(back.panel_w, Some(320.0));
 
         // A tab with no object is a typed one, and its words come back.
         let typed = Session {
@@ -224,6 +230,7 @@ mod tests {
             lang: None,
             icon_size: None,
             settings_open: None,
+            panel_w: None,
         };
         let round: Session = serde_json::from_str(&serde_json::to_string(&typed).unwrap()).unwrap();
         assert_eq!(round.tabs[0].draft, "SELECT 1 WHERE", "half a statement is still someone's work");
