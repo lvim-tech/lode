@@ -25,6 +25,8 @@ pub struct ProfileForm {
     workspace: WeakEntity<Workspace>,
     theme: Theme,
     scale: Metrics,
+    /// The main window's text font — see `ConnectionForm::font_family`.
+    font_family: String,
     /// The name it was opened under, when it already existed. A new profile has
     /// none, and saving under a name that exists replaces it.
     editing: Option<String>,
@@ -49,6 +51,7 @@ impl ProfileForm {
         scale: Metrics,
         existing: Option<(String, Value)>,
         users: Vec<String>,
+        font_family: String,
         cx: &mut Context<Self>,
     ) -> Self {
         let colors = crate::form::colors_of(&theme);
@@ -74,6 +77,7 @@ impl ProfileForm {
         ProfileForm {
             workspace,
             theme,
+            font_family,
             scale,
             editing: existing.as_ref().map(|(n, _)| n.clone()),
             users,
@@ -104,7 +108,9 @@ impl ProfileForm {
     fn spec(&self, cx: &Context<Self>) -> Value {
         json!({
             "host": self.host.read(cx).text(),
-            "port": self.port.read(cx).text().trim().parse::<u16>().unwrap_or(22),
+            // Checked by `port_problem` before a save gets this far; the
+            // fallback here is only so `spec` stays infallible.
+            "port": crate::workspace::parse_port(&self.port.read(cx).text(), 22).unwrap_or(22),
             "user": self.user.read(cx).text(),
             "auth": tunnel_auth_json(
                 &self.auth,
@@ -113,6 +119,11 @@ impl ProfileForm {
                 &self.password.source.wrap(self.password.input.read(cx).text()),
             ),
         })
+    }
+
+    /// What is wrong with the typed port, if anything.
+    fn port_problem(&self, cx: &Context<Self>) -> Option<String> {
+        crate::workspace::parse_port(&self.port.read(cx).text(), 22).err()
     }
 
     fn key_problem(&self, cx: &Context<Self>) -> Option<String> {
@@ -131,6 +142,11 @@ impl ProfileForm {
         let name = self.name.read(cx).text().trim().to_string();
         if name.is_empty() {
             self.error = Some("a profile needs a name".into());
+            cx.notify();
+            return;
+        }
+        if let Some(why) = self.port_problem(cx) {
+            self.error = Some(why);
             cx.notify();
             return;
         }
@@ -379,6 +395,10 @@ impl Render for ProfileForm {
             .size_full()
             .bg(t.base())
             .text_color(t.fg())
+            // The main window's type. Without this a separate window takes the
+            // platform default, so this one was in a different face from the
+            // window that opened it.
+            .font_family(SharedString::from(self.font_family.clone()))
             .text_size(ms.body())
             .child(head)
             .child(body)

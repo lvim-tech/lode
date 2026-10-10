@@ -294,10 +294,43 @@ else
     report "migration" "skipped (no sqlite3 CLI to write a legacy file)"
 fi
 
+# A RENAME takes everything scoped to the name with it. Saving under the new
+# name and deleting the old one is not a rename: the saved queries stay behind,
+# pointing at a name nothing answers to.
+send '{"id":36,"method":"store.connections.rename","params":{"from":"smoke","to":"smoke2"}}'
+REN=$(await '.id == 36')
+check "rename connection" "$(printf '%s' "$REN" | jq -r '.result.renamed')" "true"
+check "its queries moved with it" "$(printf '%s' "$REN" | jq -r '.result.moved.queries')" "1"
+send '{"id":37,"method":"store.queries.list","params":{"conn":"smoke2"}}'
+check "the query answers to the new name" \
+    "$(await '.id == 37' | jq -r '[.result.queries[].name] | join(",")')" "q1"
+send '{"id":38,"method":"store.queries.list","params":{"conn":"smoke"}}'
+check "and not to the old one" "$(await '.id == 38' | jq -r '.result.queries | length')" "0"
+
+# A name already taken is refused: `save` overwrites by name, so a rename that
+# swallowed the other connection would be a way to lose one.
+send '{"id":39,"method":"store.connections.save","params":{"name":"taken","driver":"sqlite","spec":{"params":{"file":"/tmp/t.db"}}}}'
+await '.id == 39' >/dev/null
+send '{"id":40,"method":"store.connections.rename","params":{"from":"smoke2","to":"taken"}}'
+check "a taken name is refused" "$(await '.id == 40' | jq -r 'has("error")')" "true"
+send '{"id":41,"method":"store.connections.rename","params":{"from":"smoke2","to":"smoke"}}'
+await '.id == 41' >/dev/null
+
+# A REMOVE takes everything scoped to the name too. It used to take only the
+# saved queries, so a chart or a dashboard was left pointing at a name nothing
+# answers to — invisible in every list, and waiting to attach itself to the next
+# connection given that name.
+send '{"id":42,"method":"store.charts.save","params":{"conn":"smoke","name":"c1","sql":"SELECT 1","measure":"n"}}'
+await '.id == 42' >/dev/null
 send '{"id":34,"method":"store.connections.remove","params":{"name":"smoke"}}'
-check "remove connection" "$(await '.id == 34' | jq -r '.result.removed')" "true"
+RM=$(await '.id == 34')
+check "remove connection" "$(printf '%s' "$RM" | jq -r '.result.removed')" "true"
+check "it says what went: queries" "$(printf '%s' "$RM" | jq -r '.result.took.queries')" "1"
+check "it says what went: charts" "$(printf '%s' "$RM" | jq -r '.result.took.charts')" "1"
 send '{"id":35,"method":"store.queries.list","params":{"conn":"smoke"}}'
 check "its queries went with it" "$(await '.id == 35' | jq -r '.result.queries | length')" "0"
+send '{"id":43,"method":"store.charts.list","params":{"conn":"smoke"}}'
+check "and its charts too" "$(await '.id == 43' | jq -r '.result.charts | length')" "0"
 
 # ── 9. stdin EOF shuts the engine down ───────────────────────────────────────
 # ── instance metrics and saved charts ────────────────────────────────────────

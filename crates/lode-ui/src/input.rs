@@ -315,9 +315,12 @@ impl TextInput {
 
     fn paste(&mut self, _: &Paste, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) {
-            // One line, so a pasted newline becomes a space rather than silently
-            // truncating what was pasted.
-            self.replace_text_in_range(None, &text.replace('\n', " "), window, cx);
+            // One line, so a pasted newline becomes a space rather than
+            // silently truncating what was pasted. BOTH characters: text
+            // copied from a Windows editor or a browser arrives as CRLF, and
+            // replacing only the `\n` left the `\r` in the field — invisible,
+            // and sent to the engine as part of a host name or a statement.
+            self.replace_text_in_range(None, &text.replace(['\n', '\r'], " "), window, cx);
         }
     }
 
@@ -506,7 +509,13 @@ impl EntityInputHandler for TextInput {
         self.selected_range = new_selected_range_utf16
             .as_ref()
             .map(|r| self.range_from_utf16(r))
-            .map(|new_range| new_range.start + range.start..new_range.end + range.end)
+            // BOTH ends are offsets from the start of the replaced range.
+            // This said `+ range.end` for the end, which is the line as it
+            // stands in gpui's own example and is wrong whenever the replaced
+            // range is not empty: committing an IME composition over a
+            // selection left the caret `range.len()` characters too far right,
+            // so the next keystroke landed outside the text just inserted.
+            .map(|new_range| new_range.start + range.start..new_range.end + range.start)
             .unwrap_or_else(|| range.start + new_text.len()..range.start + new_text.len());
         cx.emit(InputEvent::Changed);
         cx.notify();

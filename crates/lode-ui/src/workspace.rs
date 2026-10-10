@@ -207,6 +207,14 @@ pub struct Tab {
     /// The node kind it was opened as — kept because the browse template is
     /// chosen by kind, so reopening the tab has to ask the same question again.
     pub kind: String,
+    /// Whether this run is already in the engine's history.
+    ///
+    /// The record used to be written when the state arrived, which is BEFORE
+    /// the page — so a SELECT was filed with no row count at all, because the
+    /// engine's `affected` is for writes. Now a read waits for its first page
+    /// and files the row count it actually got, and this says the filing has
+    /// happened so the second page does not file it again.
+    pub recorded: bool,
     /// Free-text statement, for engines that are typed.
     pub sql: String,
     /// Structured values, for engines that declare a query form.
@@ -222,6 +230,13 @@ pub struct Tab {
     pub affected: Option<u64>,
     pub ms: u64,
     pub error: Option<String>,
+    /// A statement the engine called destructive, waiting for a person.
+    ///
+    /// The console has always asked before running one; a tab did not, so the
+    /// same `DROP` went straight through when it was typed in the tab's box
+    /// instead. `(statement, reason)` — the reason is the engine's sentence,
+    /// which is what makes somebody stop.
+    pub confirm: Option<(String, String)>,
     pub selected: Option<usize>,
     pub view: ResultView,
     pub sub: SubTab,
@@ -366,47 +381,6 @@ pub fn audit_parts(a: &lode_proto::AuditRow, open: bool) -> Vec<AuditPart> {
 pub fn audit_row_h(parts: &[AuditPart], line_h: f32, pad: f32) -> f32 {
     let fixed = parts.iter().filter(|p| !p.wraps).count().max(1) as f32;
     fixed * line_h + pad * 2.0
-}
-
-/// The settings panel's groups, as DATA.
-///
-/// Pulled out of the drawing so it can be counted without a screen. The panel
-/// came back empty once and nothing could say whether the builder had produced
-/// nothing or the drawing had swallowed it; this answers that question in a
-/// test. (It was the drawing: `min_w_0` on a leaf heading, which GPUI is free
-/// to collapse to zero width, and did.)
-///
-/// Always FIVE. A stored open-state is a hint about which are expanded and can
-/// never remove a group — a name nobody recognises is ignored, and a stored
-/// state with no recognisable name at all falls back to the default rather than
-/// to a panel with everything shut, which looks broken.
-pub const SETTINGS_GROUPS: [&str; 5] = ["theme", "type", "view", "language", "profiles"];
-
-/// Which group is open by default: the one people come here for.
-pub const SETTINGS_DEFAULT_OPEN: &str = "theme";
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct GroupRow {
-    pub id: &'static str,
-    pub open: bool,
-}
-
-pub fn settings_rows(stored: &std::collections::BTreeSet<String>) -> Vec<GroupRow> {
-    // Does the stored state mean anything at all? A set holding only names this
-    // version does not know is a set from a different version, and honouring it
-    // would shut everything.
-    let usable = stored.iter().any(|n| SETTINGS_GROUPS.contains(&n.as_str()));
-    SETTINGS_GROUPS
-        .iter()
-        .map(|id| GroupRow {
-            id,
-            open: if usable {
-                stored.contains(*id)
-            } else {
-                *id == SETTINGS_DEFAULT_OPEN
-            },
-        })
-        .collect()
 }
 
 /// The horizontal scrollbar's arithmetic, as one function.
@@ -768,6 +742,8 @@ impl Tab {
             affected: None,
             ms: 0,
             error: None,
+            confirm: None,
+            recorded: false,
             selected: None,
             view: ResultView::default_for(meta),
             sub: SubTab::Documents,
@@ -792,6 +768,7 @@ impl Tab {
     /// Clear everything the previous run produced, keeping the query.
     pub fn reset_result(&mut self) {
         self.state = RunState::Running;
+        self.recorded = false;
         self.error = None;
         self.rows.clear();
         self.columns.clear();
@@ -876,6 +853,12 @@ impl Tab {
 pub struct Task {
     pub id: u64,
     pub label: String,
+    /// The engine call this task is watching, once the engine has named it. It
+    /// is what a Stop on the task's own row sends `query.cancel` for — without
+    /// it the only way to stop a statement is the tab it was started from, and
+    /// a task list that shows something running but cannot stop it is a list of
+    /// things to wait for.
+    pub call_id: Option<u64>,
     pub started: Instant,
     pub elapsed: Option<Duration>,
     pub error: Option<String>,
@@ -889,6 +872,7 @@ impl Task {
         Task {
             id,
             label,
+            call_id: None,
             started: Instant::now(),
             elapsed: None,
             error: None,
@@ -1173,8 +1157,271 @@ pub fn node_matches(node: &Node, filter: &str) -> bool {
     node.children.iter().any(|c| node_matches(c, filter))
 }
 
+/// How long to wait before trying to start the engine again, by attempt.
+///
+/// **A crashed engine is not the end of the window.** The drivers run in
+/// another process precisely so that one of them dying takes nothing else with
+/// it, and a client that then says "restart to reconnect" throws away the one
+/// advantage of that design. So it tries again — but not forever and not in a
+/// tight loop: an engine that cannot start (a missing binary, a broken store)
+/// must not become a spawn storm. Three tries, a second apart and then wider,
+/// and after that the window says so and offers the button.
+pub fn respawn_delay(attempt: u32) -> Option<std::time::Duration> {
+    match attempt {
+        0 => Some(std::time::Duration::from_secs(1)),
+        1 => Some(std::time::Duration::from_secs(3)),
+        2 => Some(std::time::Duration::from_secs(8)),
+        _ => None,
+    }
+}
+
+/// Read a typed port, or say what is wrong with it.
+///
+/// `parse().unwrap_or(22)` is what both tunnel windows did, and it is the worst
+/// possible answer: somebody who types `2222 ` with a stray character, or `22o`,
+/// gets a profile that silently points at port 22 — a different machine's SSH,
+/// or nothing — and the only symptom is a connection that fails later with a
+/// message about the host. An empty field IS the default, because a field
+/// nobody touched is a question nobody answered; anything else must parse.
+pub fn parse_port(text: &str, default: u16) -> Result<u16, String> {
+    let t = text.trim();
+    if t.is_empty() {
+        return Ok(default);
+    }
+    match t.parse::<u16>() {
+        Ok(0) => Err("port 0 is not a port".into()),
+        Ok(n) => Ok(n),
+        Err(_) => Err(format!("\"{t}\" is not a port number (1-65535)")),
+    }
+}
+
+/// What one word from the engine means for a task that is watching a call.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Settle {
+    /// The engine is still working; the task keeps counting.
+    Running,
+    /// It is over. `Some(reason)` is what the row shows in the error colour.
+    Finished(Option<String>),
+}
+
+/// Read a `query.state` into the task's outcome.
+///
+/// Used on BOTH paths: the call that still has a tab, and the ORPHAN — a call
+/// whose tab was closed while it ran. The orphan is the reason this exists.
+/// Its state used to arrive, find no tab, and return early, leaving the task
+/// counting upwards for the rest of the session; and `pump()` asks for a
+/// repaint for as long as any task is running, so one orphan meant a window
+/// that never stopped redrawing.
+///
+/// A cancelled call is finished with a REASON rather than silently: a row that
+/// just stops counting cannot be told apart from one that succeeded.
+pub fn task_settled(state: &str, error: Option<&str>) -> Settle {
+    match state {
+        "done" => Settle::Finished(None),
+        "failed" => Settle::Finished(Some(
+            error.filter(|e| !e.trim().is_empty()).unwrap_or("query failed").to_string(),
+        )),
+        "cancelled" => Settle::Finished(Some("cancelled".to_string())),
+        _ => Settle::Running,
+    }
+}
+
+/// Whether a log line is one somebody has to be told about.
+///
+/// `info` is the running commentary — every connect, every save, every query.
+/// Counting it would leave the badge permanently lit, which is the same as not
+/// having one. Anything else is a warning or a failure, and those are what the
+/// count is for.
+pub fn counts_as_unread(level: &str) -> bool {
+    level != "info"
+}
+
+/// The padlock, closed.
+pub const LINK_LOCKED: &str = "\u{f023}";
+/// The padlock, open — a link somebody could read off the wire.
+pub const LINK_OPEN: &str = "\u{f09c}";
+
+/// What the padlock beside a connection shows, and what it says when asked.
+pub struct Link {
+    pub glyph: &'static str,
+    /// The catalogue key for the tooltip, not a sentence — see `i18n`.
+    pub tip: &'static str,
+    /// False for a link carrying credentials and rows in the clear. The caller
+    /// says it out loud once, at connect; the glyph says it for as long as the
+    /// connection is open.
+    pub safe: bool,
+}
+
+/// Read a connection's transport into the one thing a person needs from it.
+///
+/// Three outcomes, not four. A tunnel and TLS are both "nobody on the wire can
+/// read this", so they share the closed padlock and differ only in the words;
+/// `encrypted == false` is the one that matters, and a tunnel flag alongside it
+/// does NOT soften it — the engine is the one that says whether the bytes are
+/// encrypted, and when it says no, no is the answer.
+pub fn link_label(encrypted: bool, tunneled: bool) -> Link {
+    match (encrypted, tunneled) {
+        (false, _) => Link { glyph: LINK_OPEN, tip: "tip.link_plain", safe: false },
+        (true, true) => Link { glyph: LINK_LOCKED, tip: "tip.link_tunnel", safe: true },
+        (true, false) => Link { glyph: LINK_LOCKED, tip: "tip.link_tls", safe: true },
+    }
+}
+
+/// The engine's refusal of an unconfirmed destructive statement, read back as
+/// the reason it gave.
+///
+/// The client asks `query.classify` first, but a statement can turn dangerous
+/// between the two calls (a view replaced under it), and an engine older than
+/// `classify` only ever refuses at `execute`. Either way the answer carries the
+/// reason, and a reason is something to show rather than a red line to read.
+pub fn needs_confirm_from_error(error: &str) -> Option<String> {
+    error
+        .strip_prefix("needs confirming:")
+        .map(|rest| rest.trim().to_string())
+        .filter(|rest| !rest.is_empty())
+}
+
+/// Which connection a command typed into the console belongs to.
+///
+/// **The one in front of the person, not the one that happened to connect
+/// first.** With two databases open, the console sent every line to
+/// `conns.first()` — so a `DROP` typed while looking at the second one landed
+/// in the first. The active tab names its connection; a tab whose connection
+/// has since dropped yields nothing, and the caller says so rather than
+/// quietly choosing somebody else's database.
+pub fn pick_target(active_tab_conn: Option<&str>, connected: &[String]) -> Option<String> {
+    match active_tab_conn {
+        Some(name) if connected.iter().any(|c| c == name) => Some(name.to_string()),
+        Some(_) => None,
+        None => connected.first().cloned(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use super::pick_target;
+
+    /// Three tries, each further apart, and then the window stops trying.
+    #[test]
+    fn the_engine_is_given_three_chances() {
+        assert_eq!(super::respawn_delay(0), Some(std::time::Duration::from_secs(1)));
+        assert!(super::respawn_delay(1).unwrap() > super::respawn_delay(0).unwrap());
+        assert!(super::respawn_delay(2).unwrap() > super::respawn_delay(1).unwrap());
+        assert_eq!(super::respawn_delay(3), None, "a fourth try is a spawn storm");
+    }
+
+    /// A mistyped port must not quietly become 22.
+    #[test]
+    fn a_port_that_is_not_a_number_is_refused() {
+        assert_eq!(super::parse_port("2222", 22), Ok(2222));
+        // Untouched means the default; that much IS an answer.
+        assert_eq!(super::parse_port("", 22), Ok(22));
+        assert_eq!(super::parse_port("  ", 1080), Ok(1080));
+        // And everything else is a mistake worth saying out loud.
+        assert!(super::parse_port("22o", 22).is_err());
+        assert!(super::parse_port("-1", 22).is_err());
+        assert!(super::parse_port("70000", 22).is_err());
+        assert!(super::parse_port("0", 22).is_err());
+        assert!(super::parse_port("22 22", 22).is_err());
+    }
+
+    /// A task whose tab is gone still has to be told its call is over, and a
+    /// cancelled call says so rather than just stopping.
+    #[test]
+    fn a_task_is_told_how_its_call_ended() {
+        use super::Settle;
+        assert_eq!(super::task_settled("done", None), Settle::Finished(None));
+        assert_eq!(
+            super::task_settled("failed", Some("no such table")),
+            Settle::Finished(Some("no such table".into()))
+        );
+        assert_eq!(
+            super::task_settled("failed", None),
+            Settle::Finished(Some("query failed".into())),
+            "a failure with no words is still a failure"
+        );
+        assert_eq!(
+            super::task_settled("failed", Some("   ")),
+            Settle::Finished(Some("query failed".into()))
+        );
+        assert_eq!(
+            super::task_settled("cancelled", None),
+            Settle::Finished(Some("cancelled".into()))
+        );
+        assert_eq!(super::task_settled("running", None), Settle::Running);
+    }
+
+    /// The whole point of settling an orphan: a running task keeps the window
+    /// repainting, so one that is never finished never lets it rest.
+    #[test]
+    fn a_settled_task_stops_running() {
+        let mut t = super::Task::new(1, "x".into());
+        assert!(t.running());
+        assert_eq!(t.call_id, None);
+        t.finish(std::time::Duration::from_millis(3), Some("cancelled".into()));
+        assert!(!t.running());
+        assert!(t.failed());
+        assert!(t.open, "a failure is shown without being asked for");
+    }
+
+    /// The badge counts what somebody must look at, and nothing else.
+    #[test]
+    fn only_a_warning_lights_the_badge() {
+        assert!(!super::counts_as_unread("info"));
+        assert!(super::counts_as_unread("warn"));
+        assert!(super::counts_as_unread("error"));
+        assert!(super::counts_as_unread("debug"), "an unknown level is shown, not swallowed");
+    }
+
+    /// The padlock tells the truth in three cases, and a tunnel flag never
+    /// talks the engine out of saying the link is in the clear.
+    #[test]
+    fn the_padlock_says_what_the_engine_said() {
+        let tls = super::link_label(true, false);
+        assert_eq!(tls.glyph, super::LINK_LOCKED);
+        assert_eq!(tls.tip, "tip.link_tls");
+        assert!(tls.safe);
+
+        let tunnel = super::link_label(true, true);
+        assert_eq!(tunnel.glyph, super::LINK_LOCKED);
+        assert_eq!(tunnel.tip, "tip.link_tunnel", "a tunnel is worth naming as one");
+        assert!(tunnel.safe);
+
+        let plain = super::link_label(false, false);
+        assert_eq!(plain.glyph, super::LINK_OPEN);
+        assert_eq!(plain.tip, "tip.link_plain");
+        assert!(!plain.safe);
+
+        let lying = super::link_label(false, true);
+        assert_eq!(lying.glyph, super::LINK_OPEN, "not encrypted is not encrypted");
+        assert!(!lying.safe);
+    }
+
+    /// An engine that refuses at execute still says why, and that sentence is
+    /// what the tab shows above its buttons.
+    #[test]
+    fn a_refusal_carries_the_reason_back() {
+        assert_eq!(
+            super::needs_confirm_from_error("needs confirming: this deletes every row"),
+            Some("this deletes every row".to_string())
+        );
+        // Anything else is an ordinary error and stays one.
+        assert_eq!(super::needs_confirm_from_error("syntax error at or near \"DROP\""), None);
+        assert_eq!(super::needs_confirm_from_error("needs confirming:"), None);
+    }
+
+    /// The console follows the eye.
+    #[test]
+    fn the_target_is_the_tab_in_front_of_you() {
+        let open = vec!["prod".to_string(), "staging".to_string()];
+        assert_eq!(pick_target(Some("staging"), &open), Some("staging".into()));
+        // No tab at all: the one connection there is — a console opened before
+        // any tab means that one.
+        assert_eq!(pick_target(None, &open), Some("prod".into()));
+        // A tab whose connection dropped: nothing, rather than another database.
+        assert_eq!(pick_target(Some("gone"), &open), None);
+        assert_eq!(pick_target(None, &[]), None);
+    }
 
     fn an_audit_row() -> lode_proto::AuditRow {
         serde_json::from_value(serde_json::json!({
@@ -1233,59 +1480,6 @@ mod tests {
         // height is whatever the text needs.
         let fixed = parts.iter().filter(|p| !p.wraps).count();
         assert_eq!(audit_row_h(&parts, line_h, pad), fixed as f32 * line_h + 2.0 * pad);
-    }
-
-    /// The settings panel has five groups, whatever the session says.
-    ///
-    /// It came back EMPTY once — not one group, not one heading — and nothing
-    /// could say whether the builder had produced nothing or the drawing had
-    /// lost it. This settles that half without a screen.
-    #[test]
-    fn the_settings_panel_always_has_its_five_groups() {
-        use std::collections::BTreeSet;
-
-        // Nothing stored: five groups, and the one people come for is open.
-        let rows = settings_rows(&BTreeSet::new());
-        assert_eq!(rows.len(), 5);
-        assert_eq!(
-            rows.iter().filter(|r| r.open).map(|r| r.id).collect::<Vec<_>>(),
-            vec![SETTINGS_DEFAULT_OPEN]
-        );
-
-        // A sensible stored state is honoured exactly.
-        let stored: BTreeSet<String> = ["language", "view"].iter().map(|s| s.to_string()).collect();
-        let rows = settings_rows(&stored);
-        assert_eq!(rows.len(), 5);
-        let open: Vec<&str> = rows.iter().filter(|r| r.open).map(|r| r.id).collect();
-        assert_eq!(open, vec!["view", "language"]);
-
-        // RUBBISH, and a state from a version that named things differently:
-        // still five groups, and the default open rather than everything shut.
-        for junk in [
-            vec!["nonsense"],
-            vec!["0", "1", "2"],
-            vec![""],
-        ] {
-            let stored: BTreeSet<String> = junk.iter().map(|s| s.to_string()).collect();
-            let rows = settings_rows(&stored);
-            assert_eq!(rows.len(), 5, "junk {junk:?} lost a group");
-            assert_eq!(
-                rows.iter().filter(|r| r.open).map(|r| r.id).collect::<Vec<_>>(),
-                vec![SETTINGS_DEFAULT_OPEN],
-                "junk {junk:?} should fall back to the default, not shut everything"
-            );
-        }
-
-        // One recognisable name among junk IS meaningful: it is honoured, and
-        // the unknown names are ignored rather than treated as groups.
-        let stored: BTreeSet<String> =
-            ["profiles", "who-knows"].iter().map(|s| s.to_string()).collect();
-        let rows = settings_rows(&stored);
-        assert_eq!(rows.len(), 5);
-        assert_eq!(
-            rows.iter().filter(|r| r.open).map(|r| r.id).collect::<Vec<_>>(),
-            vec!["profiles"]
-        );
     }
 
     /// A tooltip appears where text is CUT and nowhere else.

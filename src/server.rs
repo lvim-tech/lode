@@ -710,6 +710,7 @@ impl Server {
             "store.connections.get" => self.store_conn_get(params).await,
             "store.connections.save" => self.store_conn_save(params).await,
             "store.connections.remove" => self.store_conn_remove(params).await,
+            "store.connections.rename" => self.store_conn_rename(params).await,
             "store.queries.list" => self.store_query_list(params).await,
             "store.queries.get" => self.store_query_get(params).await,
             "store.queries.save" => self.store_query_save(params).await,
@@ -1701,7 +1702,28 @@ impl Server {
             name: String,
         }
         let p: P = serde_json::from_value(params)?;
-        Ok(json!({ "removed": self.store()?.remove_connection(p.name).await? }))
+        // The store answers `{removed, took:{…}}` — `removed` is where it has
+        // always been, so an older client reads it unchanged.
+        self.store()?.remove_connection(p.name).await
+    }
+
+    /// Rename a saved connection and move everything scoped to its name.
+    ///
+    /// The client used to do this as save-then-remove, which left the saved
+    /// queries, charts, dashboards and scripts pointing at a name that no
+    /// longer existed. One call, one transaction, and the counts come back so
+    /// the window can say what moved.
+    async fn store_conn_rename(&self, params: Json) -> anyhow::Result<Json> {
+        #[derive(Deserialize)]
+        struct P {
+            from: String,
+            to: String,
+        }
+        let p: P = serde_json::from_value(params)?;
+        if p.from == p.to {
+            anyhow::bail!("the two names are the same");
+        }
+        self.store()?.rename_connection(p.from, p.to).await
     }
 
     async fn store_query_list(&self, params: Json) -> anyhow::Result<Json> {

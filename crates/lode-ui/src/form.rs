@@ -181,6 +181,12 @@ pub struct ConnectionForm {
     /// a dialog in its own OS window is still the same application, and a form
     /// at a different size from the panel behind it reads as a different one.
     scale: Metrics,
+    /// The two fonts the main window resolved. Handed over for the same reason
+    /// the scale is: one application, one face. The root used to name a font
+    /// outright, which is a second decision about something already decided
+    /// once, by `$LODE_FONT`.
+    font_family: String,
+    icon_family: String,
     tab: FormTab,
     editing: Option<String>,
     driver: String,
@@ -210,6 +216,14 @@ pub struct ConnectionForm {
     /// `kerberos`: a principal, which used to be written out as null.
     auth_principal: Entity<TextInput>,
     tls_mode: String,
+    /// The three files a verified link can need: the CA that signs the server,
+    /// and a client certificate with its key. `TlsSpec` has carried them since
+    /// the engine's first version and the README promises them; this window had
+    /// no way to type one, so a connection that needed a CA could only be made
+    /// elsewhere — and then this form deleted it on the next save.
+    tls_ca: Entity<TextInput>,
+    tls_cert: Entity<TextInput>,
+    tls_key: Entity<TextInput>,
     /// "read_only" | "confirm" | "open" — what the engine will let this
     /// connection do. It belongs on the connection, not on a preference, so it
     /// travels with the connection wherever it is opened from.
@@ -252,9 +266,58 @@ pub struct ConnectionForm {
     tunnel_passphrase: Field,
     tunnel_password: Field,
 
+    /// The spec this form opened on, kept whole.
+    ///
+    /// **A form edits the fields it knows; it must not delete the ones it does
+    /// not.** A spec can carry `tls.ca`, a client certificate, `proxy`,
+    /// `proxy_profile` and `hooks` — written by the Neovim client, by hand, or
+    /// by an older version of this window — and saving used to send only what
+    /// these inputs hold, which silently dropped the rest. Everything edited
+    /// here is merged ONTO this (see [`merge_spec`]); empty for a new one.
+    existing_spec: Value,
+
     /// The last answer from each `conn.test` stage.
     tests: HashMap<&'static str, Result<String, String>>,
     error: Option<String>,
+}
+
+/// The spec to save: `edited` laid over `existing`, key by key.
+///
+/// A key whose edited value is `Null` is REMOVED rather than written as null —
+/// that is how the form says "this connection no longer has a tunnel". `tls` is
+/// the one key merged rather than replaced: the form owns `mode` and the paths
+/// it shows, and anything else under `tls` belongs to whoever put it there.
+pub fn merge_spec(existing: &Value, edited: Value) -> Value {
+    let mut out = match existing {
+        Value::Object(m) => m.clone(),
+        _ => serde_json::Map::new(),
+    };
+    let Value::Object(edits) = edited else { return Value::Object(out) };
+    for (key, value) in edits {
+        if key == "tls" {
+            let mut tls = match out.get("tls") {
+                Some(Value::Object(m)) => m.clone(),
+                _ => serde_json::Map::new(),
+            };
+            if let Value::Object(edited_tls) = value {
+                for (k, v) in edited_tls {
+                    if v.is_null() {
+                        tls.remove(&k);
+                    } else {
+                        tls.insert(k, v);
+                    }
+                }
+            }
+            out.insert("tls".into(), Value::Object(tls));
+            continue;
+        }
+        if value.is_null() {
+            out.remove(&key);
+        } else {
+            out.insert(key, value);
+        }
+    }
+    Value::Object(out)
 }
 
 impl ConnectionForm {
@@ -267,6 +330,7 @@ impl ConnectionForm {
         tunnel_profile_specs: std::collections::BTreeMap<String, Value>,
         aws_profiles: Vec<String>,
         existing: Option<(String, String, Value)>,
+        fonts: (String, String),
         cx: &mut Context<Self>,
     ) -> Self {
         let colors = colors_of(&theme);
@@ -309,8 +373,10 @@ impl ConnectionForm {
         let (tpw_src, tpw_arg) = Source::unwrap(&get(&tunnel_auth_v, "password"));
         let key_path = get(&tunnel_auth_v, "path");
 
+        let tls_v = spec.get("tls").cloned().unwrap_or(json!({}));
         let mut form = ConnectionForm {
             workspace,
+            existing_spec: spec.clone(),
             tab: FormTab::Main,
             editing: existing.as_ref().map(|(n, _, _)| n.clone()),
             driver: driver.clone(),
@@ -354,6 +420,9 @@ impl ConnectionForm {
                 .and_then(Value::as_str)
                 .unwrap_or("prefer")
                 .to_string(),
+            tls_ca: mk(cx, "path to a CA bundle", &get(&tls_v, "ca")),
+            tls_cert: mk(cx, "path to a client certificate", &get(&tls_v, "client_cert")),
+            tls_key: mk(cx, "path to the certificate's key", &get(&tls_v, "client_key")),
             // A connection saved before policies existed has none recorded, and
             // comes back as "asks first" — the setting that fails toward asking.
             policy: spec
@@ -404,6 +473,8 @@ impl ConnectionForm {
             error: None,
             theme,
             scale,
+            font_family: fonts.0,
+            icon_family: fonts.1,
         };
         let stored_params = spec.get("params").cloned().unwrap_or(json!({}));
         form.rebuild_params(&stored_params, cx);
@@ -464,29 +535,37 @@ impl ConnectionForm {
         // A profile INSTEAD of a spelled-out tunnel. Naming one and spelling one
         // out is refused by the engine rather than resolved by precedence, so
         // the form sends exactly one of them.
-        if let Some(name) = self.tunnel_profile.clone().filter(|_| self.tunnel_on) {
-            let mut out = json!({
-                "driver": self.driver,
-                "params": Value::Object(params),
-                "auth": auth,
-                "tls": { "mode": self.tls_mode },
-                "tunnel_profile": name,
-                "policy": self.policy
-            });
-            if let Some(m) = out.as_object_mut() {
-                m.remove("tunnel");
-            }
-            return out;
-        }
-        let tunnel = if self.tunnel_on { self.tunnel_spec(cx) } else { Value::Null };
-        json!({
+        // Exactly one of the two, and `Null` for the other: `merge_spec` reads a
+        // null as "take this key off the spec", which is what an unticked tunnel
+        // means. Naming a profile AND spelling a tunnel out is refused by the
+        // engine rather than resolved by precedence.
+        let (tunnel, tunnel_profile) = match self.tunnel_profile.clone().filter(|_| self.tunnel_on) {
+            Some(name) => (Value::Null, json!(name)),
+            None if self.tunnel_on => (self.tunnel_spec(cx), Value::Null),
+            None => (Value::Null, Value::Null),
+        };
+        // An empty box means the file is NOT part of the spec: `Null` takes the
+        // key off (see `merge_spec`), rather than saving an empty path the
+        // engine would then try to open.
+        let path_or_null = |input: &Entity<TextInput>| {
+            let text = input.read(cx).text().trim().to_string();
+            if text.is_empty() { Value::Null } else { json!(text) }
+        };
+        let edited = json!({
             "driver": self.driver,
             "params": Value::Object(params),
             "auth": auth,
-            "tls": { "mode": self.tls_mode },
+            "tls": {
+                "mode": self.tls_mode,
+                "ca": path_or_null(&self.tls_ca),
+                "client_cert": path_or_null(&self.tls_cert),
+                "client_key": path_or_null(&self.tls_key),
+            },
             "tunnel": tunnel,
+            "tunnel_profile": tunnel_profile,
             "policy": self.policy
-        })
+        });
+        merge_spec(&self.existing_spec, edited)
     }
 
     fn run_test(&mut self, stage: &'static str, cx: &mut Context<Self>) {
@@ -521,6 +600,9 @@ impl ConnectionForm {
             self.tunnel_passphrase.input.clone(),
             self.tunnel_password.input.clone(),
             self.profile_name.clone(),
+            self.tls_ca.clone(),
+            self.tls_cert.clone(),
+            self.tls_key.clone(),
         ];
         out.extend(self.params.values().map(|f| f.input.clone()));
         out
@@ -616,10 +698,24 @@ impl ConnectionForm {
         );
         json!({
             "host": self.tunnel_host.read(cx).text(),
-            "port": self.tunnel_port.read(cx).text().trim().parse::<u16>().unwrap_or(22),
+            // See `tunnel_port_problem`: a save is refused before this runs,
+            // so the fallback is only so `spec` stays infallible.
+            "port": crate::workspace::parse_port(&self.tunnel_port.read(cx).text(), 22)
+                .unwrap_or(22),
             "user": self.tunnel_user.read(cx).text(),
             "auth": tauth
         })
+    }
+
+    /// What is wrong with the typed tunnel port, if anything. An empty field is
+    /// the default; anything that is not a port is a refusal, not a silent 22.
+    fn tunnel_port_problem(&self, cx: &Context<Self>) -> Option<String> {
+        if !self.tunnel_on {
+            return None;
+        }
+        crate::workspace::parse_port(&self.tunnel_port.read(cx).text(), 22)
+            .err()
+            .map(|e| format!("SSH tunnel: {e}"))
     }
 
     /// Store the tunnel fields as a named profile, for every other connection.
@@ -627,6 +723,13 @@ impl ConnectionForm {
         let name = self.profile_name.read(cx).text().trim().to_string();
         if name.is_empty() {
             self.error = Some("a profile needs a name".into());
+            cx.notify();
+            return;
+        }
+        if let Some(why) =
+            crate::workspace::parse_port(&self.tunnel_port.read(cx).text(), 22).err()
+        {
+            self.error = Some(why);
             cx.notify();
             return;
         }
@@ -661,6 +764,12 @@ impl ConnectionForm {
         // Refused here rather than at dial time. The connection that broke was
         // broken by a save, and a save is the last moment anybody is looking at
         // the field that is wrong.
+        if let Some(why) = self.tunnel_port_problem(cx) {
+            self.error = Some(why);
+            self.tab = FormTab::Access;
+            cx.notify();
+            return;
+        }
         if let Some(why) = self.key_path_problem(cx) {
             self.error = Some(format!("SSH key: {why}"));
             self.tab = FormTab::Access;
@@ -1114,6 +1223,10 @@ impl ConnectionForm {
     }
 
     /// A small icon in a fixed square, the same one the main window uses.
+    ///
+    /// In the ICON font. The eye (`f06e`/`f070`) is a Nerd Font codepoint, and
+    /// drawn in the text font it is a box — which is what it was, because this
+    /// inherited the root's family.
     fn icon_inline(&self, glyph: &'static str, colour: gpui::Rgba) -> gpui::Div {
         let ms = self.scale;
         let box_w = (ms.base() * 1.25).round();
@@ -1125,6 +1238,7 @@ impl ConnectionForm {
             .w(px(box_w))
             .h(px(box_w))
             .line_height(px(box_w))
+            .font_family(SharedString::from(self.icon_family.clone()))
             .text_size(ms.small())
             .text_color(colour)
             .child(glyph)
@@ -1592,6 +1706,14 @@ impl Render for ConnectionForm {
                         t.warning(),
                     ));
                 }
+                // The three files, under the mode they belong to. Shown for
+                // every TLS-capable driver: which of them a server wants is the
+                // server's business, and an empty box costs nothing.
+                body = body.child(self.path_row("CA bundle", &self.tls_ca.clone(), "pick-tls-ca", cx));
+                body = body
+                    .child(self.path_row("Client cert", &self.tls_cert.clone(), "pick-tls-cert", cx));
+                body = body
+                    .child(self.path_row("Client key", &self.tls_key.clone(), "pick-tls-key", cx));
                 body = body.child(self.stage_row("tls", cx));
                 }
 
@@ -2004,7 +2126,11 @@ impl Render for ConnectionForm {
             .size_full()
             .bg(t.base())
             .text_color(t.fg())
-            .font_family("CodeNerdFont")
+            // The main window's type, handed over rather than written here.
+            // This said "CodeNerdFont" — so somebody whose $LODE_FONT is
+            // anything else got one window in a different face, and a machine
+            // without that font got whatever the platform fell back to.
+            .font_family(SharedString::from(self.font_family.clone()))
             .text_size(ms.body())
             .child(head)
             .child(tabs)
@@ -2016,6 +2142,103 @@ impl Render for ConnectionForm {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// **Saving a connection must not delete what the form cannot see.** A spec
+    /// written elsewhere — by the Neovim client, by hand — carries a CA bundle,
+    /// a proxy profile, hooks. The form edits none of those, and it used to
+    /// send only the keys it knew, so opening such a connection and pressing
+    /// Save silently stripped them.
+    #[test]
+    fn a_save_keeps_the_keys_the_form_never_shows() {
+        let existing = json!({
+            "driver": "postgres",
+            "params": { "host": "old.example", "port": "5432" },
+            "auth": { "kind": "password", "user": "a", "password": "p" },
+            "tls": { "mode": "require", "ca": "/etc/ssl/ca.pem", "client_cert": "/etc/ssl/c.pem" },
+            "proxy_profile": "office",
+            "hooks": { "before_connect": "notify" },
+            "policy": "read_write"
+        });
+        let edited = json!({
+            "driver": "postgres",
+            "params": { "host": "new.example", "port": "5432" },
+            "auth": { "kind": "password", "user": "b", "password": "q" },
+            "tls": { "mode": "verify_full" },
+            "tunnel": Value::Null,
+            "tunnel_profile": Value::Null,
+            "policy": "read_only"
+        });
+
+        let out = merge_spec(&existing, edited);
+        // What the form owns is the form's.
+        assert_eq!(out["params"]["host"], json!("new.example"));
+        assert_eq!(out["auth"]["user"], json!("b"));
+        assert_eq!(out["policy"], json!("read_only"));
+        assert_eq!(out["tls"]["mode"], json!("verify_full"));
+        // What it does not own survives untouched — including the rest of `tls`.
+        assert_eq!(out["tls"]["ca"], json!("/etc/ssl/ca.pem"));
+        assert_eq!(out["tls"]["client_cert"], json!("/etc/ssl/c.pem"));
+        assert_eq!(out["proxy_profile"], json!("office"));
+        assert_eq!(out["hooks"]["before_connect"], json!("notify"));
+    }
+
+    /// A tunnel switched off is REMOVED, not written as null: the engine reads
+    /// the key's presence, and the two names are exclusive — naming a profile
+    /// takes the spelled-out tunnel off the spec and the other way round.
+    #[test]
+    fn switching_a_tunnel_off_takes_it_off_the_spec() {
+        let with_tunnel = json!({
+            "driver": "mysql",
+            "tunnel": { "host": "jump", "auth": { "kind": "key", "path": "~/.ssh/id" } },
+            "tls": { "mode": "disable" }
+        });
+
+        let off = merge_spec(
+            &with_tunnel,
+            json!({ "tunnel": Value::Null, "tunnel_profile": Value::Null, "tls": { "mode": "disable" } }),
+        );
+        assert!(off.get("tunnel").is_none(), "an unticked tunnel is gone, not null: {off}");
+        assert!(off.get("tunnel_profile").is_none());
+
+        let by_profile = merge_spec(
+            &with_tunnel,
+            json!({ "tunnel": Value::Null, "tunnel_profile": "office", "tls": { "mode": "disable" } }),
+        );
+        assert!(by_profile.get("tunnel").is_none(), "a profile replaces a spelled-out tunnel");
+        assert_eq!(by_profile["tunnel_profile"], json!("office"));
+    }
+
+    /// The three TLS files round-trip, and an empty box takes its key off the
+    /// spec rather than saving a path to nowhere.
+    #[test]
+    fn the_tls_files_go_in_and_come_back_out() {
+        let saved = merge_spec(
+            &json!({ "driver": "postgres" }),
+            json!({ "tls": { "mode": "verify_full", "ca": "~/ca.pem", "client_cert": "~/c.pem", "client_key": "~/c.key" } }),
+        );
+        assert_eq!(saved["tls"]["ca"], json!("~/ca.pem"));
+        assert_eq!(saved["tls"]["client_cert"], json!("~/c.pem"));
+        assert_eq!(saved["tls"]["client_key"], json!("~/c.key"));
+
+        // Cleared in the window: gone from the spec, not an empty string.
+        let cleared = merge_spec(
+            &saved,
+            json!({ "tls": { "mode": "require", "ca": Value::Null, "client_cert": Value::Null, "client_key": Value::Null } }),
+        );
+        assert_eq!(cleared["tls"]["mode"], json!("require"));
+        assert!(cleared["tls"].get("ca").is_none(), "an empty box is no key: {cleared}");
+        assert!(cleared["tls"].get("client_cert").is_none());
+        assert!(cleared["tls"].get("client_key").is_none());
+    }
+
+    /// A new connection has nothing to merge onto, and must come out as the
+    /// engine's shape all the same.
+    #[test]
+    fn a_new_connection_merges_onto_nothing() {
+        let out = merge_spec(&json!({}), json!({ "driver": "sqlite", "tls": { "mode": "disable" } }));
+        assert_eq!(out["driver"], json!("sqlite"));
+        assert_eq!(out["tls"]["mode"], json!("disable"));
+    }
 
     /// Each auth kind carries ITS OWN keys and not one belonging to another.
     ///

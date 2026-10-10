@@ -119,6 +119,14 @@ pub fn load() -> Session {
     serde_json::from_str(&text).unwrap_or_default()
 }
 
+/// Write the session out.
+///
+/// To a TEMPORARY file first, then rename it over the real one. A rename within
+/// a directory is atomic, so a reader sees either the old file or the new one
+/// and never a half-written one — and this is written on every tab change, on
+/// every theme change and on quit, which is exactly the shape that gets caught
+/// by a crash or a power cut partway through. A truncated `session.json` does
+/// not parse, and a session that does not parse is every open tab lost.
 pub fn save(s: &Session) {
     let Some(p) = path() else { return };
     if let Some(dir) = p.parent() {
@@ -126,8 +134,15 @@ pub fn save(s: &Session) {
             return;
         }
     }
-    if let Ok(text) = serde_json::to_string_pretty(s) {
-        let _ = std::fs::write(p, text);
+    let Ok(text) = serde_json::to_string_pretty(s) else { return };
+    let tmp = p.with_extension("json.tmp");
+    if std::fs::write(&tmp, text).is_err() {
+        return;
+    }
+    // If the rename fails the temporary file is left behind rather than the
+    // real one being removed: the old session is still better than none.
+    if std::fs::rename(&tmp, &p).is_err() {
+        let _ = std::fs::remove_file(&tmp);
     }
 }
 
@@ -135,9 +150,38 @@ pub fn save(s: &Session) {
 mod tests {
     use super::*;
 
-    /// Which groups were left open survives a round trip, BY NAME. An index
-    /// would re-open somebody else's groups the moment one is added in the
-    /// middle of the list.
+    /// What `save` leaves on disk PARSES.
+    ///
+    /// The write goes to a temporary file and is renamed over the real one, so
+    /// this also checks the rename happened: without it the real file would not
+    /// exist at all and the read below would find nothing.
+    #[test]
+    fn what_save_writes_can_be_read_back() {
+        let dir = std::env::temp_dir().join(format!("lode-session-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::env::set_var("LODE_DATA_DIR", &dir);
+
+        let mut s = Session::default();
+        s.theme = Some("LvimBase_dark".into());
+        s.active = 2;
+        save(&s);
+
+        let p = path().expect("a path, with LODE_DATA_DIR set");
+        let text = std::fs::read_to_string(&p).expect("the file is there");
+        let back: Session = serde_json::from_str(&text).expect("and it parses");
+        assert_eq!(back.theme.as_deref(), Some("LvimBase_dark"));
+        assert_eq!(back.active, 2);
+        // The temporary file does not outlive the write.
+        assert!(!p.with_extension("json.tmp").exists(), "the .tmp was left behind");
+
+        std::env::remove_var("LODE_DATA_DIR");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// An old session's `settings_open` still PARSES. Nothing writes it since
+    /// the settings panel became a window, and a field that stops being written
+    /// must not stop being readable — a session file that fails to parse is
+    /// every open tab lost.
     #[test]
     fn the_open_settings_groups_round_trip_by_name() {
         let mut s = Session::default();

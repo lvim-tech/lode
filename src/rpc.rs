@@ -135,7 +135,16 @@ use serde_json::json;
 ///      of damage rather than a warning. A client that wanted to ask first had
 ///      no way to. Additive: nothing else changed, and a client that does not
 ///      call it behaves exactly as before.
-pub const PROTO: u32 = 14;
+/// **15** — `store.connections.rename {from, to}` → `{renamed, moved: {queries,
+///      charts, dashboards, scripts}}`. A rename used to be the client's own
+///      save-under-the-new-name plus remove-the-old, and everything scoped to
+///      the connection's NAME — saved queries, charts, dashboards, scripts —
+///      stayed behind pointing at a name nothing answered to. One call, one
+///      transaction. The audit is deliberately not rewritten: it records what
+///      happened under the name in use at the time. Refuses a name already
+///      taken, because `save` overwrites by name and would eat the other
+///      connection. Additive: a client that does not call it behaves as before.
+pub const PROTO: u32 = 15;
 
 /// One decoded incoming request.
 #[derive(Debug, Deserialize)]

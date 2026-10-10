@@ -41,7 +41,8 @@ use crate::workspace::{
     bar_label, bar_label_of, clamped_scroll, column_editable, copy_as_insert, copy_as_select, fuzzy_score, row_key,
     value_range, ChartShape, Cond,
     PendingWrite, Toast,
-    fmt_duration, preview, type_badge, Live, ResultView, RunState, SubTab, Tab, Task,
+    fmt_duration, needs_confirm_from_error, pick_target, preview, respawn_delay, type_badge, Live,
+    ResultView, RunState, SubTab, Tab, Task,
 };
 
 gpui::actions!(
@@ -167,6 +168,11 @@ fn pick_font(cx: &gpui::App) -> String {
 /// Listed rather than discovered, because the check has to happen once at
 /// startup: asking the text system per frame would be a font lookup per icon
 /// per paint.
+/// How many log lines are kept. Enough to hold a whole session's worth of
+/// warnings, bounded because a client that runs for a week and talks to a noisy
+/// engine would otherwise keep every line of it.
+const LOG_KEEP: usize = 500;
+
 const GLYPHS: &[(&str, &str)] = &[
     // The rail.
     ("\u{f1c0}", "DB"),
@@ -193,6 +199,9 @@ const GLYPHS: &[(&str, &str)] = &[
     ("\u{f0da}", ">"),
     ("\u{f0de}", "^"),
     ("\u{f0dd}", "v"),
+    // The padlock beside an open connection — see `link_label`.
+    (crate::workspace::LINK_LOCKED, "L"),
+    (crate::workspace::LINK_OPEN, "U"),
 ];
 
 /// The advance of one character per pixel of text size, in this font.
@@ -370,21 +379,20 @@ pub fn report_panels(cx: &gpui::App) {
         println!("geometry: NOT POSITIVE: {}", bad.join(", "));
     }
 
-    // The settings panel's groups, from the same function the panel uses.
-    let rows = crate::workspace::settings_rows(&Default::default());
+    // The settings WINDOW's categories. There is no settings panel any more:
+    // the gear opens a window, because a list beside the detail of what is
+    // picked in it is not a shape a narrow column can hold.
+    let cats = crate::settings::Category::all();
     println!(
-        "settings groups: {} ({})",
-        rows.len(),
-        rows.iter()
-            .map(|r| format!("{}{}", r.id, if r.open { "*" } else { "" }))
-            .collect::<Vec<_>>()
-            .join(" ")
+        "settings categories: {} ({})",
+        cats.len(),
+        cats.iter().map(|c| c.title()).collect::<Vec<_>>().join(" · ")
     );
 
     // Which panels END by returning their own list. Settings once did not: it
     // fell through to the connections path and ended up with two scrolling
     // lists sharing one height.
-    println!("panels that return their own list: connections, instance, history, audit, tasks, settings");
+    println!("panels that return their own list: connections, instance, history, audit, tasks");
     println!("it cannot see the layout.");
     println!("LODE_THEMES picks how the theme list is laid out (default: flat):");
     println!("  outer   [A] panel does NOT scroll; the theme box does — side by side");
@@ -486,53 +494,54 @@ impl ProfileRow {
             format!("{who}{host}:{port} · {auth}")
         }
     }
-}
 
-/// A foldable group of settings.
-///
-/// The theme list is 48 rows. Left open beside everything else it pushes the
-/// rest of the settings off the bottom, and a setting somebody cannot see is a
-/// setting they do not know exists. Groups hold a growing number of things in a
-/// fixed amount of room — the same move as the result's sub-tabs.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SettingsGroup {
-    Theme,
-    Type,
-    View,
-    Language,
-    Profiles,
-}
-
-impl SettingsGroup {
-    pub fn all() -> [SettingsGroup; 5] {
-        [
-            SettingsGroup::Theme,
-            SettingsGroup::Type,
-            SettingsGroup::View,
-            SettingsGroup::Language,
-            SettingsGroup::Profiles,
-        ]
-    }
-
-    /// The word that goes in the session. Not the index: a group inserted in
-    /// the middle would silently re-open somebody else's groups.
-    pub fn id(self) -> &'static str {
-        match self {
-            SettingsGroup::Theme => "theme",
-            SettingsGroup::Type => "type",
-            SettingsGroup::View => "view",
-            SettingsGroup::Language => "language",
-            SettingsGroup::Profiles => "profiles",
+    /// The same line, but knowing which KIND of profile it is.
+    ///
+    /// A proxy has no port 22 and no `user@`. `summary` assumes a tunnel —
+    /// which is what it was written for — and a SOCKS proxy on no port at all
+    /// came out as `socks-host:22`, a sentence that is simply false. What a
+    /// proxy has is a kind (`socks5`, `http`) and a host and port, so that is
+    /// what it says.
+    pub fn summary_of(&self, kind: &str) -> String {
+        if kind != "proxy" {
+            return self.summary();
+        }
+        let g = |k: &str| self.spec.get(k).and_then(Value::as_str).unwrap_or("");
+        let host = g("host");
+        if host.is_empty() {
+            return "—".into();
+        }
+        let how = match g("kind") {
+            "" => "socks5",
+            other => other,
+        };
+        match self.spec.get("port").and_then(Value::as_u64) {
+            Some(port) => format!("{how} · {host}:{port}"),
+            // No port rather than an invented one: a profile saved without one
+            // is a profile that is not finished, and saying `:1080` would hide
+            // that behind a plausible number.
+            None => format!("{how} · {host} (no port)"),
         }
     }
+}
 
-    fn key(self) -> &'static str {
+/// What a name is being asked for.
+///
+/// A saved query used to take the TAB'S TITLE, which is "Draft" for anything
+/// typed by hand and the first forty characters of the statement otherwise —
+/// so two drafts saved in a row overwrote each other without a word, and
+/// nothing in the window ever asked what to call them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NameFor {
+    Query,
+    Chart,
+}
+
+impl NameFor {
+    fn what(self) -> &'static str {
         match self {
-            SettingsGroup::Theme => "settings.theme",
-            SettingsGroup::Type => "settings.group_type",
-            SettingsGroup::View => "settings.group_view",
-            SettingsGroup::Language => "settings.language",
-            SettingsGroup::Profiles => "settings.group_profiles",
+            NameFor::Query => "query",
+            NameFor::Chart => "chart",
         }
     }
 }
@@ -628,7 +637,10 @@ pub enum Rail {
     /// a refusal buried in a thousand SELECTs is a refusal nobody finds.
     Audit,
     Tasks,
-    Settings,
+    // There is no `Settings` here any more. The gear at the bottom of the rail
+    // opens a WINDOW: almost everything that belongs in settings is a list
+    // beside the detail of what is picked in it — tunnels, proxies, hooks,
+    // drivers, MCP policies — and a narrow column cannot hold that shape.
 }
 
 impl Rail {
@@ -640,7 +652,6 @@ impl Rail {
             Rail::History => "\u{f1da}",
             Rail::Audit => "\u{f132}",
             Rail::Tasks => "\u{f0ae}",
-            Rail::Settings => "\u{f013}",
         }
     }
     /// The key its name is under. Not the name itself: a `&'static str` here
@@ -653,7 +664,6 @@ impl Rail {
             Rail::History => "rail.history",
             Rail::Audit => "rail.audit",
             Rail::Tasks => "rail.tasks",
-            Rail::Settings => "rail.settings",
         }
     }
 
@@ -664,7 +674,6 @@ impl Rail {
             Rail::History => "History",
             Rail::Audit => "Audit",
             Rail::Tasks => "Tasks",
-            Rail::Settings => "Settings",
         }
     }
 }
@@ -697,11 +706,23 @@ enum Pending {
     /// The small sample a document store needs before it can say what a field
     /// holds. Two steps, because a result is run and then paged.
     NodeSample { key: String },
-    NodeSamplePage { key: String },
+    NodeSamplePage { key: String, call_id: u64 },
+    /// How many saved queries a connection has, asked BEFORE it is removed so
+    /// the question can say what would be lost.
+    ConnQueryCount { name: String },
+    ConnRemoved { name: String },
     /// A profile was removed, and the engine says which connections used it.
     ProfileRemoved { kind: &'static str, name: String },
-    /// A connection saved from that window.
-    FormSave,
+    /// A tab's statement was sent to be classified before it is run.
+    ClassifyTab { tab: u64, statement: String },
+    /// The engine was asked to rename a connection; the edited spec follows
+    /// once it answers, so a refused rename never reaches the store as a save.
+    Rename { to: String, driver: String, spec: Value },
+    /// A connection saved from that window. `rename_from` is the name it used
+    /// to have: the removal of the old one waits for this save to SUCCEED,
+    /// because sending both at once loses the connection entirely when the
+    /// save is refused (a name already taken, a store that would not write).
+    FormSave { rename_from: Option<String> },
     History,
     Audit,
     Metrics { conn: String },
@@ -736,6 +757,26 @@ pub struct Workspace {
     engine: Option<Engine>,
     hello: Option<Hello>,
     fatal: Option<String>,
+    /// How many times the engine has been started again after it exited, and
+    /// when the next attempt is due. See [`respawn_delay`].
+    /// A connection somebody has asked to remove, and what would go with it:
+    /// `(name, saved queries)`. The count is `None` until the engine answers.
+    confirm_conn_rm: Option<(String, Option<usize>)>,
+    /// A save is waiting for a name — see `NameFor`.
+    naming: Option<NameFor>,
+    save_name: Entity<TextInput>,
+    /// Something changed that belongs in the session file, and it has not been
+    /// written yet. See `remember`.
+    session_dirty: bool,
+    /// When it was last written, so a burst of changes costs one write.
+    session_written: Option<Instant>,
+    /// Warnings and errors nobody has looked at yet. The log used to be
+    /// write-only — twenty places pushed into it and no screen ever read it,
+    /// so a plaintext warning or a refused classify went nowhere. This is the
+    /// number beside the task count, and opening Tasks clears it.
+    log_unread: usize,
+    respawn_attempts: u32,
+    respawn_at: Option<std::time::Instant>,
     store_ok: bool,
 
     saved: Vec<SavedConnection>,
@@ -757,6 +798,10 @@ pub struct Workspace {
     node_sample: HashMap<String, Vec<Vec<Value>>>,
     /// The column order of that sample, so a value can be matched to a field.
     node_sample_cols: HashMap<String, Vec<String>>,
+    /// A sample's call, by id, while it runs: `call_id -> node key`. A sample is
+    /// the one call that belongs to NEITHER a tab nor a board tile, so without
+    /// this its `query.state` has nowhere to land.
+    sample_calls: HashMap<u64, String>,
 
     tabs: Vec<Tab>,
     active: usize,
@@ -795,7 +840,7 @@ pub struct Workspace {
 
     rail: Rail,
     status: String,
-    log: Vec<(String, String)>,
+    log: std::collections::VecDeque<(String, String)>,
 
     /// What was open last time, held until its connections come back: a tab can
     /// only be reopened once its connection has a schema again, which is several
@@ -901,7 +946,6 @@ pub struct Workspace {
     /// column.
     settings_window: Option<gpui::WindowHandle<crate::settings::SettingsWindow>>,
     /// A profile somebody has pressed delete on, waiting to be confirmed.
-    confirm_profile_rm: Option<(&'static str, String)>,
     /// Which connections point at each profile, by profile name. Asked before
     /// anything is removed, which is what makes it a warning.
     profile_users: std::collections::BTreeMap<String, Vec<String>>,
@@ -911,11 +955,6 @@ pub struct Workspace {
     /// has had profiles since protocol 9 and no client has ever shown them, so
     /// the feature existed and was unreachable.
     profiles: std::collections::BTreeMap<&'static str, Vec<ProfileRow>>,
-    /// Which settings groups are open. Remembered, like everything else here.
-    open_groups: std::collections::BTreeSet<String>,
-    /// The filter over the theme list, because there are 48 of them and their
-    /// names are long.
-    theme_filter: Entity<TextInput>,
     /// How wide one character is, per pixel of text size.
     ///
     /// Measured once at startup from the font actually resolved, so "does this
@@ -976,13 +1015,21 @@ impl Workspace {
         let export_path = cx.new(|cx| TextInput::new(cx, "result.csv", colors));
         let history_filter = cx.new(|cx| TextInput::new(cx, "Search history…", colors));
         let audit_filter = cx.new(|cx| TextInput::new(cx, "Search the audit log…", colors));
-        let theme_filter = cx.new(|cx| TextInput::new(cx, "Filter themes…", colors));
         let board_name = cx.new(|cx| TextInput::new(cx, "name this dashboard", colors));
         let tile_text = cx.new(|cx| TextInput::new(cx, "heading for this tile", colors));
         let board_time_col = cx.new(|cx| TextInput::new(cx, "column", colors));
         let board_time_from = cx.new(|cx| TextInput::new(cx, "2026-01-01", colors));
         let board_time_to = cx.new(|cx| TextInput::new(cx, "2026-02-01", colors));
         let palette_input = cx.new(|cx| TextInput::new(cx, "Type to find a command…", colors));
+        let save_name = cx.new(|cx| TextInput::new(cx, "name it, then press Enter", colors));
+        cx.subscribe(&save_name, |this, input, ev: &InputEvent, cx| {
+            if matches!(ev, InputEvent::Submit) {
+                let name = input.read(cx).text().trim().to_string();
+                this.named(name, cx);
+            }
+            cx.notify();
+        })
+        .detach();
         let console = cx.new(|cx| {
             TextInput::new(cx, "Type a command and press Enter — it runs against the open connection", colors)
         });
@@ -1002,6 +1049,14 @@ impl Workspace {
             engine: None,
             hello: None,
             fatal: None,
+            confirm_conn_rm: None,
+            naming: None,
+            save_name,
+            session_dirty: false,
+            session_written: None,
+            log_unread: 0,
+            respawn_attempts: 0,
+            respawn_at: None,
             store_ok: false,
             saved: Vec::new(),
             conns: Vec::new(),
@@ -1011,6 +1066,7 @@ impl Workspace {
             node_asked: HashSet::new(),
             node_sample: HashMap::new(),
             node_sample_cols: HashMap::new(),
+            sample_calls: HashMap::new(),
             tabs: Vec::new(),
             active: 0,
             next_tab: 1,
@@ -1026,7 +1082,7 @@ impl Workspace {
             tasks_open: true,
             rail: Rail::Connections,
             status: "starting the engine…".into(),
-            log: Vec::new(),
+            log: std::collections::VecDeque::new(),
             restore: restore.clone(),
             filter,
             inputs: HashMap::new(),
@@ -1083,21 +1139,10 @@ impl Workspace {
                 .unwrap_or_default(),
             json_indent: restore.json_indent.unwrap_or(4).clamp(2, 4),
             themes: theme::discover(),
-            // Open by default: the one somebody actually comes here for. Its
-            // list is capped and scrolls, so being open costs a fixed amount of
-            // room rather than 48 rows.
-            open_groups: restore
-                .settings_open
-                .clone()
-                .unwrap_or_else(|| vec![SettingsGroup::Theme.id().to_string()])
-                .into_iter()
-                .collect(),
-            theme_filter,
             profiles: std::collections::BTreeMap::new(),
             profile_window: None,
             settings_window: None,
             profile_users: std::collections::BTreeMap::new(),
-            confirm_profile_rm: None,
             aws_profiles: Vec::new(),
             char_ratio: char_ratio(cx, &font_family),
             missing_glyphs: missing_in(cx, &icon_family),
@@ -1157,6 +1202,16 @@ impl Workspace {
             Err(e) => w.fatal = Some(e.to_string()),
         }
 
+        // The session is written from `pump` on a 500 ms debounce, so a change
+        // made in the last half second would be lost on the way out. Written
+        // once more here, unconditionally — this is the one moment where the
+        // cost of a file write does not matter.
+        cx.on_app_quit(|w: &mut Workspace, _| {
+            w.write_session();
+            async {}
+        })
+        .detach();
+
         // The engine answers on its own schedule, so the view polls it. A timer
         // rather than a blocking read: the window stays live while a query runs,
         // which is the whole point of the engine being another process.
@@ -1187,8 +1242,79 @@ impl Workspace {
         self.hello.as_ref()?.drivers.iter().find(|d| d.kind == driver)
     }
 
+    /// Start the engine again after it exited, and pick the session back up.
+    ///
+    /// A short `hello` rather than the startup one: this runs on the window's
+    /// thread, and fifteen seconds of a frozen window while a broken engine
+    /// fails to answer is worse than saying so quickly and trying again.
+    fn try_respawn(&mut self, _cx: &mut Context<Self>) {
+        const RESPAWN_HELLO: Duration = Duration::from_secs(3);
+        match Engine::spawn(None).and_then(|e| e.hello(RESPAWN_HELLO).map(|h| (e, h))) {
+            Ok((engine, hello)) => {
+                self.status = format!(
+                    "{} {} — protocol {}, {} drivers",
+                    hello.engine.as_deref().unwrap_or("engine"),
+                    hello.version.as_deref().unwrap_or("?"),
+                    hello.proto,
+                    hello.drivers.len()
+                );
+                self.hello = Some(hello);
+                self.engine = Some(engine);
+                self.respawn_attempts = 0;
+                self.fatal = None;
+                self.toast("the engine is back".to_string(), false);
+                // The saved list comes first: reconnecting what was open is
+                // done from `restore.connections` once it arrives (see
+                // `Pending::Connections`), which is the same path a cold start
+                // takes.
+                self.ask(Pending::StoreStatus, "store.status", json!({}));
+                self.ask(Pending::Connections, "store.connections.list", json!({}));
+            }
+            Err(e) => {
+                self.respawn_attempts += 1;
+                match respawn_delay(self.respawn_attempts) {
+                    Some(d) => {
+                        self.status = format!("the engine would not start ({e}) — trying again…");
+                        self.respawn_at = Some(std::time::Instant::now() + d);
+                    }
+                    // Out of tries: this is the one case that is fatal, and it
+                    // says what went wrong rather than "restart".
+                    None => {
+                        self.fatal = Some(format!(
+                            "the engine exited and would not start again: {e}. Its drivers run in \
+                             a separate process, so this window survived it."
+                        ));
+                    }
+                }
+            }
+        }
+    }
+
+    /// Put a line in the log, and count it if it is one somebody should see.
+    ///
+    /// `info` is background noise — what connected, what moved. `warn` and
+    /// `error` are the ones that mean something went differently than asked,
+    /// and those raise the unread count until the Tasks panel is opened.
+    fn log_push(&mut self, level: &str, text: String) {
+        if crate::workspace::counts_as_unread(level) {
+            self.log_unread += 1;
+        }
+        self.log.push_back((level.to_string(), text));
+        if self.log.len() > LOG_KEEP {
+            self.log.pop_front();
+        }
+    }
+
     fn live(&self, name: &str) -> Option<&Live> {
         self.conns.iter().find(|c| c.name == name)
+    }
+
+    /// The connection a command without a tab of its own belongs to: the active
+    /// tab's, falling back to the only one open. See [`pick_target`].
+    fn target_conn(&self) -> Option<String> {
+        let open: Vec<String> = self.conns.iter().map(|c| c.name.clone()).collect();
+        let active = self.tabs.get(self.active).map(|t| t.conn_name.as_str());
+        pick_target(active, &open)
     }
 
     /// The driver metadata for a connection BY NAME — what a board needs to ask
@@ -1210,6 +1336,17 @@ impl Workspace {
 
     fn pump(&mut self, cx: &mut Context<Self>) {
         let mut changed = false;
+        // The session, if something asked for it to be written — see `remember`.
+        self.flush_session();
+        if self.engine.is_none() {
+            if let Some(due) = self.respawn_at {
+                if std::time::Instant::now() >= due {
+                    self.respawn_at = None;
+                    self.try_respawn(cx);
+                    changed = true;
+                }
+            }
+        }
         if let Some(words) = self.pending_tile_text.take() {
             self.tile_text.update(cx, |i, cx| i.set_text(words, cx));
         }
@@ -1220,13 +1357,27 @@ impl Workspace {
             changed = true;
             match msg {
                 Message::Closed => {
-                    self.fatal = Some(
-                        "the engine exited. Its drivers run in a separate process, so this window \
-                         survived it — restart to reconnect."
-                            .into(),
-                    );
+                    // **The window outlives the engine, and now it says so by
+                    // acting.** The drivers run in another process so that one
+                    // of them dying takes nothing else with it; telling the
+                    // person to restart threw that away. What was connected is
+                    // remembered, the tabs stop pretending to run, and the
+                    // engine is started again on a widening delay.
+                    self.restore.connections =
+                        self.conns.iter().map(|c| c.name.clone()).collect();
                     self.engine = None;
                     self.conns.clear();
+                    for tab in self.tabs.iter_mut().filter(|t| t.state == RunState::Running) {
+                        tab.state = RunState::Failed;
+                        tab.error = Some("the engine exited".into());
+                    }
+                    for task in self.tasks.iter_mut().filter(|t| t.running()) {
+                        task.finish(Duration::from_millis(0), Some("the engine exited".into()));
+                    }
+                    self.status = "the engine exited — starting it again…".into();
+                    self.toast("the engine exited — starting it again".to_string(), true);
+                    self.respawn_at =
+                        respawn_delay(self.respawn_attempts).map(|d| std::time::Instant::now() + d);
                     break;
                 }
                 Message::Notification { method, params } => self.on_notification(&method, params),
@@ -1276,7 +1427,63 @@ impl Workspace {
                     }
                     return;
                 }
-                let Some(&tab_id) = self.calls.get(&st.call_id) else { return };
+                // A sample's call next: it belongs to a node in the tree, not
+                // to a tab, so nothing below would find it.
+                if let Some(key) = self.sample_calls.remove(&st.call_id) {
+                    match st.state.as_str() {
+                        "done" => {
+                            let call_id = st.call_id;
+                            self.ask(
+                                Pending::NodeSamplePage { key, call_id },
+                                "query.page",
+                                json!({ "call_id": call_id, "from": 0, "n": NODE_SAMPLE }),
+                            );
+                        }
+                        "failed" | "cancelled" => {
+                            // Nothing is remembered for the key: an empty sample
+                            // cached here is a node that never shows its types
+                            // again, however many times it is expanded.
+                            let call_id = st.call_id;
+                            self.ask(
+                                Pending::Ignore("release"),
+                                "query.release",
+                                json!({ "call_id": call_id }),
+                            );
+                            if let Some(e) = st.error.clone() {
+                                self.log_push("warn", format!("sample failed: {e}"));
+                            }
+                        }
+                        // Still running: put it back and wait for the next word.
+                        _ => {
+                            self.sample_calls.insert(st.call_id, key);
+                        }
+                    }
+                    return;
+                }
+                // A call whose TAB is gone — closed, or re-run under a new
+                // call — still has a task watching it, and that task has to be
+                // told. Before this the state arrived, found no tab, returned,
+                // and the task counted upwards until the window closed; and
+                // `pump()` keeps repainting while any task runs.
+                let Some(&tab_id) = self.calls.get(&st.call_id) else {
+                    if let crate::workspace::Settle::Finished(err) =
+                        crate::workspace::task_settled(&st.state, st.error.as_deref())
+                    {
+                        if let Some(task_id) = self.call_tasks.remove(&st.call_id) {
+                            if let Some(t) = self.tasks.iter_mut().find(|t| t.id == task_id) {
+                                t.finish(Duration::from_millis(st.ms), err);
+                            }
+                        }
+                        // And let the buffer go: nothing is left to page it.
+                        let call_id = st.call_id;
+                        self.ask(
+                            Pending::Ignore("release"),
+                            "query.release",
+                            json!({ "call_id": call_id }),
+                        );
+                    }
+                    return;
+                };
                 let want_page = {
                     let Some(tab) = self.tabs.iter_mut().find(|t| t.id == tab_id) else { return };
                     tab.ms = st.ms;
@@ -1289,7 +1496,16 @@ impl Workspace {
                         }
                         "failed" => {
                             tab.state = RunState::Failed;
-                            tab.error = st.error.clone();
+                            // An engine that refuses an unconfirmed statement
+                            // says why: that sentence becomes the tab's own
+                            // confirmation, not a red line to read twice.
+                            match st.error.as_deref().and_then(needs_confirm_from_error) {
+                                Some(reason) => {
+                                    tab.confirm = Some((tab.sql.clone(), reason));
+                                    tab.error = None;
+                                }
+                                None => tab.error = st.error.clone(),
+                            }
                             false
                         }
                         "cancelled" => {
@@ -1300,8 +1516,13 @@ impl Workspace {
                     }
                 };
                 if let Some(&task_id) = self.call_tasks.get(&st.call_id) {
-                    if let Some(t) = self.tasks.iter_mut().find(|t| t.id == task_id) {
-                        t.finish(Duration::from_millis(st.ms), st.error.clone());
+                    if let crate::workspace::Settle::Finished(err) =
+                        crate::workspace::task_settled(&st.state, st.error.as_deref())
+                    {
+                        self.call_tasks.remove(&st.call_id);
+                        if let Some(t) = self.tasks.iter_mut().find(|t| t.id == task_id) {
+                            t.finish(Duration::from_millis(st.ms), err);
+                        }
                     }
                 }
                 if want_page {
@@ -1312,37 +1533,27 @@ impl Workspace {
                         json!({ "call_id": call_id, "from": 0, "n": PAGE }),
                     );
                 }
-                // Record it HERE, once it is over, with the state it reached and
-                // the time it took. The history is the engine's, so what this
-                // client runs shows up in the editor's log as well — and writing
-                // it at launch instead would mean every row said "running".
-                if matches!(st.state.as_str(), "done" | "failed" | "cancelled") {
-                    let found = self
-                        .tabs
-                        .iter()
-                        .find(|t| t.id == tab_id)
-                        .map(|t| (t.sql.trim().to_string(), t.conn_name.clone(), t.driver.clone()));
-                    if let Some((sql, conn, driver)) = found {
-                        if !sql.is_empty() {
-                            self.ask(
-                                Pending::Ignore("history"),
-                                "store.history.record",
-                                json!({
-                                    "conn": conn, "driver": driver, "statement": sql,
-                                    "state": st.state, "ms": st.ms, "rows": st.affected
-                                }),
-                            );
-                        }
+                // **File it in the history, with a row count that is true.**
+                //
+                // A WRITE knows its count now: `affected` is what the engine
+                // answers for one. A READ does not — `affected` is empty for a
+                // select, and this used to file every read with no count at
+                // all. A read is filed when its first page arrives, where the
+                // total (or the rows actually handed over) is known. A failure
+                // and a cancellation are filed here, because no page follows
+                // one.
+                match st.state.as_str() {
+                    "failed" | "cancelled" => self.record_run(tab_id, &st.state, st.ms, None),
+                    "done" if st.affected.is_some() => {
+                        self.record_run(tab_id, "done", st.ms, st.affected)
                     }
+                    _ => {}
                 }
             }
             "daemon.log" => {
                 let level = params.get("level").and_then(Value::as_str).unwrap_or("info").to_string();
                 let message = params.get("message").and_then(Value::as_str).unwrap_or("").to_string();
-                self.log.push((level, message));
-                if self.log.len() > 200 {
-                    self.log.remove(0);
-                }
+                self.log_push(&level, message);
             }
             _ => {}
         }
@@ -1401,6 +1612,19 @@ impl Workspace {
                     boards: Vec::new(),
                 });
                 self.status = format!("connected: {name}");
+                // Said once, out loud, at the moment it becomes true. The
+                // padlock in the row says it from then on, but a person who
+                // just typed a password deserves to be told before they type
+                // the next statement.
+                if !crate::workspace::link_label(
+                    v.get("encrypted").and_then(Value::as_bool).unwrap_or(false),
+                    v.get("tunneled").and_then(Value::as_bool).unwrap_or(false),
+                )
+                .safe
+                {
+                    let warn = format!("{name}: {}", self.lang.tr("toast.plaintext"));
+                    self.toast(warn, true);
+                }
                 self.remember();
                 self.ask(
                     Pending::Dashboards { conn: name.clone() },
@@ -1430,6 +1654,9 @@ impl Workspace {
                 let call_id = v.get("call_id").and_then(Value::as_u64).unwrap_or(0);
                 self.calls.insert(call_id, tab);
                 self.call_tasks.insert(call_id, task);
+                if let Some(t) = self.tasks.iter_mut().find(|t| t.id == task) {
+                    t.call_id = Some(call_id);
+                }
                 if let Some(t) = self.tabs.iter_mut().find(|t| t.id == tab) {
                     t.call_id = Some(call_id);
                     t.state = RunState::Running;
@@ -1440,6 +1667,7 @@ impl Workspace {
                     return;
                 }
                 let Ok(page) = serde_json::from_value::<lode_proto::Page>(v) else { return };
+                let mut filing = None;
                 if let Some(t) = self.tabs.iter_mut().find(|t| t.id == tab) {
                     t.columns = page.columns;
                     t.rows = page.rows;
@@ -1447,6 +1675,23 @@ impl Workspace {
                     t.has_more = page.has_more;
                     t.total = page.total;
                     t.affected = page.affected.or(t.affected);
+                    // **What belonged to the OLD result goes.** A sort is over
+                    // a column this result may not have; a selected row and an
+                    // open detail are indexes into rows that are gone. Left
+                    // alone, the grid drew a highlight on whatever row happened
+                    // to be in that position, or showed a detail panel of the
+                    // previous result's values beside the new ones.
+                    t.sort = None;
+                    let n = t.rows.len();
+                    t.selected = t.selected.filter(|i| *i < n);
+                    t.detail = t.detail.filter(|i| *i < n);
+                    if !t.recorded {
+                        filing = Some((t.ms, t.total.map(|v| v as u64).or(Some(n as u64))));
+                    }
+                }
+                // A read's row count is known HERE and nowhere earlier.
+                if let Some((ms, rows)) = filing {
+                    self.record_run(tab, "done", ms, rows);
                 }
             }
             Pending::Ignore(_) => {}
@@ -1688,6 +1933,13 @@ impl Workspace {
                         });
                     }
                 }
+                // And the settings window, which LISTS them: it opens asking
+                // for both kinds, so without this it shows "none yet" over a
+                // list that arrived a moment later.
+                if let Some(h) = self.settings_window.clone() {
+                    let (tun, prx) = (self.profile_rows("tunnel"), self.profile_rows("proxy"));
+                    let _ = h.update(cx, |w, _, cx| w.profiles_arrived(tun, prx, cx));
+                }
             }
             Pending::NodeColumns { key } => {
                 let cols: Vec<TableColumn> =
@@ -1702,15 +1954,21 @@ impl Workspace {
                 self.node_indexes.insert(key, idx);
             }
             Pending::NodeSample { key } => {
+                // **The page is NOT asked for here.** `query.execute` answers
+                // with a call id the moment the statement is away, and a page
+                // asked at that moment gets `{ready: false}` — which this code
+                // read as "no rows" and remembered as an empty sample, so the
+                // types never appeared and expanding the node again found the
+                // empty answer cached. The call is remembered instead, and the
+                // page is asked for when `query.state` says `done`.
                 if let Some(call_id) = v.get("call_id").and_then(Value::as_u64) {
-                    self.ask(
-                        Pending::NodeSamplePage { key },
-                        "query.page",
-                        json!({ "call_id": call_id, "offset": 0, "limit": NODE_SAMPLE }),
-                    );
+                    self.sample_calls.insert(call_id, key);
                 }
             }
-            Pending::NodeSamplePage { key } => {
+            Pending::NodeSamplePage { key, call_id } => {
+                // The engine holds a call's buffer until it is released, and a
+                // sample is read once and never paged again.
+                self.ask(Pending::Ignore("release"), "query.release", json!({ "call_id": call_id }));
                 let cols: Vec<String> = v
                     .get("columns")
                     .and_then(Value::as_array)
@@ -1727,11 +1985,29 @@ impl Workspace {
                 self.node_sample_cols.insert(key.clone(), cols);
                 self.node_sample.insert(key, rows);
             }
+            Pending::ConnQueryCount { name } => {
+                let n = v.get("queries").and_then(Value::as_array).map(Vec::len).unwrap_or(0);
+                // Only fills in the question that is already up: an answer that
+                // arrives after it was dismissed must not re-open it.
+                if let Some((who, count)) = self.confirm_conn_rm.as_mut() {
+                    if *who == name {
+                        *count = Some(n);
+                    }
+                }
+            }
+            Pending::ConnRemoved { name } => {
+                self.saved.retain(|c| c.name != name);
+                self.ask(Pending::Connections, "store.connections.list", json!({}));
+                self.toast(format!("removed connection: {name}"), false);
+            }
             Pending::ProfileUsers { name } => {
                 let users: Vec<String> =
                     serde_json::from_value(v.get("users").cloned().unwrap_or(json!([])))
                         .unwrap_or_default();
                 self.profile_users.insert(name, users);
+                // The settings window reads these off this window as it paints,
+                // so it needs telling they are here, nothing more.
+                self.poke_settings(cx);
             }
             Pending::ProfileSaved { kind } => {
                 // Stored. The window goes and the list is asked for again, so a
@@ -1757,15 +2033,53 @@ impl Workspace {
                         users.join(", ")
                     );
                     self.toast(msg.clone(), true);
-                    self.log.push(("warn".into(), msg));
+                    self.log_push("warn", msg);
                 }
                 self.ask(Pending::Profiles { kind }, "store.profiles.list", json!({ "kind": kind }));
             }
-            Pending::FormSave => {
-                // Stored. Now the window goes, and the panel is asked for the
-                // list again so the new name and driver are there immediately —
-                // a save somebody has to go and refresh to see is a save they
-                // are not sure happened.
+            Pending::ClassifyTab { tab, statement } => {
+                match v.get("reason").and_then(Value::as_str) {
+                    // Named a reason: the tab holds it, with the statement, and
+                    // waits. Nothing is sent to the database yet.
+                    Some(reason) => {
+                        if let Some(t) = self.tabs.iter_mut().find(|t| t.id == tab) {
+                            t.confirm = Some((statement, reason.to_string()));
+                        }
+                    }
+                    None => self.run_tab_confirmed(tab, false),
+                }
+            }
+            Pending::Rename { to, driver, spec } => {
+                // Renamed, and the engine says what moved with it. Now the spec
+                // the window holds goes onto the row under its new name.
+                let moved = v.get("moved").cloned().unwrap_or_else(|| json!({}));
+                let total: u64 = moved
+                    .as_object()
+                    .map(|m| m.values().filter_map(Value::as_u64).sum())
+                    .unwrap_or(0);
+                if total > 0 {
+                    self.log_push("info", format!("renamed to {to}; {total} saved items moved with it"),
+                    );
+                }
+                self.ask(
+                    Pending::FormSave { rename_from: None },
+                    "store.connections.save",
+                    json!({ "name": to, "driver": driver, "spec": spec }),
+                );
+            }
+            Pending::FormSave { rename_from } => {
+                // Stored under the new name: only now is the old one taken off.
+                if let Some(old) = rename_from {
+                    self.ask(
+                        Pending::Ignore("rename"),
+                        "store.connections.remove",
+                        json!({ "name": old }),
+                    );
+                }
+                // Now the window goes, and the panel is asked for the list again
+                // so the new name and driver are there immediately — a save
+                // somebody has to go and refresh to see is a save they are not
+                // sure happened.
                 self.close_form(cx);
                 self.ask(Pending::Connections, "store.connections.list", json!({}));
                 self.toast("connection saved".to_string(), false);
@@ -1817,14 +2131,14 @@ impl Workspace {
                         b.stale = Some(e.clone());
                     }
                 }
-                self.log.push(("error".into(), e));
+                self.log_push("error", e);
             }
             Pending::BoardSaved { .. } => {
                 // The engine refuses a board that is wrong and says WHICH tile.
                 // It goes to the toast AND to the log, because the toast
                 // expires and this is the sentence that explains the refusal.
                 self.toast(e.clone(), true);
-                self.log.push(("error".into(), e));
+                self.log_push("error", e);
             }
             Pending::Connect { name, .. } => {
                 self.status = format!("could not connect to {name}");
@@ -1853,7 +2167,25 @@ impl Workspace {
             }
             // A failed stage is the engine naming the layer that is wrong, so it
             // goes back to the window beside the button that asked.
-            Pending::FormSave => {
+            Pending::ClassifyTab { tab, .. } => {
+                // Could not check: that is not permission to run. The tab says
+                // so where the person is looking, rather than in a log nobody
+                // reads.
+                if let Some(t) = self.tabs.iter_mut().find(|t| t.id == tab) {
+                    t.error = Some(format!("could not check what this statement does: {e}"));
+                    t.state = RunState::Failed;
+                }
+                self.toast(e, true);
+            }
+            Pending::Rename { .. } => {
+                // A refused rename stops here: nothing was saved, nothing was
+                // removed, and the window still holds the typing.
+                if let Some(h) = self.form_window.clone() {
+                    let _ = h.update(cx, |form, _, cx| f_save_failed(form, e.clone(), cx));
+                }
+                self.toast(e, true);
+            }
+            Pending::FormSave { .. } => {
                 // The window is still open, which is the point: the refusal
                 // goes into it, beside the fields that still hold the typing.
                 if let Some(h) = self.form_window.clone() {
@@ -1866,11 +2198,9 @@ impl Workspace {
             }
             // A classification that failed is NOT permission to run: the answer
             // was "I do not know", and the whole point is to ask first.
-            Pending::Classify { statement, .. } => self.log.push((
-                "error".into(),
-                format!("could not check whether this is destructive, so it was not run: {statement} — {e}"),
-            )),
-            _ => self.log.push(("error".into(), e)),
+            Pending::Classify { statement, .. } => self.log_push("error", format!("could not check whether this is destructive, so it was not run: {statement} — {e}"),
+            ),
+            _ => self.log_push("error", e),
         }
     }
 
@@ -1925,10 +2255,8 @@ impl Workspace {
             .map(|m| m.browse_for(kind).to_string())
             .unwrap_or_default();
         if template.is_empty() {
-            self.log.push((
-                "warn".into(),
-                format!("the {driver} driver declares no browse statement (engine older than protocol 3)"),
-            ));
+            self.log_push("warn", format!("the {driver} driver declares no browse statement (engine older than protocol 3)"),
+            );
             return;
         }
         let title = match schema.filter(|s| !s.is_empty()) {
@@ -2201,8 +2529,25 @@ impl Workspace {
         }
     }
 
+    /// Run a tab — **after asking the engine what the statement means.**
+    ///
+    /// The console has always classified first; a tab ran straight away, so the
+    /// same `DROP` typed into the tab's box went through without a word. Only
+    /// the engine knows what a statement does in that driver's language, so it
+    /// is asked, and a named reason stops the tab the way it stops the console.
     fn run_tab(&mut self, tab_id: u64) {
-        self.run_tab_confirmed(tab_id, false)
+        let Some(idx) = self.tabs.iter().position(|t| t.id == tab_id) else { return };
+        self.tabs[idx].confirm = None;
+        let statement = self.tabs[idx].sql.clone();
+        if statement.trim().is_empty() {
+            return;
+        }
+        let driver = self.tabs[idx].driver.clone();
+        self.ask(
+            Pending::ClassifyTab { tab: tab_id, statement },
+            "query.classify",
+            json!({ "driver": driver, "statement": self.tabs[idx].sql.clone() }),
+        );
     }
 
     /// Run a tab, saying whether the person has already been asked.
@@ -2214,7 +2559,7 @@ impl Workspace {
         let Some(idx) = self.tabs.iter().position(|t| t.id == tab_id) else { return };
         let (conn_name, title) = (self.tabs[idx].conn_name.clone(), self.tabs[idx].title.clone());
         let Some(live) = self.live(&conn_name) else {
-            self.log.push(("warn".into(), format!("{conn_name} is not connected")));
+            self.log_push("warn", format!("{conn_name} is not connected"));
             return;
         };
         let conn_id = live.conn_id;
@@ -2223,11 +2568,11 @@ impl Workspace {
             return;
         }
         let old = self.tabs[idx].call_id.take();
+        let old_running = self.tabs[idx].state == RunState::Running;
         self.tabs[idx].reset_result();
 
         if let Some(old) = old {
-            self.calls.remove(&old);
-            self.ask(Pending::Ignore("release"), "query.release", json!({ "call_id": old }));
+            self.let_go_of_call(old, old_running);
         }
         let task_id = self.next_task;
         self.next_task += 1;
@@ -2311,7 +2656,33 @@ impl Workspace {
 
     /// Remember what is open. Called after anything that changes it; writing a
     /// small file on each change is cheaper than deciding when to.
-    fn remember(&self) {
+    /// Say that something worth remembering changed.
+    ///
+    /// It does NOT write. Fourteen places call this, several of them on a
+    /// keystroke or a click — paging a result, dragging the panel's edge,
+    /// switching tabs — and each call serialized the whole session and wrote it
+    /// to disk. The write happens from `pump`, at most once every 500 ms, so a
+    /// burst of changes costs one file write instead of one per change.
+    fn remember(&mut self) {
+        self.session_dirty = true;
+    }
+
+    /// Write the session if it is dirty and enough time has passed.
+    fn flush_session(&mut self) {
+        if !self.session_dirty {
+            return;
+        }
+        if let Some(last) = self.session_written {
+            if last.elapsed() < Duration::from_millis(500) {
+                return;
+            }
+        }
+        self.session_dirty = false;
+        self.session_written = Some(Instant::now());
+        self.write_session();
+    }
+
+    fn write_session(&self) {
         session::save(&Session {
             connections: self.conns.iter().map(|c| c.name.clone()).collect(),
             tabs: self
@@ -2352,6 +2723,10 @@ impl Workspace {
             active: self.active,
             theme: Some(self.theme_name.clone()),
             json_indent: Some(self.json_indent),
+            // Nothing opens or closes a settings group any more — the panel
+            // became a window with categories. The field stays in the file's
+            // shape so a session written by an older build still parses.
+            settings_open: None,
             lang: Some(self.lang.tag().into()),
             // `None` when it is the default, so a later change to the default
             // reaches anybody who has not picked a size of their own. Writing
@@ -2361,14 +2736,12 @@ impl Workspace {
             icon_size: Some(self.scale.icon_size())
                 .filter(|v| *v != crate::metrics::DEFAULT_ICON),
             panel_w: self.scale.panel_set(),
-            settings_open: Some(self.open_groups.iter().cloned().collect()),
             rail: match self.rail {
                 Rail::Connections => "connections",
                 Rail::Instance => "instance",
                 Rail::History => "history",
                 Rail::Audit => "audit",
                 Rail::Tasks => "tasks",
-                Rail::Settings => "settings",
             }
             .into(),
         });
@@ -2377,8 +2750,11 @@ impl Workspace {
     fn close_tab(&mut self, id: u64) {
         if let Some(pos) = self.tabs.iter().position(|t| t.id == id) {
             if let Some(call) = self.tabs[pos].call_id {
-                self.calls.remove(&call);
-                self.ask(Pending::Ignore("release"), "query.release", json!({ "call_id": call }));
+                // A statement whose tab is gone has nobody waiting for it, and
+                // it is still holding a connection on the server. Closing the
+                // tab stops it.
+                let running = self.tabs[pos].state == RunState::Running;
+                self.let_go_of_call(call, running);
             }
             self.tabs.remove(pos);
             self.inputs.retain(|(t, _), _| *t != id);
@@ -2417,8 +2793,8 @@ impl Workspace {
     /// destroys anything, because only the engine knows what the statement means
     /// in that driver's language.
     fn console_submit(&mut self, line: String, _cx: &mut Context<Self>) {
-        let Some(conn) = self.conns.first().map(|c| c.name.clone()) else {
-            self.log.push(("warn".into(), "nothing is connected".into()));
+        let Some(conn) = self.target_conn() else {
+            self.log_push("warn", "nothing is connected".into());
             return;
         };
         let Some(live) = self.live(&conn) else { return };
@@ -2506,6 +2882,7 @@ impl Workspace {
             Some((_, d, _)) => format!("lode — Edit {d} connection"),
             None => "lode — New connection".to_string(),
         };
+        let fonts = (self.font_family.clone(), self.icon_family.clone());
         let bounds = Bounds::centered(None, size(px(720.0), px(560.0)), cx);
         let opened = cx.open_window(
             WindowOptions {
@@ -2516,11 +2893,11 @@ impl Workspace {
                 }),
                 ..Default::default()
             },
-            |_window, cx| cx.new(|cx| ConnectionForm::new(me, theme, self.scale, drivers, tunnel_profiles, tunnel_profile_specs, aws_profiles, existing, cx)),
+            |_window, cx| cx.new(|cx| ConnectionForm::new(me, theme, self.scale, drivers, tunnel_profiles, tunnel_profile_specs, aws_profiles, existing, fonts, cx)),
         );
         match opened {
             Ok(h) => self.form_window = Some(h),
-            Err(e) => self.log.push(("error".into(), format!("could not open the window: {e}"))),
+            Err(e) => self.log_push("error", format!("could not open the window: {e}")),
         }
     }
 
@@ -2553,6 +2930,7 @@ impl Workspace {
             Some((n, _)) => format!("lode — Tunnel {n}"),
             None => "lode — New tunnel".to_string(),
         };
+        let font = self.font_family.clone();
         let bounds = Bounds::centered(None, size(px(620.0), px(420.0)), cx);
         let opened = cx.open_window(
             WindowOptions {
@@ -2562,13 +2940,13 @@ impl Workspace {
             },
             |_window, cx| {
                 cx.new(|cx| {
-                    crate::profile::ProfileForm::new(me, theme, scale, existing, users, cx)
+                    crate::profile::ProfileForm::new(me, theme, scale, existing, users, font, cx)
                 })
             },
         );
         match opened {
             Ok(h) => self.profile_window = Some(h),
-            Err(e) => self.log.push(("error".into(), format!("could not open the window: {e}"))),
+            Err(e) => self.log_push("error", format!("could not open the window: {e}")),
         }
     }
 
@@ -2582,11 +2960,8 @@ impl Workspace {
         }
         self.ask_profiles();
         let drivers = self.hello.as_ref().map(|h| h.drivers.clone()).unwrap_or_default();
-        let prof = |kind: &str| -> Vec<(String, Value)> {
-            self.profiles
-                .get(kind)
-                .map(|v| v.iter().map(|p| (p.name.clone(), p.spec.clone())).collect())
-                .unwrap_or_default()
+        let prof = |kind: &str| -> Vec<ProfileRow> {
+            self.profiles.get(kind).cloned().unwrap_or_default()
         };
         let about: Vec<(String, String)> = self
             .hello
@@ -2605,6 +2980,7 @@ impl Workspace {
         let (theme, scale) = (self.theme.clone(), self.scale);
         let me = cx.entity().downgrade();
         let (tun, prx) = (prof("tunnel"), prof("proxy"));
+        let fonts = (self.font_family.clone(), self.icon_family.clone());
         let bounds = Bounds::centered(None, size(px(900.0), px(620.0)), cx);
         let opened = cx.open_window(
             WindowOptions {
@@ -2618,14 +2994,14 @@ impl Workspace {
             |_window, cx| {
                 cx.new(|cx| {
                     crate::settings::SettingsWindow::new(
-                        me, theme, scale, drivers, tun, prx, about, cx,
+                        me, theme, scale, drivers, tun, prx, about, fonts, cx,
                     )
                 })
             },
         );
         match opened {
             Ok(h) => self.settings_window = Some(h),
-            Err(e) => self.log.push(("error".into(), format!("could not open the window: {e}"))),
+            Err(e) => self.log_push("error", format!("could not open the window: {e}")),
         }
     }
 
@@ -2711,31 +3087,78 @@ impl Workspace {
         renamed_from: Option<String>,
         cx: &mut Context<Self>,
     ) {
+        let rename_from = renamed_from.filter(|o| *o != name);
+        // **An engine that can rename, renames.** Saved queries, charts,
+        // dashboards and scripts are scoped to the connection's NAME: a save
+        // under the new name followed by a delete of the old one leaves all of
+        // them pointing at a name nothing answers to. `store.connections.rename`
+        // (protocol 15) moves them in one transaction; the save that follows
+        // writes the edited spec onto the renamed row.
+        let engine_renames = self.hello.as_ref().map_or(false, |h| h.proto >= 15);
+        if let (true, Some(old)) = (engine_renames, rename_from.clone()) {
+            self.ask(
+                Pending::Rename { to: name.clone(), driver: driver.clone(), spec: spec.clone() },
+                "store.connections.rename",
+                json!({ "from": old, "to": name }),
+            );
+            return;
+        }
+        // Older engine: a save under the new name and a removal of the old, but
+        // SEQUENTIAL, not parallel. Fired together, a refused save left the old
+        // name removed and the new one never written — a connection deleted by
+        // pressing Save.
         self.ask(
-            Pending::FormSave,
+            Pending::FormSave { rename_from },
             "store.connections.save",
             json!({ "name": name, "driver": driver, "spec": spec }),
         );
-        // A rename is a save under the new name and a removal of the old: the
-        // store is keyed by name and has no rename of its own.
-        if let Some(old) = renamed_from.filter(|o| *o != name) {
-            self.ask(
-                Pending::Ignore("rename"),
-                "store.connections.remove",
-                json!({ "name": old }),
-            );
-        }
         // NOT closed here. The window closes when the ENGINE says the
         // connection is stored — see `Pending::FormSave`. Closing on the way out
         // of this function closes it whether the save worked or not, and a
         // window that vanishes on a failed save takes the typing with it.
+        //
+        // The repaint IS needed: the status line already says the save is in
+        // flight, and nothing else this frame asks for one.
+        cx.notify();
     }
 
     /// Save the active tab's statement under its title, for this connection.
     /// The engine owns saved queries, so one saved here appears in the editor.
+    /// Ask what to call it. The save itself is `save_query_as`.
     fn save_query(&mut self, cx: &mut Context<Self>) {
+        self.ask_for_name(NameFor::Query, cx);
+    }
+
+    /// Put up the naming row, with what the tab is called as the suggestion.
+    fn ask_for_name(&mut self, what: NameFor, cx: &mut Context<Self>) {
         let Some(tab) = self.tabs.get(self.active) else { return };
-        let (conn, name) = (tab.conn_name.clone(), tab.title.clone());
+        if tab.sql.trim().is_empty() && tab.fields.is_empty() {
+            self.toast("there is nothing to save yet".to_string(), true);
+            return;
+        }
+        let suggestion = tab.title.clone();
+        self.naming = Some(what);
+        self.save_name.update(cx, |i, cx| i.set_text(suggestion, cx));
+        cx.notify();
+    }
+
+    /// The name came back from the row. Nothing is saved under an empty one.
+    fn named(&mut self, name: String, cx: &mut Context<Self>) {
+        let Some(what) = self.naming.take() else { return };
+        if name.is_empty() {
+            self.naming = Some(what);
+            self.toast(format!("a {} needs a name", what.what()), true);
+            return;
+        }
+        match what {
+            NameFor::Query => self.save_query_as(name, cx),
+            NameFor::Chart => self.save_chart_as(name, cx),
+        }
+    }
+
+    fn save_query_as(&mut self, name: String, cx: &mut Context<Self>) {
+        let Some(tab) = self.tabs.get(self.active) else { return };
+        let conn = tab.conn_name.clone();
         let id = tab.id;
         self.sync_tab_from_inputs(id, cx);
         let Some(tab) = self.tabs.iter().find(|t| t.id == id) else { return };
@@ -2762,8 +3185,9 @@ impl Workspace {
     /// list and by a saved query.
     fn open_sql(&mut self, conn: &str, title: &str, sql: &str, cx: &mut Context<Self>) {
         if self.live(conn).is_none() {
-            self.log
-                .push(("warn".into(), format!("{conn} is not connected")));
+            // A click that does nothing at all reads as a broken list, so this
+            // one says why in the corner as well as in the log.
+            self.toast(format!("{conn} is not connected"), true);
             return;
         }
         self.run_statement_titled(conn, title, sql, false, cx);
@@ -2844,8 +3268,7 @@ impl Workspace {
     /// nobody can go back and read.
     fn toast(&mut self, text: impl Into<String>, bad: bool) {
         let text = text.into();
-        self.log
-            .push((if bad { "error".into() } else { "info".into() }, text.clone()));
+        self.log_push(if bad { "error" } else { "info" }, text.clone());
         let id = self.next_toast;
         self.next_toast += 1;
         self.toasts.push(Toast { id, text, bad, born: Instant::now() });
@@ -2909,7 +3332,7 @@ impl Workspace {
                 act: PaletteAct::View(v),
             });
         }
-        for r in [Rail::Connections, Rail::Instance, Rail::History, Rail::Audit, Rail::Tasks, Rail::Settings] {
+        for r in [Rail::Connections, Rail::Instance, Rail::History, Rail::Audit, Rail::Tasks] {
             out.push(PaletteItem {
                 label: format!("{} {}", self.lang.tr("panel.look_again").split(' ').next().unwrap_or("Show"), self.lang.tr(r.key())),
                 hint: "panel".into(),
@@ -2988,6 +3411,9 @@ impl Workspace {
         match act {
             PaletteAct::Rail(r) => {
                 self.rail = r;
+                if r == Rail::Tasks {
+                    self.log_unread = 0;
+                }
                 if r == Rail::History && self.history.is_empty() {
                     self.ask(Pending::History, "store.history.list", json!({ "limit": 200 }));
                 }
@@ -3361,8 +3787,12 @@ impl Workspace {
     /// Save what the chart is showing. The statement and the measured column,
     /// under a name — kept by the ENGINE, so it is there in the editor too.
     fn save_chart(&mut self, cx: &mut Context<Self>) {
+        self.ask_for_name(NameFor::Chart, cx);
+    }
+
+    fn save_chart_as(&mut self, name: String, cx: &mut Context<Self>) {
         let Some(tab) = self.tabs.get(self.active) else { return };
-        let (conn, name, id) = (tab.conn_name.clone(), tab.title.clone(), tab.id);
+        let (conn, id) = (tab.conn_name.clone(), tab.id);
         self.sync_tab_from_inputs(id, cx);
         let Some(tab) = self.tabs.iter().find(|t| t.id == id) else { return };
         if tab.sql.trim().is_empty() {
@@ -3391,7 +3821,9 @@ impl Workspace {
 
     /// Ask the server what it is doing. One round trip, when asked.
     fn ask_metrics(&mut self) {
-        let Some(live) = self.conns.first() else { return };
+        // The instance being looked at, not the first one that connected.
+        let Some(target) = self.target_conn() else { return };
+        let Some(live) = self.live(&target) else { return };
         let (name, conn_id, driver) = (live.name.clone(), live.conn_id, live.driver.clone());
         if !self.meta(&driver).map_or(false, |m| m.caps.metrics) {
             self.metrics.clear();
@@ -3736,6 +4168,49 @@ impl Workspace {
         self.propose_write(tab_id, row, set, false, cx);
     }
 
+    /// Put one run in the engine's history, once.
+    ///
+    /// The history is the ENGINE's, so what this client runs shows up in the
+    /// editor's log too. Filed when it is OVER, with the state it reached:
+    /// writing it at launch would mean every row said "running".
+    fn record_run(&mut self, tab_id: u64, state: &str, ms: u64, rows: Option<u64>) {
+        let found = self.tabs.iter_mut().find(|t| t.id == tab_id).and_then(|t| {
+            if t.recorded || t.sql.trim().is_empty() {
+                return None;
+            }
+            t.recorded = true;
+            Some((t.sql.trim().to_string(), t.conn_name.clone(), t.driver.clone()))
+        });
+        let Some((sql, conn, driver)) = found else { return };
+        self.ask(
+            Pending::Ignore("history"),
+            "store.history.record",
+            json!({
+                "conn": conn, "driver": driver, "statement": sql,
+                "state": state, "ms": ms, "rows": rows
+            }),
+        );
+    }
+
+    /// Let go of a call the client no longer has a tab for.
+    ///
+    /// A call that is still WORKING is cancelled and nothing more. Releasing it
+    /// in the same breath would be wrong in a way that is easy to miss: release
+    /// drops the engine's handle, and dropping a handle is not the same as
+    /// telling a query to stop — and the two requests are separate lines, so
+    /// the release can be read first and the cancel then finds nothing. The
+    /// engine answers a cancel with a `query.state`, and the release happens
+    /// there (see the orphan branch) once there is nothing left to stop.
+    fn let_go_of_call(&mut self, call_id: u64, running: bool) {
+        self.calls.remove(&call_id);
+        if running {
+            self.ask(Pending::Ignore("cancel"), "query.cancel", json!({ "call_id": call_id }));
+        } else {
+            self.call_tasks.remove(&call_id);
+            self.ask(Pending::Ignore("release"), "query.release", json!({ "call_id": call_id }));
+        }
+    }
+
     fn cancel_active(&mut self) {
         let Some(tab) = self.tabs.get(self.active) else { return };
         let Some(call_id) = tab.call_id else { return };
@@ -3754,7 +4229,7 @@ impl Workspace {
     /// repaint by hand: one assignment and the next frame is the new theme. The
     /// input fields are the exception — they cache their colours — so they are
     /// handed the new ones here.
-    fn use_theme(&mut self, name: &str, cx: &mut Context<Self>) {
+    pub fn use_theme(&mut self, name: &str, cx: &mut Context<Self>) {
         let Some(path) = self.themes.get(name).cloned() else { return };
         match theme::load(&path) {
             Ok(t) => {
@@ -3775,6 +4250,9 @@ impl Workspace {
                 if let Some(h) = self.profile_window.clone() {
                     let _ = h.update(cx, |f, _, cx| f.set_theme(th.clone(), cx));
                 }
+                if let Some(h) = self.settings_window.clone() {
+                    let _ = h.update(cx, |f, _, cx| f.set_theme(th.clone(), cx));
+                }
                 self.remember();
                 self.toast(format!("theme: {name}"), false);
                 cx.notify();
@@ -3783,8 +4261,97 @@ impl Workspace {
             // than leaving the old one up with no explanation.
             Err(e) => {
                 self.toast(format!("{name}: {e}"), true);
-                self.log.push(("error".into(), format!("{name}: {e}")));
+                self.log_push("error", format!("{name}: {e}"));
             }
+        }
+    }
+
+    /// Everything the settings window shows of this window's own state.
+    ///
+    /// Read FRESH on every paint rather than copied in when the window opens: a
+    /// copy is a second truth, and the first time somebody changed the text
+    /// size from the keyboard the settings window would be showing the old
+    /// number beside a stepper that moves the new one.
+    pub fn appearance(&self) -> crate::settings::Appearance {
+        crate::settings::Appearance {
+            theme_name: self.theme_name.clone(),
+            themes: self.themes.keys().cloned().collect(),
+            theme_dirs: theme::theme_dirs().iter().map(|d| d.display().to_string()).collect(),
+            base: self.scale.base(),
+            icon: self.scale.icon_size(),
+            lang: self.lang,
+            json_indent: self.json_indent,
+            font_family: self.font_family.clone(),
+            icon_family: self.icon_family.clone(),
+        }
+    }
+
+    /// Look for theme files again, and say what changed. Folders are read at
+    /// startup, and a theme dropped in afterwards is the ordinary case.
+    pub fn rescan_themes(&mut self, cx: &mut Context<Self>) {
+        let before = self.themes.len();
+        self.themes = theme::discover();
+        let now = self.themes.len();
+        self.toast(format!("{now} theme(s) found, was {before}"), false);
+        self.poke_settings(cx);
+        cx.notify();
+    }
+
+    pub fn set_base(&mut self, base: f32, cx: &mut Context<Self>) {
+        self.scale = self.scale.with_base(base);
+        self.remember();
+        self.poke_settings(cx);
+        cx.notify();
+    }
+
+    pub fn set_icon(&mut self, size: f32, cx: &mut Context<Self>) {
+        self.scale = self.scale.with_icon(size);
+        self.remember();
+        self.poke_settings(cx);
+        cx.notify();
+    }
+
+    pub fn reset_scale(&mut self, cx: &mut Context<Self>) {
+        self.scale = Metrics::new(crate::metrics::DEFAULT_BASE);
+        self.remember();
+        self.poke_settings(cx);
+        cx.notify();
+    }
+
+    pub fn set_lang(&mut self, lang: Lang, cx: &mut Context<Self>) {
+        self.lang = lang;
+        self.relabel_inputs(cx);
+        self.remember();
+        self.poke_settings(cx);
+        cx.notify();
+    }
+
+    pub fn set_json_indent(&mut self, n: u8, cx: &mut Context<Self>) {
+        self.json_indent = n;
+        self.remember();
+        self.poke_settings(cx);
+        cx.notify();
+    }
+
+    /// The saved profiles of one kind, and who points at each — what the
+    /// settings window lists.
+    pub fn profile_rows(&self, kind: &str) -> Vec<ProfileRow> {
+        self.profiles.get(kind).cloned().unwrap_or_default()
+    }
+
+    pub fn profile_users_of(&self, name: &str) -> Vec<String> {
+        self.profile_users.get(name).cloned().unwrap_or_default()
+    }
+
+    /// Hand the settings window the sizes again and ask it to repaint.
+    ///
+    /// It keeps its own `Metrics` so it can draw without reaching back on every
+    /// row; the cost of that is this call, and a setter that forgets it leaves
+    /// a window whose own text does not change when it changes everything else.
+    fn poke_settings(&mut self, cx: &mut Context<Self>) {
+        let ms = self.scale;
+        if let Some(h) = self.settings_window.clone() {
+            let _ = h.update(cx, |w, _, cx| w.set_scale(ms, cx));
         }
     }
 
@@ -3817,14 +4384,14 @@ impl Workspace {
 
     /// Every live field, so a theme change reaches all of them.
     ///
-    /// This list is kept BY HAND and that is its weakness: `theme_filter` was
-    /// added and not added here, so on a light theme it stayed dark — the one
-    /// field in the window still wearing the old palette. Anything added below
-    /// must be added here, and `--check-panels` prints the count so a
-    /// disagreement shows up as a number rather than as somebody noticing.
+    /// This list is kept BY HAND and that is its weakness: the theme filter was
+    /// once added to the window and not added here, so on a light theme it
+    /// stayed dark — the one field still wearing the old palette. Anything
+    /// added below must be added here, and `--check-panels` prints the count so
+    /// a disagreement shows up as a number rather than as somebody noticing.
     fn all_inputs(&self) -> Vec<Entity<TextInput>> {
         let mut out = vec![
-            self.theme_filter.clone(),
+            self.save_name.clone(),
             self.filter.clone(),
             self.console.clone(),
             self.export_path.clone(),
@@ -4119,74 +4686,6 @@ impl Workspace {
             .child(SharedString::from(text.to_uppercase()))
     }
 
-    fn group_open(&self, g: SettingsGroup) -> bool {
-        // Through the same function the test counts, so the panel and the thing
-        // asserting about the panel cannot come to disagree.
-        crate::workspace::settings_rows(&self.open_groups)
-            .into_iter()
-            .find(|r| r.id == g.id())
-            .map(|r| r.open)
-            .unwrap_or(false)
-    }
-
-    /// A group's heading: its name, what it is set to, and whether it is open.
-    ///
-    /// The VALUE is on the row, so a closed group still answers the question it
-    /// exists for — which theme, what size, which language — without being
-    /// opened. A group that has to be opened to be read is a group somebody
-    /// opens every time, and then it may as well not fold.
-    fn group_header(
-        &self,
-        g: SettingsGroup,
-        value: impl Into<SharedString>,
-        cx: &mut Context<Self>,
-    ) -> impl IntoElement {
-        let (t, ms) = (self.t(), self.scale);
-        let open = self.group_open(g);
-        div()
-            .id(SharedString::from(format!("group-{}", g.id())))
-            .flex()
-            .items_center()
-            .gap_1()
-            .w_full()
-            .px_2()
-            .py_1()
-            .cursor_pointer()
-            .bg(t.status())
-            .hover(|d| d.bg(t.hover()))
-            .child(self.icon_inline(
-                if open { "\u{f0d7}" } else { "\u{f0da}" },
-                t.muted(),
-            ))
-            // NOT `min_w_0` on the text itself. A leaf with `min_w_0` is free
-            // to size itself to nothing, and GPUI takes the offer: the heading
-            // collapses to zero width and the group reads as absent. This trap
-            // has been walked into here before, which is why `line_in` exists —
-            // it wraps the text in a block with a DEFINITE width, which is also
-            // the only way truncation ever draws an ellipsis.
-            .child(self.line_in(
-                self.lang.tr(g.key()).to_uppercase(),
-                ms.tiny(),
-                t.title(),
-                ms.line_w() - ms.base() * 6.0,
-            ))
-            .child({
-                // Cut with an ellipsis and offered in full on hover, instead of
-                // running off the panel's edge mid-glyph — `LvimBase_` and
-                // `14 / 28 p` were the two that showed it.
-                let v: SharedString = value.into();
-                let w = ms.line_w() * 0.42;
-                self.line_tip(v, ms.tiny(), t.muted(), w, format!("gv-{}", g.id()))
-            })
-            .on_click(cx.listener(move |this, _, _, cx| {
-                if !this.open_groups.remove(g.id()) {
-                    this.open_groups.insert(g.id().to_string());
-                }
-                this.remember();
-                cx.notify();
-            }))
-    }
-
     fn rail_el(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let t = self.t();
         let ms = self.scale;
@@ -4242,6 +4741,11 @@ impl Workspace {
                     .child(self.icon_el(mode.glyph(), if on { t.accent() } else { t.muted() }))
                     .on_click(cx.listener(move |this, _, _, cx| {
                         this.rail = mode;
+                        // The log is read here, so the count beside the task
+                        // total goes back to nothing.
+                        if mode == Rail::Tasks {
+                            this.log_unread = 0;
+                        }
                         if mode == Rail::History && this.history.is_empty() {
                             this.ask(Pending::History, "store.history.list", json!({ "limit": 200 }));
                         }
@@ -4252,11 +4756,6 @@ impl Workspace {
                         // nothing asks again.
                         if mode == Rail::Instance {
                             this.ask_metrics();
-                        }
-                        // The profiles are small and change rarely; asked when
-                        // the panel that shows them is opened.
-                        if mode == Rail::Settings {
-                            this.ask_profiles();
                         }
                         this.remember();
                         cx.notify();
@@ -4290,7 +4789,7 @@ impl Workspace {
                 .hover(|d| d.bg(t.hover()))
                 .cursor_pointer()
                 .tooltip(self.tip("rail.settings", None))
-                .child(self.icon_el(Rail::Settings.glyph(), t.muted()))
+                .child(self.icon_el("\u{f013}", t.muted()))
                 .on_click(cx.listener(|this, _, _, cx| {
                     this.open_settings(cx);
                 })),
@@ -4323,552 +4822,6 @@ impl Workspace {
             .border_color(t.border());
 
         match self.rail {
-            Rail::Settings => {
-                // `closed` is variant C: the theme group starts shut whatever
-                // the session remembers, so the filter is the way in.
-                let g_theme = self.group_open(SettingsGroup::Theme);
-                // ── WHERE A TEXT FIELD GOES IN THIS PANEL, DECIDED ONCE ─────
-                //
-                // ABOVE the scrolling list. Never inside it. A `TextInput` is
-                // not a div: it is a custom element that shapes its own line,
-                // measures it, and installs an `EntityInputHandler` during
-                // paint, and inside a scrolling list it takes the whole panel
-                // down with it. History and audit have always put their search
-                // fields here, which is why neither has ever shown this.
-                //
-                // That rules out making the field LOOK like part of its group:
-                // the group's heading and content both live in the list, and
-                // the field cannot. So it stays put instead — always present,
-                // in one predictable place, like the other two panels' — rather
-                // than appearing and vanishing as a group is opened and closed,
-                // which is a field flickering in a strip that belongs to no
-                // group at all.
-                //
-                // Typing in it opens the theme group, so it still does
-                // something when that group is shut.
-                panel = panel.child(
-                    div()
-                        .px_2()
-                        .py_1()
-                        .child(self.field(ms.small(), self.theme_filter.clone())),
-                );
-                let mut list = self.panel_list("settings-list");
-                list = list.child(self.group_header(
-                    SettingsGroup::Theme,
-                    self.theme_name.clone(),
-                    cx,
-                ));
-                if g_theme {
-                list = list.child(
-                    div()
-                        .id("theme-rescan")
-                        .px_2()
-                        .py_1()
-                        .cursor_pointer()
-                        .hover(|d| d.bg(t.hover()))
-                        .text_size(ms.small())
-                        .text_color(t.accent())
-                        .child(SharedString::from(format!(
-                            "{}  {}",
-                            "\u{f021}",
-                            self.lang.tr("panel.rescan")
-                        )))
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            let before = this.themes.len();
-                            this.themes = theme::discover();
-                            let now = this.themes.len();
-                            this.toast(
-                                format!("{now} theme(s) found, was {before}"),
-                                false,
-                            );
-                            cx.notify();
-                        })),
-                );
-                // WHICH folders. "Look again" said nothing about where it would
-                // look, so a list that did not change left nobody any wiser —
-                // the same reason the empty case already names them.
-                for d in theme::theme_dirs() {
-                    list = list.child(div().px_2().child(self.line(
-                        d.display().to_string(),
-                        ms.tiny(),
-                        t.muted(),
-                        ms.line_w(),
-                    )));
-                }
-                if self.themes.is_empty() {
-                    // WHICH directories were searched. "No themes" on its own is
-                    // a message somebody can do nothing with.
-                    list = list.child(div().px_2().child(self.small(
-                        self.lang.tr("settings.no_themes"),
-                        t.warning(),
-                    )));
-                    for d in theme::theme_dirs() {
-                        list = list.child(div().px_2().child(self.line(
-                            d.display().to_string(),
-                            ms.small(),
-                            t.muted(),
-                            ms.line_w(),
-                        )));
-                    }
-                    list = list.child(div().px_2().child(self.small(
-                        "the built-in theme is the generated LvimBase_dark",
-                        t.muted(),
-                    )));
-                }
-                // The list is CAPPED and scrolls inside itself. Open, it costs a
-                // fixed amount of room instead of pushing everything below it off
-                // the bottom — which is what it did, and is why nobody found the
-                // settings under it.
-                let filter = self.theme_filter.read(cx).text().trim().to_lowercase();
-                // ── HOW A LONG LIST LIVES IN THIS PANEL — SETTLED ───────────
-                //
-                // A capped box with its own scrolling, INSIDE the panel's
-                // scrolling list. Nesting one scroller in another is fine and
-                // always was: this box was removed on my guess that it blanked
-                // the panel, and it did not — `return panel;` did. Measured
-                // across five arrangements and this one draws, so it is the
-                // rule for every long list this panel grows, the profiles
-                // included.
-                //
-                // About a third of the panel's height, so the groups below stay
-                // reachable, and the panel still scrolls to them.
-                let names: Vec<String> = self
-                    .themes
-                    .keys()
-                    .filter(|n| filter.is_empty() || n.to_lowercase().contains(&filter))
-                    .cloned()
-                    .collect();
-                let mut themes = div()
-                    .id("theme-list")
-                    .max_h(px(ms.base() * 18.0))
-                    .overflow_y_scroll()
-                    .flex()
-                    .flex_col();
-                let mut shown = 0usize;
-                // ALL of them, in the panel's own scrolling list. No cap and no
-                // inner scroller: the first blanked the panel, and the second
-                // hid thirty-six themes behind a line of text, which is a
-                // worse answer to "there are a lot of these" than scrolling is.
-                // The group folds, so somebody who wants the other groups near
-                // the top closes this one — that is their decision to make, and
-                // truncating the list made it for them.
-                for name in names.iter() {
-                    shown += 1;
-                    let on = *name == self.theme_name;
-                    let pick = name.clone();
-                    themes = themes.child(
-                        div()
-                            .id(SharedString::from(format!("theme-{name}")))
-                            .flex()
-                            .items_center()
-                            .gap_1()
-                            .px_2()
-                            .py(px(2.0))
-                            .cursor_pointer()
-                            .hover(|d| d.bg(t.hover()))
-                            .when(on, |d| d.bg(t.selected()))
-                            .child(
-                                div()
-                                    .w(px(ms.base()))
-                                    .flex_none()
-                                    .text_size(ms.tiny())
-                                    .text_color(t.accent())
-                                    .child(if on { "\u{f00c}" } else { " " }),
-                            )
-                            .child(self.line_in(
-                                name.clone(),
-                                ms.small(),
-                                if on { t.fg() } else { t.muted() },
-                                ms.line_w() - ms.base() - 14.0,
-                            ))
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                this.use_theme(&pick, cx);
-                            })),
-                    );
-                }
-                list = list.child(themes);
-                // A filter that matches nothing says so, rather than showing an
-                // empty space that looks like a missing list.
-                if shown == 0 && !self.themes.is_empty() {
-                    list = list.child(div().px_2().child(self.small(
-                        format!("no theme matches \"{}\"", self.theme_filter.read(cx).text().trim()),
-                        t.muted(),
-                    )));
-                }
-                }
-
-                let g_view = self.group_open(SettingsGroup::View);
-                list = list.child(self.group_header(
-                    SettingsGroup::View,
-                    format!("{} spaces", self.json_indent),
-                    cx,
-                ));
-                if g_view {
-                list = list.child(self.section(self.lang.tr("settings.json_indent")));
-                let mut row = div().flex().items_center().gap_2().px_2().py_1();
-                for n in [2u8, 3, 4] {
-                    let on = self.json_indent == n;
-                    row = row.child(
-                        div()
-                            .id(SharedString::from(format!("jsonind-{n}")))
-                            .px_2()
-                            .cursor_pointer()
-                            .text_size(ms.body())
-                            .text_color(if on { t.inverted() } else { t.fg() })
-                            .when(on, |d| d.bg(t.accent()))
-                            .hover(|d| d.bg(t.hover()))
-                            .child(SharedString::from(n.to_string()))
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                this.json_indent = n;
-                                this.remember();
-                                cx.notify();
-                            })),
-                    );
-                }
-                list = list.child(row);
-
-                }
-
-                let g_lang = self.group_open(SettingsGroup::Language);
-                list = list.child(self.group_header(
-                    SettingsGroup::Language,
-                    self.lang.label(),
-                    cx,
-                ));
-                if g_lang {
-                list = list.child(self.section(self.lang.tr("settings.language")));
-                let mut langs = div().flex().items_center().gap_2().px_2().py_1();
-                for l in Lang::ALL.iter().copied() {
-                    let on = self.lang == l;
-                    langs = langs.child(
-                        div()
-                            .id(SharedString::from(format!("lang-{}", l.tag())))
-                            .px_2()
-                            .cursor_pointer()
-                            .text_size(ms.body())
-                            .text_color(if on { t.inverted() } else { t.fg() })
-                            .when(on, |d| d.bg(t.accent()))
-                            .hover(|d| d.bg(t.hover()))
-                            // Its own name, not its English one: somebody
-                            // looking for their language looks for the word
-                            // they would write.
-                            .child(SharedString::from(l.label()))
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                this.lang = l;
-                                this.relabel_inputs(cx);
-                                this.remember();
-                                cx.notify();
-                            })),
-                    );
-                }
-                list = list.child(langs);
-                list = list.child(div().px_2().child(self.small(
-                    // Said, not left to be discovered: a window in Bulgarian
-                    // showing an English refusal looks half-finished unless it
-                    // is explained.
-                    "the engine's refusals and the audit log stay in English — they are the record, not the interface",
-                    t.muted(),
-                )));
-                }
-
-                let g_type = self.group_open(SettingsGroup::Type);
-                list = list.child(self.group_header(
-                    SettingsGroup::Type,
-                    format!("{} / {} px", self.scale.base(), self.scale.icon_size()),
-                    cx,
-                ));
-                if g_type {
-                list = list.child(self.section(self.lang.tr("settings.text")));
-                list = list.child(div().px_2().child(self.line(
-                    format!("text: {} · icons: {}", self.font_family, self.icon_family),
-                    ms.small(),
-                    t.muted(),
-                    ms.line_w(),
-                )));
-                list = list.child(self.section(self.lang.tr("settings.icon_size")));
-                // Its own row, beside its own stepper: the rail is navigation
-                // and the text is content, and enlarging one is not a request
-                // for the other.
-                let istep = |label: &'static str, delta: f32| {
-                    div()
-                        .id(SharedString::from(format!("icon{label}")))
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .w(px(ms.base() * 1.8))
-                        .h(px(ms.base() * 1.8))
-                        .cursor_pointer()
-                        .bg(t.raised())
-                        .hover(|d| d.bg(t.hover()))
-                        .text_size(ms.body())
-                        .text_color(t.accent())
-                        .child(label)
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            this.scale = this.scale.with_icon(this.scale.icon_size() + delta);
-                            this.remember();
-                            cx.notify();
-                        }))
-                };
-                list = list.child(
-                    div()
-                        .flex()
-                        .items_center()
-                        .gap_2()
-                        .px_2()
-                        .py_1()
-                        .child(istep("\u{2212}", -2.0))
-                        .child(
-                            div()
-                                .min_w(px(ms.base() * 2.5))
-                                .text_size(ms.body())
-                                .text_color(t.fg())
-                                .child(SharedString::from(format!("{} px", ms.icon_size()))),
-                        )
-                        .child(istep("+", 2.0))
-                        // Shown beside the number, so the effect is visible
-                        // before anything is pressed.
-                        .child(self.icon_el("\u{f1c0}", t.muted()))
-                        .child(self.icon_el("\u{f013}", t.accent())),
-                );
-                list = list.child(div().px_2().child(self.line(
-                    format!("the rail is {} px wide, which comes off this", ms.rail_w()),
-                    ms.small(),
-                    t.muted(),
-                    ms.line_w(),
-                )));
-
-                list = list.child(self.section(self.lang.tr("settings.text_size")));
-                // One number, and it moves everything: the steps, the grid row
-                // height, the rail. Here rather than only in an environment
-                // variable because "a bit bigger" is a thing somebody adjusts
-                // while looking at the result, not between restarts.
-                let step = |label: &'static str, delta: f32| {
-                    div()
-                        .id(label)
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .w(px(ms.base() * 1.8))
-                        .h(px(ms.base() * 1.8))
-                        .cursor_pointer()
-                        .bg(t.raised())
-                        .hover(|d| d.bg(t.hover()))
-                        .text_size(ms.body())
-                        .text_color(t.accent())
-                        .child(label)
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            this.scale = this.scale.with_base(this.scale.base() + delta);
-                            this.remember();
-                            cx.notify();
-                        }))
-                };
-                list = list.child(
-                    div()
-                        .flex()
-                        .items_center()
-                        .gap_2()
-                        .px_2()
-                        .py_1()
-                        .child(step("\u{2212}", -1.0))
-                        .child(
-                            div()
-                                .min_w(px(ms.base() * 2.5))
-                                .text_size(ms.body())
-                                .text_color(t.fg())
-                                .child(SharedString::from(format!("{} px", ms.base()))),
-                        )
-                        .child(step("+", 1.0))
-                        .child(
-                            div()
-                                .id("size-reset")
-                                .px_2()
-                                .cursor_pointer()
-                                .hover(|d| d.bg(t.hover()))
-                                .text_size(ms.small())
-                                .text_color(t.muted())
-                                .child(self.tr("settings.reset"))
-                                .on_click(cx.listener(|this, _, _, cx| {
-                                    this.scale = Metrics::new(crate::metrics::DEFAULT_BASE);
-                                    this.remember();
-                                    cx.notify();
-                                })),
-                        ),
-                );
-                list = list.child(div().px_2().child(self.line(
-                    format!(
-                        "every size comes off this one — headings {}, body {}, small {}, a grid row {}",
-                        f32::from(ms.heading()),
-                        f32::from(ms.body()),
-                        f32::from(ms.small()),
-                        ms.row_h()
-                    ),
-                    ms.small(),
-                    t.muted(),
-                    ms.line_w(),
-                )));
-                }
-
-                let g_prof = self.group_open(SettingsGroup::Profiles);
-                let n_prof: usize = self.profiles.values().map(Vec::len).sum();
-                list = list.child(self.group_header(
-                    SettingsGroup::Profiles,
-                    format!("{n_prof}"),
-                    cx,
-                ));
-                if g_prof {
-                    for kind in ["tunnel", "proxy"] {
-                        list = list.child(self.section(kind));
-                        let rows = self.profiles.get(kind).cloned().unwrap_or_default();
-                        if rows.is_empty() {
-                            list = list.child(div().px_2().child(self.small(
-                                format!(
-                                    "none yet — build one in a connection's Access tab and press \
-                                     \"save as profile\""
-                                ),
-                                t.muted(),
-                            )));
-                        }
-                        for r in rows {
-                            let (k, name) = (kind, r.name.clone());
-                            list = list.child(
-                                div()
-                                    .flex()
-                                    .items_center()
-                                    .gap_1()
-                                    .px_2()
-                                    .py(px(2.0))
-                                    .hover(|d| d.bg(t.hover()))
-                                    .child(
-                                        div()
-                                            .flex_1()
-                                            .min_w_0()
-                                            .flex()
-                                            .flex_col()
-                                            .child(self.line_in(
-                                                r.name.clone(),
-                                                ms.small(),
-                                                t.fg(),
-                                                ms.line_w() - ms.base() * 2.0,
-                                            ))
-                                            // WHAT it is, read off its own spec.
-                                            .child(self.line_in(
-                                                r.summary(),
-                                                ms.tiny(),
-                                                t.muted(),
-                                                ms.line_w() - ms.base() * 2.0,
-                                            )),
-                                    )
-                                    .child({
-                                        let n = r.name.clone();
-                                        div()
-                                            .id(SharedString::from(format!("prof-ed-{k}-{n}")))
-                                            .flex_none()
-                                            .cursor_pointer()
-                                            .tooltip(self.tip("tip.edit_profile", None))
-                                            .hover(|d| d.bg(t.hover()))
-                                            .child(self.action_el("\u{f044}", t.fg()))
-                                            .on_click(cx.listener({
-                                                let (n, sp) = (n.clone(), r.spec.clone());
-                                                move |this, _, _, cx| {
-                                                    this.open_profile(Some((n.clone(), sp.clone())), cx);
-                                                }
-                                            }))
-                                    })
-                                    .child(
-                                        div()
-                                            .id(SharedString::from(format!("prof-rm-{k}-{name}")))
-                                            .flex_none()
-                                            .cursor_pointer()
-                                            .tooltip(self.tip("tip.remove_profile", None))
-                                            .hover(|d| d.bg(t.hover()))
-                                            .child(self.action_el("\u{f00d}", t.fg()))
-                                            .on_click(cx.listener({
-                                                let n = name.clone();
-                                                move |this, _, _, cx| {
-                                                    // ASK first. The list of
-                                                    // dependants is already here.
-                                                    this.confirm_profile_rm = Some((k, n.clone()));
-                                                    cx.notify();
-                                                }
-                                            })),
-                                    ),
-                            );
-                            // The warning stands where the row is, before
-                            // anything happens — not in a toast afterwards.
-                            let users = self.profile_users.get(&r.name).cloned().unwrap_or_default();
-                            if !users.is_empty() {
-                                list = list.child(div().px_2().child(self.small(
-                                    format!("used by {}: {}", users.len(), users.join(", ")),
-                                    t.muted(),
-                                )));
-                            }
-                            if self.confirm_profile_rm.as_ref()
-                                == Some(&(kind, r.name.clone()))
-                            {
-                                let why = if users.is_empty() {
-                                    format!("Remove \"{}\"? Nothing points at it.", r.name)
-                                } else {
-                                    format!(
-                                        "Remove \"{}\"? {} connection(s) point at it and would \
-                                         stop connecting: {}",
-                                        r.name,
-                                        users.len(),
-                                        users.join(", ")
-                                    )
-                                };
-                                list = list.child(div().px_2().child(self.small(why, t.warning())));
-                                let n = r.name.clone();
-                                list = list.child(
-                                    div()
-                                        .flex()
-                                        .gap_2()
-                                        .px_2()
-                                        .py_1()
-                                        .child(
-                                            div()
-                                                .id(SharedString::from(format!("prof-yes-{n}")))
-                                                .px_2()
-                                                .cursor_pointer()
-                                                .border_1()
-                                                .border_color(t.error())
-                                                .text_size(ms.small())
-                                                .text_color(t.fg())
-                                                .child("remove it")
-                                                .on_click(cx.listener({
-                                                    let n = n.clone();
-                                                    move |this, _, _, cx| {
-                                                        this.remove_profile(kind, &n);
-                                                        this.confirm_profile_rm = None;
-                                                        cx.notify();
-                                                    }
-                                                })),
-                                        )
-                                        .child(
-                                            div()
-                                                .id(SharedString::from(format!("prof-no-{n}")))
-                                                .px_2()
-                                                .cursor_pointer()
-                                                .text_size(ms.small())
-                                                .text_color(t.muted())
-                                                .child("keep it")
-                                                .on_click(cx.listener(|this, _, _, cx| {
-                                                    this.confirm_profile_rm = None;
-                                                    cx.notify();
-                                                })),
-                                        ),
-                                );
-                            }
-                        }
-                    }
-                }
-                // RETURN, like every other panel. Settings alone fell through
-                // to the connections path below, so the panel ended up with TWO
-                // `flex_1` scrolling lists competing for one height — and with
-                // the connections list, the filter and "New connection" stacked
-                // under the settings, which nobody asked for either. Four arms
-                // return here and this one did not; that asymmetry was the bug.
-                return panel.child(list);
-            }
             Rail::Instance => {
                 let who = self.metrics_conn.clone().unwrap_or_else(|| "nothing connected".into());
                 panel = panel.child(self.section(&format!("Instance \u{2014} {who}")));
@@ -5213,19 +5166,97 @@ impl Workspace {
                 panel = panel.child(self.section(&format!("Tasks ({})", self.tasks.len())));
                 let mut list = self.panel_list("tasks-list");
                 for task in self.tasks.iter().rev().take(200) {
-                    list = list.child(
-                        div()
-                            .w_full()
-                            .overflow_hidden()
-                            .px_2()
-                            .py_1()
-                            .child(self.line(
-                                format!("{} · {}", task.label, fmt_duration(task.duration())),
+                    let (id, running, call) = (task.id, task.running(), task.call_id);
+                    // The row, and — while it is running — a Stop on it. A list
+                    // that shows a statement working and offers no way to stop
+                    // it is a list of things to wait for; the tab it came from
+                    // may not even be open any more.
+                    let mut row = div()
+                        .id(SharedString::from(format!("task-{id}")))
+                        .w_full()
+                        .overflow_hidden()
+                        .px_2()
+                        .py_1()
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .cursor_pointer()
+                        .hover(|d| d.bg(t.hover()));
+                    row = row.child(
+                        div().flex_1().min_w_0().child(self.line(
+                            format!("{} · {}", task.label, fmt_duration(task.duration())),
+                            ms.small(),
+                            if task.failed() { t.error() } else { t.muted() },
+                            ms.line_w() - ms.base() * 3.0,
+                        )),
+                    );
+                    if let (true, Some(call_id)) = (running, call) {
+                        row = row.child(
+                            div()
+                                .id(SharedString::from(format!("stop-task-{id}")))
+                                .flex_none()
+                                .cursor_pointer()
+                                .hover(|d| d.bg(t.hover()))
+                                .tooltip(self.tip("tip.stop_task", None))
+                                .child(self.action_el("\u{f00d}", t.error()))
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.ask(
+                                        Pending::Ignore("cancel"),
+                                        "query.cancel",
+                                        json!({ "call_id": call_id }),
+                                    );
+                                    cx.notify();
+                                })),
+                        );
+                    }
+                    // A failure keeps its words. `Task::open` has always said a
+                    // failed task starts expanded, and nothing ever drew the
+                    // expansion, so the reason was kept and never shown.
+                    let mut cell = div().w_full().flex().flex_col();
+                    cell = cell.child(row.on_click(cx.listener(move |this, _, _, cx| {
+                        if let Some(t) = this.tasks.iter_mut().find(|t| t.id == id) {
+                            t.open = !t.open;
+                        }
+                        cx.notify();
+                    })));
+                    if task.open {
+                        if let Some(err) = task.error.clone() {
+                            cell = cell.child(
+                                div()
+                                    .w_full()
+                                    .px_2()
+                                    .pb_1()
+                                    .text_size(ms.tiny())
+                                    .text_color(t.error())
+                                    .child(SharedString::from(err)),
+                            );
+                        }
+                    }
+                    list = list.child(cell);
+                }
+                // The log, under the tasks. Everything the client learned and
+                // had nowhere to say: a plaintext link, a classify it could not
+                // run, a panel that failed to load.
+                if !self.log.is_empty() {
+                    panel = panel.child(list);
+                    panel = panel.child(self.section(&format!("Log ({})", self.log.len())));
+                    let mut lines = self.panel_list("log-list");
+                    for (level, text) in self.log.iter().rev().take(200) {
+                        let colour = match level.as_str() {
+                            "error" => t.error(),
+                            "warn" => t.warning(),
+                            _ => t.muted(),
+                        };
+                        lines = lines.child(
+                            div().w_full().overflow_hidden().px_2().py(px(1.0)).child(self.line(
+                                text.clone(),
                                 ms.small(),
-                                if task.failed() { t.error() } else { t.muted() },
+                                colour,
                                 ms.line_w(),
                             )),
-                    );
+                        );
+                    }
+                    return panel.child(lines);
                 }
                 return panel.child(list);
             }
@@ -5267,7 +5298,12 @@ impl Workspace {
             .iter()
             .filter(|c| crate::workspace::matches_filter(&c.name, &filter))
         {
-            let is_live = self.conns.iter().any(|l| l.name == c.name);
+            let live = self.conns.iter().find(|l| l.name == c.name);
+            let is_live = live.is_some();
+            // The padlock, for an OPEN connection only: a saved connection that
+            // is not connected has no transport yet, and a lock drawn over a
+            // spec would be a promise about something that has not happened.
+            let link = live.map(|l| crate::workspace::link_label(l.encrypted, l.tunneled));
             let name = c.name.clone();
             let name2 = c.name.clone();
             list = list.child(
@@ -5297,10 +5333,24 @@ impl Workspace {
                             c.name.clone(),
                             ms.body(),
                             if is_live { t.fg() } else { t.muted() },
-                            ms.line_w() - ms.base() * 7.5,
+                            // The budget for the name: the driver's label, the
+                            // pencil, the x, and the padlock when there is one.
+                            ms.line_w() - ms.base() * if link.is_some() { 10.5 } else { 9.0 },
                             format!("cn-{}", c.name),
                         )),
                     )
+                    .children(link.map(|l| {
+                        div()
+                            .id(SharedString::from(format!("lock-{}", c.name)))
+                            .flex_none()
+                            .text_size(ms.tiny())
+                            // Red, not muted: a plaintext link is the one thing
+                            // in this row somebody has to notice without
+                            // hovering anything.
+                            .text_color(if l.safe { t.muted() } else { t.error() })
+                            .tooltip(self.tip(l.tip, None))
+                            .child(SharedString::from(l.glyph))
+                    }))
                     .child(div().flex_none().child(self.small(c.driver.clone(), t.muted())))
                     .child(
                         div()
@@ -5326,6 +5376,31 @@ impl Workspace {
                                 }
                             })),
                     )
+                    // Removing one was possible from nowhere at all: a
+                    // connection added by mistake stayed in the list forever.
+                    .child(
+                        div()
+                            .id(SharedString::from(format!("rm-{}", c.name)))
+                            .flex_none()
+                            .cursor_pointer()
+                            .hover(|d| d.bg(t.hover()))
+                            .tooltip(self.tip("tip.remove_conn", None))
+                            .child(self.action_el("\u{f00d}", t.muted()))
+                            .on_click(cx.listener({
+                                let n = c.name.clone();
+                                move |this, _, _, cx| {
+                                    // ASK, and ask the engine what would go with
+                                    // it while the question is on screen.
+                                    this.confirm_conn_rm = Some((n.clone(), None));
+                                    this.ask(
+                                        Pending::ConnQueryCount { name: n.clone() },
+                                        "store.queries.list",
+                                        json!({ "conn": n }),
+                                    );
+                                    cx.notify();
+                                }
+                            })),
+                    )
                     // A double click was tried here and taken out again. The
                     // first click of a double click has already fired by the
                     // time the second arrives, so "open the settings" also
@@ -5343,6 +5418,66 @@ impl Workspace {
                     })),
             );
             let _ = name2;
+
+            // The question stands where the row is, with the count in it.
+            if let Some((who, count)) = self.confirm_conn_rm.clone() {
+                if who == c.name {
+                    let why = self
+                        .lang
+                        .tr("conn.remove_ask")
+                        .replace("{name}", &who)
+                        .replace("{n}", &count.map(|n| n.to_string()).unwrap_or_else(|| "…".into()));
+                    list = list.child(div().px_2().child(self.small(why, t.warning())));
+                    let (yes, no) = (who.clone(), who.clone());
+                    list = list.child(
+                        div()
+                            .flex()
+                            .gap_2()
+                            .px_2()
+                            .py_1()
+                            .child(
+                                div()
+                                    .id(SharedString::from(format!("rm-yes-{who}")))
+                                    .px_2()
+                                    .cursor_pointer()
+                                    .border_1()
+                                    .border_color(t.error())
+                                    .text_size(ms.small())
+                                    .text_color(t.fg())
+                                    .child(self.tr("conn.remove_it"))
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        // Disconnected first if it is open: an
+                                        // engine connection outliving the saved
+                                        // connection it came from is a session
+                                        // nothing in the window can name.
+                                        if this.conns.iter().any(|l| l.name == yes) {
+                                            this.disconnect(&yes);
+                                        }
+                                        this.ask(
+                                            Pending::ConnRemoved { name: yes.clone() },
+                                            "store.connections.remove",
+                                            json!({ "name": yes }),
+                                        );
+                                        this.confirm_conn_rm = None;
+                                        cx.notify();
+                                    })),
+                            )
+                            .child(
+                                div()
+                                    .id(SharedString::from(format!("rm-no-{no}")))
+                                    .px_2()
+                                    .cursor_pointer()
+                                    .text_size(ms.small())
+                                    .text_color(t.muted())
+                                    .child(self.tr("conn.keep_it"))
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.confirm_conn_rm = None;
+                                        cx.notify();
+                                    })),
+                            ),
+                    );
+                }
+            }
         }
 
         // The schema of every open connection, each under its own heading, so
@@ -5784,7 +5919,7 @@ impl Workspace {
                         // from different connections sit side by side — and in
                         // the same square as every other inline icon, so a row
                         // of tabs does not look like a row of two sizes.
-                        self.icon_inline(driver_glyph(&tab.driver), t.accent()),
+                        self.icon_inline(DB_GLYPH, t.accent()),
                     )
                     .child(
                         div()
@@ -5850,11 +5985,19 @@ impl Workspace {
             (None, n) => format!("{n} row(s) loaded"),
         };
         let mut sub_row = div().flex().items_center().gap_3();
+        let tab_id = tab.id;
         for s in SubTab::all() {
             let on = tab.sub == s;
             let usable = s.implemented();
+            // **They take a click now.** These were bare `div`s with no id and
+            // no handler, so `tab.sub` could only be set by restoring a session
+            // — four words that look like a row of tabs and did nothing at all.
+            // The ones that are not built stay unclickable rather than
+            // switching to an empty view.
             sub_row = sub_row.child(
                 div()
+                    .id(SharedString::from(format!("sub-{}-{}", tab_id, s.label())))
+                    .when(usable && !on, |d| d.cursor_pointer().hover(|d| d.text_color(t.fg())))
                     .text_size(ms.small())
                     .text_color(if on {
                         t.fg()
@@ -5865,7 +6008,17 @@ impl Workspace {
                         // rearrange when they arrive.
                         t.border()
                     })
-                    .child(SharedString::from(s.label())),
+                    .child(SharedString::from(s.label()))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        if !usable {
+                            return;
+                        }
+                        if let Some(t) = this.tabs.iter_mut().find(|t| t.id == tab_id) {
+                            t.sub = s;
+                        }
+                        this.remember();
+                        cx.notify();
+                    })),
             );
         }
 
@@ -5885,6 +6038,15 @@ impl Workspace {
                         .flex()
                         .items_center()
                         .gap_2()
+                        .children(self.live(&tab.conn_name).map(|l| {
+                            let link = crate::workspace::link_label(l.encrypted, l.tunneled);
+                            div()
+                                .id("crumb-lock")
+                                .text_size(ms.tiny())
+                                .text_color(if link.safe { t.muted() } else { t.error() })
+                                .tooltip(self.tip(link.tip, None))
+                                .child(SharedString::from(link.glyph))
+                        }))
                         .child(self.small(tab.conn_name.clone(), t.muted()))
                         .child(self.small("›", t.border()))
                         .child(self.small(tab.title.clone(), t.fg()))
@@ -5892,6 +6054,60 @@ impl Workspace {
                         .child(self.small(format!("{} ms", tab.ms), t.muted())),
                 ),
         );
+
+        // ── the naming row ──────────────────────────────────────────────────
+        // Above the views, only while a save is waiting for a name. Not a modal
+        // over the result: the thing being named is the result, and covering it
+        // up to ask what to call it is exactly backwards.
+        if let Some(what) = self.naming {
+            body = body.child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .w_full()
+                    .px_3()
+                    .py_1()
+                    .flex_none()
+                    .bg(t.raised())
+                    .border_b_1()
+                    .border_color(t.accent())
+                    .child(self.small(
+                        format!("{} {}", self.lang.tr("result.name_it"), what.what()),
+                        t.muted(),
+                    ))
+                    .child(div().flex_1().text_size(ms.body()).child(self.save_name.clone()))
+                    .child(
+                        div()
+                            .id("name-ok")
+                            .px_2()
+                            .cursor_pointer()
+                            .hover(|d| d.bg(t.hover()))
+                            .text_size(ms.small())
+                            .text_color(t.accent())
+                            .child(self.tr("result.save"))
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                let name = this.save_name.read(cx).text().trim().to_string();
+                                this.named(name, cx);
+                                cx.notify();
+                            })),
+                    )
+                    .child(
+                        div()
+                            .id("name-no")
+                            .px_2()
+                            .cursor_pointer()
+                            .hover(|d| d.bg(t.hover()))
+                            .text_size(ms.small())
+                            .text_color(t.muted())
+                            .child(self.tr("tip.cancel_edit"))
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.naming = None;
+                                cx.notify();
+                            })),
+                    ),
+            );
+        }
 
         // ── view switch ─────────────────────────────────────────────────────
         // The sub-tabs belong HERE, next to the views, not pinned to the far
@@ -5981,6 +6197,68 @@ impl Workspace {
         body = body.child(self.query_bar(tab, cx));
         if self.export_open {
             body = body.child(self.export_row(tab, cx));
+        }
+
+        // A statement the engine called destructive: the reason, the statement,
+        // and two buttons. The same card the console shows, in the tab that
+        // asked — nothing has been sent to the database at this point.
+        if let Some((statement, reason)) = tab.confirm.clone() {
+            let id = tab.id;
+            body = body.child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .m_3()
+                    .p_2()
+                    .border_1()
+                    .border_color(t.error())
+                    .child(self.small(reason, t.error()))
+                    .child(self.small(statement, t.fg()))
+                    .child(
+                        div()
+                            .flex()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .id("tab-confirm-run")
+                                    .px_2()
+                                    .cursor_pointer()
+                                    .text_size(ms.small())
+                                    .bg(t.error())
+                                    .text_color(t.inverted())
+                                    .child(SharedString::from(self.tr("write.run_it")))
+                                    .on_click(cx.listener(move |this, _, _, _cx| {
+                                        if let Some(tab) =
+                                            this.tabs.iter_mut().find(|t| t.id == id)
+                                        {
+                                            tab.confirm = None;
+                                        }
+                                        // Confirmed by a person, and the engine
+                                        // is told so — it refuses when it was not.
+                                        this.run_tab_confirmed(id, true);
+                                    })),
+                            )
+                            .child(
+                                div()
+                                    .id("tab-confirm-leave")
+                                    .px_2()
+                                    .cursor_pointer()
+                                    .text_size(ms.small())
+                                    .text_color(t.muted())
+                                    .child(SharedString::from(self.tr("write.leave_it")))
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        if let Some(tab) =
+                                            this.tabs.iter_mut().find(|t| t.id == id)
+                                        {
+                                            tab.confirm = None;
+                                        }
+                                        cx.notify();
+                                    })),
+                            ),
+                    ),
+            );
+            return body.into_any_element();
         }
 
         if let Some(err) = &tab.error {
@@ -7850,7 +8128,10 @@ impl Workspace {
                         div()
                             .w(gpui::relative(frac))
                             .h_full()
-                            .bg(if dragging { t.accent() } else { t.accent() }),
+                            // The thumb says it is being dragged. Both arms of
+                            // this were the accent, so a drag looked exactly
+                            // like a hover and the bar gave no feedback at all.
+                            .bg(if dragging { t.fg() } else { t.accent() }),
                     )
                     // Pressing anywhere on the track jumps there, which is what
                     // a click on a scrollbar's empty half should do anyway.
@@ -8488,11 +8769,9 @@ impl Workspace {
     fn console_el(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let t = self.t();
         let ms = self.scale;
-        let target = self
-            .conns
-            .first()
-            .map(|c| c.name.clone())
-            .unwrap_or_else(|| "nothing connected".into());
+        // The same answer the line will be sent to, so the header cannot say one
+        // database while the statement goes to another.
+        let target = self.target_conn().unwrap_or_else(|| "nothing connected".into());
 
         let mut panel = div()
             .flex()
@@ -8628,7 +8907,16 @@ impl Workspace {
                     .child(self.small(
                         format!("{failed} failed"),
                         if failed > 0 { t.error() } else { t.muted() },
-                    )),
+                    ))
+                    // What the client has to say and had nowhere to say it.
+                    // Zero is not drawn: a permanent "0 unread" teaches the eye
+                    // to skip the place where the number appears.
+                    .when(self.log_unread > 0, |d| {
+                        d.child(self.small(
+                            format!("{} unread", self.log_unread),
+                            t.warning(),
+                        ))
+                    }),
             )
     }
 }
@@ -8650,13 +8938,16 @@ fn input_colors(t: &Theme) -> InputColors {
 /// The glyph for a driver, by the shape of what it is rather than by a list of
 /// names: the engine says whether it is relational, and that is the only
 /// distinction a one-character icon can honestly carry.
-fn driver_glyph(driver: &str) -> &'static str {
-    match driver {
-        "redis" => "\u{f1c0}",
-        "mongodb" => "\u{f1c0}",
-        _ => "\u{f1c0}",
-    }
-}
+/// The glyph beside a tab's name.
+///
+/// ONE glyph for every driver, deliberately. This was a `match` whose three
+/// arms returned the same codepoint — a function pretending to make a decision
+/// it was not making, and the first thing anybody would do with it is add a
+/// fourth arm and believe the other three. A per-driver icon needs icons that
+/// exist in the icon font for every driver the engine can grow, including the
+/// external ones, which is a promise this cannot keep; the DRIVER'S NAME is
+/// already on the row next to it and says more than a logo would.
+const DB_GLYPH: &str = "\u{f1c0}";
 
 impl Workspace {
     /// The corner messages. They stack upward from the bottom right, newest

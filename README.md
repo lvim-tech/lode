@@ -82,7 +82,7 @@ notification   {"method":"…","params":{…}}
 
 `proto` grows **additively**: a client accepts any engine reporting
 `proto >= its minimum`, so a newer engine keeps working with an older client.
-The current protocol is **13**. What each version added is listed in
+The current protocol is **15**. What each version added is listed in
 `src/rpc.rs` beside the constant.
 
 ### Handshake
@@ -178,6 +178,7 @@ own SQLite database — so two clients share them.
 | `store.connections.get` | `{ name }` | `{ connection }` or `null` |
 | `store.connections.save` | `{ name, driver, spec }` | `{ saved }` |
 | `store.connections.remove` | `{ name }` | `{ removed }` |
+| `store.connections.rename` | `{ from, to }` | `{ renamed, moved }` (`proto >= 15`) |
 | `store.queries.list` | `{ conn }` | `{ queries }` |
 | `store.queries.get` | `{ conn, name }` | `{ query }` or `null` |
 | `store.queries.save` | `{ conn, name, sql }` | `{ saved }` |
@@ -188,11 +189,20 @@ own SQLite database — so two clients share them.
 | `store.charts.save` | `{ conn, name, sql, measure }` | `{ saved }` |
 | `store.charts.remove` | `{ conn, name }` | `{ removed }` |
 | `store.audit.list` | `{ limit, conn? }` | `{ audit, mode }` |
+| `store.profiles.users` | `{ kind, name }` | `{ users }` (`proto >= 14`) |
 | `store.import` | `{ path }` | `{ connections, queries, history }` |
 
 A saved connection keeps only the **template**: `spec` is the
 `{ params, auth, tls, tunnel }` JSON with secrets still as templates. Nothing
 resolved is ever stored.
+
+`store.connections.rename` exists because everything else here is scoped to the
+connection's **name**: a save under the new name plus a remove of the old one
+leaves every saved query, chart, dashboard and script pointing at a name nothing
+answers to. One call, one transaction, and `moved` says how many of each
+followed. A name already taken is refused, since `save` overwrites by name and
+would eat the other connection. The audit log is deliberately **not** rewritten:
+it records what happened under the name in use at the time.
 
 `store.import` reads an older client's own SQLite file and copies what is
 missing — keyed by `name` for connections, `(conn, name)` for queries, and
@@ -798,21 +808,33 @@ resolves one and never sees a resolved value.
 
 ### Fonts
 
-The grid and the editor use a monospace face and the chrome a proportional one.
-Each is looked for in order: `$LODE_FONT_MONO` / `$LODE_FONT_UI`, then well-known
-names under the standard font roots, then a bounded search of those roots. With
-nothing found, egui's built-in font is used and the application is plain but
-correct. `$LODE_FONT_SIZE` sets the base text size (default 13) and everything
-else is derived from it.
-
-Icon glyphs appear only when the monospace face is a **Nerd Font**; otherwise the
-buttons carry words. A glyph from a font that is not installed is an empty box,
+Two fonts, for two jobs. The **text** font is what a result is read in; the
+**icon** font is chosen for having the glyphs and drawing them all at one width.
+Both are chosen by ASKING the text system which fonts are installed, never by
+naming one and hoping — a glyph from a font that is not there is an empty box,
 and an empty box is worse than the word it replaced.
+
+`$LODE_FONT` picks the text font and wins outright, because somebody who sets it
+has already decided. Otherwise the first installed Nerd Font from a short list
+is used. `$LODE_ICON_FONT` picks the icon font, and is only honoured if it
+actually covers every glyph the interface draws; otherwise a purpose-built
+symbol font is preferred, then any monospaced Nerd variant, then the text font.
+
+`lode --check-icons` prints every glyph the interface uses, whether the chosen
+font has it, and its advance width, so this can be checked where there is no
+screen. `lode --check-panels` prints the numbers a panel is laid out from.
+
+The text size is set in **Settings → General** and remembered; every other size
+— headings, the grid's row height, the rail's width — is derived from it.
 
 ### What it does not do yet
 
-Charts, dashboards, a visual query builder, in-grid row editing, scripting and an
-MCP server. They are the next steps, not hidden ones.
+A multi-line statement editor (the statement box is one line), several
+statements in one run, foreign keys and a schema diagram, and a face for the
+MCP approval queue. They are the next steps, not hidden ones.
+
+Charts, dashboards, a visual query builder, in-grid row editing, scripting,
+connection hooks and the MCP server are **built**.
 
 ### Themes
 
@@ -824,7 +846,7 @@ mkdir -p ~/.config/lode/themes
 cp /path/to/lvim-colorscheme/extras/lode/*.toml ~/.config/lode/themes/
 ```
 
-Pick one in the Theme menu, or set `LODE_THEME` to a file's stem.
+Pick one in **Settings → General**, or set `LODE_THEME` to a file's stem.
 `$LODE_THEME_DIR` overrides the search path. With no theme files at all a
 built-in palette applies, so a fresh build is usable immediately.
 

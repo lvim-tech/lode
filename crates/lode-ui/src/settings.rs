@@ -14,12 +14,29 @@
 
 use gpui::prelude::*;
 use gpui::{div, px, Context, Entity, SharedString, WeakEntity, Window};
-use serde_json::Value;
 
 use crate::app::Workspace;
 use crate::input::TextInput;
 use crate::metrics::Metrics;
 use crate::theme::Theme;
+
+/// What the window shows of the MAIN window's state.
+///
+/// Read fresh on every paint from the workspace rather than copied in at open
+/// time. A copy is a second truth: the text size can be changed from the
+/// keyboard while this window is open, and a stored number would then sit
+/// beside a stepper that moves a different one.
+pub struct Appearance {
+    pub theme_name: String,
+    pub themes: Vec<String>,
+    pub theme_dirs: Vec<String>,
+    pub base: f32,
+    pub icon: f32,
+    pub lang: crate::i18n::Lang,
+    pub json_indent: u8,
+    pub font_family: String,
+    pub icon_family: String,
+}
 
 /// One page of the window.
 ///
@@ -77,7 +94,7 @@ impl Category {
     /// One sentence saying what this page is for, shown above its content.
     pub fn blurb(self) -> &'static str {
         match self {
-            Category::General => "How the window looks and what it remembers.",
+            Category::General => "The theme, the sizes, the language and what the window remembers.",
             Category::Keys => "What the keyboard does.",
             Category::Audit => "What the engine records, and how much of it.",
             Category::Tunnels => {
@@ -123,8 +140,21 @@ pub struct SettingsWindow {
     /// What the workspace knew when this opened: driver metadata and profiles.
     /// Handed over rather than fetched, so the window has no engine of its own.
     drivers: Vec<lode_proto::DriverMeta>,
-    tunnels: Vec<(String, Value)>,
-    proxies: Vec<(String, Value)>,
+    tunnels: Vec<crate::app::ProfileRow>,
+    proxies: Vec<crate::app::ProfileRow>,
+    /// Which profile a remove has been ASKED about. The question stands on the
+    /// row, before anything happens — not in a toast afterwards.
+    confirm_rm: Option<(&'static str, String)>,
+    /// The theme filter.
+    ///
+    /// In the HEADER, never in the page. A `TextInput` shapes and measures its
+    /// own line and installs an input handler while painting, and inside a
+    /// scrolling list it takes the list down with it — which is the lesson the
+    /// rail's settings panel paid for twice.
+    theme_filter: Entity<TextInput>,
+    /// The two fonts, so every window is in the same type as the main one.
+    font_family: String,
+    icon_family: String,
     /// Which driver's detail is shown on the Drivers page.
     driver_shown: Option<String>,
     about: Vec<(String, String)>,
@@ -136,13 +166,15 @@ impl SettingsWindow {
         theme: Theme,
         scale: Metrics,
         drivers: Vec<lode_proto::DriverMeta>,
-        tunnels: Vec<(String, Value)>,
-        proxies: Vec<(String, Value)>,
+        tunnels: Vec<crate::app::ProfileRow>,
+        proxies: Vec<crate::app::ProfileRow>,
         about: Vec<(String, String)>,
+        fonts: (String, String),
         cx: &mut Context<Self>,
     ) -> Self {
         let colors = crate::form::colors_of(&theme);
         let search = cx.new(|cx| TextInput::new(cx, "Search settings…", colors));
+        let theme_filter = cx.new(|cx| TextInput::new(cx, "Filter themes…", colors));
         let driver_shown = drivers.first().map(|d| d.kind.clone());
         SettingsWindow {
             workspace,
@@ -153,13 +185,23 @@ impl SettingsWindow {
             drivers,
             tunnels,
             proxies,
+            confirm_rm: None,
+            theme_filter,
+            font_family: fonts.0,
+            icon_family: fonts.1,
             driver_shown,
             about,
         }
     }
 
     pub fn all_inputs(&self) -> Vec<Entity<TextInput>> {
-        vec![self.search.clone()]
+        vec![self.search.clone(), self.theme_filter.clone()]
+    }
+
+    /// The sizes changed under us — see `Workspace::poke_settings`.
+    pub fn set_scale(&mut self, scale: Metrics, cx: &mut Context<Self>) {
+        self.scale = scale;
+        cx.notify();
     }
 
     pub fn set_theme(&mut self, theme: Theme, cx: &mut Context<Self>) {
@@ -173,8 +215,8 @@ impl SettingsWindow {
 
     pub fn profiles_arrived(
         &mut self,
-        tunnels: Vec<(String, Value)>,
-        proxies: Vec<(String, Value)>,
+        tunnels: Vec<crate::app::ProfileRow>,
+        proxies: Vec<crate::app::ProfileRow>,
         cx: &mut Context<Self>,
     ) {
         self.tunnels = tunnels;
@@ -300,7 +342,19 @@ impl Render for SettingsWindow {
             .bg(t.panel())
             .border_b_1()
             .border_color(t.border())
-            .child(div().flex_1().text_size(ms.body()).child(self.search.clone()));
+            .child(div().flex_1().text_size(ms.body()).child(self.search.clone()))
+            // The theme filter lives up here with it, on the one page that has
+            // a list long enough to need filtering. Up here because a field
+            // cannot go in the scrolling page — see `theme_filter`.
+            .when(self.category == Category::General, |d| {
+                d.child(
+                    div()
+                        .w(px(ms.base() * 14.0))
+                        .flex_none()
+                        .text_size(ms.body())
+                        .child(self.theme_filter.clone()),
+                )
+            });
 
         let foot = div()
             .flex()
@@ -333,6 +387,11 @@ impl Render for SettingsWindow {
             .size_full()
             .bg(t.base())
             .text_color(t.fg())
+            // The SAME type as the main window. A separate window gets the
+            // platform default unless it is told, and `$LODE_FONT` chose the
+            // other one — so the settings window was in a different face from
+            // the window it belongs to.
+            .font_family(SharedString::from(self.font_family.clone()))
             .line_height(ms.line_h())
             .text_size(ms.body())
             .child(head)
@@ -366,6 +425,83 @@ impl SettingsWindow {
                     .child(label.into()),
             )
             .child(div().flex_1().text_size(ms.small()).text_color(t.fg()).child(value.into()))
+    }
+
+    /// A heading inside a page. ONE style of heading in this window: the rail's
+    /// settings panel had two (a fold header and a section line) and the two
+    /// were never told apart by anybody reading it.
+    fn head(&self, label: impl Into<SharedString>) -> gpui::Div {
+        let (t, ms) = (&self.theme, self.scale);
+        div()
+            .pt_2()
+            .text_size(ms.tiny())
+            .text_color(t.title())
+            .child(label.into())
+    }
+
+    /// A glyph in the ICON font. The eye and the padlock are in the icon font
+    /// and nowhere else; drawn in the text font they come out as a box.
+    fn icon(&self, glyph: &'static str, colour: gpui::Rgba) -> gpui::Div {
+        let ms = self.scale;
+        div()
+            .font_family(SharedString::from(self.icon_family.clone()))
+            .text_size(px(ms.icon_size()))
+            .text_color(colour)
+            .child(glyph)
+    }
+
+    /// One square button of a stepper.
+    fn step(
+        &self,
+        id: String,
+        label: &'static str,
+        on_press: impl Fn(&mut Self, &mut Window, &mut Context<Self>) + 'static,
+        cx: &mut Context<Self>,
+    ) -> gpui::Stateful<gpui::Div> {
+        let (t, ms) = (&self.theme, self.scale);
+        div()
+            .id(SharedString::from(id))
+            .flex()
+            .items_center()
+            .justify_center()
+            .w(px(ms.base() * 1.8))
+            .h(px(ms.base() * 1.8))
+            .flex_none()
+            .cursor_pointer()
+            .bg(t.raised())
+            .hover(|d| d.bg(t.hover()))
+            .text_size(ms.body())
+            .text_color(t.accent())
+            .child(label)
+            .on_click(cx.listener(move |this, _, window, cx| on_press(this, window, cx)))
+    }
+
+    /// One of a row of mutually exclusive choices.
+    fn pick(
+        &self,
+        id: String,
+        label: impl Into<SharedString>,
+        on: bool,
+        on_press: impl Fn(&mut Self, &mut Window, &mut Context<Self>) + 'static,
+        cx: &mut Context<Self>,
+    ) -> gpui::Stateful<gpui::Div> {
+        let (t, ms) = (&self.theme, self.scale);
+        div()
+            .id(SharedString::from(id))
+            .px_2()
+            .flex_none()
+            .cursor_pointer()
+            .text_size(ms.body())
+            .text_color(if on { t.inverted() } else { t.fg() })
+            .when(on, |d| d.bg(t.accent()))
+            .hover(|d| d.bg(t.hover()))
+            .child(label.into())
+            .on_click(cx.listener(move |this, _, window, cx| on_press(this, window, cx)))
+    }
+
+    /// What the main window currently looks like. `None` only if it has gone.
+    fn appearance(&self, cx: &gpui::App) -> Option<Appearance> {
+        Some(self.workspace.upgrade()?.read(cx).appearance())
     }
 
     fn note(&self, text: impl Into<SharedString>) -> gpui::Div {
@@ -454,32 +590,449 @@ impl SettingsWindow {
                     ));
                 }
             }
-            Category::Tunnels | Category::Proxies => {
-                let (rows, what) = if self.category == Category::Tunnels {
-                    (&self.tunnels, "tunnel")
-                } else {
-                    (&self.proxies, "proxy")
+            Category::General => {
+                let Some(a) = self.appearance(cx) else {
+                    return out.child(self.note("the main window has gone")).into_any_element();
                 };
-                if rows.is_empty() {
-                    out = out.child(self.note(format!("No saved {what}s yet.")));
+
+                // ── the theme ───────────────────────────────────────────────
+                out = out.child(self.head("THEME"));
+                out = out.child(
+                    div()
+                        .id("themes-rescan")
+                        .px_1()
+                        .cursor_pointer()
+                        .hover(|d| d.bg(t.hover()))
+                        .text_size(ms.small())
+                        .text_color(t.accent())
+                        .child("look again")
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            let _ = this.workspace.update(cx, |w, cx| w.rescan_themes(cx));
+                            cx.notify();
+                        })),
+                );
+                // WHICH folders were read. "No themes" on its own is something
+                // nobody can act on.
+                for d in &a.theme_dirs {
+                    out = out.child(
+                        div().text_size(ms.tiny()).text_color(t.muted()).child(d.clone()),
+                    );
                 }
-                for (name, spec) in rows {
-                    let g = |k: &str| spec.get(k).and_then(Value::as_str).unwrap_or("").to_string();
-                    let port = spec.get("port").and_then(Value::as_u64).unwrap_or(22);
-                    let kind = spec
-                        .get("auth")
-                        .and_then(|a| a.get("kind"))
-                        .and_then(Value::as_str)
-                        .or_else(|| spec.get("kind").and_then(Value::as_str))
-                        .unwrap_or("agent");
-                    out = out.child(self.row(
-                        name.clone(),
-                        format!("{}@{}:{port} · {kind}", g("user"), g("host")),
+                if a.themes.is_empty() {
+                    out = out.child(
+                        div()
+                            .text_size(ms.small())
+                            .text_color(t.warning())
+                            .child("no theme files were found in those folders"),
+                    );
+                    out = out.child(self.note("the built-in theme is the generated LvimBase_dark"));
+                }
+                let needle = self.theme_filter.read(cx).text().trim().to_lowercase();
+                let mut names: Vec<String> = a
+                    .themes
+                    .iter()
+                    .filter(|n| needle.is_empty() || n.to_lowercase().contains(&needle))
+                    .cloned()
+                    .collect();
+                names.sort();
+                // Every one of them, in the page's own scrolling. No cap and no
+                // inner scroller: a window is wide and tall enough that the
+                // thing the rail's panel kept fighting — thirty-six themes in a
+                // narrow column — is not a problem here.
+                let mut list = div().flex().flex_col().py_1();
+                for name in &names {
+                    let on = *name == a.theme_name;
+                    let pick = name.clone();
+                    list = list.child(
+                        div()
+                            .id(SharedString::from(format!("theme-{name}")))
+                            .flex()
+                            .items_center()
+                            .gap_1()
+                            .px_1()
+                            .py(px(1.0))
+                            .cursor_pointer()
+                            .hover(|d| d.bg(t.hover()))
+                            .when(on, |d| d.bg(t.selected()))
+                            .child(
+                                div()
+                                    .w(px(ms.base()))
+                                    .flex_none()
+                                    .text_size(ms.tiny())
+                                    .text_color(t.accent())
+                                    .child(if on { "\u{f00c}" } else { " " }),
+                            )
+                            .child(
+                                div()
+                                    .text_size(ms.small())
+                                    .text_color(if on { t.fg() } else { t.muted() })
+                                    .child(SharedString::from(name.clone())),
+                            )
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                let pick = pick.clone();
+                                let _ = this.workspace.update(cx, |w, cx| w.use_theme(&pick, cx));
+                                cx.notify();
+                            })),
+                    );
+                }
+                out = out.child(list);
+                if names.is_empty() && !a.themes.is_empty() {
+                    out = out.child(self.note(format!(
+                        "no theme matches \"{}\"",
+                        self.theme_filter.read(cx).text().trim()
+                    )));
+                }
+
+                // ── the type ────────────────────────────────────────────────
+                out = out.child(self.head("TEXT AND ICONS"));
+                out = out.child(self.row("Text font", a.font_family.clone()));
+                out = out.child(self.row("Icon font", a.icon_family.clone()));
+                out = out.child(self.note(
+                    "$LODE_FONT and $LODE_ICON_FONT choose these; they are read at startup.",
+                ));
+
+                // One number, and it moves everything: the steps, the grid row
+                // height, the rail. Adjusted while looking at the result, which
+                // is why it is here and not only an environment variable.
+                let base = a.base;
+                out = out.child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .py_1()
+                        .child(
+                            div()
+                                .w(px(ms.base() * 13.0))
+                                .flex_none()
+                                .text_size(ms.small())
+                                .text_color(t.muted())
+                                .child("Text size"),
+                        )
+                        .child(self.step(
+                            "text-less".into(),
+                            "\u{2212}",
+                            move |this, _, cx| {
+                                let _ = this
+                                    .workspace
+                                    .update(cx, |w, cx| w.set_base(base - 1.0, cx));
+                                cx.notify();
+                            },
+                            cx,
+                        ))
+                        .child(
+                            div()
+                                .min_w(px(ms.base() * 3.0))
+                                .text_size(ms.body())
+                                .text_color(t.fg())
+                                .child(SharedString::from(format!("{base} px"))),
+                        )
+                        .child(self.step(
+                            "text-more".into(),
+                            "+",
+                            move |this, _, cx| {
+                                let _ = this
+                                    .workspace
+                                    .update(cx, |w, cx| w.set_base(base + 1.0, cx));
+                                cx.notify();
+                            },
+                            cx,
+                        ))
+                        .child(
+                            div()
+                                .id("size-reset")
+                                .px_2()
+                                .cursor_pointer()
+                                .hover(|d| d.bg(t.hover()))
+                                .text_size(ms.small())
+                                .text_color(t.muted())
+                                .child("reset")
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    let _ = this.workspace.update(cx, |w, cx| w.reset_scale(cx));
+                                    cx.notify();
+                                })),
+                        ),
+                );
+                // The rail is navigation and the text is content; enlarging one
+                // is not a request for the other, so they have their own rows.
+                let icon = a.icon;
+                out = out.child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .py_1()
+                        .child(
+                            div()
+                                .w(px(ms.base() * 13.0))
+                                .flex_none()
+                                .text_size(ms.small())
+                                .text_color(t.muted())
+                                .child("Icon size"),
+                        )
+                        .child(self.step(
+                            "icon-less".into(),
+                            "\u{2212}",
+                            move |this, _, cx| {
+                                let _ = this
+                                    .workspace
+                                    .update(cx, |w, cx| w.set_icon(icon - 2.0, cx));
+                                cx.notify();
+                            },
+                            cx,
+                        ))
+                        .child(
+                            div()
+                                .min_w(px(ms.base() * 3.0))
+                                .text_size(ms.body())
+                                .text_color(t.fg())
+                                .child(SharedString::from(format!("{icon} px"))),
+                        )
+                        .child(self.step(
+                            "icon-more".into(),
+                            "+",
+                            move |this, _, cx| {
+                                let _ = this
+                                    .workspace
+                                    .update(cx, |w, cx| w.set_icon(icon + 2.0, cx));
+                                cx.notify();
+                            },
+                            cx,
+                        ))
+                        // Beside the number, so the effect can be seen before
+                        // anything is pressed.
+                        .child(self.icon("\u{f1c0}", t.muted()))
+                        .child(self.icon("\u{f013}", t.accent())),
+                );
+                out = out.child(self.note(format!(
+                    "every size comes off the text size — headings {}, body {}, small {}, a grid \
+                     row {}, and the rail is {} px wide",
+                    f32::from(ms.heading()),
+                    f32::from(ms.body()),
+                    f32::from(ms.small()),
+                    ms.row_h(),
+                    ms.rail_w()
+                )));
+
+                // ── the language ────────────────────────────────────────────
+                out = out.child(self.head("LANGUAGE"));
+                let mut langs = div().flex().items_center().gap_2().py_1();
+                for l in crate::i18n::Lang::ALL.iter().copied() {
+                    // Its own name, not its English one: somebody looking for
+                    // their language looks for the word they would write.
+                    langs = langs.child(self.pick(
+                        format!("lang-{}", l.tag()),
+                        l.label(),
+                        a.lang == l,
+                        move |this, _, cx| {
+                            let _ = this.workspace.update(cx, |w, cx| w.set_lang(l, cx));
+                            cx.notify();
+                        },
+                        cx,
                     ));
                 }
+                out = out.child(langs);
                 out = out.child(self.note(
-                    "Edited in their own window — from the palette, or from a connection's \
-                     Access tab.",
+                    "the engine's refusals and the audit log stay in English — they are the \
+                     record, not the interface",
+                ));
+
+                // ── what the window remembers ───────────────────────────────
+                out = out.child(self.head("APPEARANCE"));
+                let mut inds = div().flex().items_center().gap_2().py_1().child(
+                    div()
+                        .w(px(ms.base() * 13.0))
+                        .flex_none()
+                        .text_size(ms.small())
+                        .text_color(t.muted())
+                        .child("JSON indent"),
+                );
+                for n in [2u8, 3, 4] {
+                    inds = inds.child(self.pick(
+                        format!("jsonind-{n}"),
+                        n.to_string(),
+                        a.json_indent == n,
+                        move |this, _, cx| {
+                            let _ = this.workspace.update(cx, |w, cx| w.set_json_indent(n, cx));
+                            cx.notify();
+                        },
+                        cx,
+                    ));
+                }
+                out = out.child(inds);
+                out = out.child(self.note(
+                    "the theme, the sizes, the language, the open tabs and this window's panel \
+                     are remembered in ~/.local/share/lode/session.json",
+                ));
+            }
+            Category::Tunnels | Category::Proxies => {
+                let (rows, kind) = if self.category == Category::Tunnels {
+                    (self.tunnels.clone(), "tunnel")
+                } else {
+                    (self.proxies.clone(), "proxy")
+                };
+                if rows.is_empty() {
+                    out = out.child(self.note(format!(
+                        "No saved {kind}s yet — build one in a connection's Access tab and press \
+                         \"save as profile\"."
+                    )));
+                }
+                out = out.child(
+                    div()
+                        .id(SharedString::from(format!("prof-new-{kind}")))
+                        .px_1()
+                        .cursor_pointer()
+                        .hover(|d| d.bg(t.hover()))
+                        .text_size(ms.small())
+                        .text_color(t.accent())
+                        .child(SharedString::from(format!("+  new {kind}")))
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            let _ = this.workspace.update(cx, |w, cx| w.open_profile(None, cx));
+                            cx.notify();
+                        })),
+                );
+                for r in &rows {
+                    let users = self
+                        .workspace
+                        .upgrade()
+                        .map(|w| w.read(cx).profile_users_of(&r.name))
+                        .unwrap_or_default();
+                    let (name, spec) = (r.name.clone(), r.spec.clone());
+                    out = out.child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .py(px(1.0))
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .flex()
+                                    .flex_col()
+                                    .child(
+                                        div()
+                                            .text_size(ms.small())
+                                            .text_color(t.fg())
+                                            .child(SharedString::from(r.name.clone())),
+                                    )
+                                    // WHAT it is, read off its own spec.
+                                    .child(
+                                        div()
+                                            .text_size(ms.tiny())
+                                            .text_color(t.muted())
+                                            .child(SharedString::from(r.summary_of(kind))),
+                                    ),
+                            )
+                            .child({
+                                let (n, sp) = (name.clone(), spec.clone());
+                                div()
+                                    .id(SharedString::from(format!("prof-ed-{kind}-{n}")))
+                                    .flex_none()
+                                    .px_1()
+                                    .cursor_pointer()
+                                    .hover(|d| d.bg(t.hover()))
+                                    .text_size(ms.small())
+                                    .text_color(t.fg())
+                                    .child("edit")
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        let (n, sp) = (n.clone(), sp.clone());
+                                        let _ = this.workspace.update(cx, |w, cx| {
+                                            w.open_profile(Some((n, sp)), cx)
+                                        });
+                                        cx.notify();
+                                    }))
+                            })
+                            .child({
+                                let n = name.clone();
+                                div()
+                                    .id(SharedString::from(format!("prof-rm-{kind}-{n}")))
+                                    .flex_none()
+                                    .px_1()
+                                    .cursor_pointer()
+                                    .hover(|d| d.bg(t.hover()))
+                                    .text_size(ms.small())
+                                    .text_color(t.muted())
+                                    .child("remove")
+                                    // ASK first. The list of dependants is
+                                    // already here, so the warning can stand
+                                    // where the row is rather than arriving as
+                                    // a toast once it is too late.
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        this.confirm_rm = Some((kind, n.clone()));
+                                        cx.notify();
+                                    }))
+                            }),
+                    );
+                    if !users.is_empty() {
+                        out = out.child(self.note(format!(
+                            "used by {}: {}",
+                            users.len(),
+                            users.join(", ")
+                        )));
+                    }
+                    if self.confirm_rm.as_ref() == Some(&(kind, r.name.clone())) {
+                        let why = if users.is_empty() {
+                            format!("Remove \"{}\"? Nothing points at it.", r.name)
+                        } else {
+                            format!(
+                                "Remove \"{}\"? {} connection(s) point at it and would stop \
+                                 connecting: {}",
+                                r.name,
+                                users.len(),
+                                users.join(", ")
+                            )
+                        };
+                        out = out.child(
+                            div().text_size(ms.small()).text_color(t.warning()).child(why),
+                        );
+                        let n = name.clone();
+                        out = out.child(
+                            div()
+                                .flex()
+                                .gap_2()
+                                .py_1()
+                                .child(
+                                    div()
+                                        .id(SharedString::from(format!("prof-yes-{n}")))
+                                        .px_2()
+                                        .cursor_pointer()
+                                        .border_1()
+                                        .border_color(t.error())
+                                        .text_size(ms.small())
+                                        .text_color(t.fg())
+                                        .child("remove it")
+                                        .on_click(cx.listener({
+                                            let n = n.clone();
+                                            move |this, _, _, cx| {
+                                                let n = n.clone();
+                                                let _ = this.workspace.update(cx, |w, _| {
+                                                    w.remove_profile(kind, &n)
+                                                });
+                                                this.confirm_rm = None;
+                                                cx.notify();
+                                            }
+                                        })),
+                                )
+                                .child(
+                                    div()
+                                        .id(SharedString::from(format!("prof-no-{n}")))
+                                        .px_2()
+                                        .cursor_pointer()
+                                        .text_size(ms.small())
+                                        .text_color(t.muted())
+                                        .child("keep it")
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            this.confirm_rm = None;
+                                            cx.notify();
+                                        })),
+                                ),
+                        );
+                    }
+                }
+                out = out.child(self.note(
+                    "A connection picks one by name in its Access tab. A connection whose \
+                     profile is missing FAILS rather than falling back to a direct link.",
                 ));
             }
             Category::About => {
@@ -493,10 +1046,6 @@ impl SettingsWindow {
             // nobody knows about — which is what these have been.
             other => {
                 out = out.child(self.note(match other {
-                    Category::General => {
-                        "Theme, text and icon sizes, language and JSON indent are still in the \
-                         rail's panel. They move here next."
-                    }
                     Category::Keys => {
                         "The palette is ctrl-p and the grid has its own keys. None of the rail's \
                          panels has a key yet, which is the gap this page is for."
@@ -577,6 +1126,40 @@ mod tests {
             assert!(!c.keywords().is_empty(), "{} has nothing to search on", c.title());
             assert!(!c.blurb().is_empty(), "{} does not say what it is for", c.title());
         }
+    }
+
+    /// A proxy is not a tunnel, and its line must not invent a port 22 or a
+    /// `user@` for it.
+    #[test]
+    fn a_proxy_row_does_not_pretend_to_be_a_tunnel() {
+        use crate::app::ProfileRow;
+        use serde_json::json;
+
+        let tunnel = ProfileRow {
+            name: "bastion".into(),
+            spec: json!({ "host": "jump.example", "user": "ops", "auth": { "kind": "agent" } }),
+        };
+        assert_eq!(tunnel.summary_of("tunnel"), "ops@jump.example:22 · agent");
+
+        // The same spec read as a proxy: no user, no 22.
+        let proxy = ProfileRow {
+            name: "office".into(),
+            spec: json!({ "host": "socks.example", "port": 1080, "kind": "socks5" }),
+        };
+        assert_eq!(proxy.summary_of("proxy"), "socks5 · socks.example:1080");
+
+        // A proxy saved without a port SAYS so. Showing `:1080` would hide an
+        // unfinished profile behind a plausible number.
+        let no_port = ProfileRow {
+            name: "half".into(),
+            spec: json!({ "host": "socks.example", "kind": "http" }),
+        };
+        assert_eq!(no_port.summary_of("proxy"), "http · socks.example (no port)");
+
+        // Nothing at all is still an answer.
+        let empty = ProfileRow { name: "x".into(), spec: json!({}) };
+        assert_eq!(empty.summary_of("proxy"), "—");
+        assert_eq!(empty.summary_of("tunnel"), "—");
     }
 
     /// The four section headings group the eleven pages; every page sits under

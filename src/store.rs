@@ -362,11 +362,89 @@ impl Store {
     /// Delete a saved connection. Also drops the queries saved under it —
     /// they are scoped BY connection name and would otherwise be unreachable
     /// rows that reappear if a new connection reused the name.
-    pub async fn remove_connection(&self, name: String) -> anyhow::Result<bool> {
+    /// Remove a saved connection and everything scoped to its NAME.
+    ///
+    /// **Charts, dashboards and scripts went with the queries only after this
+    /// was fixed.** They are keyed by connection name exactly as queries are,
+    /// and removing the connection left them behind pointing at a name nothing
+    /// answers to — invisible in every list, and ready to attach themselves to
+    /// the next connection that happens to be given the same name. That is the
+    /// same fault `rename_connection` was written for, on the other path.
+    ///
+    /// One transaction, and the counts come back so the window can say what
+    /// went. The AUDIT is deliberately left alone: it records what happened,
+    /// and a statement that ran did run whether or not the connection it ran on
+    /// still exists.
+    pub async fn remove_connection(&self, name: String) -> anyhow::Result<Json> {
         self.with(move |c| {
-            let n = c.execute("DELETE FROM connections WHERE name = ?1", params![name])?;
-            c.execute("DELETE FROM queries WHERE conn = ?1", params![name])?;
-            Ok(n > 0)
+            let tx = c.unchecked_transaction()?;
+            let n = tx.execute("DELETE FROM connections WHERE name = ?1", params![name])?;
+            let queries = tx.execute("DELETE FROM queries WHERE conn = ?1", params![name])?;
+            let charts = tx.execute("DELETE FROM charts WHERE conn = ?1", params![name])?;
+            let dashboards =
+                tx.execute("DELETE FROM dashboards WHERE conn = ?1", params![name])?;
+            let scripts = tx.execute("DELETE FROM scripts WHERE conn = ?1", params![name])?;
+            tx.commit()?;
+            Ok(json!({
+                "removed": n > 0,
+                "took": {
+                    "queries": queries,
+                    "charts": charts,
+                    "dashboards": dashboards,
+                    "scripts": scripts
+                }
+            }))
+        })
+        .await
+    }
+
+    /// Rename a saved connection, taking everything scoped to its NAME with it.
+    ///
+    /// **A rename used to be a save under the new name and a delete of the old
+    /// one**, which is not a rename: the saved queries, charts, dashboards and
+    /// scripts are keyed by connection name, so they stayed behind pointing at
+    /// a name nothing answers to. One transaction moves them.
+    ///
+    /// The AUDIT is deliberately left alone. It records what happened under the
+    /// name that was in use at the time, and rewriting it would make the log
+    /// say something that never happened.
+    ///
+    /// Refuses when `to` is already taken — `save_connection` overwrites by
+    /// name, and a rename that silently swallows another connection is a way
+    /// to lose one.
+    pub async fn rename_connection(&self, from: String, to: String) -> anyhow::Result<Json> {
+        self.with(move |c| {
+            let taken: i64 = c.query_row(
+                "SELECT COUNT(*) FROM connections WHERE name = ?1",
+                params![to],
+                |r| r.get(0),
+            )?;
+            if taken > 0 {
+                anyhow::bail!("a connection called {to} already exists");
+            }
+            let tx = c.unchecked_transaction()?;
+            let renamed = tx.execute(
+                "UPDATE connections SET name = ?2 WHERE name = ?1",
+                params![from, to],
+            )?;
+            if renamed == 0 {
+                anyhow::bail!("no connection called {from}");
+            }
+            let queries = tx.execute("UPDATE queries SET conn = ?2 WHERE conn = ?1", params![from, to])?;
+            let charts = tx.execute("UPDATE charts SET conn = ?2 WHERE conn = ?1", params![from, to])?;
+            let dashboards =
+                tx.execute("UPDATE dashboards SET conn = ?2 WHERE conn = ?1", params![from, to])?;
+            let scripts = tx.execute("UPDATE scripts SET conn = ?2 WHERE conn = ?1", params![from, to])?;
+            tx.commit()?;
+            Ok(json!({
+                "renamed": true,
+                "moved": {
+                    "queries": queries,
+                    "charts": charts,
+                    "dashboards": dashboards,
+                    "scripts": scripts
+                }
+            }))
         })
         .await
     }
@@ -1200,8 +1278,38 @@ mod tests {
         assert_eq!(all.len(), 1, "a re-save must UPDATE, not duplicate");
         let got = s.get_connection("prod".into()).await.unwrap().unwrap();
         assert_eq!(got["spec"]["params"]["host"], "h2");
-        assert!(s.remove_connection("prod".into()).await.unwrap());
+        assert_eq!(s.remove_connection("prod".into()).await.unwrap()["removed"], true);
         assert!(s.get_connection("prod".into()).await.unwrap().is_none());
+    }
+
+    /// Removing a connection takes everything scoped to its NAME with it.
+    ///
+    /// It used to take only the saved queries. A chart, a dashboard or a script
+    /// left behind is invisible in every list — nothing lists by a connection
+    /// that does not exist — and it would attach itself to the next connection
+    /// given the same name.
+    #[tokio::test]
+    async fn removing_a_connection_takes_what_belonged_to_it() {
+        let (s, _dir) = temp_store("conn-cascade");
+        s.save_connection("gone".into(), "postgres".into(), json!({})).await.unwrap();
+        s.save_connection("stays".into(), "postgres".into(), json!({})).await.unwrap();
+        s.save_query("gone".into(), "q".into(), "SELECT 1".into()).await.unwrap();
+        s.save_query("stays".into(), "q".into(), "SELECT 1".into()).await.unwrap();
+        s.save_chart("gone".into(), "c".into(), "SELECT 1".into(), "n".into()).await.unwrap();
+        s.save_script("gone".into(), "s".into(), "lua".into(), "print(1)".into())
+            .await
+            .unwrap();
+
+        let out = s.remove_connection("gone".into()).await.unwrap();
+        assert_eq!(out["removed"], true);
+        assert_eq!(out["took"]["queries"], 1);
+        assert_eq!(out["took"]["charts"], 1);
+        assert_eq!(out["took"]["scripts"], 1);
+
+        assert!(s.list_queries("gone".into()).await.unwrap().is_empty());
+        assert!(s.list_charts("gone".into()).await.unwrap().is_empty());
+        // And the other connection is untouched.
+        assert_eq!(s.list_queries("stays".into()).await.unwrap().len(), 1);
     }
 
     #[tokio::test]
