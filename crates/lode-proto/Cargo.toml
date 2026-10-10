@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2021"
 license = "BSD-3-Clause"
 description = "Client side of the lode protocol: spawn the engine and speak newline-delimited JSON-RPC to it"
+repository = "https://github.com/lvim-tech/lode"
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }

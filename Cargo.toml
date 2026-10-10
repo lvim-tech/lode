@@ -17,6 +17,7 @@ version = "0.1.0"
 edition = "2021"
 license = "BSD-3-Clause"
 description = "The lode database engine: an async, out-of-process database backend spoken to over newline-delimited JSON-RPC on stdio"
+repository = "https://github.com/lvim-tech/lode"
 
 # A binary (the daemon), NOT a library: DB work needs a tokio runtime, pools, TLS
 # and cancellation, so a client spawns the engine as a child process and is
