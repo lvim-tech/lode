@@ -931,6 +931,10 @@ pub struct Workspace {
 
     /// Where the result grid is scrolled to, sideways.
     grid_scroll: gpui::ScrollHandle,
+    /// The row list's own handle, so moving the cursor with the keyboard can
+    /// bring the row into view. Without it `j` thirty times moved a selection
+    /// nobody could see: the highlight was real and thirty rows below the fold.
+    grid_rows: gpui::UniformListScrollHandle,
     /// How much wider than the window the grid is, in pixels.
     ///
     /// DERIVED from the column widths rather than read from the scroll handle.
@@ -1147,6 +1151,7 @@ impl Workspace {
             resizing: None,
             panel_drag: None,
             grid_scroll: gpui::ScrollHandle::new(),
+            grid_rows: gpui::UniformListScrollHandle::new(),
             grid_overflow: std::cell::Cell::new(0.0),
             hbar_drag: std::cell::Cell::new(false),
             lang: restore
@@ -3281,6 +3286,13 @@ impl Workspace {
         if tab.detail.is_some() {
             tab.detail = tab.selected;
         }
+        let want = tab.selected;
+        // And the list follows it. CENTRED rather than merely "in view": a row
+        // scrolled to the bottom edge gives no sight of what comes next, and
+        // the next thing is what somebody moving the cursor is looking for.
+        if let Some(i) = want {
+            self.grid_rows.scroll_to_item(i, gpui::ScrollStrategy::Center);
+        }
         cx.notify();
     }
 
@@ -4057,6 +4069,44 @@ impl Workspace {
     }
 
     /// Start editing one cell, loading the input with what is there now.
+    /// Put the cursor on a row.
+    ///
+    /// A click used to go straight to `begin_edit`, so clicking a cell either
+    /// opened an editor or raised a toast explaining why it could not — and
+    /// there was no way to simply SAY WHICH ROW, which is what a click on a
+    /// grid means everywhere else. Selecting is the first click's job; editing
+    /// is the second click on a cell of a row already chosen.
+    fn select_row(&mut self, tab_id: u64, row: usize, cx: &mut Context<Self>) {
+        if let Some(t) = self.tabs.iter_mut().find(|t| t.id == tab_id) {
+            if row >= t.rows.len() {
+                return;
+            }
+            t.selected = Some(row);
+            // A detail panel that is open is showing "the row", not "that row".
+            if t.detail.is_some() {
+                t.detail = Some(row);
+            }
+        }
+        cx.notify();
+    }
+
+    /// A click on a cell: choose the row, and edit only if the row was already
+    /// chosen. The reason a cell cannot be edited goes in the STATUS line, not
+    /// in a toast — a toast for something somebody merely clicked past is noise,
+    /// and this one fired on every click on a key column.
+    fn click_cell(&mut self, tab_id: u64, row: usize, col: usize, cx: &mut Context<Self>) {
+        let already = self
+            .tabs
+            .iter()
+            .find(|t| t.id == tab_id)
+            .map_or(false, |t| t.selected == Some(row));
+        if !already {
+            self.select_row(tab_id, row, cx);
+            return;
+        }
+        self.begin_edit(tab_id, row, col, cx);
+    }
+
     fn begin_edit(&mut self, tab_id: u64, row: usize, col: usize, cx: &mut Context<Self>) {
         let Some(idx) = self.tabs.iter().position(|t| t.id == tab_id) else { return };
         if !column_editable(&self.tabs[idx], col) {
@@ -4067,7 +4117,8 @@ impl Workspace {
                 Some(c) => format!("{} is not a column of the table, so there is nothing to write it to", c.name),
                 None => "no such column".into(),
             };
-            self.toast(why, true);
+            self.status = why;
+            cx.notify();
             return;
         }
         if let Err(why) = row_key(&self.tabs[idx], row) {
@@ -7238,7 +7289,11 @@ impl Workspace {
                 div()
                     .id(SharedString::from(format!("val-{tab_id}-{ci}")))
                     .text_size(ms.body())
-                    .text_color(if null { t.muted() } else { t.fg() })
+                    // The same two marks the grid uses for an absent value:
+                    // the null ink and italic. It was the ordinary muted ink
+                    // here, which is also what a present-but-dim value gets.
+                    .text_color(if null { t.null_fg() } else { t.fg() })
+                    .when(null, |d| d.italic())
                     .when(can, |d| d.cursor_pointer().hover(|h| h.bg(t.hover_mark())))
                     .child(SharedString::from(
                         cell_text(v).unwrap_or_else(|| "NULL".to_string()),
@@ -7635,8 +7690,19 @@ impl Workspace {
                                         .truncate()
                                         .text_size(ms.small())
                                         .text_color(t.header_fg())
-                                        .child(SharedString::from(format!("{name}{arrow}"))),
+                                        .child(SharedString::from(name.clone())),
                                 )
+                                // The sort arrow, its OWN element. Glued to the
+                                // end of the name it was cut off with the name:
+                                // a column narrow enough to truncate lost the
+                                // one mark that says how it is ordered.
+                                .children((!arrow.is_empty()).then(|| {
+                                    div()
+                                        .flex_none()
+                                        .text_size(ms.tiny())
+                                        .text_color(t.accent())
+                                        .child(arrow.trim())
+                                }))
                                 .child(
                                     div()
                                         .flex_none()
@@ -7645,7 +7711,11 @@ impl Workspace {
                                         .child(sum.kind),
                                 ),
                         );
-                        if sum.total > 0 {
+                        // Only when some of the page is MISSING the field. A bar
+                        // that is always full and a line that always says
+                        // "100% of 200" are a row of the grid spent saying
+                        // nothing — and they hid the columns that do have gaps.
+                        if sum.total > 0 && sum.present < sum.total {
                             let frac = (sum.present as f32 / sum.total as f32).clamp(0.0, 1.0);
                             head = head
                                 .child(
@@ -7675,15 +7745,34 @@ impl Workspace {
                                         .truncate()
                                         .px(px(ms.cell_pad()))
                                         .text_size(ms.tiny())
-                                        .text_color(t.muted())
+                                        .text_color(t.warning())
                                         .child(SharedString::from(format!(
-                                            "{}% of {}",
-                                            sum.percent(),
-                                            sum.total
+                                            "{} of {}",
+                                            sum.present, sum.total
                                         ))),
                                 );
                         }
                         head
+                    })
+                    // The whole story on hover, including the percentage, which
+                    // does not have to take a line of the grid to be available.
+                    .tooltip({
+                        let (th, sc) = (self.theme.clone(), self.scale);
+                        let sum = crate::workspace::column_summary(
+                            &tab.rows,
+                            ci,
+                            tab.columns
+                                .get(ci)
+                                .map(|c| c.type_name.as_str())
+                                .filter(|s| !s.trim().is_empty()),
+                        );
+                        let words = format!(
+                            "{name} — {} · {}% of {} row(s) have it",
+                            sum.kind,
+                            sum.percent(),
+                            sum.total
+                        );
+                        crate::tip::Tip::build(words, None, th, sc)
                     })
                     .on_click(cx.listener(move |this, _, _, cx| {
                         this.sort_by(tab_id, ci);
@@ -7704,7 +7793,6 @@ impl Workspace {
                     .bg(t.divider())
                     .hover(|d| d.bg(t.accent()))
                     .cursor_col_resize()
-                    .hover(|d| d.bg(t.accent()))
                     .on_mouse_down(
                         MouseButton::Left,
                         cx.listener(move |this, ev: &gpui::MouseDownEvent, _, cx| {
@@ -7717,9 +7805,24 @@ impl Workspace {
 
         let rows: Vec<Vec<Value>> = tab.rows.clone();
         let first = tab.from;
-        let (muted, null_fg, row_alt, fg) = (t.muted(), t.null_fg(), t.row_alt(), t.fg());
+        let (num_fg, null_fg, row_alt, fg) = (t.row_number(), t.null_fg(), t.row_alt(), t.fg());
         let cols2 = cols.clone();
         let widths: HashMap<usize, f32> = tab.widths.clone();
+        // Which columns hold NUMBERS, worked out once for the page rather than
+        // per cell: a column of right-aligned numbers lines its digits up by
+        // place value, which is most of what scanning a column of amounts is.
+        let aligns: HashMap<usize, crate::workspace::Align> = cols
+            .iter()
+            .map(|(ci, _)| {
+                let declared = tab
+                    .columns
+                    .get(*ci)
+                    .map(|c| c.type_name.as_str())
+                    .filter(|x| !x.trim().is_empty());
+                let sum = crate::workspace::column_summary(&tab.rows, *ci, declared);
+                (*ci, crate::workspace::cell_align(sum.kind))
+            })
+            .collect();
 
         let list = uniform_list(
             "rows",
@@ -7734,13 +7837,34 @@ impl Workspace {
                     this.meta(&t.driver).map_or(false, |m| m.caps.edit) && t.object.is_some()
                 });
                 let edit_input = this.inputs.get(&(tab_id, "edit".to_string())).cloned();
-                let hover_bg = this.t().hover();
+                let hover_bg = this.t().hover_mark();
+                // WHICH ROW AM I ON. Read from the workspace, like the editor
+                // above: the grid drew no cursor at all, so `j` and `k` moved
+                // something invisible and a click on a row did nothing anybody
+                // could see.
+                let here = tb.and_then(|t| t.selected);
+                let (sel_bg, accent) = (this.t().selected_mark(), this.t().accent());
                 let mut out = Vec::new();
                 for i in range {
+                    let on = here == Some(i);
                     let mut line = div()
+                        .id(SharedString::from(format!("row-{tab_id}-{i}")))
                         .flex()
                         .w_full()
                         .h(px(ms.row_h()))
+                        // The same mark the rail uses for the chosen panel: a
+                        // filled background AND an edge. The background alone
+                        // is nearly invisible on several light palettes even
+                        // after `selected_mark`; the edge is unmistakable.
+                        .when(on, |d| d.bg(sel_bg).border_l_2().border_color(accent))
+                        // The edge is reserved on EVERY row, in the row's own
+                        // colour: without it the chosen row is two pixels wider
+                        // than its neighbours and the whole grid shifts as the
+                        // cursor moves.
+                        .when(!on, |d| d.border_l_2().border_color(gpui::transparent_black()))
+                        .on_click(cx2.listener(move |this, _, _, cx| {
+                            this.select_row(tab_id, i, cx);
+                        }))
                         // ONE ROW TALL, whatever is in it. `uniform_list` puts
                         // every row at a fixed offset, so a cell that grows
                         // taller than its row does not push the next one down —
@@ -7760,15 +7884,17 @@ impl Workspace {
                                 .truncate()
                                 .px(px(ms.cell_pad()))
                                 .text_size(ms.tiny())
-                                .text_color(muted)
+                                .text_color(num_fg)
                                 .child(SharedString::from((first + i + 1).to_string())),
                         );
                     for (ci, _) in &cols2 {
                         let cell = rows.get(i).and_then(|r| r.get(*ci));
-                        let (text, colour) = match cell.and_then(cell_text) {
-                            None => ("NULL".to_string(), null_fg),
-                            Some(s) => (s.replace('\n', "⏎"), fg),
+                        let (text, colour, is_null) = match cell.and_then(cell_text) {
+                            None => ("NULL".to_string(), null_fg, true),
+                            Some(s) => (s.replace('\n', "⏎"), fg, false),
                         };
+                        let right = aligns.get(ci).copied()
+                            == Some(crate::workspace::Align::Right);
                         let w = widths.get(ci).copied().unwrap_or(ms.col_w());
                         // A key column is not editable — changing it would move
                         // the row rather than change it — and neither is a
@@ -7831,12 +7957,19 @@ impl Workspace {
                                             .px(px(ms.cell_pad()))
                                             .text_size(ms.body())
                                             .text_color(colour)
+                                            .when(right, |d| d.text_right())
+                                            // NULL is not a value called NULL.
+                                            // Italic says it is the absence of
+                                            // one, so a cell holding the four
+                                            // letters as TEXT can still be told
+                                            // apart from an empty one.
+                                            .when(is_null, |d| d.italic())
                                             .child(SharedString::from(text)),
                                     )
                                     .on_click(cx2.listener({
                                         let ci = *ci;
                                         move |this, _, _, cx| {
-                                            this.begin_edit(tab_id, i, ci, cx);
+                                            this.click_cell(tab_id, i, ci, cx);
                                             cx.notify();
                                         }
                                     })),
@@ -7848,6 +7981,7 @@ impl Workspace {
                 out
             }),
         )
+        .track_scroll(self.grid_rows.clone())
         .h_full();
 
         // Header and rows share ONE horizontally scrolling parent, so the

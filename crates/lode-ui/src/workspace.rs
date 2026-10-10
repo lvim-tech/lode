@@ -1054,6 +1054,42 @@ pub fn column_summary(
     }
 }
 
+/// Which edge a column's values line up against.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Align {
+    Left,
+    Right,
+}
+
+/// Numbers go RIGHT; everything else goes left.
+///
+/// Not a style preference. A column of right-aligned numbers lines its digits
+/// up by place value, so `9`, `81` and `1204` can be compared by their width
+/// alone — which is most of what somebody scanning a column of amounts is
+/// doing. Left-aligned, the same three are read one at a time.
+///
+/// A MIXED column stays left: there is no place value to line up when half the
+/// cells are words, and the mixture is itself worth seeing.
+pub fn cell_align(kind: &str) -> Align {
+    match kind {
+        "int" | "num" => Align::Right,
+        _ => Align::Left,
+    }
+}
+
+/// How many lines a column heading needs.
+///
+/// Two when there is something to say beyond the name: the type it holds, or
+/// that some of its cells are empty. One otherwise — a header that is always
+/// two lines tall spends a row of the grid on white space.
+pub fn header_rows(sum: &ColumnSummary) -> usize {
+    if sum.kind == "null" && sum.present == sum.total {
+        1
+    } else {
+        2
+    }
+}
+
 /// A one-line preview of a value, for a collapsed tree node.
 pub fn preview(v: &Value) -> String {
     match v {
@@ -1310,7 +1346,39 @@ mod tests {
         assert_eq!(super::respawn_delay(3), None, "a fourth try is a spawn storm");
     }
 
-    /// A mistyped port must not quietly become 22.
+    /// Numbers line up on the right, and nothing else does.
+    #[test]
+    fn a_column_of_numbers_lines_up_by_place_value() {
+        use super::Align;
+        assert_eq!(super::cell_align("int"), Align::Right);
+        assert_eq!(super::cell_align("num"), Align::Right);
+        for other in ["string", "bool", "date", "oid", "object", "array", "null", "mixed"] {
+            assert_eq!(super::cell_align(other), Align::Left, "{other}");
+        }
+    }
+
+    /// A heading is two lines only when it has something to say on the second.
+    #[test]
+    fn a_heading_earns_its_second_line() {
+        use super::ColumnSummary;
+        // Nothing known and nothing missing: one line.
+        assert_eq!(
+            super::header_rows(&ColumnSummary { kind: "null", present: 10, total: 10 }),
+            1
+        );
+        // A type to name.
+        assert_eq!(
+            super::header_rows(&ColumnSummary { kind: "int", present: 10, total: 10 }),
+            2
+        );
+        // Or gaps to report, even with no type.
+        assert_eq!(
+            super::header_rows(&ColumnSummary { kind: "null", present: 3, total: 10 }),
+            2
+        );
+    }
+
+    /// A mistyped port must not quietly become 22.    /// A mistyped port must not quietly become 22.
     #[test]
     fn a_port_that_is_not_a_number_is_refused() {
         assert_eq!(super::parse_port("2222", 22), Ok(2222));
