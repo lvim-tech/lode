@@ -102,6 +102,12 @@ gpui::actions!(
         ShowTasks,
         /// Run the active tab again: f5.
         Refresh,
+        /// The cell cursor sideways, and what to do with the cell it is on.
+        NextCol,
+        PrevCol,
+        CopyCell,
+        CopyRowTsv,
+        CopyPageTsv,
         /// Pick a tab by position: ctrl-1 … ctrl-9. Nine, because the tenth
         /// would be ctrl-0 and nobody counts the tenth tab.
         GoTab1,
@@ -164,6 +170,16 @@ pub fn bind_workspace_keys(cx: &mut gpui::App) {
         KeyBinding::new("ctrl-shift-a", ShowAudit, None),
         KeyBinding::new("ctrl-shift-t", ShowTasks, None),
         KeyBinding::new("f5", Refresh, None),
+        // The CELL cursor. `,` and `.` because shift-h and shift-l are already
+        // the grid's horizontal scroll, and a cursor that also scrolled would
+        // be two things on one key.
+        KeyBinding::new(",", PrevCol, OUTSIDE),
+        KeyBinding::new(".", NextCol, OUTSIDE),
+        // `y` for the page, as lvim-db has it; ctrl-c for the cell and
+        // ctrl-shift-c for the row, as everything else has them.
+        KeyBinding::new("y", CopyPageTsv, OUTSIDE),
+        KeyBinding::new("ctrl-c", CopyCell, OUTSIDE),
+        KeyBinding::new("ctrl-shift-c", CopyRowTsv, OUTSIDE),
         // Paging is `[` and `]`, which ARE bare — so they stay outside a field.
         KeyBinding::new("[", PrevPage, OUTSIDE),
         KeyBinding::new("]", NextPage, OUTSIDE),
@@ -688,6 +704,9 @@ pub enum PaletteAct {
     OpenSettings,
     /// A page of rows, signed.
     Page(i64),
+    CopyCell,
+    CopyRow,
+    CopyPage,
 }
 
 /// Read a typed cell back into a JSON value.
@@ -3772,6 +3791,9 @@ impl Workspace {
         out.push(PaletteItem { label: "Scroll the grid left".into(), hint: "shift-h".into(), act: PaletteAct::ScrollGrid(1.0) });
         out.push(PaletteItem { label: "Scroll the grid right".into(), hint: "shift-l".into(), act: PaletteAct::ScrollGrid(-1.0) });
         out.push(PaletteItem { label: "Run this tab".into(), hint: "r / f5".into(), act: PaletteAct::RunActive });
+        out.push(PaletteItem { label: "Copy this cell".into(), hint: "ctrl-c".into(), act: PaletteAct::CopyCell });
+        out.push(PaletteItem { label: "Copy this row".into(), hint: "ctrl-shift-c".into(), act: PaletteAct::CopyRow });
+        out.push(PaletteItem { label: "Copy the loaded rows".into(), hint: "y".into(), act: PaletteAct::CopyPage });
         out.push(PaletteItem { label: "New tab".into(), hint: "ctrl-t".into(), act: PaletteAct::NewTab });
         out.push(PaletteItem { label: "Close this tab".into(), hint: "ctrl-w".into(), act: PaletteAct::CloseTab });
         out.push(PaletteItem { label: "The tab before this".into(), hint: "ctrl-tab".into(), act: PaletteAct::LastTab });
@@ -3918,6 +3940,18 @@ impl Workspace {
             }
             PaletteAct::OpenSettings => self.open_settings(cx),
             PaletteAct::Page(by) => self.page_by(by),
+            PaletteAct::CopyCell => self.copy_cell(cx),
+            PaletteAct::CopyRow => {
+                let what = self
+                    .tabs
+                    .get(self.active)
+                    .and_then(|t| t.selected.or(t.detail).map(|r| (t.id, r)));
+                match what {
+                    Some((id, row)) => self.copy_row_tsv(id, row, cx),
+                    None => self.toast("pick a row first".to_string(), true),
+                }
+            }
+            PaletteAct::CopyPage => self.copy_page_tsv(cx),
             PaletteAct::ToggleConsole => {
                 self.drawer = match self.drawer {
                     Some(Drawer::Command) => None,
@@ -3978,6 +4012,56 @@ impl Workspace {
             if as_insert { "row copied as INSERT" } else { "row copied as SELECT" },
             false,
         );
+    }
+
+    /// The cell cursor sideways.
+    fn step_col(&mut self, by: isize, cx: &mut Context<Self>) {
+        let Some(tab) = self.tabs.get_mut(self.active) else { return };
+        let count = tab.grid_columns().len();
+        tab.cursor_col = crate::workspace::step_col(tab.cursor_col, by, count);
+        // A cell cursor with no row under it is a cursor on nothing.
+        if tab.selected.is_none() && !tab.rows.is_empty() {
+            tab.selected = Some(0);
+        }
+        cx.notify();
+    }
+
+    /// The cell the cursor is on, on the clipboard.
+    ///
+    /// Straight out of the page, and that is not a shortcut. The engine buffers
+    /// rows WHOLE — `query.cell` exists for a client that did not keep the page
+    /// it was given, and the README says so: "a cell's full value is always
+    /// retrievable even when the grid truncated it". The truncation is in the
+    /// DRAWING, at the column's edge; the value in hand is complete, so asking
+    /// again would be a round trip for something already here.
+    fn copy_cell(&mut self, cx: &mut Context<Self>) {
+        let Some(tab) = self.tabs.get(self.active) else { return };
+        let Some(row) = tab.selected.or(tab.detail) else {
+            self.toast("pick a row first".to_string(), true);
+            return;
+        };
+        let cols = tab.grid_columns();
+        let Some(ci) = cols.get(tab.cursor_col).map(|(i, _)| *i) else { return };
+        let Some(value) = tab.rows.get(row).and_then(|r| r.get(ci)).cloned() else { return };
+        let text = cell_text(&value).unwrap_or_default();
+        cx.write_to_clipboard(ClipboardItem::new_string(text));
+        self.toast("cell copied".to_string(), false);
+    }
+
+    /// Every loaded row as tab-separated values, with the column names above.
+    fn copy_page_tsv(&mut self, cx: &mut Context<Self>) {
+        let Some(tab) = self.tabs.get(self.active) else { return };
+        if tab.rows.is_empty() {
+            self.toast("nothing to copy".to_string(), true);
+            return;
+        }
+        let cols: Vec<String> = tab.columns.iter().map(|c| c.name.clone()).collect();
+        let text = crate::menu::page_tsv(&cols, &tab.rows);
+        let n = tab.rows.len();
+        cx.write_to_clipboard(ClipboardItem::new_string(text));
+        // How MANY, because what is copied is what is LOADED — the same honesty
+        // the export row has about itself.
+        self.toast(format!("{n} loaded row(s) copied"), false);
     }
 
     /// One row as tab-separated values.
@@ -4534,6 +4618,14 @@ impl Workspace {
             .iter()
             .find(|t| t.id == tab_id)
             .map_or(false, |t| t.selected == Some(row));
+        // The CELL cursor goes where the click did, whichever of the two
+        // things the click turns out to mean: `ctrl-c` after a click must copy
+        // the cell that was clicked.
+        if let Some(t) = self.tabs.iter_mut().find(|t| t.id == tab_id) {
+            if let Some(at) = t.grid_columns().iter().position(|(i, _)| *i == col) {
+                t.cursor_col = at;
+            }
+        }
         if !already {
             self.select_row(tab_id, row, cx);
             return;
@@ -8669,6 +8761,10 @@ impl Workspace {
                 // something invisible and a click on a row did nothing anybody
                 // could see.
                 let here = tb.and_then(|t| t.selected);
+                // WHICH CELL. Only on the row the cursor is on — a column
+                // highlight running down the whole grid would be a second
+                // cursor competing with the first.
+                let here_col = tb.map(|t| t.cursor_col).unwrap_or(0);
                 let (sel_bg, accent) = (this.t().selected_mark(), this.t().accent());
                 let mut out = Vec::new();
                 for i in range {
@@ -8735,7 +8831,8 @@ impl Workspace {
                                 .text_color(num_fg)
                                 .child(SharedString::from((first + i + 1).to_string())),
                         );
-                    for (ci, _) in &cols2 {
+                    for (at, (ci, _)) in cols2.iter().enumerate() {
+                        let on_cell = on && at == here_col;
                         let cell = rows.get(i).and_then(|r| r.get(*ci));
                         let (text, colour, is_null) = match cell.and_then(cell_text) {
                             None => ("NULL".to_string(), null_fg, true),
@@ -8798,6 +8895,11 @@ impl Workspace {
                                     .when(editable_here && col_editable, |d| {
                                         d.cursor_pointer().hover(move |h| h.bg(hover_bg))
                                     })
+                                    // The cell under the cursor is OUTLINED,
+                                    // not filled: the row it is on is already
+                                    // filled, and a second fill on top of it
+                                    // reads as a different kind of selection.
+                                    .when(on_cell, |d| d.border_1().border_color(accent))
                                     .child(
                                         div()
                                             .w(px(w))
@@ -10317,6 +10419,20 @@ impl Render for Workspace {
                 this.palette_sel = this.palette_sel.saturating_sub(1);
                 cx.notify();
             }))
+            .on_action(cx.listener(|this, _: &NextCol, _, cx| this.step_col(1, cx)))
+            .on_action(cx.listener(|this, _: &PrevCol, _, cx| this.step_col(-1, cx)))
+            .on_action(cx.listener(|this, _: &CopyCell, _, cx| this.copy_cell(cx)))
+            .on_action(cx.listener(|this, _: &CopyRowTsv, _, cx| {
+                let what = this
+                    .tabs
+                    .get(this.active)
+                    .and_then(|t| t.selected.or(t.detail).map(|r| (t.id, r)));
+                match what {
+                    Some((id, row)) => this.copy_row_tsv(id, row, cx),
+                    None => this.toast("pick a row first".to_string(), true),
+                }
+            }))
+            .on_action(cx.listener(|this, _: &CopyPageTsv, _, cx| this.copy_page_tsv(cx)))
             .on_action(cx.listener(|this, _: &NewTab, _, cx| this.new_draft_tab(cx)))
             .on_action(cx.listener(|this, _: &CloseTab, _, cx| {
                 if let Some(t) = this.tabs.get(this.active) {

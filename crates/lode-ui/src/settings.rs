@@ -76,21 +76,25 @@ const KEYS: &[(&str, &[(&str, &str)])] = &[
             ("Close it", "ctrl-w"),
             ("The one before this", "ctrl-tab"),
             ("By position", "ctrl-1 \u{2026} ctrl-9"),
-            ("Left, right", "h, l"),
+            ("Left / right", "h / l"),
         ],
     ),
     (
         "THE RESULT",
         &[
-            ("Run this tab", "r, f5"),
+            ("Run this tab", "r / f5"),
             ("Run what is in the editor", "ctrl-enter"),
             ("Run it in a new tab", "ctrl-shift-enter"),
-            ("A row down, up", "j, k"),
-            ("First row, last", "g, shift-g"),
-            ("A page down, up", "ctrl-f, ctrl-b"),
-            ("The grid sideways", "shift-h, shift-l"),
-            ("A page of rows", "[, ]"),
+            ("A row down / up", "j / k"),
+            ("First / last row", "g / shift-g"),
+            ("A page down / up", "ctrl-f / ctrl-b"),
+            ("The grid sideways", "shift-h / shift-l"),
+            ("A page of rows", "[ / ]"),
             ("Show the row", "enter"),
+            ("A cell left / right", ", / ."),
+            ("Copy the cell", "ctrl-c"),
+            ("Copy the row", "ctrl-shift-c"),
+            ("Copy the loaded rows", "y"),
             ("Export", "ctrl-e"),
         ],
     ),
@@ -98,17 +102,17 @@ const KEYS: &[(&str, &[(&str, &str)])] = &[
         "THE EDITOR",
         &[
             ("A new line", "enter"),
-            ("Indent, unindent", "tab, shift-tab"),
+            ("Indent / unindent", "tab / shift-tab"),
             ("Comment the block", "ctrl-/"),
             ("Duplicate the line", "ctrl-d"),
-            ("Undo, redo", "ctrl-z, ctrl-shift-z"),
-            ("A word left, right", "ctrl-left, ctrl-right"),
+            ("Undo / redo", "ctrl-z / ctrl-shift-z"),
+            ("A word left / right", "ctrl-left / ctrl-right"),
         ],
     ),
     (
         "A WINDOW OF ITS OWN",
         &[
-            ("The next field, the last", "tab, shift-tab"),
+            ("The next / previous field", "tab / shift-tab"),
             ("Save", "enter"),
             ("Close", "escape"),
         ],
@@ -1304,10 +1308,11 @@ mod tests {
         let mut missing = Vec::new();
         for (_, rows) in KEYS {
             for (action, keys) in *rows {
-                // A row may list two ways to do one thing ("r, f5"); each has
-                // to be bound somewhere. Split on COMMA-SPACE, not on comma:
-                // `ctrl-,` is a key whose name ends in one.
-                for key in keys.split(", ").map(str::trim) {
+                // A row may list two ways to do one thing ("r / f5"); each
+                // has to be bound somewhere. The separator is a SLASH, not a
+                // comma: `ctrl-,` and `,` are both keys whose own name is a
+                // comma, and a comma separator cannot tell them apart.
+                for key in keys.split(" / ").map(str::trim) {
                     // The ranges and the words are not literal bindings.
                     if key.contains('\u{2026}') {
                         continue;

@@ -245,6 +245,12 @@ pub struct Tab {
     /// which is what makes somebody stop.
     pub confirm: Option<(String, String)>,
     pub selected: Option<usize>,
+    /// Which COLUMN the cell cursor is in, as an index into `columns`.
+    ///
+    /// A row cursor answers "which record"; a cell cursor answers "which
+    /// value", and copying one value was the thing this grid could not do at
+    /// all — the only way out was an export of everything.
+    pub cursor_col: usize,
     pub view: ResultView,
     pub sub: SubTab,
     /// Which rows are expanded in the Tree view.
@@ -750,6 +756,7 @@ impl Tab {
             ms: 0,
             error: None,
             confirm: None,
+            cursor_col: 0,
             ran: String::new(),
             recorded: false,
             selected: None,
@@ -1060,6 +1067,19 @@ pub fn column_summary(
         present,
         total,
     }
+}
+
+/// Move the cell cursor sideways, within the columns there are.
+///
+/// It STOPS at the ends rather than wrapping. A row cursor wraps harmlessly —
+/// the row above the first is the last — but a cell cursor that wraps turns one
+/// press too many into a jump across the whole table, and the thing somebody
+/// was reading is gone.
+pub fn step_col(now: usize, by: isize, count: usize) -> usize {
+    if count == 0 {
+        return 0;
+    }
+    (now as isize + by).clamp(0, count as isize - 1) as usize
 }
 
 /// Which tab is already showing this object, if any.
@@ -1543,6 +1563,20 @@ mod tests {
         assert!(super::respawn_delay(1).unwrap() > super::respawn_delay(0).unwrap());
         assert!(super::respawn_delay(2).unwrap() > super::respawn_delay(1).unwrap());
         assert_eq!(super::respawn_delay(3), None, "a fourth try is a spawn storm");
+    }
+
+    /// The cell cursor stops at the edges of the table.
+    #[test]
+    fn the_cell_cursor_does_not_wrap() {
+        assert_eq!(super::step_col(0, 1, 3), 1);
+        assert_eq!(super::step_col(2, 1, 3), 2, "one press too many stays put");
+        assert_eq!(super::step_col(0, -1, 3), 0);
+        assert_eq!(super::step_col(1, -1, 3), 0);
+        // A big jump is clamped, not wrapped.
+        assert_eq!(super::step_col(0, 99, 3), 2);
+        assert_eq!(super::step_col(2, -99, 3), 0);
+        // No columns at all is an answer.
+        assert_eq!(super::step_col(5, 1, 0), 0);
     }
 
     /// One tab per object, and a dashboard is not an object.
