@@ -173,6 +173,13 @@ fn pick_font(cx: &gpui::App) -> String {
 /// engine would otherwise keep every line of it.
 const LOG_KEEP: usize = 500;
 
+/// The size the font is PROBED at, which is not a layout length.
+///
+/// "Does this family have this glyph" and "how wide is it relative to its size"
+/// are both answered at whatever size the question is asked; it is written once
+/// here so it does not read as a measurement that forgot to follow the scale.
+const GLYPH_PROBE: f32 = 20.0;
+
 const GLYPHS: &[(&str, &str)] = &[
     // The rail.
     ("\u{f1c0}", "DB"),
@@ -315,7 +322,7 @@ fn missing_in(cx: &gpui::App, family: &str) -> std::collections::HashSet<char> {
     let mut missing = std::collections::HashSet::new();
     for (g, _) in GLYPHS {
         if let Some(ch) = g.chars().next() {
-            if cx.text_system().typographic_bounds(id, px(16.0), ch).is_err() {
+            if cx.text_system().typographic_bounds(id, px(GLYPH_PROBE), ch).is_err() {
                 missing.insert(ch);
             }
         }
@@ -356,6 +363,12 @@ pub fn report_panels(cx: &gpui::App) {
     println!("row_h     {:>6.0} px (grid)", ms.row_h());
     println!("panel_row {:>6.0} px", ms.panel_row_h());
     println!("action    {:>6.0} px in a {:.0} px box", f32::from(ms.action()), ms.action_box());
+    // The chrome, which used to be literals chosen against a base of 12.
+    println!("status_h  {:>6.0} px   tab_h {:.0}   control_h {:.0}", ms.status_h(), ms.tab_h(), ms.control_h());
+    println!("num_w     {:>6.0} px   indent {:.0}   gutter {:.0}   marker {:.0}", ms.num_w(), ms.indent(), ms.gutter(), ms.marker_w());
+    println!("palette   {:>6.0} px tall, {:.0} px down", ms.palette_h(), ms.palette_top());
+    let (ww, wh) = ms.window(crate::metrics::Window::Settings);
+    println!("settings window {ww:.0} x {wh:.0} px");
 
     // Every number above has to be positive, or the thing it sizes is invisible
     // while still drawing its border — which is exactly what an "empty panel
@@ -424,12 +437,12 @@ pub fn report_icons(cx: &gpui::App) {
     let (mut present, mut widths) = (0usize, Vec::new());
     for (g, fallback) in GLYPHS {
         let ch = g.chars().next().unwrap_or(' ');
-        match cx.text_system().typographic_bounds(id, px(20.0), ch) {
+        match cx.text_system().typographic_bounds(id, px(GLYPH_PROBE), ch) {
             Ok(b) => {
                 present += 1;
                 widths.push(cx
                     .text_system()
-                    .advance(id, px(20.0), ch)
+                    .advance(id, px(GLYPH_PROBE), ch)
                     .map(|a| f32::from(a.width))
                     .unwrap_or(0.0));
                 println!(
@@ -618,7 +631,11 @@ const PAGE: usize = 200;
 // Was `const ROW_H: f32 = 20.0; const COL_W: f32 = 150.0;`. Both now come from
 // the type scale: a row that does not grow with the text in it pinches, and the
 // pinch is invisible in a screenshot taken at the old size. See `metrics.rs`.
-const NUM_W: f32 = 44.0;
+//
+// The row-number column went the same way (`metrics::num_w`). It was 44 and it
+// takes part in the grid's total width, so at a large text size the numbers
+// overflowed a column the arithmetic still believed was 44 wide — and the last
+// data column became unreachable by exactly the difference.
 const BLOCKING: Duration = Duration::from_secs(15);
 
 /// What the icon rail selects. It changes the PANEL, never the work area.
@@ -2883,7 +2900,8 @@ impl Workspace {
             None => "lode — New connection".to_string(),
         };
         let fonts = (self.font_family.clone(), self.icon_family.clone());
-        let bounds = Bounds::centered(None, size(px(720.0), px(560.0)), cx);
+        let (w, h) = self.scale.window(crate::metrics::Window::Connection);
+        let bounds = Bounds::centered(None, size(px(w), px(h)), cx);
         let opened = cx.open_window(
             WindowOptions {
                 window_bounds: Some(WindowBounds::Windowed(bounds)),
@@ -2931,7 +2949,8 @@ impl Workspace {
             None => "lode — New tunnel".to_string(),
         };
         let font = self.font_family.clone();
-        let bounds = Bounds::centered(None, size(px(620.0), px(420.0)), cx);
+        let (w, h) = self.scale.window(crate::metrics::Window::Profile);
+        let bounds = Bounds::centered(None, size(px(w), px(h)), cx);
         let opened = cx.open_window(
             WindowOptions {
                 window_bounds: Some(WindowBounds::Windowed(bounds)),
@@ -2981,7 +3000,10 @@ impl Workspace {
         let me = cx.entity().downgrade();
         let (tun, prx) = (prof("tunnel"), prof("proxy"));
         let fonts = (self.font_family.clone(), self.icon_family.clone());
-        let bounds = Bounds::centered(None, size(px(900.0), px(620.0)), cx);
+        // Derived: at a large text size a window of 900×620 held half a page
+        // and put its own Close button off the bottom edge.
+        let (w, h) = self.scale.window(crate::metrics::Window::Settings);
+        let bounds = Bounds::centered(None, size(px(w), px(h)), cx);
         let opened = cx.open_window(
             WindowOptions {
                 window_bounds: Some(WindowBounds::Windowed(bounds)),
@@ -4467,7 +4489,7 @@ impl Workspace {
             .flex_none()
             .px_1()
             .cursor_pointer()
-            .hover(|d| d.bg(t.hover()))
+            .hover(|d| d.bg(t.hover_mark()))
             .text_size(ms.tiny())
             .text_color(t.accent())
             .child(label)
@@ -4726,11 +4748,11 @@ impl Workspace {
                     // which is most of them. The bar is now three pixels and
                     // full height, because at two on a narrow rail neither mark
                     // could be read.
-                    .when(on, |d| d.bg(t.selected()).border_l_3().border_color(t.accent()))
+                    .when(on, |d| d.bg(t.selected_mark()).border_l_3().border_color(t.accent()))
                     .when(!on, |d| d.border_l_3().border_color(t.status()))
                     // The buttons touch, so the hover has to be what says where
                     // one ends: it fills exactly one button's height.
-                    .hover(|d| d.bg(t.hover()))
+                    .hover(|d| d.bg(t.hover_mark()))
                     .cursor_pointer()
                     // The name of the panel, from the same catalogue key its own
                     // heading uses — a rail of glyphs is otherwise learned only
@@ -4786,7 +4808,7 @@ impl Workspace {
                 .flex_none()
                 .border_l_3()
                 .border_color(t.status())
-                .hover(|d| d.bg(t.hover()))
+                .hover(|d| d.bg(t.hover_mark()))
                 .cursor_pointer()
                 .tooltip(self.tip("rail.settings", None))
                 .child(self.icon_el("\u{f013}", t.muted()))
@@ -4911,7 +4933,7 @@ impl Workspace {
                         .px_2()
                         .py_1()
                         .cursor_pointer()
-                        .hover(|d| d.bg(t.hover()))
+                        .hover(|d| d.bg(t.hover_mark()))
                         .text_size(ms.small())
                         .text_color(t.accent())
                         .child(SharedString::from(format!("{}  {}", "\u{f021}", self.lang.tr("panel.reload_history"))))
@@ -4967,7 +4989,7 @@ impl Workspace {
                             .px_2()
                             .py(px(2.0))
                             .cursor_pointer()
-                            .hover(|d| d.bg(t.hover()))
+                            .hover(|d| d.bg(t.hover_mark()))
                             .child(self.line_tip(
                                 one,
                                 ms.small(),
@@ -5005,7 +5027,7 @@ impl Workspace {
                         .px_2()
                         .py_1()
                         .cursor_pointer()
-                        .hover(|d| d.bg(t.hover()))
+                        .hover(|d| d.bg(t.hover_mark()))
                         .text_size(ms.small())
                         .text_color(t.accent())
                         .child(SharedString::from(format!("{}  {}", "\u{f021}", self.lang.tr("panel.reload_audit"))))
@@ -5090,7 +5112,7 @@ impl Workspace {
                         // thirty things rather than as one block.
                         .mb(px(2.0))
                         .cursor_pointer()
-                        .hover(|d| d.bg(t.hover()));
+                        .hover(|d| d.bg(t.hover_mark()));
                     // A closed record is exactly its lines; an open one is free
                     // to grow, because a wrapped reason is as tall as it needs.
                     if !open {
@@ -5181,7 +5203,7 @@ impl Workspace {
                         .items_center()
                         .gap_2()
                         .cursor_pointer()
-                        .hover(|d| d.bg(t.hover()));
+                        .hover(|d| d.bg(t.hover_mark()));
                     row = row.child(
                         div().flex_1().min_w_0().child(self.line(
                             format!("{} · {}", task.label, fmt_duration(task.duration())),
@@ -5196,7 +5218,7 @@ impl Workspace {
                                 .id(SharedString::from(format!("stop-task-{id}")))
                                 .flex_none()
                                 .cursor_pointer()
-                                .hover(|d| d.bg(t.hover()))
+                                .hover(|d| d.bg(t.hover_mark()))
                                 .tooltip(self.tip("tip.stop_task", None))
                                 .child(self.action_el("\u{f00d}", t.error()))
                                 .on_click(cx.listener(move |this, _, _, cx| {
@@ -5270,7 +5292,7 @@ impl Workspace {
                 .px_2()
                 .py_1()
                 .cursor_pointer()
-                .hover(|d| d.bg(t.hover()))
+                .hover(|d| d.bg(t.hover_mark()))
                 .text_size(ms.small())
                 .text_color(t.accent())
                 .child(SharedString::from(format!("{}  {}", "\u{f067}", self.lang.tr("panel.new_connection"))))
@@ -5317,8 +5339,8 @@ impl Workspace {
                     // rather than chosen — see `panel_row_h`.
                     .h(px(ms.panel_row_h()))
                     .cursor_pointer()
-                    .hover(|d| d.bg(t.hover()))
-                    .when(is_live, |d| d.bg(t.selected()))
+                    .hover(|d| d.bg(t.hover_mark()))
+                    .when(is_live, |d| d.bg(t.selected_mark()))
                     .child(
                         div()
                             .text_size(ms.tiny())
@@ -5362,7 +5384,7 @@ impl Workspace {
                             // a connection concludes it cannot be edited. Now it
                             // is at the icon size, in the accent, and it lights
                             // up under the pointer.
-                            .hover(|d| d.bg(t.hover()))
+                            .hover(|d| d.bg(t.hover_mark()))
                             .tooltip(self.tip("tip.edit_conn", None))
                             // The ordinary foreground, not the accent: on a
                             // palette with a quiet accent the pencil was barely
@@ -5383,7 +5405,7 @@ impl Workspace {
                             .id(SharedString::from(format!("rm-{}", c.name)))
                             .flex_none()
                             .cursor_pointer()
-                            .hover(|d| d.bg(t.hover()))
+                            .hover(|d| d.bg(t.hover_mark()))
                             .tooltip(self.tip("tip.remove_conn", None))
                             .child(self.action_el("\u{f00d}", t.muted()))
                             .on_click(cx.listener({
@@ -5497,11 +5519,11 @@ impl Workspace {
                             .flex()
                             .items_center()
                             .gap_1()
-                            .pl(px(10.0))
+                            .pl(px(ms.gutter()))
                             .pr_2()
                             .py(px(2.0))
                             .cursor_pointer()
-                            .hover(|d| d.bg(t.hover()))
+                            .hover(|d| d.bg(t.hover_mark()))
                             .child(self.icon_inline("\u{f080}", t.accent()))
                             .child(self.line_in(c.name.clone(), ms.small(), t.fg(), ms.line_w() - ms.base() - 14.0))
                             .on_click(cx.listener({
@@ -5524,11 +5546,11 @@ impl Workspace {
                     .flex()
                     .items_center()
                     .gap_1()
-                    .pl(px(10.0))
+                    .pl(px(ms.gutter()))
                     .pr_2()
                     .py(px(2.0))
                     .cursor_pointer()
-                    .hover(|d| d.bg(t.hover()))
+                    .hover(|d| d.bg(t.hover_mark()))
                     .tooltip(self.tip("tip.new_board", None))
                     .child(self.icon_inline("\u{f067}", t.accent()))
                     .child(self.line_in(self.tr("panel.new_dashboard"), ms.small(), t.accent(), ms.line_w() - ms.base() - 14.0))
@@ -5546,11 +5568,11 @@ impl Workspace {
                         .flex()
                         .items_center()
                         .gap_1()
-                        .pl(px(10.0))
+                        .pl(px(ms.gutter()))
                         .pr_2()
                         .py(px(2.0))
                         .cursor_pointer()
-                        .hover(|d| d.bg(t.hover()))
+                        .hover(|d| d.bg(t.hover_mark()))
                         .tooltip(self.tip("tip.open_board", None))
                         .child(self.icon_inline("\u{f00a}", t.accent()))
                         .child(self.line_in(name.clone(), ms.small(), t.fg(), ms.line_w() - ms.base() - 14.0))
@@ -5571,11 +5593,11 @@ impl Workspace {
                             .flex()
                             .items_center()
                             .gap_1()
-                            .pl(px(10.0))
+                            .pl(px(ms.gutter()))
                             .pr_2()
                             .py(px(2.0))
                             .cursor_pointer()
-                            .hover(|d| d.bg(t.hover()))
+                            .hover(|d| d.bg(t.hover_mark()))
                             .child(self.icon_inline("\u{f15c}", t.accent()))
                             .child(self.line_in(q.name.clone(), ms.small(), t.fg(), ms.line_w() - ms.base() - 14.0))
                             .on_click(cx.listener({
@@ -5633,11 +5655,11 @@ impl Workspace {
             .flex()
             .items_center()
             .gap_1()
-            .pl(px(8.0 + depth as f32 * 12.0))
+            .pl(px(ms.gutter() + depth as f32 * ms.indent()))
             .pr_2()
             .py(px(2.0))
             .cursor_pointer()
-            .hover(|d| d.bg(t.hover()))
+            .hover(|d| d.bg(t.hover_mark()))
             .child({
                 // A table has TWO things to do: open it, and look inside it.
                 // The row keeps the common one; the arrow is its own target for
@@ -5803,7 +5825,7 @@ impl Workspace {
                         .pl(px(pad + 12.0))
                         .py(px(1.0))
                         .cursor_pointer()
-                        .hover(|d| d.bg(t.hover()))
+                        .hover(|d| d.bg(t.hover_mark()))
                         // A click puts the NAME where text is being written.
                         // Details belong on the row, not behind a click, and
                         // the name is the thing somebody is about to type.
@@ -5894,7 +5916,7 @@ impl Workspace {
             .flex()
             .items_center()
             .w_full()
-            .h(px(30.0))
+            .h(px(ms.tab_h()))
             .bg(t.panel())
             .border_b_1()
             .border_color(t.border());
@@ -5931,7 +5953,7 @@ impl Workspace {
                         div()
                             .id(SharedString::from(format!("tabx-{}", tab.id)))
                             .tooltip(self.tip("tip.close_tab", None))
-                            .hover(|d| d.bg(t.hover()))
+                            .hover(|d| d.bg(t.hover_mark()))
                             .child(self.action_el("\u{f00d}", t.muted()))
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 this.close_tab(id);
@@ -6006,7 +6028,7 @@ impl Workspace {
                     } else {
                         // Laid out but not built; shown so the row does not
                         // rearrange when they arrive.
-                        t.border()
+                        t.disabled()
                     })
                     .child(SharedString::from(s.label()))
                     .on_click(cx.listener(move |this, _, _, cx| {
@@ -6048,7 +6070,7 @@ impl Workspace {
                                 .child(SharedString::from(link.glyph))
                         }))
                         .child(self.small(tab.conn_name.clone(), t.muted()))
-                        .child(self.small("›", t.border()))
+                        .child(self.small("›", t.divider()))
                         .child(self.small(tab.title.clone(), t.fg()))
                         .child(self.small(count, t.muted()))
                         .child(self.small(format!("{} ms", tab.ms), t.muted())),
@@ -6082,7 +6104,7 @@ impl Workspace {
                             .id("name-ok")
                             .px_2()
                             .cursor_pointer()
-                            .hover(|d| d.bg(t.hover()))
+                            .hover(|d| d.bg(t.hover_mark()))
                             .text_size(ms.small())
                             .text_color(t.accent())
                             .child(self.tr("result.save"))
@@ -6097,7 +6119,7 @@ impl Workspace {
                             .id("name-no")
                             .px_2()
                             .cursor_pointer()
-                            .hover(|d| d.bg(t.hover()))
+                            .hover(|d| d.bg(t.hover_mark()))
                             .text_size(ms.small())
                             .text_color(t.muted())
                             .child(self.tr("tip.cancel_edit"))
@@ -6113,7 +6135,7 @@ impl Workspace {
         // The sub-tabs belong HERE, next to the views, not pinned to the far
         // corner of the breadcrumbs: they are about the result below them.
         let mut views = div().flex().items_center().gap_2().px_3().py_1();
-        views = views.child(sub_row).child(self.small("│", t.border()));
+        views = views.child(sub_row).child(self.small("│", t.divider()));
         for v in [ResultView::Tree, ResultView::Table, ResultView::Json, ResultView::Chart] {
             let on = tab.view == v;
             let tab_id = tab.id;
@@ -6141,7 +6163,7 @@ impl Workspace {
                 .px_2()
                 .cursor_pointer()
                 .text_size(ms.small())
-                .text_color(if running { t.error() } else { t.border() })
+                .text_color(if running { t.error() } else { t.disabled() })
                 .child("Cancel")
                 .on_click(cx.listener(|this, _, _, cx| {
                     this.cancel_active();
@@ -6361,7 +6383,7 @@ impl Workspace {
                         .cursor_pointer()
                         .text_size(ms.small())
                         .text_color(t.accent())
-                        .hover(|d| d.bg(t.hover()))
+                        .hover(|d| d.bg(t.hover_mark()))
                         .child("Name it")
                         .on_click(cx.listener(move |this, _, _, cx| {
                             let n = this.board_name.read(cx).text().trim().to_string();
@@ -6395,7 +6417,7 @@ impl Workspace {
                 .text_size(ms.small())
                 .text_color(if editing { t.inverted() } else { t.accent() })
                 .when(editing, |d| d.bg(t.accent()))
-                .hover(|d| d.bg(t.hover()))
+                .hover(|d| d.bg(t.hover_mark()))
                 .child(if editing { "Done" } else { "Arrange" })
                 .on_click(cx.listener(move |this, _, _, cx| {
                     if let Some(bd) = this.board_mut(tab_id) {
@@ -6418,7 +6440,7 @@ impl Workspace {
                         .cursor_pointer()
                         .text_size(ms.small())
                         .text_color(t.accent())
-                        .hover(|d| d.bg(t.hover()))
+                        .hover(|d| d.bg(t.hover_mark()))
                         .child(label)
                         .on_click(cx.listener(move |this, _, _, cx| {
                             this.board_add(tab_id, kind);
@@ -6436,7 +6458,7 @@ impl Workspace {
                     .cursor_pointer()
                     .text_size(ms.small())
                     .text_color(t.accent())
-                    .hover(|d| d.bg(t.hover()))
+                    .hover(|d| d.bg(t.hover_mark()))
                     .child("\u{f021}  Refresh")
                     .on_click(cx.listener(move |this, _, _, cx| {
                         this.run_board(tab_id);
@@ -6451,7 +6473,7 @@ impl Workspace {
                     .text_size(ms.small())
                     .text_color(if b.dirty { t.inverted() } else { t.muted() })
                     .when(b.dirty, |d| d.bg(t.accent()))
-                    .hover(|d| d.bg(t.hover()))
+                    .hover(|d| d.bg(t.hover_mark()))
                     .child(if b.dirty { "Save" } else { "Saved" })
                     .on_click(cx.listener(move |this, _, _, cx| this.save_board(tab_id, cx))),
             );
@@ -6480,7 +6502,7 @@ impl Workspace {
                     .cursor_pointer()
                     .text_size(ms.small())
                     .text_color(t.accent())
-                    .hover(|d| d.bg(t.hover()))
+                    .hover(|d| d.bg(t.hover_mark()))
                     .child("Apply")
                     .on_click(cx.listener(move |this, _, _, cx| {
                         this.board_apply_time(tab_id, cx);
@@ -6494,7 +6516,7 @@ impl Workspace {
                     .cursor_pointer()
                     .text_size(ms.small())
                     .text_color(t.muted())
-                    .hover(|d| d.bg(t.hover()))
+                    .hover(|d| d.bg(t.hover_mark()))
                     .child("clear")
                     .on_click(cx.listener(move |this, _, _, cx| {
                         if let Some(bd) = this.board_mut(tab_id) {
@@ -6559,7 +6581,7 @@ impl Workspace {
                                     .cursor_pointer()
                                     .text_size(ms.small())
                                     .text_color(t.accent())
-                                    .hover(|d| d.bg(t.hover()))
+                                    .hover(|d| d.bg(t.hover_mark()))
                                     .child("Set")
                                     .on_click(cx.listener(move |this, _, _, cx| {
                                         let txt = this.tile_text.read(cx).text().to_string();
@@ -6588,7 +6610,7 @@ impl Workspace {
                                     .text_size(ms.small())
                                     .text_color(if on { t.inverted() } else { t.fg() })
                                     .when(on, |d| d.bg(t.accent()))
-                                    .hover(|d| d.bg(t.hover()))
+                                    .hover(|d| d.bg(t.hover_mark()))
                                     .child(SharedString::from(c.name.clone()))
                                     .on_click(cx.listener(move |this, _, _, cx| {
                                         if let Some(bd) = this.board_mut(tab_id) {
@@ -6610,7 +6632,7 @@ impl Workspace {
                             .cursor_pointer()
                             .text_size(ms.small())
                             .text_color(t.error())
-                            .hover(|d| d.bg(t.hover()))
+                            .hover(|d| d.bg(t.hover_mark()))
                             .child("Remove")
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 if let Some(bd) = this.board_mut(tab_id) {
@@ -6684,7 +6706,7 @@ impl Workspace {
             .h(px(tile.h as f32 * row_h))
             // The gutter is padding, not a gap in the grid: one division to get
             // a tile's place, and two tiles side by side still meet exactly.
-            .p(px(4.0));
+            .p(px(ms.gutter()));
 
         let mut inner = div()
             .flex()
@@ -6771,8 +6793,8 @@ impl Workspace {
                     div()
                         .id(SharedString::from(format!("grip-{tab_id}-{i}")))
                         .absolute()
-                        .right(px(4.0))
-                        .bottom(px(4.0))
+                        .right(px(ms.gutter()))
+                        .bottom(px(ms.gutter()))
                         .w(px(ms.base()))
                         .h(px(ms.base()))
                         .bg(t.accent())
@@ -6915,7 +6937,7 @@ impl Workspace {
                         .text_size(ms.small())
                         .text_color(if on { t.inverted() } else { t.fg() })
                         .when(on, |d| d.bg(t.accent()))
-                        .hover(|d| d.bg(t.hover()))
+                        .hover(|d| d.bg(t.hover_mark()))
                         .child(SharedString::from(name))
                         .on_click(cx.listener(move |this, _, _, cx| {
                             if let Some(tb) = this.tabs.iter_mut().find(|x| x.id == tab_id) {
@@ -6942,7 +6964,7 @@ impl Workspace {
                     .flex()
                     .items_center()
                     .gap_2()
-                    .h(px(16.0))
+                    .h(px(ms.chart_row_h()))
                     .child(
                         div()
                             .w(px(ms.base() * 11.5))
@@ -7055,7 +7077,7 @@ impl Workspace {
                     .text_size(ms.small())
                     .text_color(if on { t.inverted() } else { t.fg() })
                     .when(on, |d| d.bg(t.accent()))
-                    .hover(|d| d.bg(t.hover()))
+                    .hover(|d| d.bg(t.hover_mark()))
                     .child(SharedString::from(c.name.clone()))
                     .on_click(cx.listener(move |this, _, _, cx| {
                         if let Some(tb) = this.tabs.iter_mut().find(|x| x.id == tab_id) {
@@ -7140,7 +7162,7 @@ impl Workspace {
                 div()
                     .id(SharedString::from(format!("b-rm-{i}")))
                     .tooltip(self.tip("tip.remove_tile", None))
-                    .hover(|d| d.bg(t.hover()))
+                    .hover(|d| d.bg(t.hover_mark()))
                     .px_1()
                     .cursor_pointer()
                                                             .child(self.action_el("\u{f00d}", t.muted()))
@@ -7333,7 +7355,7 @@ impl Workspace {
                     div()
                         .id("detail-close")
                         .tooltip(self.tip("tip.close_detail", Some("esc")))
-                        .hover(|d| d.bg(t.hover()))
+                        .hover(|d| d.bg(t.hover_mark()))
                         .px_1()
                         .cursor_pointer()
                                                                         .child(self.action_el("\u{f00d}", t.muted()))
@@ -7378,7 +7400,7 @@ impl Workspace {
                     .id(SharedString::from(format!("val-{tab_id}-{ci}")))
                     .text_size(ms.body())
                     .text_color(if null { t.muted() } else { t.fg() })
-                    .when(can, |d| d.cursor_pointer().hover(|h| h.bg(t.hover())))
+                    .when(can, |d| d.cursor_pointer().hover(|h| h.bg(t.hover_mark())))
                     .child(SharedString::from(
                         cell_text(v).unwrap_or_else(|| "NULL".to_string()),
                     ))
@@ -7628,7 +7650,7 @@ impl Workspace {
                         .px_2()
                         .cursor_pointer()
                         .text_size(ms.small())
-                        .text_color(if can_prev { t.fg() } else { t.border() })
+                        .text_color(if can_prev { t.fg() } else { t.disabled() })
                         .child("◀")
                         .on_click(cx.listener(|this, _, _, cx| {
                             this.page_by(-1);
@@ -7645,7 +7667,7 @@ impl Workspace {
                         .px_2()
                         .cursor_pointer()
                         .text_size(ms.small())
-                        .text_color(if can_next { t.fg() } else { t.border() })
+                        .text_color(if can_next { t.fg() } else { t.disabled() })
                         .child("▶")
                         .on_click(cx.listener(|this, _, _, cx| {
                             this.page_by(1);
@@ -7746,7 +7768,7 @@ impl Workspace {
         // itself or there is nothing to scroll, and the width has to be exact:
         // one pixel short and the last column is unreachable, which is the bug
         // this is fixing.
-        let total_w: f32 = NUM_W
+        let total_w: f32 = ms.num_w()
             + cols
                 .iter()
                 .map(|(ci, _)| tab.widths.get(ci).copied().unwrap_or(ms.col_w()) + 3.0)
@@ -7761,7 +7783,7 @@ impl Workspace {
             .overflow_hidden()
             .child(
                 div()
-                    .w(px(NUM_W))
+                    .w(px(ms.num_w()))
                     .flex_none()
                     .px(px(ms.cell_pad()))
                     .child(self.small("#", t.header_fg())),
@@ -7788,7 +7810,7 @@ impl Workspace {
                     .flex_none()
                     .overflow_hidden()
                     .cursor_pointer()
-                    .hover(|d| d.bg(t.hover()))
+                    .hover(|d| d.bg(t.hover_mark()))
                     .child({
                         // The NAME with its type, and under it how much of the
                         // page actually has the field. A document store
@@ -7885,7 +7907,11 @@ impl Workspace {
                     .id(SharedString::from(format!("grip-{tab_id}-{ci}")))
                     .w(px(3.0))
                     .h_full()
-                    .bg(t.border())
+                    // A grip is something to aim a pointer at, so it uses the
+                    // visible `divider` rather than the box-edge `border`,
+                    // which vanishes into the base on half the palettes.
+                    .bg(t.divider())
+                    .hover(|d| d.bg(t.accent()))
                     .cursor_col_resize()
                     .hover(|d| d.bg(t.accent()))
                     .on_mouse_down(
@@ -7938,7 +7964,7 @@ impl Workspace {
                         .when(i % 2 == 1, |d| d.bg(row_alt))
                         .child(
                             div()
-                                .w(px(NUM_W))
+                                .w(px(ms.num_w()))
                                 .flex_none()
                                 .truncate()
                                 .px(px(ms.cell_pad()))
@@ -8118,8 +8144,8 @@ impl Workspace {
                     .w_full()
                     // Thicker than the six pixels it was: a bar has to be
                     // grabbable, and a seven-pixel target is a target people
-                    // miss.
-                    .h(px(12.0))
+                    // miss. Derived, so it stays grabbable at every text size.
+                    .h(px(ms.hbar_h() * 2.0))
                     .flex_none()
                     .bg(t.status())
                     .cursor_pointer()
@@ -8238,7 +8264,7 @@ impl Workspace {
                             .id("tree-copy-all")
                             .px_1()
                             .cursor_pointer()
-                            .hover(|d| d.bg(t.hover()))
+                            .hover(|d| d.bg(t.hover_mark()))
                             .text_size(ms.tiny())
                             .text_color(t.accent())
                             .child("copy all")
@@ -8263,8 +8289,8 @@ impl Workspace {
                     .px_2()
                     .py(px(2.0))
                     .cursor_pointer()
-                    .hover(|d| d.bg(t.hover()))
-                    .child(self.small(format!("{}", i + 1), t.line_nr()))
+                    .hover(|d| d.bg(t.hover_mark()))
+                    .child(self.small(format!("{}", i + 1), t.row_number()))
                     .child(self.small(if open { "\u{f0d7}" } else { "\u{f0da}" }, t.muted()))
                     // The first few fields, not `{6}`. Thirty rows of `{6}`,
                     // `{5}`, `{7}` cannot be told apart without opening every
@@ -8282,7 +8308,7 @@ impl Workspace {
                             .flex_none()
                             .px_1()
                             .cursor_pointer()
-                            .hover(|d| d.bg(t.hover()))
+                            .hover(|d| d.bg(t.hover_mark()))
                             .text_size(ms.tiny())
                             .text_color(t.accent())
                             .child("copy")
@@ -8393,7 +8419,7 @@ impl Workspace {
                             .flex()
                             .items_center()
                             .gap_2()
-                            .pl(px(16.0 + depth as f32 * 14.0))
+                            .pl(px(ms.marker_w() + depth as f32 * ms.indent()))
                             .py(px(1.0))
                             .child(
                                 div()
@@ -8435,7 +8461,7 @@ impl Workspace {
                                         .id(SharedString::from(format!("tv-{}-{r}-{ci}", tab.id)))
                                         .flex_1()
                                         .cursor_pointer()
-                                        .hover(|d| d.bg(t.hover()))
+                                        .hover(|d| d.bg(t.hover_mark()))
                                         .text_size(ms.small())
                                         .text_color(t.fg())
                                         .child(SharedString::from(preview(val)))
@@ -8476,7 +8502,7 @@ impl Workspace {
                                     .flex_none()
                                     .px_1()
                                     .cursor_pointer()
-                                    .hover(|d| d.bg(t.hover()))
+                                    .hover(|d| d.bg(t.hover_mark()))
                                     .text_size(ms.tiny())
                                     .text_color(t.muted())
                                     .child("copy")
@@ -8507,7 +8533,7 @@ impl Workspace {
             other => {
                 out = out.child(
                     div()
-                        .pl(px(16.0 + depth as f32 * 14.0))
+                        .pl(px(ms.marker_w() + depth as f32 * ms.indent()))
                         .text_size(ms.small())
                         .text_color(t.fg())
                         .child(SharedString::from(preview(other))),
@@ -8554,7 +8580,7 @@ impl Workspace {
                 .flex()
                 .items_center()
                 .gap_2()
-                .child(self.small(format!("{}", i + 1), t.line_nr()))
+                .child(self.small(format!("{}", i + 1), t.row_number()))
                 .child(self.copy_el(
                     format!("jcopy-{tab_id}-{i}"),
                     text.clone(),
@@ -8567,7 +8593,7 @@ impl Workspace {
                         .id(SharedString::from(format!("jedit-{tab_id}-{i}")))
                         .px_1()
                         .cursor_pointer()
-                        .hover(|d| d.bg(t.hover()))
+                        .hover(|d| d.bg(t.hover_mark()))
                         .text_size(ms.tiny())
                         .text_color(t.accent())
                         .child("edit")
@@ -8884,7 +8910,7 @@ impl Workspace {
             .items_center()
             .justify_between()
             .w_full()
-            .h(px(22.0))
+            .h(px(self.scale.status_h()))
             .px_3()
             .bg(t.status())
             .border_t_1()
@@ -8959,7 +8985,8 @@ impl Workspace {
         }
         let t = self.t();
         let ms = self.scale;
-        let mut stack = div().absolute().right(px(16.0)).bottom(px(16.0)).flex().flex_col().gap_1();
+        let inset = px(self.scale.toast_inset());
+        let mut stack = div().absolute().right(inset).bottom(inset).flex().flex_col().gap_1();
         for x in self.toasts.iter().rev().take(5) {
             stack = stack.child(
                 div()
@@ -8988,7 +9015,7 @@ impl Workspace {
         let matches = self.palette_matches(cx);
         let sel = self.palette_sel.min(matches.len().saturating_sub(1));
 
-        let mut list = div().flex().flex_col().max_h(px(420.0)).overflow_hidden();
+        let mut list = div().flex().flex_col().max_h(px(ms.palette_h())).overflow_hidden();
         if matches.is_empty() {
             list = list.child(div().px_3().py_1().child(self.small(self.lang.tr("panel.nothing_matches"), t.muted())));
         }
@@ -9004,9 +9031,9 @@ impl Workspace {
                     .px_3()
                     .py(px(3.0))
                     .cursor_pointer()
-                    .when(on, |d| d.bg(t.selected()).border_l_2().border_color(t.accent()))
+                    .when(on, |d| d.bg(t.selected_mark()).border_l_2().border_color(t.accent()))
                     .when(!on, |d| d.border_l_2().border_color(t.panel()))
-                    .hover(|d| d.bg(t.hover()))
+                    .hover(|d| d.bg(t.hover_mark()))
                     .child(
                         div()
                             .text_size(ms.body())
@@ -9024,7 +9051,7 @@ impl Workspace {
         Some(
             div()
                 .absolute()
-                .top(px(60.0))
+                .top(px(ms.palette_top()))
                 .left_0()
                 .right_0()
                 .flex()
@@ -9233,7 +9260,8 @@ impl Render for Workspace {
                         .w(px(3.0))
                         .h_full()
                         .flex_none()
-                        .bg(t.border())
+                        .bg(t.divider())
+                        .hover(|d| d.bg(t.accent()))
                         .cursor_col_resize()
                         .hover(|d| d.bg(t.accent()))
                         .on_mouse_down(

@@ -331,11 +331,180 @@ impl Metrics {
     pub fn cell_pad(self) -> f32 {
         (self.base * 0.45).round()
     }
+
+    /// The status bar's height: one line of text and the padding a cell uses,
+    /// above and below.
+    ///
+    /// It was `px(22.0)`, which at a base of 20 is shorter than the text it
+    /// holds — so the bar clipped its own descenders at exactly the setting
+    /// somebody chooses because they could not read it.
+    pub fn status_h(self) -> f32 {
+        (f32::from(self.line_h()) + self.cell_pad() * 2.0).round()
+    }
+
+    /// The tab strip's height. Tall enough for the close action in it, by the
+    /// same derivation `panel_row_h` uses — a tab with an action it cannot fit
+    /// is a close button drawn over its own border.
+    pub fn tab_h(self) -> f32 {
+        (f32::from(self.line_h()).max(self.action_box() + 4.0)).round()
+    }
+
+    /// The height of one control: a button, a chip, a field.
+    ///
+    /// ONE number for all three, because a row of them at three heights reads
+    /// as three unrelated things. Big enough for the text plus a little air,
+    /// derived so it follows the scale.
+    pub fn control_h(self) -> f32 {
+        (self.base * 2.1).round()
+    }
+
+    /// The horizontal scrollbar's thickness. A grip, not a panel.
+    pub fn hbar_h(self) -> f32 {
+        (self.base * 0.6).round()
+    }
+
+    /// The row-number column in the grid.
+    ///
+    /// Wide enough for five digits, which is more rows than a page holds. It
+    /// was `NUM_W = 44.0` and took part in the grid's total width, so at a
+    /// large base the numbers overflowed a column the arithmetic still
+    /// believed was 44 wide.
+    pub fn num_w(self) -> f32 {
+        (self.base * 3.2).round()
+    }
+
+    /// One level of indent in a tree.
+    pub fn indent(self) -> f32 {
+        (self.base * 0.85).round()
+    }
+
+    /// The standard inset from a panel's edge, where `px_2` and `pl(10.0)` were
+    /// both used to mean the same thing.
+    pub fn gutter(self) -> f32 {
+        (self.base * 0.6).round()
+    }
+
+    /// The box a tree's open/shut arrow sits in — the same box an inline icon
+    /// gets, so the text after it lines up whether there is an arrow or not.
+    pub fn marker_w(self) -> f32 {
+        (self.base * 1.25).round()
+    }
+
+    /// How far a toast sits from the corner.
+    pub fn toast_inset(self) -> f32 {
+        (self.base * 1.2).round()
+    }
+
+    /// How far down the window the command palette hangs.
+    pub fn palette_top(self) -> f32 {
+        (self.base * 6.0).round()
+    }
+
+    /// The palette's height: fourteen lines and its field.
+    pub fn palette_h(self) -> f32 {
+        (f32::from(self.line_h()) * 14.0 + self.control_h()).round()
+    }
+
+    /// The height of one bar in a chart, and of one row of a chart's legend.
+    pub fn chart_row_h(self) -> f32 {
+        f32::from(self.line_h())
+    }
+
+    /// The size a separate window opens at.
+    ///
+    /// Derived like everything else, because a window sized in absolute pixels
+    /// holds half a form at a large text size. `Window::Main` is the first
+    /// window and is deliberately generous.
+    pub fn window(self, kind: Window) -> (f32, f32) {
+        let (w, h) = match kind {
+            Window::Main => (92.0, 58.0),
+            Window::Settings => (64.0, 44.0),
+            Window::Connection => (52.0, 40.0),
+            Window::Profile => (44.0, 30.0),
+        };
+        ((self.base * w).round(), (self.base * h).round())
+    }
+}
+
+/// The windows this client opens, for [`Metrics::window`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Window {
+    Main,
+    Settings,
+    Connection,
+    Profile,
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every chrome height holds what goes in it, at every base.
+    ///
+    /// These were literals — `px(22.0)` for the status bar, `px(26.0)` for the
+    /// tab strip, `44.0` for the row numbers — chosen against a base of 12 and
+    /// then left behind when the text could be set to 24. The bar clipped its
+    /// own descenders at exactly the setting somebody picks because they could
+    /// not read it.
+    #[test]
+    fn the_chrome_holds_what_goes_in_it() {
+        let mut b = MIN_BASE;
+        while b <= MAX_BASE {
+            let mut i = MIN_ICON;
+            while i <= MAX_ICON {
+                let m = Metrics::new(b).with_icon(i);
+                let line = f32::from(m.line_h());
+                assert!(
+                    m.status_h() >= f32::from(m.small()) * 1.45,
+                    "base {b}: status bar {} is shorter than its text",
+                    m.status_h()
+                );
+                assert!(m.status_h() >= line, "base {b}: status bar is shorter than a line");
+                assert!(
+                    m.tab_h() > m.action_box(),
+                    "base {b} icon {i}: the tab's close action does not fit in {}",
+                    m.tab_h()
+                );
+                assert!(
+                    m.control_h() >= f32::from(m.body()) * 1.3,
+                    "base {b}: a control is too short for its label"
+                );
+                // Five digits of row number, at the small step's advance.
+                assert!(
+                    m.num_w() >= f32::from(m.small()) * 2.5,
+                    "base {b}: the number column is too narrow"
+                );
+                assert!(m.marker_w() > 0.0 && m.indent() > 0.0 && m.gutter() > 0.0, "base {b}");
+                assert!(m.hbar_h() >= 3.0, "base {b}: the scrollbar is too thin to grab");
+                i += 2.0;
+            }
+            b += 1.0;
+        }
+    }
+
+    /// A window opens big enough to hold its own form.
+    ///
+    /// They were absolute: 720×560 for the connection window, 620×420 for the
+    /// tunnel one. At a base of 24 the connection form is taller than 560, so
+    /// the window opened with its footer — and its Save — off the bottom.
+    #[test]
+    fn a_window_grows_with_the_text_in_it() {
+        for kind in [Window::Main, Window::Settings, Window::Connection, Window::Profile] {
+            let small = Metrics::new(MIN_BASE).window(kind);
+            let large = Metrics::new(MAX_BASE).window(kind);
+            assert!(large.0 > small.0 && large.1 > small.1, "{kind:?} does not follow the scale");
+            assert!(small.0 > 300.0 && small.1 > 200.0, "{kind:?} opens too small to use");
+        }
+        // The main window is the biggest, and every window is wider than tall:
+        // these hold rows of fields and lists beside detail.
+        let m = Metrics::new(DEFAULT_BASE);
+        assert!(m.window(Window::Main).0 > m.window(Window::Settings).0);
+        assert!(m.window(Window::Settings).0 > m.window(Window::Connection).0);
+        for kind in [Window::Main, Window::Settings, Window::Connection, Window::Profile] {
+            let (w, h) = m.window(kind);
+            assert!(w > h, "{kind:?} is taller than it is wide");
+        }
+    }
 
     /// The steps are ordered, and the floor is the floor. A scale whose `small`
     /// could overtake its `body` would be a scale in name only.

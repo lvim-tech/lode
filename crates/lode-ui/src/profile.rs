@@ -295,7 +295,7 @@ impl Render for ProfileForm {
                             .cursor_pointer()
                             .border_1()
                             .border_color(t.border())
-                            .hover(|d| d.bg(t.hover()))
+                            .hover(|d| d.bg(t.hover_mark()))
                             .text_size(ms.small())
                             .text_color(t.fg())
                             .child("browse\u{2026}")

@@ -245,6 +245,133 @@ impl Theme {
         hex(&self.grid.line_nr, self.muted())
     }
 
+    // ── DERIVED roles ───────────────────────────────────────────────────────
+    //
+    // **Nothing below changes an editor pair.** The rule at the top of this
+    // file — every value is the same byte the editor has — is about the roles
+    // the EDITOR defines, and it still holds: not one of them is touched here.
+    //
+    // These are roles the editor does not have. An editor has no "the row you
+    // are on in a result grid, which must be visible against the panel it sits
+    // on" and no "this control is off". Where a theme's own surface is too
+    // close to its neighbour for the job — `selected` sits one step from
+    // `hover` on nearly every light palette, and both are a hair from `panel`
+    // — the colour is MIXED from two of the theme's own values rather than
+    // chosen. A mix is still the theme: it has no colour of its own in it.
+    //
+    // If you are here to delete this "because of the rule": the rule is about
+    // the editor's pairs. Deleting it brings back a selected row that cannot be
+    // seen on 24 of the 48 palettes.
+
+    /// How visible `a` is against `b`, as a WCAG contrast ratio.
+    pub fn contrast(a: Rgba, b: Rgba) -> f32 {
+        let lum = |c: Rgba| {
+            let f = |v: f32| if v <= 0.03928 { v / 12.92 } else { ((v + 0.055) / 1.055).powf(2.4) };
+            0.2126 * f(c.r) + 0.7152 * f(c.g) + 0.0722 * f(c.b)
+        };
+        let (x, y) = (lum(a), lum(b));
+        let (hi, lo) = if x > y { (x, y) } else { (y, x) };
+        (hi + 0.05) / (lo + 0.05)
+    }
+
+    /// `a` laid over `b` at `alpha`. Linear, on the stored components, so the
+    /// result is between two of the theme's own colours and nothing else.
+    pub fn mix(a: Rgba, b: Rgba, alpha: f32) -> Rgba {
+        let k = alpha.clamp(0.0, 1.0);
+        Rgba {
+            r: b.r + (a.r - b.r) * k,
+            g: b.g + (a.g - b.g) * k,
+            b: b.b + (a.b - b.b) * k,
+            a: 1.0,
+        }
+    }
+
+    /// The weakest mix of `over` onto `under` that reaches `want`.
+    ///
+    /// A fixed ladder rather than arithmetic, because contrast is not linear in
+    /// alpha: it depends on both colours' luminance, so "how much accent do I
+    /// need here" has a different answer on every one of the 48 palettes. The
+    /// ladder climbs until the answer is yes and stops, which keeps the mark as
+    /// close to the theme's own surface as the job allows.
+    ///
+    /// `second` is tried when `over` cannot get there at any strength — an
+    /// accent whose luminance is near the panel's is invisible on it however
+    /// much is used, and on those palettes the ordinary foreground is what is
+    /// left. Both are the theme's own colours either way.
+    fn toward(over: Rgba, second: Rgba, under: Rgba, want: f32) -> Rgba {
+        for c in [over, second] {
+            for k in [0.08, 0.12, 0.18, 0.25, 0.34, 0.45, 0.6] {
+                let m = Self::mix(c, under, k);
+                if Self::contrast(m, under) >= want {
+                    return m;
+                }
+            }
+        }
+        // Nothing reached it. The strongest mix is still the best answer there
+        // is, and it is better than silently returning the surface itself.
+        Self::mix(second, under, 0.6)
+    }
+
+    /// The background under the pointer.
+    ///
+    /// The theme's own `hover` when it can be told apart from the panel at all;
+    /// otherwise the faintest mix that can. A hover is the weaker of the two
+    /// marks by construction — see `selected_mark`.
+    pub fn hover_mark(&self) -> Rgba {
+        let own = self.hover();
+        if Self::contrast(own, self.panel()) >= 1.18 {
+            own
+        } else {
+            Self::toward(self.accent(), self.fg(), self.panel(), 1.2)
+        }
+    }
+
+    /// The background of the row, tab or list entry that is CHOSEN.
+    ///
+    /// The theme's own `selected` when it is BOTH visible against the panel and
+    /// louder than the hover; otherwise a mix that is. On most light palettes
+    /// `surface.selected` is within a percent of `surface.panel` — so "which
+    /// row am I on" had no answer — and on several it is quieter than
+    /// `surface.hover`, which means the row under the pointer looked more
+    /// chosen than the chosen one.
+    pub fn selected_mark(&self) -> Rgba {
+        let floor = 1.45_f32.max(Self::contrast(self.hover_mark(), self.panel()) * 1.15);
+        let own = self.selected();
+        if Self::contrast(own, self.panel()) >= floor {
+            own
+        } else {
+            Self::toward(self.accent(), self.fg(), self.panel(), floor)
+        }
+    }
+
+    /// The ink for something that is there but cannot be used.
+    ///
+    /// `border` was being used for this — a BORDER colour as TEXT, which is
+    /// below 2:1 on most palettes and reads as a rendering fault rather than
+    /// as "not available". Dimmer than the real text, still legible: it has to
+    /// be READ to know what is unavailable.
+    pub fn disabled(&self) -> Rgba {
+        Self::toward(self.muted(), self.fg(), self.panel(), 2.2)
+    }
+
+    /// The ink for a row number or a line number.
+    ///
+    /// `line_nr` is the editor's GUTTER colour, meant to be nearly invisible
+    /// beside code. In a result grid the row number is something people count
+    /// along, so it gets the ordinary muted ink and `line_nr` stays for the
+    /// gutter's own background.
+    pub fn row_number(&self) -> Rgba {
+        self.muted()
+    }
+
+    /// A line that has to be SEEN: a tile's edge, a panel's grip, a column's
+    /// handle. `border` disappears into the base on half the palettes, which
+    /// is right for a box's edge and wrong for a divider somebody has to aim
+    /// at with a pointer.
+    pub fn divider(&self) -> Rgba {
+        Self::toward(self.muted(), self.fg(), self.base(), 2.0)
+    }
+
     /// The colour a type badge is drawn in. Mapped from the badge word rather
     /// than from a driver name, so a type this client has never heard of lands
     /// on the neutral ink instead of nothing.
@@ -345,6 +472,75 @@ mod tests {
         assert_eq!(hex("20272b", rgb(0xff0000)).g, rgb(0x20272b).g);
         assert_eq!(hex("nope", rgb(0xff0000)).r, rgb(0xff0000).r);
         assert_eq!(hex("#12345", rgb(0xff0000)).r, rgb(0xff0000).r);
+    }
+
+    /// The DERIVED roles carry their own thresholds, on every theme installed.
+    ///
+    /// Not the editor's pairs — those are deliberately left at whatever
+    /// contrast the editor has, which is the whole point of this file and is
+    /// asserted below. These are the roles the editor does not define, where
+    /// this client is the one making the choice and so has to be answerable
+    /// for it: a selected row that cannot be seen is not a style, it is a grid
+    /// that does not say where you are.
+    ///
+    /// Reads `$LODE_THEME_DIR` or the standard folders. With no theme files
+    /// installed it still checks the built-in one, so it is never a test that
+    /// passes by finding nothing.
+    #[test]
+    fn the_derived_roles_can_be_seen_on_every_theme() {
+        let mut themes: Vec<(String, Theme)> = vec![("builtin".into(), Theme::builtin())];
+        for (name, path) in discover() {
+            if let Ok(t) = load(&path) {
+                themes.push((name, t));
+            }
+        }
+        let mut bad = Vec::new();
+        for (name, t) in &themes {
+            let checks = [
+                ("selected_mark/panel", Theme::contrast(t.selected_mark(), t.panel()), 1.45),
+                ("hover_mark/panel", Theme::contrast(t.hover_mark(), t.panel()), 1.18),
+                ("disabled/panel", Theme::contrast(t.disabled(), t.panel()), 2.0),
+                ("row_number/base", Theme::contrast(t.row_number(), t.base()), 2.0),
+                ("divider/base", Theme::contrast(t.divider(), t.base()), 1.9),
+            ];
+            for (what, got, want) in checks {
+                if got < want {
+                    bad.push(format!("{name}: {what} is {got:.2}, wanted {want}"));
+                }
+            }
+            // And a selection still has to be stronger than a hover, or the
+            // row under the pointer and the row you are on look the same.
+            if Theme::contrast(t.selected_mark(), t.panel())
+                <= Theme::contrast(t.hover_mark(), t.panel())
+            {
+                bad.push(format!("{name}: a hover is louder than a selection"));
+            }
+        }
+        assert!(
+            bad.is_empty(),
+            "{} of {} themes fail a DERIVED role:\n{}",
+            bad.len(),
+            themes.len(),
+            bad.join("\n")
+        );
+    }
+
+    /// `mix` stays between its two colours and reaches each of them.
+    #[test]
+    fn a_mix_introduces_no_colour_of_its_own() {
+        let a = rgb(0x000000);
+        let b = rgb(0xffffff);
+        assert_eq!(Theme::mix(a, b, 0.0).r, b.r, "alpha 0 is the backdrop");
+        assert_eq!(Theme::mix(a, b, 1.0).r, a.r, "alpha 1 is the overlay");
+        let half = Theme::mix(a, b, 0.5);
+        assert!(half.r > 0.49 && half.r < 0.51, "{}", half.r);
+        // Out of range is clamped rather than wrapped.
+        assert_eq!(Theme::mix(a, b, 2.0).r, a.r);
+        assert_eq!(Theme::mix(a, b, -1.0).r, b.r);
+        // Contrast is symmetric and at least 1.
+        assert!((Theme::contrast(a, b) - Theme::contrast(b, a)).abs() < 0.001);
+        assert!(Theme::contrast(a, a) >= 0.999 && Theme::contrast(a, a) <= 1.001);
+        assert!(Theme::contrast(a, b) > 20.0, "black on white is the maximum");
     }
 
     /// The port must not have changed a single value: this is the editor's

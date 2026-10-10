@@ -1045,7 +1045,7 @@ impl ConnectionForm {
                         self.theme.clone(),
                         ms,
                     ))
-                    .hover(|d| d.bg(t.hover()))
+                    .hover(|d| d.bg(t.hover_mark()))
                     // Open eye while it is showing, struck-through eye while it
                     // is not: the icon says what you are looking at, not what
                     // pressing it would do.
@@ -1147,7 +1147,7 @@ impl ConnectionForm {
                     .cursor_pointer()
                     .border_1()
                     .border_color(t.border())
-                    .hover(|d| d.bg(t.hover()))
+                    .hover(|d| d.bg(t.hover_mark()))
                     .text_size(ms.small())
                     .text_color(t.fg())
                     .child("browse\u{2026}")
@@ -1201,7 +1201,7 @@ impl ConnectionForm {
                     .cursor_pointer()
                     .border_1()
                     .border_color(t.border())
-                    .hover(|d| d.bg(t.hover()))
+                    .hover(|d| d.bg(t.hover_mark()))
                     .text_size(ms.small())
                     .text_color(t.fg())
                     .child("browse\u{2026}")
@@ -1860,7 +1860,7 @@ impl Render for ConnectionForm {
                                     .flex_none()
                                     .px_1()
                                     .cursor_pointer()
-                                    .hover(|d| d.bg(t.hover()))
+                                    .hover(|d| d.bg(t.hover_mark()))
                                     .text_size(ms.tiny())
                                     .text_color(t.accent())
                                     .child("edit this tunnel")
@@ -1983,7 +1983,7 @@ impl Render for ConnectionForm {
                                     .border_1()
                                     .border_color(t.accent())
                                     .text_color(t.fg())
-                                    .hover(|d| d.bg(t.hover()))
+                                    .hover(|d| d.bg(t.hover_mark()))
                                     .child("save")
                                     .on_click(cx.listener(|this, _, _, cx| {
                                         this.save_tunnel_profile(cx);
@@ -2037,9 +2037,9 @@ impl Render for ConnectionForm {
                             .px_2()
                             .py_1()
                             .cursor_pointer()
-                            .when(on, |d| d.bg(t.selected()).border_l_2().border_color(t.accent()))
+                            .when(on, |d| d.bg(t.selected_mark()).border_l_2().border_color(t.accent()))
                             .when(!on, |d| d.border_l_2().border_color(t.panel()))
-                            .hover(|d| d.bg(t.hover()))
+                            .hover(|d| d.bg(t.hover_mark()))
                             .child(
                                 div()
                                     .text_size(ms.body())
