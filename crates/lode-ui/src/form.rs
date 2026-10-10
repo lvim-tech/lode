@@ -907,6 +907,35 @@ pub fn auth_json(p: AuthParts<'_>) -> Value {
 /// When the portal cannot be reached the button SAYS so rather than doing
 /// nothing — a control that silently fails is one somebody presses twice and
 /// then stops trusting.
+/// The chooser for a file to WRITE: a name that need not exist yet.
+///
+/// A separate call from `pick_file` because the platform prompt is a different
+/// one — "choose an existing file" and "name a new file" are different
+/// questions and the portal asks them differently.
+pub fn pick_new_path<F>(input: Entity<TextInput>, on_fail: F, cx: &mut gpui::App)
+where
+    F: FnOnce(String, &mut gpui::AsyncApp) + 'static,
+{
+    let rx = cx.prompt_for_new_path(std::path::Path::new(""), None);
+    cx.spawn(async move |cx: &mut gpui::AsyncApp| {
+        match rx.await {
+            Ok(Ok(Some(path))) => {
+                let text = path.to_string_lossy().to_string();
+                let _ = input.update(cx, |i, cx| i.set_text(text, cx));
+            }
+            Ok(Ok(None)) => {}
+            Ok(Err(e)) => on_fail(format!("the file chooser could not open: {e}"), cx),
+            Err(_) => on_fail(
+                "the file chooser did not answer — this desktop may have no \
+                 xdg-desktop-portal running"
+                    .to_string(),
+                cx,
+            ),
+        }
+    })
+    .detach();
+}
+
 pub fn pick_file<F>(input: Entity<TextInput>, on_fail: F, cx: &mut gpui::App)
 where
     F: FnOnce(String, &mut gpui::AsyncApp) + 'static,

@@ -85,7 +85,125 @@ pub fn render(columns: &[Column], rows: &[Vec<Value>], format: Format) -> String
     }
 }
 
+/// One line of CSV or TSV: the column NAMES.
+fn header(columns: &[Column], delim: char) -> String {
+    columns
+        .iter()
+        .map(|c| csv_field(&c.name, delim))
+        .collect::<Vec<_>>()
+        .join(&delim.to_string())
+}
+
+/// One line of CSV or TSV: a row's cells, in the columns' order.
+///
+/// By POSITION against the column list, not by whatever the row happens to
+/// hold: a row shorter than the header gets empty cells rather than a line with
+/// fewer separators, which would move every column after it.
+fn line(columns: &[Column], row: &[Value], delim: char) -> String {
+    (0..columns.len())
+        .map(|i| {
+            row.get(i)
+                .and_then(cell_text)
+                .map(|s| csv_field(&s, delim))
+                .unwrap_or_default()
+        })
+        .collect::<Vec<_>>()
+        .join(&delim.to_string())
+}
+
 /// Write the rendered rows to `path`, creating parent directories.
+/// A file being written a page at a time.
+///
+/// WHY IT IS NOT ONE CALL. `write` renders every row into one string and then
+/// writes it: fine for the two hundred rows a page holds, and not fine for a
+/// table of two million, where it would want the whole table in memory twice —
+/// once as rows and once as text — to produce a file that is written in one go
+/// at the end. This holds a `BufWriter` open and takes the rows as they arrive.
+///
+/// The FORMATS differ in what a file needs around its rows, which is the whole
+/// reason this is a type and not a loop: CSV and TSV need a header once, JSON
+/// needs brackets and a comma between every pair but not after the last. A
+/// writer that forgot the last bracket would produce a file that parses as
+/// nothing.
+pub struct Streaming {
+    out: std::io::BufWriter<std::fs::File>,
+    format: Format,
+    columns: Vec<Column>,
+    written: usize,
+    path: std::path::PathBuf,
+}
+
+impl Streaming {
+    /// Open the file and write whatever comes BEFORE the rows.
+    pub fn new(path: &Path, columns: &[Column], format: Format) -> anyhow::Result<Self> {
+        if let Some(parent) = path.parent() {
+            if !parent.as_os_str().is_empty() {
+                std::fs::create_dir_all(parent)?;
+            }
+        }
+        let file = std::fs::File::create(path)?;
+        let mut out = std::io::BufWriter::new(file);
+        use std::io::Write;
+        match format {
+            Format::Json => write!(out, "[")?,
+            Format::Csv => writeln!(out, "{}", header(columns, ','))?,
+            Format::Tsv => writeln!(out, "{}", header(columns, '\t'))?,
+        }
+        Ok(Streaming {
+            out,
+            format,
+            columns: columns.to_vec(),
+            written: 0,
+            path: path.to_path_buf(),
+        })
+    }
+
+    pub fn written(&self) -> usize {
+        self.written
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// One page of rows.
+    pub fn push(&mut self, rows: &[Vec<Value>]) -> anyhow::Result<()> {
+        use std::io::Write;
+        for row in rows {
+            match self.format {
+                Format::Json => {
+                    // The comma goes BEFORE every row but the first, so there
+                    // is never a trailing one — a file ending in `,]` parses as
+                    // nothing, and the alternative is knowing in advance which
+                    // row is last, which a stream does not.
+                    if self.written > 0 {
+                        write!(self.out, ",")?;
+                    }
+                    let mut m = serde_json::Map::new();
+                    for (i, c) in self.columns.iter().enumerate() {
+                        m.insert(c.name.clone(), row.get(i).cloned().unwrap_or(Value::Null));
+                    }
+                    write!(self.out, "{}", Value::Object(m))?;
+                }
+                Format::Csv => writeln!(self.out, "{}", line(&self.columns, row, ','))?,
+                Format::Tsv => writeln!(self.out, "{}", line(&self.columns, row, '\t'))?,
+            }
+            self.written += 1;
+        }
+        Ok(())
+    }
+
+    /// Write whatever comes AFTER the rows, and flush.
+    pub fn finish(mut self) -> anyhow::Result<usize> {
+        use std::io::Write;
+        if self.format == Format::Json {
+            write!(self.out, "]")?;
+        }
+        self.out.flush()?;
+        Ok(self.written)
+    }
+}
+
 pub fn write(path: &Path, columns: &[Column], rows: &[Vec<Value>], format: Format) -> anyhow::Result<usize> {
     if let Some(parent) = path.parent() {
         if !parent.as_os_str().is_empty() {
@@ -101,6 +219,86 @@ pub fn write(path: &Path, columns: &[Column], rows: &[Vec<Value>], format: Forma
 mod tests {
     use super::*;
     use serde_json::json;
+
+    fn named(names: &[&str]) -> Vec<Column> {
+        names
+            .iter()
+            .map(|n| Column { name: n.to_string(), type_name: String::new() })
+            .collect()
+    }
+
+    /// A streamed file is the same file, page by page.
+    ///
+    /// The thing that goes wrong in a streaming writer is the EDGES — a header
+    /// written twice, a trailing comma, a missing bracket — and every one of
+    /// them produces a file that parses as nothing while looking roughly right.
+    #[test]
+    fn a_streamed_file_is_whole() {
+        let dir = std::env::temp_dir().join(format!("lode-export-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let c = named(&["a", "b"]);
+        let page1 = vec![vec![json!(1), json!("x")], vec![json!(2), json!("y")]];
+        let page2 = vec![vec![json!(3), json!("z")]];
+
+        for (fmt, name) in [(Format::Json, "j.json"), (Format::Csv, "c.csv"), (Format::Tsv, "t.tsv")] {
+            let path = dir.join(name);
+            let mut w = Streaming::new(&path, &c, fmt).expect("opens");
+            w.push(&page1).expect("first page");
+            w.push(&page2).expect("second page");
+            let n = w.finish().expect("closes");
+            assert_eq!(n, 3, "{name}");
+            let text = std::fs::read_to_string(&path).expect("reads back");
+            match fmt {
+                Format::Json => {
+                    // It PARSES, which is the only thing that matters about a
+                    // JSON file, and holds all three rows in order.
+                    let v: Value = serde_json::from_str(&text).expect("valid JSON");
+                    let arr = v.as_array().expect("an array");
+                    assert_eq!(arr.len(), 3);
+                    assert_eq!(arr[0]["a"], json!(1));
+                    assert_eq!(arr[2]["b"], json!("z"));
+                    assert!(!text.contains(",]"), "a trailing comma: {text}");
+                }
+                _ => {
+                    let lines: Vec<&str> = text.lines().collect();
+                    assert_eq!(lines.len(), 4, "a header and three rows: {text}");
+                    assert_eq!(lines[0].matches(if fmt == Format::Csv { ',' } else { '\t' }).count(), 1);
+                    assert!(lines[1].starts_with('1'));
+                    assert!(lines[3].starts_with('3'));
+                }
+            }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Nothing pushed at all still leaves a file that parses.
+    #[test]
+    fn an_empty_export_is_still_a_file() {
+        let dir = std::env::temp_dir().join(format!("lode-export-empty-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let c = named(&["a"]);
+        let path = dir.join("e.json");
+        let w = Streaming::new(&path, &c, Format::Json).expect("opens");
+        assert_eq!(w.finish().expect("closes"), 0);
+        let text = std::fs::read_to_string(&path).expect("reads");
+        let v: Value = serde_json::from_str(&text).expect("valid JSON");
+        assert_eq!(v.as_array().map(Vec::len), Some(0));
+
+        let path = dir.join("e.csv");
+        let w = Streaming::new(&path, &c, Format::Csv).expect("opens");
+        assert_eq!(w.finish().expect("closes"), 0);
+        let text = std::fs::read_to_string(&path).expect("reads");
+        assert_eq!(text.lines().count(), 1, "the header, and nothing else");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A row shorter than the header does not move the columns after it.
+    #[test]
+    fn a_short_row_keeps_its_separators() {
+        let c = named(&["a", "b", "c"]);
+        assert_eq!(super::line(&c, &[json!(1)], ','), "1,,");
+        assert_eq!(super::line(&c, &[], '\t'), "\t\t");
+    }
 
     fn cols() -> Vec<Column> {
         vec![

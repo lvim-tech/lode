@@ -647,6 +647,18 @@ impl NameFor {
     }
 }
 
+/// An export walking the whole result.
+struct Exporting {
+    tab: u64,
+    call_id: u64,
+    /// The task's row in the drawer, so progress is visible where every other
+    /// long thing reports — and so it can be stopped from there.
+    task: u64,
+    at: usize,
+    writer: crate::export::Streaming,
+    total: Option<usize>,
+}
+
 /// A page of the bottom drawer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Drawer {
@@ -826,6 +838,8 @@ enum Pending {
     /// `schema.ddl` asked for by the context menu: the answer goes on the
     /// clipboard rather than into a tab.
     DdlCopy,
+    /// One page of an export walking the whole result.
+    ExportPage,
     /// What the settings window's Access and MCP pages report.
     AccessList,
     Approvals,
@@ -917,6 +931,12 @@ pub struct Workspace {
     /// The panel, folded away. Remembered, because somebody who wants the room
     /// wants it next time too.
     panel_hidden: bool,
+    /// An export writing the WHOLE result, page by page.
+    ///
+    /// The tab it is reading, the file being written, and the next offset to
+    /// ask for. Held here rather than in the tab because it outlives what the
+    /// tab shows: the grid goes on holding one page while this walks the rest.
+    exporting: Option<Exporting>,
     /// A connection somebody asked to close while it was still working, and
     /// what it is working on.
     confirm_disconnect: Option<(String, Vec<String>)>,
@@ -1238,6 +1258,7 @@ impl Workspace {
             engine: None,
             hello: None,
             fatal: None,
+            exporting: None,
             confirm_disconnect: None,
             console_hist: None,
             menu: None,
@@ -2052,6 +2073,14 @@ impl Workspace {
                         .unwrap_or_default();
                 if let Some(t) = self.tabs.iter_mut().find(|t| t.id == tab) {
                     t.indexes = idx;
+                }
+            }
+            Pending::ExportPage => {
+                if !v.get("ready").and_then(Value::as_bool).unwrap_or(false) {
+                    return;
+                }
+                if let Ok(page) = serde_json::from_value::<lode_proto::Page>(v) {
+                    self.export_page(page, cx);
                 }
             }
             Pending::AccessList => {
@@ -2949,6 +2978,16 @@ impl Workspace {
         if statement.trim().is_empty() {
             return;
         }
+        // A tab whose result is being exported does not start another: the new
+        // run would take the tab's `call_id` and the old call would be let go
+        // from under the export.
+        if self.exporting.as_ref().map(|e| e.tab) == Some(tab_id) {
+            self.toast(
+                "an export of this result is running — it has to finish first".to_string(),
+                true,
+            );
+            return;
+        }
         self.tabs[idx].ran = statement.clone();
         let old = self.tabs[idx].call_id.take();
         let old_running = self.tabs[idx].state == RunState::Running;
@@ -3670,6 +3709,113 @@ impl Workspace {
             _ => "nothing loaded to export".to_string(),
         };
         self.status = msg;
+    }
+
+    /// Write the WHOLE result to the chosen file, a page at a time.
+    ///
+    /// Not one call: a table of two million rows would want itself in memory
+    /// twice — once as rows, once as text — to produce a file written in one go
+    /// at the end. The file is opened now, each page is written as it arrives,
+    /// and the task row in the drawer says how far it has got.
+    ///
+    /// It reads the SAME call the grid is showing, so nothing is run twice and
+    /// the file matches what is on screen. The engine buffers the call's rows,
+    /// which is what makes that possible.
+    fn start_export_all(&mut self, cx: &mut Context<Self>) {
+        let path = self.export_path.read(cx).text().trim().to_string();
+        if path.is_empty() {
+            self.toast("name a file first".to_string(), true);
+            return;
+        }
+        if self.exporting.is_some() {
+            self.toast("an export is already running".to_string(), true);
+            return;
+        }
+        let Some(tab) = self.tabs.get(self.active) else { return };
+        let Some(call_id) = tab.call_id else {
+            self.toast("run something first".to_string(), true);
+            return;
+        };
+        let (tab_id, columns, total) = (tab.id, tab.columns.clone(), tab.total);
+        let writer = match crate::export::Streaming::new(
+            std::path::Path::new(&path),
+            &columns,
+            self.export_format,
+        ) {
+            Ok(w) => w,
+            Err(e) => {
+                self.toast(format!("could not open {path}: {e}"), true);
+                return;
+            }
+        };
+        let task = self.next_task;
+        self.next_task += 1;
+        self.tasks.push(Task::new(task, format!("export \u{2192} {path}")));
+        self.exporting = Some(Exporting { tab: tab_id, call_id, task, at: 0, writer, total });
+        // The first page. Each answer asks for the next, which is the loop.
+        self.ask(
+            Pending::ExportPage,
+            "query.page",
+            json!({ "call_id": call_id, "from": 0, "n": PAGE }),
+        );
+        self.drawer = Some(Drawer::Tasks);
+    }
+
+    /// One page has arrived: write it and ask for the next, or finish.
+    fn export_page(&mut self, page: lode_proto::Page, cx: &mut Context<Self>) {
+        let Some(mut job) = self.exporting.take() else { return };
+        let got = page.rows.len();
+        if let Err(e) = job.writer.push(&page.rows) {
+            let n = job.writer.written();
+            self.finish_export_task(job.task, Some(format!("after {n} row(s): {e}")));
+            self.toast(format!("the export failed: {e}"), true);
+            return;
+        }
+        job.at += got;
+        // The engine says `has_more`; the row count is the belt and braces. A
+        // page of nothing would otherwise loop for ever against an engine that
+        // answered `has_more` wrongly.
+        let more = page.has_more && got > 0;
+        if !more {
+            let path = job.writer.path().display().to_string();
+            match job.writer.finish() {
+                Ok(n) => {
+                    self.finish_export_task(job.task, None);
+                    self.status = format!("wrote {n} row(s) to {path}");
+                    self.toast(format!("wrote {n} row(s)"), false);
+                }
+                Err(e) => {
+                    self.finish_export_task(job.task, Some(e.to_string()));
+                    self.toast(format!("the export could not be closed: {e}"), true);
+                }
+            }
+            cx.notify();
+            return;
+        }
+        let (call_id, from) = (job.call_id, job.at);
+        // The task row counts up, which is the only sign a long export is
+        // alive at all.
+        let label = match job.total {
+            Some(total) => format!("export {} of {total}", job.at),
+            None => format!("export {} row(s)", job.at),
+        };
+        if let Some(t) = self.tasks.iter_mut().find(|t| t.id == job.task) {
+            t.label = label;
+        }
+        self.exporting = Some(job);
+        self.ask(
+            Pending::ExportPage,
+            "query.page",
+            json!({ "call_id": call_id, "from": from, "n": PAGE }),
+        );
+        cx.notify();
+    }
+
+    fn finish_export_task(&mut self, task: u64, error: Option<String>) {
+        if let Some(t) = self.tasks.iter_mut().find(|t| t.id == task) {
+            let d = t.duration();
+            t.finish(d, error);
+        }
     }
 
     /// Order the loaded page by a column; clicking the same one again reverses
@@ -4976,6 +5122,13 @@ impl Workspace {
     /// engine answers a cancel with a `query.state`, and the release happens
     /// there (see the orphan branch) once there is nothing left to stop.
     fn let_go_of_call(&mut self, call_id: u64, running: bool) {
+        // NOT while an export is reading it. The export walks the engine's
+        // buffer for this very call; releasing it would end the file halfway
+        // with "no such call", and the file would look finished.
+        if self.exporting.as_ref().map(|e| e.call_id) == Some(call_id) {
+            self.calls.remove(&call_id);
+            return;
+        }
         self.calls.remove(&call_id);
         if running {
             self.ask(Pending::Ignore("cancel"), "query.cancel", json!({ "call_id": call_id }));
@@ -8696,14 +8849,43 @@ impl Workspace {
             );
         }
 
-        row.child(div().w(px(ms.base() * 18.0)).child(self.field(ms.small(), self.export_path.clone()))).child(
-            btn(t, ms, "export-write", "Write", Btn::Primary)
-                .on_click(cx.listener(|this, _, _, cx| {
-                    this.write_export(cx);
-                    cx.notify();
-                })),
-        )
-        .into_any_element()
+        row.child(div().w(px(ms.base() * 18.0)).child(self.field(ms.small(), self.export_path.clone())))
+            // The file CHOOSER, so a path does not have to be typed. The same
+            // portal the connection window's "browse…" uses.
+            .child(
+                btn(t, ms, "export-pick", self.tr("form.browse"), Btn::Secondary).on_click(
+                    cx.listener(|this, _, _, cx| {
+                        let input = this.export_path.clone();
+                        crate::form::pick_new_path(
+                            input,
+                            |why, cx| {
+                                let _ = cx;
+                                eprintln!("lode: {why}");
+                            },
+                            cx,
+                        );
+                    }),
+                ),
+            )
+            .child(
+                btn(t, ms, "export-write", self.tr("export.loaded"), Btn::Primary)
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.write_export(cx);
+                        cx.notify();
+                    })),
+            )
+            // ALL of it, not just what is on screen. The row has always said
+            // "loaded row(s)" and been honest about it; this is the other
+            // answer, and the one somebody exporting a table actually wants.
+            .children((tab.total.unwrap_or(0) > tab.rows.len() || tab.has_more).then(|| {
+                btn(t, ms, "export-all", self.tr("export.all"), Btn::Secondary).on_click(
+                    cx.listener(|this, _, _, cx| {
+                        this.start_export_all(cx);
+                        cx.notify();
+                    }),
+                )
+            }))
+            .into_any_element()
     }
 
     fn table_el(&self, tab: &Tab, cx: &mut Context<Self>) -> gpui::AnyElement {
