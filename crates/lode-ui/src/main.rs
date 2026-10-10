@@ -27,6 +27,7 @@ mod settings;
 mod theme;
 mod profile;
 mod tip;
+mod widgets;
 mod workspace;
 
 use gpui::{px, size, AppContext as _, Application, Bounds, WindowBounds, WindowOptions};

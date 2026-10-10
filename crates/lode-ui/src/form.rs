@@ -26,9 +26,11 @@ use lode_proto::DriverMeta;
 use serde_json::{json, Value};
 
 use crate::app::Workspace;
+use crate::i18n::Lang;
 use crate::input::{InputColors, TextInput};
 use crate::metrics::Metrics;
 use crate::theme::Theme;
+use crate::widgets::{btn, chip, Btn};
 
 /// Where a value comes from. The engine's `secret.rs` resolves exactly these,
 /// which is why the list is this and not a wish.
@@ -153,11 +155,24 @@ pub enum FormTab {
 }
 
 impl FormTab {
-    fn label(self) -> &'static str {
+    /// The catalogue KEY, not the word: the tab strip is this window's own
+    /// chrome and a window in Bulgarian showing three English tabs is what the
+    /// i18n note in `i18n.rs` is about.
+    fn key(self) -> &'static str {
         match self {
-            FormTab::Main => "Main",
-            FormTab::Access => "Access (SSH)",
-            FormTab::Settings => "Settings",
+            FormTab::Main => "form.tab_main",
+            FormTab::Access => "form.tab_access",
+            FormTab::Settings => "form.tab_settings",
+        }
+    }
+
+    /// A stable id for the element, which must NOT follow the language — an id
+    /// that changes with the locale is a different element to GPUI.
+    fn id(self) -> &'static str {
+        match self {
+            FormTab::Main => "main",
+            FormTab::Access => "access",
+            FormTab::Settings => "settings",
         }
     }
 }
@@ -187,6 +202,11 @@ pub struct ConnectionForm {
     /// once, by `$LODE_FONT`.
     font_family: String,
     icon_family: String,
+    /// The interface's language. Handed over like the theme and the fonts, and
+    /// updated by `set_lang` when it changes behind this window — a dialog in
+    /// its own OS window is still the same application, and a form in English
+    /// beside a panel in Bulgarian reads as a different one.
+    lang: Lang,
     tab: FormTab,
     editing: Option<String>,
     driver: String,
@@ -323,16 +343,15 @@ pub fn merge_spec(existing: &Value, edited: Value) -> Value {
 impl ConnectionForm {
     pub fn new(
         workspace: WeakEntity<Workspace>,
-        theme: Theme,
-        scale: Metrics,
+        look: crate::widgets::Look,
         drivers: Vec<DriverMeta>,
         tunnel_profiles: Vec<String>,
         tunnel_profile_specs: std::collections::BTreeMap<String, Value>,
         aws_profiles: Vec<String>,
         existing: Option<(String, String, Value)>,
-        fonts: (String, String),
         cx: &mut Context<Self>,
     ) -> Self {
+        let crate::widgets::Look { theme, scale, text_font, icon_font, lang } = look;
         let colors = colors_of(&theme);
         let driver = existing
             .as_ref()
@@ -473,8 +492,9 @@ impl ConnectionForm {
             error: None,
             theme,
             scale,
-            font_family: fonts.0,
-            icon_family: fonts.1,
+            font_family: text_font,
+            icon_family: icon_font,
+            lang,
         };
         let stored_params = spec.get("params").cloned().unwrap_or(json!({}));
         form.rebuild_params(&stored_params, cx);
@@ -963,8 +983,21 @@ pub fn colors_of(t: &Theme) -> InputColors {
 }
 
 impl ConnectionForm {
+    /// One phrase of the interface, in the chosen language.
+    fn tr(&self, key: &str) -> SharedString {
+        SharedString::from(self.lang.tr(key))
+    }
+
+    /// The language changed behind this window.
+    pub fn set_lang(&mut self, lang: Lang, cx: &mut Context<Self>) {
+        self.lang = lang;
+        cx.notify();
+    }
+
+    /// Kept as a method for the forty call sites below; the DRAWING is the
+    /// shared one, so a change to it reaches every window at once.
     fn small(&self, text: impl Into<SharedString>, c: gpui::Rgba) -> impl IntoElement {
-        div().text_size(self.scale.small()).text_color(c).child(text.into())
+        crate::widgets::small(self.scale, text, c)
     }
 
     /// A labelled row: label, source chooser where one applies, field.
@@ -1006,14 +1039,7 @@ impl ConnectionForm {
                 let on = source == s;
                 let k = key.clone();
                 picker = picker.child(
-                    div()
-                        .id(SharedString::from(format!("src-{k}-{}", s.label())))
-                        .px_1()
-                        .cursor_pointer()
-                        .text_size(ms.tiny())
-                        .text_color(if on { t.inverted() } else { t.muted() })
-                        .when(on, |d| d.bg(t.accent()))
-                        .child(SharedString::from(s.label()))
+                    chip(&t, ms, format!("src-{k}-{}", s.label()), s.label(), on)
                         .on_click(cx.listener(move |this, _, _, cx| {
                             this.set_source(&k, s, cx);
                             cx.notify();
@@ -1040,7 +1066,7 @@ impl ConnectionForm {
                     .flex_none()
                     .cursor_pointer()
                     .tooltip(crate::tip::Tip::build(
-                        if shown { "Hide the value" } else { "Show the value" },
+                        if shown { self.tr("tip.hide") } else { self.tr("tip.reveal") },
                         None,
                         self.theme.clone(),
                         ms,
@@ -1125,7 +1151,9 @@ impl ConnectionForm {
     /// about one file.
     fn path_row(
         &self,
-        label: &'static str,
+        // Not `&'static str` any more: the label comes from the catalogue, and
+        // a translated phrase is owned, not a literal in the binary.
+        label: impl Into<SharedString>,
         input: &Entity<TextInput>,
         id: &'static str,
         cx: &mut Context<Self>,
@@ -1140,17 +1168,7 @@ impl ConnectionForm {
             .child(div().w(px(ms.label_w())).flex_none().child(self.small(label, t.muted())))
             .child(div().flex_1().text_size(ms.body()).child(input.clone()))
             .child(
-                div()
-                    .id(SharedString::from(id))
-                    .flex_none()
-                    .px_2()
-                    .cursor_pointer()
-                    .border_1()
-                    .border_color(t.border())
-                    .hover(|d| d.bg(t.hover_mark()))
-                    .text_size(ms.small())
-                    .text_color(t.fg())
-                    .child("browse\u{2026}")
+                btn(t, ms, id, self.tr("form.browse"), Btn::Secondary)
                     .on_click(cx.listener(move |_this, _, _, cx| {
                         let me = cx.entity().downgrade();
                         pick_file(
@@ -1194,17 +1212,7 @@ impl ConnectionForm {
             )
             .child(div().flex_1().text_size(ms.body()).child(input.clone()))
             .child(
-                div()
-                    .id(SharedString::from(format!("pick-{key}")))
-                    .flex_none()
-                    .px_2()
-                    .cursor_pointer()
-                    .border_1()
-                    .border_color(t.border())
-                    .hover(|d| d.bg(t.hover_mark()))
-                    .text_size(ms.small())
-                    .text_color(t.fg())
-                    .child("browse\u{2026}")
+                btn(t, ms, format!("pick-{key}"), self.tr("form.browse"), Btn::Secondary)
                     .on_click(cx.listener(move |_this, _, _, cx| {
                         let me = cx.entity().downgrade();
                         pick_file(
@@ -1246,22 +1254,7 @@ impl ConnectionForm {
 
     /// A drawn checkbox: a box, with a tick in it when it is on.
     fn tick(&self, on: bool) -> gpui::Div {
-        let (t, ms) = (&self.theme, self.scale);
-        let side = (ms.base() * 1.1).round();
-        div()
-            .flex()
-            .items_center()
-            .justify_center()
-            .flex_none()
-            .w(px(side))
-            .h(px(side))
-            .line_height(px(side))
-            .border_1()
-            .border_color(if on { t.accent() } else { t.border() })
-            .when(on, |d| d.bg(t.accent()))
-            .text_size(ms.tiny())
-            .text_color(t.inverted())
-            .child(if on { "\u{f00c}" } else { "" })
+        crate::widgets::tick(&self.theme, self.scale, on)
     }
 
     /// What stops this test from being worth running, and WHERE to fix it.
@@ -1370,7 +1363,7 @@ impl Render for ConnectionForm {
                         "{} {display} connection",
                         if self.editing.is_some() { "Edit" } else { "New" }
                     ))))
-                    .child(self.small("Fields marked * are required", t.muted())),
+                    .child(self.small(self.tr("form.required"), t.muted())),
             );
         // The name sits top right, not as the first row of the form.
         head = head.child(
@@ -1378,7 +1371,7 @@ impl Render for ConnectionForm {
                 .flex()
                 .items_center()
                 .gap_2()
-                .child(self.small("Name", t.muted()))
+                .child(self.small(self.tr("form.name"), t.muted()))
                 .child(div().w(px(ms.field_w())).child(self.name.clone())),
         );
 
@@ -1395,13 +1388,13 @@ impl Render for ConnectionForm {
             let on = self.tab == ft;
             tabs = tabs.child(
                 div()
-                    .id(SharedString::from(ft.label()))
+                    .id(ft.id())
                     .px_1()
                     .cursor_pointer()
                     .text_size(ms.body())
                     .text_color(if on { t.fg() } else { t.muted() })
                     .when(on, |d| d.border_b_1().border_color(t.accent()))
-                    .child(SharedString::from(ft.label()))
+                    .child(self.tr(ft.key()))
                     .on_click(cx.listener(move |this, _, _, cx| {
                         this.tab = ft;
                         cx.notify();
@@ -1422,7 +1415,7 @@ impl Render for ConnectionForm {
                     .bg(t.accent())
                     .text_size(ms.tiny())
                     .text_color(t.inverted())
-                    .child("SSH"),
+                    .child(self.tr("form.ssh")),
             );
         }
 
@@ -1457,14 +1450,7 @@ impl Render for ConnectionForm {
                 for (kind, disp) in drivers {
                     let on = kind == self.driver;
                     picker = picker.child(
-                        div()
-                            .id(SharedString::from(format!("drv-{kind}")))
-                            .px_1()
-                            .cursor_pointer()
-                            .text_size(ms.tiny())
-                            .text_color(if on { t.inverted() } else { t.muted() })
-                            .when(on, |d| d.bg(t.accent()))
-                            .child(SharedString::from(disp))
+                        chip(&t, ms, format!("drv-{kind}"), disp, on)
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 if this.driver != kind {
                                     this.driver = kind.clone();
@@ -1502,14 +1488,7 @@ impl Render for ConnectionForm {
                             let on = current == name;
                             let (pick_name, target) = (name.clone(), input.clone());
                             pick = pick.child(
-                                div()
-                                    .id(SharedString::from(format!("awsp-{name}")))
-                                    .px_1()
-                                    .cursor_pointer()
-                                    .text_size(ms.tiny())
-                                    .text_color(if on { t.inverted() } else { t.muted() })
-                                    .when(on, |d| d.bg(t.accent()))
-                                    .child(SharedString::from(name.clone()))
+                                chip(&t, ms, format!("awsp-{name}"), name.clone(), on)
                                     .on_click(cx.listener(move |_, _, _, cx| {
                                         target.update(cx, |i, cx| {
                                             i.set_text(pick_name.clone(), cx)
@@ -1533,11 +1512,7 @@ impl Render for ConnectionForm {
                                 .child(div().flex_1().text_size(ms.body()).child(input.clone())),
                         );
                         if self.aws_profiles.is_empty() {
-                            body = body.child(self.small(
-                                "No AWS profiles were found — type a name, or check that \
-                                 ~/.aws/config is where this engine looks.",
-                                t.muted(),
-                            ));
+                            body = body.child(self.small(self.tr("form.no_aws"), t.muted()));
                         }
                         continue;
                     }
@@ -1553,19 +1528,12 @@ impl Render for ConnectionForm {
 
                 let auths: Vec<String> = self.meta().map(|m| m.auth.clone()).unwrap_or_default();
                 let mut auth_picker = div().flex().items_center().gap_2().py_1().child(
-                    div().w(px(ms.label_w())).child(self.small("Authentication", t.muted())),
+                    div().w(px(ms.label_w())).child(self.small(self.tr("form.auth"), t.muted())),
                 );
                 for a in auths {
                     let on = a == self.auth_kind;
                     auth_picker = auth_picker.child(
-                        div()
-                            .id(SharedString::from(format!("auth-{a}")))
-                            .px_1()
-                            .cursor_pointer()
-                            .text_size(ms.tiny())
-                            .text_color(if on { t.inverted() } else { t.muted() })
-                            .when(on, |d| d.bg(t.accent()))
-                            .child(SharedString::from(a.clone()))
+                        chip(&t, ms, format!("auth-{a}"), a.clone(), on)
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 this.auth_kind = a.clone();
                                 cx.notify();
@@ -1592,12 +1560,12 @@ impl Render for ConnectionForm {
                 match self.auth_kind.as_str() {
                     "password" => {
                         let (i, src) = (self.auth_password.input.clone(), self.auth_password.source);
-                        body = body.child(self.row("Password", &i, src, true, "auth-password".into(), cx));
+                        body = body.child(self.row(&self.tr("form.password"), &i, src, true, "auth-password".into(), cx));
                     }
                     "client_cert" => {
                         let (c, k) = (self.auth_cert.clone(), self.auth_key.clone());
-                        body = body.child(self.path_row("Certificate", &c, "pick-cert", cx));
-                        body = body.child(self.path_row("Key", &k, "pick-ckey", cx));
+                        body = body.child(self.path_row(self.tr("form.certificate"), &c, "pick-cert", cx));
+                        body = body.child(self.path_row(self.tr("form.key"), &k, "pick-ckey", cx));
                         if let Some(why) = self.auth_file_problem(cx) {
                             body = body.child(self.small(why, t.error()));
                         }
@@ -1616,20 +1584,13 @@ impl Render for ConnectionForm {
                         // The providers the ENGINE found, not free text. A name
                         // typed by hand is a name that fails at connect time.
                         let mut pr = div().flex().items_center().gap_2().py_1().child(
-                            div().w(px(ms.label_w())).child(self.small("Provider", t.muted())),
+                            div().w(px(ms.label_w())).child(self.small(self.tr("form.provider"), t.muted())),
                         );
                         for p in PROVIDERS {
                             let on = self.auth_provider == p;
                             let pick = p;
                             pr = pr.child(
-                                div()
-                                    .id(SharedString::from(format!("prov-{p}")))
-                                    .px_1()
-                                    .cursor_pointer()
-                                    .text_size(ms.tiny())
-                                    .text_color(if on { t.inverted() } else { t.muted() })
-                                    .when(on, |d| d.bg(t.accent()))
-                                    .child(p)
+                                chip(&t, ms, format!("prov-{p}"), p, on)
                                     .on_click(cx.listener(move |this, _, _, cx| {
                                         this.auth_provider = pick.to_string();
                                         cx.notify();
@@ -1638,17 +1599,13 @@ impl Render for ConnectionForm {
                         }
                         body = body.child(pr);
                         let (i, src) = (self.auth_token.input.clone(), self.auth_token.source);
-                        body = body.child(self.row("Token", &i, src, true, "auth-token".into(), cx));
+                        body = body.child(self.row(&self.tr("form.token"), &i, src, true, "auth-token".into(), cx));
                         // Said plainly: the name is RECORDED and, today, read by
                         // nothing. Snowflake is the only driver that takes a
                         // provider and it uses the token alone. Better to say so
                         // than to let a chosen name imply an effect it has not
                         // got.
-                        body = body.child(self.small(
-                            "The token is what connects. The provider name is stored with the \
-                             connection and no driver reads it yet.",
-                            t.muted(),
-                        ));
+                        body = body.child(self.small(self.tr("form.token_note"), t.muted()));
                     }
                     "kerberos" => {
                         body = body.child(plain(self, "Principal", &self.auth_principal));
@@ -1656,11 +1613,7 @@ impl Render for ConnectionForm {
                     _ => {}
                 }
                 if self.auth_kind != "none" {
-                    body = body.child(self.small(
-                        "Literal is stored as typed. Env, Command and Keyring are resolved by the \
-                         engine at connect time — the client never sees the value.",
-                        t.muted(),
-                    ));
+                    body = body.child(self.small(self.tr("form.source_note"), t.muted()));
                 }
                 body = body.child(self.stage_row("endpoint", cx));
                 body = body.child(self.stage_row("auth", cx));
@@ -1680,19 +1633,12 @@ impl Render for ConnectionForm {
                 }
                 if has_tls {
                 let mut tls = div().flex().items_center().gap_2().py_1().child(
-                    div().w(px(ms.label_w())).child(self.small("SSL mode", t.muted())),
+                    div().w(px(ms.label_w())).child(self.small(self.tr("form.ssl_mode"), t.muted())),
                 );
                 for m in ["disable", "prefer", "require", "verify_ca", "verify_full"] {
                     let on = self.tls_mode == m;
                     tls = tls.child(
-                        div()
-                            .id(SharedString::from(format!("tls-{m}")))
-                            .px_1()
-                            .cursor_pointer()
-                            .text_size(ms.tiny())
-                            .text_color(if on { t.inverted() } else { t.muted() })
-                            .when(on, |d| d.bg(t.accent()))
-                            .child(SharedString::from(m))
+                        chip(&t, ms, format!("tls-{m}"), m, on)
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 this.tls_mode = m.to_string();
                                 cx.notify();
@@ -1701,19 +1647,16 @@ impl Render for ConnectionForm {
                 }
                 body = body.child(tls);
                 if self.tls_mode == "disable" {
-                    body = body.child(self.small(
-                        "the link will be PLAINTEXT — the engine warns on every connect",
-                        t.warning(),
-                    ));
+                    body = body.child(self.small(self.tr("form.plaintext_note"), t.warning()));
                 }
                 // The three files, under the mode they belong to. Shown for
                 // every TLS-capable driver: which of them a server wants is the
                 // server's business, and an empty box costs nothing.
-                body = body.child(self.path_row("CA bundle", &self.tls_ca.clone(), "pick-tls-ca", cx));
+                body = body.child(self.path_row(self.tr("form.ca_bundle"), &self.tls_ca.clone(), "pick-tls-ca", cx));
                 body = body
-                    .child(self.path_row("Client cert", &self.tls_cert.clone(), "pick-tls-cert", cx));
+                    .child(self.path_row(self.tr("form.client_cert"), &self.tls_cert.clone(), "pick-tls-cert", cx));
                 body = body
-                    .child(self.path_row("Client key", &self.tls_key.clone(), "pick-tls-key", cx));
+                    .child(self.path_row(self.tr("form.client_key"), &self.tls_key.clone(), "pick-tls-key", cx));
                 body = body.child(self.stage_row("tls", cx));
                 }
 
@@ -1740,7 +1683,7 @@ impl Render for ConnectionForm {
                             div()
                                 .text_size(ms.small())
                                 .text_color(if self.tunnel_on { t.fg() } else { t.muted() })
-                                .child("SSH tunnel"),
+                                .child(self.tr("form.ssh_tunnel")),
                         )
                         .on_click(cx.listener(|this, _, _, cx| {
                             this.tunnel_on = !this.tunnel_on;
@@ -1766,18 +1709,11 @@ impl Render for ConnectionForm {
                     // refuses a spec that names a profile AND spells a tunnel
                     // out, so this is a choice rather than two things to fill.
                     let mut pick = div().flex().items_center().gap_2().py_1().child(
-                        div().w(px(ms.label_w())).child(self.small("Tunnel", t.muted())),
+                        div().w(px(ms.label_w())).child(self.small(self.tr("form.tunnel"), t.muted())),
                     );
                     let own = self.tunnel_profile.is_none();
                     pick = pick.child(
-                        div()
-                            .id("tun-own")
-                            .px_1()
-                            .cursor_pointer()
-                            .text_size(ms.tiny())
-                            .text_color(if own { t.inverted() } else { t.muted() })
-                            .when(own, |d| d.bg(t.accent()))
-                            .child("this connection's own")
+                        chip(&t, ms, "tun-own", self.tr("form.own"), own)
                             .on_click(cx.listener(|this, _, _, cx| {
                                 this.tunnel_profile = None;
                                 cx.notify();
@@ -1787,14 +1723,7 @@ impl Render for ConnectionForm {
                         let on = self.tunnel_profile.as_deref() == Some(name.as_str());
                         let n = name.clone();
                         pick = pick.child(
-                            div()
-                                .id(SharedString::from(format!("tun-p-{name}")))
-                                .px_1()
-                                .cursor_pointer()
-                                .text_size(ms.tiny())
-                                .text_color(if on { t.inverted() } else { t.muted() })
-                                .when(on, |d| d.bg(t.accent()))
-                                .child(SharedString::from(name.clone()))
+                            chip(&t, ms, format!("tun-p-{name}"), name.clone(), on)
                                 .on_click(cx.listener(move |this, _, _, cx| {
                                     this.tunnel_profile = Some(n.clone());
                                     cx.notify();
@@ -1803,11 +1732,7 @@ impl Render for ConnectionForm {
                     }
                     body = body.child(pick);
                     if self.tunnel_profiles.is_empty() {
-                        body = body.child(self.small(
-                            "No saved tunnels yet. Fill these in and press \"save as profile\" to \
-                             reuse them on another connection.",
-                            t.muted(),
-                        ));
+                        body = body.child(self.small(self.tr("form.no_tunnels"), t.muted()));
                     }
                 }
                 // A chosen profile REPLACES the fields rather than sitting
@@ -1851,19 +1776,11 @@ impl Render for ConnectionForm {
                                 div()
                                     .w(px(ms.label_w()))
                                     .flex_none()
-                                    .child(self.small("Goes through", t.muted())),
+                                    .child(self.small(self.tr("form.goes_through"), t.muted())),
                             )
                             .child(div().flex_1().child(self.small(summary, t.fg())))
                             .child(
-                                div()
-                                    .id("edit-this-profile")
-                                    .flex_none()
-                                    .px_1()
-                                    .cursor_pointer()
-                                    .hover(|d| d.bg(t.hover_mark()))
-                                    .text_size(ms.tiny())
-                                    .text_color(t.accent())
-                                    .child("edit this tunnel")
+                                btn(&t, ms, "edit-this-profile", self.tr("form.edit_tunnel"), Btn::Link)
                                     .on_click(cx.listener({
                                         let n = name.clone();
                                         move |this, _, _, cx| {
@@ -1880,18 +1797,14 @@ impl Render for ConnectionForm {
                                     })),
                             ),
                     );
-                    body = body.child(self.small(
-                        "These values live in the profile. Changing them there changes every \
-                         connection that uses it.",
-                        t.muted(),
-                    ));
+                    body = body.child(self.small(self.tr("form.profile_note"), t.muted()));
                     body = body.child(self.stage_row("tunnel", cx));
                 }
                 if self.tunnel_on && self.tunnel_profile.is_none() {
                     for (label, input) in [
-                        ("SSH host", self.tunnel_host.clone()),
-                        ("SSH port", self.tunnel_port.clone()),
-                        ("SSH user", self.tunnel_user.clone()),
+                        (self.tr("form.ssh_host"), self.tunnel_host.clone()),
+                        (self.tr("form.ssh_port"), self.tunnel_port.clone()),
+                        (self.tr("form.ssh_user"), self.tunnel_user.clone()),
                     ] {
                         body = body.child(
                             div()
@@ -1904,19 +1817,12 @@ impl Render for ConnectionForm {
                         );
                     }
                     let mut m = div().flex().items_center().gap_2().py_1().child(
-                        div().w(px(ms.label_w())).child(self.small("Method", t.muted())),
+                        div().w(px(ms.label_w())).child(self.small(self.tr("form.method"), t.muted())),
                     );
                     for a in ["agent", "key", "password"] {
                         let on = self.tunnel_auth == a;
                         m = m.child(
-                            div()
-                                .id(SharedString::from(format!("tauth-{a}")))
-                                .px_1()
-                                .cursor_pointer()
-                                .text_size(ms.tiny())
-                                .text_color(if on { t.inverted() } else { t.muted() })
-                                .when(on, |d| d.bg(t.accent()))
-                                .child(SharedString::from(a))
+                            chip(&t, ms, format!("tauth-{a}"), a, on)
                                 .on_click(cx.listener(move |this, _, _, cx| {
                                     this.tunnel_auth = a.to_string();
                                     cx.notify();
@@ -1928,7 +1834,7 @@ impl Render for ConnectionForm {
                     // is read back by another one.
                     if self.tunnel_auth == "key" {
                         let kp = self.tunnel_key_path.clone();
-                        body = body.child(self.path_row("Key file", &kp, "pick-tkey", cx));
+                        body = body.child(self.path_row(self.tr("form.key_file"), &kp, "pick-tkey", cx));
                         if let Some(why) = self.key_path_problem(cx) {
                             body = body.child(self.small(why, t.error()));
                         }
@@ -1942,10 +1848,7 @@ impl Render for ConnectionForm {
                             "tunnel-passphrase".into(),
                             cx,
                         ));
-                        body = body.child(self.small(
-                            "Leave the passphrase empty for a key that has none.",
-                            t.muted(),
-                        ));
+                        body = body.child(self.small(self.tr("form.passphrase_note"), t.muted()));
                     }
                     if self.tunnel_auth == "password" {
                         let (i, src) =
@@ -1966,7 +1869,7 @@ impl Render for ConnectionForm {
                             .child(
                                 div()
                                     .w(px(ms.label_w()))
-                                    .child(self.small("Save as profile", t.muted())),
+                                    .child(self.small(self.tr("form.save_profile"), t.muted())),
                             )
                             .child(
                                 div()
@@ -1975,26 +1878,14 @@ impl Render for ConnectionForm {
                                     .child(self.profile_name.clone()),
                             )
                             .child(
-                                div()
-                                    .id("tun-save-profile")
-                                    .px_2()
-                                    .cursor_pointer()
-                                    .text_size(ms.small())
-                                    .border_1()
-                                    .border_color(t.accent())
-                                    .text_color(t.fg())
-                                    .hover(|d| d.bg(t.hover_mark()))
-                                    .child("save")
-                                    .on_click(cx.listener(|this, _, _, cx| {
+                                btn(&t, ms, "tun-save-profile", self.tr("form.save"), Btn::Secondary).on_click(
+                                    cx.listener(|this, _, _, cx| {
                                         this.save_tunnel_profile(cx);
-                                    })),
+                                    }),
+                                ),
                             ),
                     );
-                    body = body.child(self.small(
-                        "Saving over a name replaces it — one bastion, one entry, changed in one \
-                         place.",
-                        t.muted(),
-                    ));
+                    body = body.child(self.small(self.tr("form.save_over_note"), t.muted()));
                 }
                 }
             }
@@ -2004,29 +1895,13 @@ impl Render for ConnectionForm {
                         .pt_1()
                         .text_size(ms.tiny())
                         .text_color(t.header_fg())
-                        .child("WHAT THIS CONNECTION MAY DO"),
+                        .child(self.tr("form.policy_heading")),
                 );
-                body = body.child(self.small(
-                    "Held by the engine, not by this window: a client that skips its own \
-                     confirmation still cannot get past it.",
-                    t.muted(),
-                ));
+                body = body.child(self.small(self.tr("form.policy_note"), t.muted()));
                 for (key, label, what) in [
-                    (
-                        "read_only",
-                        "Read only",
-                        "refuses anything that changes the database \u{2014} an INSERT as firmly as a DROP",
-                    ),
-                    (
-                        "confirm",
-                        "Asks first",
-                        "writes are allowed; the dangerous ones have to be confirmed",
-                    ),
-                    (
-                        "open",
-                        "Unrestricted",
-                        "everything runs \u{2014} for a scratch database where the asking is the nuisance",
-                    ),
+                    ("read_only", "form.policy_read", "form.policy_read_why"),
+                    ("confirm", "form.policy_confirm", "form.policy_confirm_why"),
+                    ("open", "form.policy_open", "form.policy_open_why"),
                 ] {
                     let on = self.policy == key;
                     body = body.child(
@@ -2044,9 +1919,9 @@ impl Render for ConnectionForm {
                                 div()
                                     .text_size(ms.body())
                                     .text_color(if on { t.accent() } else { t.fg() })
-                                    .child(label),
+                                    .child(self.tr(label)),
                             )
-                            .child(self.small(what, t.muted()))
+                            .child(self.small(self.tr(what), t.muted()))
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 this.policy = key.to_string();
                                 cx.notify();
@@ -2073,51 +1948,29 @@ impl Render for ConnectionForm {
             .border_t_1()
             .border_color(t.border())
             .child(
-                div()
-                    .id("test-all")
-                    .px_2()
-                    .cursor_pointer()
-                    .text_size(ms.small())
-                    .border_1()
-                    .border_color(t.border())
-                    .text_color(t.fg())
-                    .child("Test connection")
-                    .on_click(cx.listener(|this, _, _, cx| {
+                btn(&t, ms, "test-all", self.tr("form.test_conn"), Btn::Secondary).on_click(cx.listener(
+                    |this, _, _, cx| {
                         // The deepest stage: it exercises everything under it.
                         this.run_test("auth", cx);
                         cx.notify();
-                    })),
+                    },
+                )),
             )
             .child(
                 div()
                     .flex()
                     .gap_2()
-                    .child(
-                        div()
-                            .id("form-cancel")
-                            .px_2()
-                            .cursor_pointer()
-                            .text_size(ms.small())
-                            .text_color(t.muted())
-                            .child("Cancel")
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                let _ = this.workspace.update(cx, |w, cx| w.close_form(cx));
-                            })),
-                    )
-                    .child(
-                        div()
-                            .id("form-save")
-                            .px_2()
-                            .cursor_pointer()
-                            .text_size(ms.small())
-                            .bg(t.accent())
-                            .text_color(t.inverted())
-                            .child("Save")
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.save(cx);
-                                cx.notify();
-                            })),
-                    ),
+                    .child(btn(&t, ms, "form-cancel", self.tr("tip.cancel_edit"), Btn::Quiet).on_click(
+                        cx.listener(|this, _, _, cx| {
+                            let _ = this.workspace.update(cx, |w, cx| w.close_form(cx));
+                        }),
+                    ))
+                    .child(btn(&t, ms, "form-save", self.tr("form.save"), Btn::Primary).on_click(cx.listener(
+                        |this, _, _, cx| {
+                            this.save(cx);
+                            cx.notify();
+                        },
+                    ))),
             );
 
         div()

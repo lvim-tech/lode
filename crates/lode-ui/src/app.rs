@@ -37,6 +37,7 @@ use crate::input::{InputColors, InputEvent, TextInput};
 use crate::metrics::Metrics;
 use crate::session::{self, Session, SessionTab};
 use crate::theme::{self, Theme};
+use crate::widgets::{btn, chip, Btn};
 use crate::workspace::{
     bar_label, bar_label_of, clamped_scroll, column_editable, copy_as_insert, copy_as_select, fuzzy_score, row_key,
     value_range, ChartShape, Cond,
@@ -2879,7 +2880,6 @@ impl Workspace {
         if self.form_window.is_some() {
             return;
         }
-        let theme = self.theme.clone();
         let drivers = self.hello.as_ref().map(|h| h.drivers.clone()).unwrap_or_default();
         let tunnel_profiles = self.profile_names("tunnel");
         let tunnel_profile_specs: std::collections::BTreeMap<String, Value> = self
@@ -2899,7 +2899,7 @@ impl Workspace {
             Some((_, d, _)) => format!("lode — Edit {d} connection"),
             None => "lode — New connection".to_string(),
         };
-        let fonts = (self.font_family.clone(), self.icon_family.clone());
+        let look = self.look();
         let (w, h) = self.scale.window(crate::metrics::Window::Connection);
         let bounds = Bounds::centered(None, size(px(w), px(h)), cx);
         let opened = cx.open_window(
@@ -2911,7 +2911,20 @@ impl Workspace {
                 }),
                 ..Default::default()
             },
-            |_window, cx| cx.new(|cx| ConnectionForm::new(me, theme, self.scale, drivers, tunnel_profiles, tunnel_profile_specs, aws_profiles, existing, fonts, cx)),
+            |_window, cx| {
+                cx.new(|cx| {
+                    ConnectionForm::new(
+                        me,
+                        look,
+                        drivers,
+                        tunnel_profiles,
+                        tunnel_profile_specs,
+                        aws_profiles,
+                        existing,
+                        cx,
+                    )
+                })
+            },
         );
         match opened {
             Ok(h) => self.form_window = Some(h),
@@ -2942,13 +2955,12 @@ impl Workspace {
             .as_ref()
             .map(|(n, _)| self.profile_users.get(n).cloned().unwrap_or_default())
             .unwrap_or_default();
-        let (theme, scale) = (self.theme.clone(), self.scale);
         let me = cx.entity().downgrade();
         let title = match &existing {
             Some((n, _)) => format!("lode — Tunnel {n}"),
             None => "lode — New tunnel".to_string(),
         };
-        let font = self.font_family.clone();
+        let look = self.look();
         let (w, h) = self.scale.window(crate::metrics::Window::Profile);
         let bounds = Bounds::centered(None, size(px(w), px(h)), cx);
         let opened = cx.open_window(
@@ -2959,7 +2971,7 @@ impl Workspace {
             },
             |_window, cx| {
                 cx.new(|cx| {
-                    crate::profile::ProfileForm::new(me, theme, scale, existing, users, font, cx)
+                    crate::profile::ProfileForm::new(me, look, existing, users, cx)
                 })
             },
         );
@@ -2996,10 +3008,9 @@ impl Workspace {
                 ]
             })
             .unwrap_or_default();
-        let (theme, scale) = (self.theme.clone(), self.scale);
         let me = cx.entity().downgrade();
         let (tun, prx) = (prof("tunnel"), prof("proxy"));
-        let fonts = (self.font_family.clone(), self.icon_family.clone());
+        let look = self.look();
         // Derived: at a large text size a window of 900×620 held half a page
         // and put its own Close button off the bottom edge.
         let (w, h) = self.scale.window(crate::metrics::Window::Settings);
@@ -3016,7 +3027,7 @@ impl Workspace {
             |_window, cx| {
                 cx.new(|cx| {
                     crate::settings::SettingsWindow::new(
-                        me, theme, scale, drivers, tun, prx, about, fonts, cx,
+                        me, look, drivers, tun, prx, about, cx,
                     )
                 })
             },
@@ -4343,7 +4354,15 @@ impl Workspace {
     pub fn set_lang(&mut self, lang: Lang, cx: &mut Context<Self>) {
         self.lang = lang;
         self.relabel_inputs(cx);
+        // The SEPARATE WINDOWS too. A connection window left open through a
+        // language change kept its English labels, which reads as a half-done
+        // translation rather than as a window nobody told.
+        if let Some(h) = self.form_window.clone() {
+            let _ = h.update(cx, |f, _, cx| f.set_lang(lang, cx));
+        }
         self.remember();
+        // The settings window reads the language off this one as it paints, so
+        // it needs only the nudge.
         self.poke_settings(cx);
         cx.notify();
     }
@@ -4363,6 +4382,18 @@ impl Workspace {
 
     pub fn profile_users_of(&self, name: &str) -> Vec<String> {
         self.profile_users.get(name).cloned().unwrap_or_default()
+    }
+
+    /// What a separate window inherits from this one: the palette, the scale,
+    /// the two fonts and the language. See `widgets::Look`.
+    pub fn look(&self) -> crate::widgets::Look {
+        crate::widgets::Look {
+            theme: self.theme.clone(),
+            scale: self.scale,
+            text_font: self.font_family.clone(),
+            icon_font: self.icon_family.clone(),
+            lang: self.lang,
+        }
     }
 
     /// Hand the settings window the sizes again and ask it to repaint.
@@ -4861,14 +4892,7 @@ impl Workspace {
                 ] {
                     let on = self.metrics_every == every;
                     rate = rate.child(
-                        div()
-                            .id(SharedString::from(format!("rate-{label}")))
-                            .px_1()
-                            .cursor_pointer()
-                            .text_size(ms.tiny())
-                            .text_color(if on { t.inverted() } else { t.muted() })
-                            .when(on, |d| d.bg(t.accent()))
-                            .child(label)
+                        chip(t, ms, format!("rate-{label}"), label, on)
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 this.metrics_every = every;
                                 cx.notify();
@@ -4876,13 +4900,7 @@ impl Workspace {
                     );
                 }
                 rate = rate.child(
-                    div()
-                        .id("metrics-now")
-                        .px_1()
-                        .cursor_pointer()
-                        .text_size(ms.tiny())
-                        .text_color(t.accent())
-                        .child("\u{f021} now")
+                    btn(t, ms, "metrics-now", "\u{f021} now", Btn::Link)
                         .on_click(cx.listener(|this, _, _, cx| {
                             this.ask_metrics();
                             cx.notify();
@@ -4928,15 +4946,7 @@ impl Workspace {
             }
             Rail::History => {
                 panel = panel.child(
-                    div()
-                        .id("history-reload")
-                        .px_2()
-                        .py_1()
-                        .cursor_pointer()
-                        .hover(|d| d.bg(t.hover_mark()))
-                        .text_size(ms.small())
-                        .text_color(t.accent())
-                        .child(SharedString::from(format!("{}  {}", "\u{f021}", self.lang.tr("panel.reload_history"))))
+                    btn(t, ms, "history-reload", format!("{}  {}", "\u{f021}", self.lang.tr("panel.reload_history")), Btn::Link)
                         .on_click(cx.listener(|this, _, _, cx| {
                             this.ask(Pending::History, "store.history.list", json!({ "limit": 200 }));
                             cx.notify();
@@ -5022,15 +5032,7 @@ impl Workspace {
             }
             Rail::Audit => {
                 panel = panel.child(
-                    div()
-                        .id("audit-reload")
-                        .px_2()
-                        .py_1()
-                        .cursor_pointer()
-                        .hover(|d| d.bg(t.hover_mark()))
-                        .text_size(ms.small())
-                        .text_color(t.accent())
-                        .child(SharedString::from(format!("{}  {}", "\u{f021}", self.lang.tr("panel.reload_audit"))))
+                    btn(t, ms, "audit-reload", format!("{}  {}", "\u{f021}", self.lang.tr("panel.reload_audit")), Btn::Link)
                         .on_click(cx.listener(|this, _, _, cx| {
                             this.ask(Pending::Audit, "store.audit.list", json!({ "limit": 300 }));
                             cx.notify();
@@ -5287,15 +5289,7 @@ impl Workspace {
 
         panel = panel.child(div().px_2().py_1().child(self.field(ms.small(), self.filter.clone())));
         panel = panel.child(
-            div()
-                .id("new-conn")
-                .px_2()
-                .py_1()
-                .cursor_pointer()
-                .hover(|d| d.bg(t.hover_mark()))
-                .text_size(ms.small())
-                .text_color(t.accent())
-                .child(SharedString::from(format!("{}  {}", "\u{f067}", self.lang.tr("panel.new_connection"))))
+            btn(t, ms, "new-conn", format!("{}  {}", "\u{f067}", self.lang.tr("panel.new_connection")), Btn::Link)
                 .on_click(cx.listener(|this, _, _, cx| {
                     this.open_form(None, cx);
                     cx.notify();
@@ -5458,15 +5452,7 @@ impl Workspace {
                             .px_2()
                             .py_1()
                             .child(
-                                div()
-                                    .id(SharedString::from(format!("rm-yes-{who}")))
-                                    .px_2()
-                                    .cursor_pointer()
-                                    .border_1()
-                                    .border_color(t.error())
-                                    .text_size(ms.small())
-                                    .text_color(t.fg())
-                                    .child(self.tr("conn.remove_it"))
+                                btn(t, ms, format!("rm-yes-{who}"), self.tr("conn.remove_it"), Btn::Danger)
                                     .on_click(cx.listener(move |this, _, _, cx| {
                                         // Disconnected first if it is open: an
                                         // engine connection outliving the saved
@@ -5485,13 +5471,7 @@ impl Workspace {
                                     })),
                             )
                             .child(
-                                div()
-                                    .id(SharedString::from(format!("rm-no-{no}")))
-                                    .px_2()
-                                    .cursor_pointer()
-                                    .text_size(ms.small())
-                                    .text_color(t.muted())
-                                    .child(self.tr("conn.keep_it"))
+                                btn(t, ms, format!("rm-no-{no}"), self.tr("conn.keep_it"), Btn::Quiet)
                                     .on_click(cx.listener(|this, _, _, cx| {
                                         this.confirm_conn_rm = None;
                                         cx.notify();
@@ -5508,7 +5488,7 @@ impl Workspace {
         for live in &self.conns {
             list = list.child(self.section(&live.name));
             if live.nodes.is_empty() {
-                list = list.child(div().px_2().child(self.small("loading…", t.muted())));
+                list = list.child(div().px_2().child(self.small(self.tr("panel.loading"), t.muted())));
             }
             if !live.charts.is_empty() {
                 list = list.child(self.section(self.lang.tr("panel.saved_charts")));
@@ -6002,9 +5982,10 @@ impl Workspace {
         let mut body = div().flex().flex_col().size_full();
 
         // ── breadcrumbs and numbers ─────────────────────────────────────────
+        let rows_word = self.lang.tr("result.rows");
         let count = match (tab.total, tab.rows.len()) {
-            (Some(total), _) => format!("{total} row(s)"),
-            (None, n) => format!("{n} row(s) loaded"),
+            (Some(total), _) => format!("{total} {rows_word}"),
+            (None, n) => format!("{n} {rows_word} loaded"),
         };
         let mut sub_row = div().flex().items_center().gap_3();
         let tab_id = tab.id;
@@ -6100,14 +6081,7 @@ impl Workspace {
                     ))
                     .child(div().flex_1().text_size(ms.body()).child(self.save_name.clone()))
                     .child(
-                        div()
-                            .id("name-ok")
-                            .px_2()
-                            .cursor_pointer()
-                            .hover(|d| d.bg(t.hover_mark()))
-                            .text_size(ms.small())
-                            .text_color(t.accent())
-                            .child(self.tr("result.save"))
+                        btn(t, ms, "name-ok", self.tr("result.save"), Btn::Link)
                             .on_click(cx.listener(|this, _, _, cx| {
                                 let name = this.save_name.read(cx).text().trim().to_string();
                                 this.named(name, cx);
@@ -6115,14 +6089,7 @@ impl Workspace {
                             })),
                     )
                     .child(
-                        div()
-                            .id("name-no")
-                            .px_2()
-                            .cursor_pointer()
-                            .hover(|d| d.bg(t.hover_mark()))
-                            .text_size(ms.small())
-                            .text_color(t.muted())
-                            .child(self.tr("tip.cancel_edit"))
+                        btn(t, ms, "name-no", self.tr("tip.cancel_edit"), Btn::Quiet)
                             .on_click(cx.listener(|this, _, _, cx| {
                                 this.naming = None;
                                 cx.notify();
@@ -6140,14 +6107,7 @@ impl Workspace {
             let on = tab.view == v;
             let tab_id = tab.id;
             views = views.child(
-                div()
-                    .id(SharedString::from(format!("view-{}-{}", tab_id, v.label())))
-                    .px_2()
-                    .cursor_pointer()
-                    .text_size(ms.small())
-                    .text_color(if on { t.inverted() } else { t.muted() })
-                    .when(on, |d| d.bg(t.accent()))
-                    .child(SharedString::from(v.label()))
+                chip(t, ms, format!("view-{}-{}", tab_id, v.label()), v.label(), on)
                     .on_click(cx.listener(move |this, _, _, cx| {
                         if let Some(tb) = this.tabs.iter_mut().find(|t| t.id == tab_id) {
                             tb.view = v;
@@ -6157,28 +6117,23 @@ impl Workspace {
             );
         }
         let running = tab.state == RunState::Running;
-        views = views.child(
-            div()
-                .id("cancel")
-                .px_2()
-                .cursor_pointer()
-                .text_size(ms.small())
-                .text_color(if running { t.error() } else { t.disabled() })
-                .child("Cancel")
-                .on_click(cx.listener(|this, _, _, cx| {
-                    this.cancel_active();
-                    cx.notify();
-                })),
-        );
+        // Off, not merely grey: a disabled control that still takes the click
+        // looks like one that worked. See `widgets::btn_off`.
+        if !running {
+            views = views.child(crate::widgets::btn_off(t, ms, self.tr("result.cancel"), Btn::Quiet));
+        }
+        if running {
+            views = views.child(
+                btn(t, ms, "cancel", self.tr("result.cancel"), Btn::Danger)
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.cancel_active();
+                        cx.notify();
+                    })),
+            );
+        }
         if tab.view == ResultView::Chart {
             views = views.child(
-                div()
-                    .id("save-chart")
-                    .px_2()
-                    .cursor_pointer()
-                    .text_size(ms.small())
-                    .text_color(t.accent())
-                    .child("Save chart")
+                btn(t, ms, "save-chart", self.tr("result.save_chart"), Btn::Link)
                     .on_click(cx.listener(|this, _, _, cx| {
                         this.save_chart(cx);
                         cx.notify();
@@ -6186,35 +6141,28 @@ impl Workspace {
             );
         }
         views = views.child(
-            div()
-                .id("save-query")
-                .px_2()
-                .cursor_pointer()
-                .text_size(ms.small())
-                .text_color(t.accent())
-                .child("Save query")
+            btn(t, ms, "save-query", self.tr("result.save_query"), Btn::Link)
                 .on_click(cx.listener(|this, _, _, cx| {
                     this.save_query(cx);
                     cx.notify();
                 })),
         );
         let has_rows = !tab.rows.is_empty();
-        views = views.child(
-            div()
-                .id("export-toggle")
-                .px_2()
-                .cursor_pointer()
-                .text_size(ms.small())
-                // A control nobody can use still has to be READABLE — greyed
-                // out to the border colour, it simply vanished, and a button
-                // that is invisible is not disabled, it is missing.
-                .text_color(if has_rows { t.accent() } else { t.muted() })
-                .child("Export")
-                .on_click(cx.listener(|this, _, _, cx| {
-                    this.export_open = !this.export_open;
-                    cx.notify();
-                })),
-        );
+        // A control nobody can use still has to be READABLE — greyed out to the
+        // border colour it simply vanished, and a button that is invisible is
+        // not disabled, it is missing.
+        if !has_rows {
+            views = views.child(crate::widgets::btn_off(t, ms, self.tr("result.export"), Btn::Quiet));
+        }
+        if has_rows {
+            views = views.child(
+                btn(t, ms, "export-toggle", self.tr("result.export"), Btn::Link)
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.export_open = !this.export_open;
+                        cx.notify();
+                    })),
+            );
+        }
         body = body.child(views);
         body = body.child(self.query_bar(tab, cx));
         if self.export_open {
@@ -6242,14 +6190,7 @@ impl Workspace {
                             .flex()
                             .gap_2()
                             .child(
-                                div()
-                                    .id("tab-confirm-run")
-                                    .px_2()
-                                    .cursor_pointer()
-                                    .text_size(ms.small())
-                                    .bg(t.error())
-                                    .text_color(t.inverted())
-                                    .child(SharedString::from(self.tr("write.run_it")))
+                                btn(t, ms, "tab-confirm-run", self.tr("write.run_it"), Btn::Danger)
                                     .on_click(cx.listener(move |this, _, _, _cx| {
                                         if let Some(tab) =
                                             this.tabs.iter_mut().find(|t| t.id == id)
@@ -6262,13 +6203,7 @@ impl Workspace {
                                     })),
                             )
                             .child(
-                                div()
-                                    .id("tab-confirm-leave")
-                                    .px_2()
-                                    .cursor_pointer()
-                                    .text_size(ms.small())
-                                    .text_color(t.muted())
-                                    .child(SharedString::from(self.tr("write.leave_it")))
+                                btn(t, ms, "tab-confirm-leave", self.tr("write.leave_it"), Btn::Quiet)
                                     .on_click(cx.listener(move |this, _, _, cx| {
                                         if let Some(tab) =
                                             this.tabs.iter_mut().find(|t| t.id == id)
@@ -6377,14 +6312,7 @@ impl Workspace {
             top = top
                 .child(div().w(px(ms.base() * 12.0)).child(self.field(ms.small(), self.board_name.clone())))
                 .child(
-                    div()
-                        .id("board-rename")
-                        .px_2()
-                        .cursor_pointer()
-                        .text_size(ms.small())
-                        .text_color(t.accent())
-                        .hover(|d| d.bg(t.hover_mark()))
-                        .child("Name it")
+                    btn(t, ms, "board-rename", self.tr("board.name_it"), Btn::Link)
                         .on_click(cx.listener(move |this, _, _, cx| {
                             let n = this.board_name.read(cx).text().trim().to_string();
                             if n.is_empty() {
@@ -6410,15 +6338,13 @@ impl Workspace {
             );
         }
         top = top.child(
-            div()
-                .id("board-edit")
-                .px_2()
-                .cursor_pointer()
-                .text_size(ms.small())
-                .text_color(if editing { t.inverted() } else { t.accent() })
-                .when(editing, |d| d.bg(t.accent()))
-                .hover(|d| d.bg(t.hover_mark()))
-                .child(if editing { "Done" } else { "Arrange" })
+            chip(
+                t,
+                ms,
+                "board-edit",
+                if editing { self.tr("board.done") } else { self.tr("board.arrange") },
+                editing,
+            )
                 .on_click(cx.listener(move |this, _, _, cx| {
                     if let Some(bd) = this.board_mut(tab_id) {
                         bd.editing = !bd.editing;
@@ -6434,14 +6360,7 @@ impl Workspace {
                 ("+ text", TileKind::Text),
             ] {
                 top = top.child(
-                    div()
-                        .id(SharedString::from(format!("add-{label}")))
-                        .px_2()
-                        .cursor_pointer()
-                        .text_size(ms.small())
-                        .text_color(t.accent())
-                        .hover(|d| d.bg(t.hover_mark()))
-                        .child(label)
+                    btn(t, ms, format!("add-{label}"), label, Btn::Link)
                         .on_click(cx.listener(move |this, _, _, cx| {
                             this.board_add(tab_id, kind);
                             cx.notify();
@@ -6452,29 +6371,14 @@ impl Workspace {
         top = top
             .child(div().flex_1())
             .child(
-                div()
-                    .id("board-refresh")
-                    .px_2()
-                    .cursor_pointer()
-                    .text_size(ms.small())
-                    .text_color(t.accent())
-                    .hover(|d| d.bg(t.hover_mark()))
-                    .child("\u{f021}  Refresh")
+                btn(t, ms, "board-refresh", format!("\u{f021}  {}", self.tr("result.refresh")), Btn::Link)
                     .on_click(cx.listener(move |this, _, _, cx| {
                         this.run_board(tab_id);
                         cx.notify();
                     })),
             )
             .child(
-                div()
-                    .id("board-save")
-                    .px_2()
-                    .cursor_pointer()
-                    .text_size(ms.small())
-                    .text_color(if b.dirty { t.inverted() } else { t.muted() })
-                    .when(b.dirty, |d| d.bg(t.accent()))
-                    .hover(|d| d.bg(t.hover_mark()))
-                    .child(if b.dirty { "Save" } else { "Saved" })
+                chip(t, ms, "board-save", if b.dirty { self.tr("board.save") } else { self.tr("board.saved") }, b.dirty)
                     .on_click(cx.listener(move |this, _, _, cx| this.save_board(tab_id, cx))),
             );
 
@@ -6487,37 +6391,23 @@ impl Workspace {
             .px_3()
             .py_1()
             .bg(t.status())
-            .child(self.small("time", t.muted()))
+            .child(self.small(self.tr("board.time"), t.muted()))
             // Real widths: a text field with none collapses to nothing, and the
             // three of them drew on top of one another.
             .child(div().w(px(ms.base() * 9.0)).flex_none().child(self.field(ms.small(), self.board_time_col.clone())))
-            .child(self.small("from", t.muted()))
+            .child(self.small(self.tr("board.from"), t.muted()))
             .child(div().w(px(ms.base() * 9.0)).flex_none().child(self.field(ms.small(), self.board_time_from.clone())))
-            .child(self.small("to", t.muted()))
+            .child(self.small(self.tr("board.to"), t.muted()))
             .child(div().w(px(ms.base() * 9.0)).flex_none().child(self.field(ms.small(), self.board_time_to.clone())))
             .child(
-                div()
-                    .id("board-time-apply")
-                    .px_2()
-                    .cursor_pointer()
-                    .text_size(ms.small())
-                    .text_color(t.accent())
-                    .hover(|d| d.bg(t.hover_mark()))
-                    .child("Apply")
+                btn(t, ms, "board-time-apply", self.tr("board.apply"), Btn::Link)
                     .on_click(cx.listener(move |this, _, _, cx| {
                         this.board_apply_time(tab_id, cx);
                     })),
             );
         if b.dash.time.is_some() {
             timebar = timebar.child(
-                div()
-                    .id("board-time-clear")
-                    .px_2()
-                    .cursor_pointer()
-                    .text_size(ms.small())
-                    .text_color(t.muted())
-                    .hover(|d| d.bg(t.hover_mark()))
-                    .child("clear")
+                btn(t, ms, "board-time-clear", self.tr("board.clear"), Btn::Quiet)
                     .on_click(cx.listener(move |this, _, _, cx| {
                         if let Some(bd) = this.board_mut(tab_id) {
                             bd.dash.time = None;
@@ -6575,14 +6465,7 @@ impl Workspace {
                         row = row
                             .child(div().w(px(ms.base() * 16.0)).child(self.field(ms.small(), self.tile_text.clone())))
                             .child(
-                                div()
-                                    .id("tile-set-text")
-                                    .px_2()
-                                    .cursor_pointer()
-                                    .text_size(ms.small())
-                                    .text_color(t.accent())
-                                    .hover(|d| d.bg(t.hover_mark()))
-                                    .child("Set")
+                                btn(t, ms, "tile-set-text", "Set", Btn::Link)
                                     .on_click(cx.listener(move |this, _, _, cx| {
                                         let txt = this.tile_text.read(cx).text().to_string();
                                         if let Some(bd) = this.board_mut(tab_id) {
@@ -6603,15 +6486,7 @@ impl Workspace {
                             let on = c.name == tile.chart;
                             let name = c.name.clone();
                             row = row.child(
-                                div()
-                                    .id(SharedString::from(format!("pick-{}", c.name)))
-                                    .px_1()
-                                    .cursor_pointer()
-                                    .text_size(ms.small())
-                                    .text_color(if on { t.inverted() } else { t.fg() })
-                                    .when(on, |d| d.bg(t.accent()))
-                                    .hover(|d| d.bg(t.hover_mark()))
-                                    .child(SharedString::from(c.name.clone()))
+                                chip(t, ms, format!("pick-{}", c.name), c.name.clone(), on)
                                     .on_click(cx.listener(move |this, _, _, cx| {
                                         if let Some(bd) = this.board_mut(tab_id) {
                                             if let Some(tl) = bd.dash.tiles.get_mut(i) {
@@ -6626,14 +6501,7 @@ impl Workspace {
                         }
                     }
                     row = row.child(div().flex_1()).child(
-                        div()
-                            .id("tile-remove")
-                            .px_2()
-                            .cursor_pointer()
-                            .text_size(ms.small())
-                            .text_color(t.error())
-                            .hover(|d| d.bg(t.hover_mark()))
-                            .child("Remove")
+                        btn(t, ms, "tile-remove", self.tr("board.remove"), Btn::Danger)
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 if let Some(bd) = this.board_mut(tab_id) {
                                     bd.remove(i);
@@ -6651,7 +6519,7 @@ impl Workspace {
         if b.dash.tiles.is_empty() {
             canvas = canvas.child(
                 div().p_3().child(self.small(
-                    "an empty board — press Arrange, then add a chart you have saved",
+                    self.tr("board.empty"),
                     t.muted(),
                 )),
             );
@@ -6930,15 +6798,7 @@ impl Workspace {
                 let on = i == chosen;
                 let name = tab.columns.get(i).map(|c| c.name.clone()).unwrap_or_default();
                 picker = picker.child(
-                    div()
-                        .id(SharedString::from(format!("ch-{tab_id}-{i}")))
-                        .px_1()
-                        .cursor_pointer()
-                        .text_size(ms.small())
-                        .text_color(if on { t.inverted() } else { t.fg() })
-                        .when(on, |d| d.bg(t.accent()))
-                        .hover(|d| d.bg(t.hover_mark()))
-                        .child(SharedString::from(name))
+                    chip(t, ms, format!("ch-{tab_id}-{i}"), name, on)
                         .on_click(cx.listener(move |this, _, _, cx| {
                             if let Some(tb) = this.tabs.iter_mut().find(|x| x.id == tab_id) {
                                 tb.chart_col = Some(i);
@@ -7050,14 +6910,7 @@ impl Workspace {
         body = body.child(self.section("Show"));
         let all = tab.builder.columns.is_empty();
         let mut cols_row = div().flex().flex_wrap().gap_2().child(
-            div()
-                .id("b-all")
-                .px_1()
-                .cursor_pointer()
-                .text_size(ms.small())
-                .text_color(if all { t.inverted() } else { t.muted() })
-                .when(all, |d| d.bg(t.accent()))
-                .child("every column")
+            chip(t, ms, "b-all", "every column", all)
                 .on_click(cx.listener(move |this, _, _, cx| {
                     if let Some(tb) = this.tabs.iter_mut().find(|x| x.id == tab_id) {
                         tb.builder.columns.clear();
@@ -7070,15 +6923,7 @@ impl Workspace {
             let on = tab.builder.columns.contains(&c.name);
             let name = c.name.clone();
             cols_row = cols_row.child(
-                div()
-                    .id(SharedString::from(format!("b-col-{}", c.name)))
-                    .px_1()
-                    .cursor_pointer()
-                    .text_size(ms.small())
-                    .text_color(if on { t.inverted() } else { t.fg() })
-                    .when(on, |d| d.bg(t.accent()))
-                    .hover(|d| d.bg(t.hover_mark()))
-                    .child(SharedString::from(c.name.clone()))
+                chip(t, ms, format!("b-col-{}", c.name), c.name.clone(), on)
                     .on_click(cx.listener(move |this, _, _, cx| {
                         if let Some(tb) = this.tabs.iter_mut().find(|x| x.id == tab_id) {
                             match tb.builder.columns.iter().position(|x| *x == name) {
@@ -7179,13 +7024,7 @@ impl Workspace {
             body = body.child(row);
         }
         body = body.child(
-            div()
-                .id("b-add")
-                .px_1()
-                .cursor_pointer()
-                .text_size(ms.small())
-                .text_color(t.accent())
-                .child("+ condition")
+            btn(t, ms, "b-add", "+ condition", Btn::Link)
                 .on_click(cx.listener(move |this, _, _, cx| {
                     this.add_condition(tab_id, cx);
                     cx.notify();
@@ -7448,27 +7287,20 @@ impl Workspace {
                     .flex()
                     .gap_2()
                     .child(
-                        div()
-                            .id("write-yes")
-                            .px_2()
-                            .cursor_pointer()
-                            .text_size(ms.small())
-                            .bg(t.error())
-                            .text_color(t.inverted())
-                            .child(if p.delete { "Delete it" } else { "Write it" })
-                            .on_click(cx.listener(move |this, _, _, cx| {
+                        btn(
+                            t,
+                            ms,
+                            "write-yes",
+                            if p.delete { "Delete it" } else { "Write it" },
+                            Btn::Danger,
+                        )
+                        .on_click(cx.listener(move |this, _, _, cx| {
                                 this.apply_write(tab_id, cx);
                                 cx.notify();
                             })),
                     )
                     .child(
-                        div()
-                            .id("write-no")
-                            .px_2()
-                            .cursor_pointer()
-                            .text_size(ms.small())
-                            .text_color(t.muted())
-                            .child("Leave it")
+                        btn(t, ms, "write-no", self.tr("write.leave_it"), Btn::Quiet)
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 if let Some(tb) = this.tabs.iter_mut().find(|x| x.id == tab_id) {
                                     tb.pending_write = None;
@@ -7494,26 +7326,14 @@ impl Workspace {
         if sql {
             foot = foot
                 .child(
-                    div()
-                        .id("copy-select")
-                        .px_2()
-                        .cursor_pointer()
-                        .text_size(ms.small())
-                        .text_color(t.accent())
-                        .child("Copy as SELECT")
+                    btn(t, ms, "copy-select", self.tr("write.copy_select"), Btn::Link)
                         .on_click(cx.listener(|this, _, _, cx| {
                             this.copy_row(false, cx);
                             cx.notify();
                         })),
                 )
                 .child(
-                    div()
-                        .id("copy-insert")
-                        .px_2()
-                        .cursor_pointer()
-                        .text_size(ms.small())
-                        .text_color(t.accent())
-                        .child("Copy as INSERT")
+                    btn(t, ms, "copy-insert", self.tr("write.copy_insert"), Btn::Link)
                         .on_click(cx.listener(|this, _, _, cx| {
                             this.copy_row(true, cx);
                             cx.notify();
@@ -7524,13 +7344,7 @@ impl Workspace {
         }
         if editable && tab.pending_write.is_none() {
             foot = foot.child(div().flex_1()).child(
-                div()
-                    .id("row-delete")
-                    .px_2()
-                    .cursor_pointer()
-                    .text_size(ms.small())
-                    .text_color(t.error())
-                    .child("Delete row")
+                btn(t, ms, "row-delete", self.tr("write.delete_row"), Btn::Danger)
                     .on_click(cx.listener(move |this, _, _, cx| {
                         this.propose_write(tab_id, i, Vec::new(), true, cx);
                         cx.notify();
@@ -7619,16 +7433,9 @@ impl Workspace {
         }
 
         // The run button says what it does in this engine's words.
-        let run_label = if structured { "Find" } else { "Run" };
+        let run_label = if structured { self.tr("result.find") } else { self.tr("result.run") };
         bar = bar.child(
-            div()
-                .id(SharedString::from(format!("run-{tab_id}")))
-                .px_2()
-                .cursor_pointer()
-                .text_size(ms.small())
-                .bg(t.accent())
-                .text_color(t.inverted())
-                .child(SharedString::from(format!("{run_label} (↵)")))
+            btn(t, ms, format!("run-{tab_id}"), format!("{run_label} (↵)"), Btn::Primary)
                 .on_click(cx.listener(move |this, _, _, cx| {
                     this.sync_tab_from_inputs(tab_id, cx);
                     this.run_tab(tab_id);
@@ -7644,36 +7451,34 @@ impl Workspace {
                 .flex()
                 .items_center()
                 .gap_1()
-                .child(
-                    div()
-                        .id("prev")
-                        .px_2()
-                        .cursor_pointer()
-                        .text_size(ms.small())
-                        .text_color(if can_prev { t.fg() } else { t.disabled() })
-                        .child("◀")
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            this.page_by(-1);
-                            cx.notify();
-                        })),
-                )
+                .children(if can_prev {
+                    Some(
+                        btn(t, ms, "prev", "◀", Btn::Quiet)
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.page_by(-1);
+                                cx.notify();
+                            }))
+                            .into_any_element(),
+                    )
+                } else {
+                    Some(crate::widgets::btn_off(t, ms, "◀", Btn::Quiet).into_any_element())
+                })
                 .child(self.small(
                     format!("{}–{}", tab.from + 1, tab.from + tab.rows.len()),
                     t.muted(),
                 ))
-                .child(
-                    div()
-                        .id("next")
-                        .px_2()
-                        .cursor_pointer()
-                        .text_size(ms.small())
-                        .text_color(if can_next { t.fg() } else { t.disabled() })
-                        .child("▶")
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            this.page_by(1);
-                            cx.notify();
-                        })),
-                ),
+                .children(if can_next {
+                    Some(
+                        btn(t, ms, "next", "▶", Btn::Quiet)
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.page_by(1);
+                                cx.notify();
+                            }))
+                            .into_any_element(),
+                    )
+                } else {
+                    Some(crate::widgets::btn_off(t, ms, "▶", Btn::Quiet).into_any_element())
+                }),
         );
         if has_narrow {
             return div()
@@ -7710,14 +7515,7 @@ impl Workspace {
         for f in [Format::Csv, Format::Tsv, Format::Json] {
             let on = self.export_format == f;
             row = row.child(
-                div()
-                    .id(SharedString::from(format!("fmt-{}", f.label())))
-                    .px_1()
-                    .cursor_pointer()
-                    .text_size(ms.tiny())
-                    .text_color(if on { t.inverted() } else { t.muted() })
-                    .when(on, |d| d.bg(t.accent()))
-                    .child(SharedString::from(f.label()))
+                chip(t, ms, format!("fmt-{}", f.label()), f.label(), on)
                     .on_click(cx.listener(move |this, _, _, cx| {
                         // Keep the extension honest when the format changes.
                         let old = this.export_format.extension();
@@ -7734,14 +7532,7 @@ impl Workspace {
         }
 
         row.child(div().w(px(ms.base() * 18.0)).child(self.field(ms.small(), self.export_path.clone()))).child(
-            div()
-                .id("export-write")
-                .px_2()
-                .cursor_pointer()
-                .text_size(ms.small())
-                .bg(t.accent())
-                .text_color(t.inverted())
-                .child("Write")
+            btn(t, ms, "export-write", "Write", Btn::Primary)
                 .on_click(cx.listener(|this, _, _, cx| {
                     this.write_export(cx);
                     cx.notify();
@@ -7759,7 +7550,7 @@ impl Workspace {
             .map(|(i, c)| (i, c.name.clone()))
             .collect();
         if cols.is_empty() {
-            return div().p_3().child(self.small("no columns", t.muted())).into_any_element();
+            return div().p_3().child(self.small(self.tr("result.no_columns"), t.muted())).into_any_element();
         }
 
         let sort = tab.sort;
@@ -8260,14 +8051,7 @@ impl Workspace {
                     .py_1()
                     .child(self.small(format!("{} document(s)", tab.rows.len()), t.muted()))
                     .child(
-                        div()
-                            .id("tree-copy-all")
-                            .px_1()
-                            .cursor_pointer()
-                            .hover(|d| d.bg(t.hover_mark()))
-                            .text_size(ms.tiny())
-                            .text_color(t.accent())
-                            .child("copy all")
+                        btn(t, ms, "tree-copy-all", "copy all", Btn::Link)
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 cx.write_to_clipboard(gpui::ClipboardItem::new_string(all.clone()));
                                 this.toast("copied".to_string(), false);
@@ -8303,15 +8087,7 @@ impl Workspace {
                         format!("dp-{tab_id}-{i}"),
                     ))
                     .child(
-                        div()
-                            .id(SharedString::from(format!("dcopy-{tab_id}-{i}")))
-                            .flex_none()
-                            .px_1()
-                            .cursor_pointer()
-                            .hover(|d| d.bg(t.hover_mark()))
-                            .text_size(ms.tiny())
-                            .text_color(t.accent())
-                            .child("copy")
+                        btn(t, ms, format!("dcopy-{tab_id}-{i}"), "copy", Btn::Link)
                             .on_click(cx.listener({
                                 let text = serde_json::to_string_pretty(&doc)
                                     .unwrap_or_else(|_| "{}".into());
@@ -8359,13 +8135,7 @@ impl Workspace {
             .gap_2()
             .child(div().flex_1().child(self.field(ms.small(), input.clone())))
             .child(
-                div()
-                    .id("edit-ok")
-                    .px_1()
-                    .cursor_pointer()
-                    .text_size(ms.small())
-                    .text_color(t.accent())
-                    .child("\u{f00c}")
+                btn(t, ms, "edit-ok", "\u{f00c}", Btn::Link)
                     .on_click(cx.listener(move |this, _, _, cx| {
                         this.commit_edit(tab_id, cx);
                         cx.notify();
@@ -8589,14 +8359,7 @@ impl Workspace {
                 ));
             if can_edit && !editing {
                 head = head.child(
-                    div()
-                        .id(SharedString::from(format!("jedit-{tab_id}-{i}")))
-                        .px_1()
-                        .cursor_pointer()
-                        .hover(|d| d.bg(t.hover_mark()))
-                        .text_size(ms.tiny())
-                        .text_color(t.accent())
-                        .child("edit")
+                    btn(t, ms, format!("jedit-{tab_id}-{i}"), "edit", Btn::Link)
                         .on_click(cx.listener(move |this, _, _, cx| {
                             this.begin_doc_edit(tab_id, i, cx);
                         })),
@@ -8651,28 +8414,14 @@ impl Workspace {
                         .gap_2()
                         .py_1()
                         .child(
-                            div()
-                                .id(SharedString::from(format!("jsave-{tab_id}-{i}")))
-                                .px_2()
-                                .cursor_pointer()
-                                .border_1()
-                                .border_color(t.accent())
-                                .text_size(ms.small())
-                                .text_color(t.fg())
-                                .child("save this document")
+                            btn(t, ms, format!("jsave-{tab_id}-{i}"), "save this document", Btn::Secondary)
                                 .on_click(cx.listener(move |this, _, _, cx| {
                                     this.commit_doc_edit(tab_id, cx);
                                     cx.notify();
                                 })),
                         )
                         .child(
-                            div()
-                                .id(SharedString::from(format!("jcancel-{tab_id}-{i}")))
-                                .px_2()
-                                .cursor_pointer()
-                                .text_size(ms.small())
-                                .text_color(t.muted())
-                                .child("cancel")
+                            btn(t, ms, format!("jcancel-{tab_id}-{i}"), "cancel", Btn::Quiet)
                                 .on_click(cx.listener(move |this, _, _, cx| {
                                     if let Some(tb) =
                                         this.tabs.iter_mut().find(|x| x.id == tab_id)
@@ -8731,18 +8480,17 @@ impl Workspace {
                     div()
                         .flex()
                         .gap_2()
-                        .child(self.small("Background tasks", t.title()))
+                        .child(self.small(self.tr("tasks.title"), t.title()))
                         .child(self.small(
-                            format!("{failed} failed"),
+                            format!("{failed} {}", self.lang.tr("tasks.failed")),
                             if failed > 0 { t.error() } else { t.muted() },
                         )),
                 )
                 .child(
-                    div()
-                        .id("clear-finished")
-                        .text_size(ms.small())
-                        .text_color(t.muted())
-                        .child("Clear finished")
+                    // It had no `cursor_pointer` and no hover at all, so the
+                    // one thing in this header that DOES something was the one
+                    // thing that did not look like it.
+                    btn(t, ms, "clear-finished", self.tr("tasks.clear_finished"), Btn::Quiet)
                         .on_click(cx.listener(|this, _, _, cx| {
                             this.clear_finished();
                             cx.notify();
@@ -8816,9 +8564,9 @@ impl Workspace {
                 .px_3()
                 .py_1()
                 .cursor_pointer()
-                .child(self.small("Command", t.title()))
+                .child(self.small(self.tr("console.title"), t.title()))
                 .child(self.small(
-                    format!("runs against {target}, dangerous commands ask first"),
+                    format!("runs against {target}, {}", self.lang.tr("console.hint")),
                     t.muted(),
                 ))
                 .on_click(cx.listener(|this, _, _, cx| {
@@ -8858,14 +8606,7 @@ impl Workspace {
                                 .flex()
                                 .gap_2()
                                 .child(
-                                    div()
-                                        .id("confirm-run")
-                                        .px_2()
-                                        .cursor_pointer()
-                                        .text_size(ms.small())
-                                        .bg(t.error())
-                                        .text_color(t.inverted())
-                                        .child("Run it")
+                                    btn(t, ms, "confirm-run", self.tr("write.run_it"), Btn::Danger)
                                         .on_click(cx.listener(|this, _, _, cx| {
                                             if let Some((conn, stmt, _)) = this.confirm.take() {
                                                 this.run_statement_approved(&conn, &stmt, cx);
@@ -8875,13 +8616,7 @@ impl Workspace {
                                         })),
                                 )
                                 .child(
-                                    div()
-                                        .id("confirm-cancel")
-                                        .px_2()
-                                        .cursor_pointer()
-                                        .text_size(ms.small())
-                                        .text_color(t.muted())
-                                        .child("Cancel")
+                                    btn(t, ms, "confirm-cancel", "Cancel", Btn::Quiet)
                                         .on_click(cx.listener(|this, _, _, cx| {
                                             this.confirm = None;
                                             cx.notify();

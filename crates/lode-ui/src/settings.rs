@@ -19,6 +19,7 @@ use crate::app::Workspace;
 use crate::input::TextInput;
 use crate::metrics::Metrics;
 use crate::theme::Theme;
+use crate::widgets::{btn, Btn};
 
 /// What the window shows of the MAIN window's state.
 ///
@@ -163,18 +164,17 @@ pub struct SettingsWindow {
 impl SettingsWindow {
     pub fn new(
         workspace: WeakEntity<Workspace>,
-        theme: Theme,
-        scale: Metrics,
+        look: crate::widgets::Look,
         drivers: Vec<lode_proto::DriverMeta>,
         tunnels: Vec<crate::app::ProfileRow>,
         proxies: Vec<crate::app::ProfileRow>,
         about: Vec<(String, String)>,
-        fonts: (String, String),
         cx: &mut Context<Self>,
     ) -> Self {
+        let crate::widgets::Look { theme, scale, text_font, icon_font, lang } = look;
         let colors = crate::form::colors_of(&theme);
         let search = cx.new(|cx| TextInput::new(cx, "Search settings…", colors));
-        let theme_filter = cx.new(|cx| TextInput::new(cx, "Filter themes…", colors));
+        let theme_filter = cx.new(|cx| TextInput::new(cx, lang.tr("settings.filter_themes"), colors));
         let driver_shown = drivers.first().map(|d| d.kind.clone());
         SettingsWindow {
             workspace,
@@ -187,8 +187,8 @@ impl SettingsWindow {
             proxies,
             confirm_rm: None,
             theme_filter,
-            font_family: fonts.0,
-            icon_family: fonts.1,
+            font_family: text_font,
+            icon_family: icon_font,
             driver_shown,
             about,
         }
@@ -368,17 +368,11 @@ impl Render for SettingsWindow {
             .border_t_1()
             .border_color(t.border())
             .child(
-                div()
-                    .id("settings-close")
-                    .px_2()
-                    .cursor_pointer()
-                    .hover(|d| d.bg(t.hover_mark()))
-                    .text_size(ms.small())
-                    .text_color(t.muted())
-                    .child("Close")
-                    .on_click(cx.listener(|this, _, _, cx| {
+                btn(&t, ms, "settings-close", "Close", Btn::Secondary).on_click(cx.listener(
+                    |this, _, _, cx| {
                         let _ = this.workspace.update(cx, |w, cx| w.close_settings(cx));
-                    })),
+                    },
+                )),
             );
 
         div()
@@ -459,20 +453,10 @@ impl SettingsWindow {
         cx: &mut Context<Self>,
     ) -> gpui::Stateful<gpui::Div> {
         let (t, ms) = (&self.theme, self.scale);
-        div()
-            .id(SharedString::from(id))
-            .flex()
-            .items_center()
-            .justify_center()
-            .w(px(ms.base() * 1.8))
-            .h(px(ms.base() * 1.8))
-            .flex_none()
-            .cursor_pointer()
-            .bg(t.raised())
-            .hover(|d| d.bg(t.hover_mark()))
-            .text_size(ms.body())
-            .text_color(t.accent())
-            .child(label)
+        // A stepper's button is square — it holds one sign, not a word — so it
+        // is the shared control with its width pinned to its height.
+        crate::widgets::btn(t, ms, id, label, Btn::Secondary)
+            .w(px(ms.control_h()))
             .on_click(cx.listener(move |this, _, window, cx| on_press(this, window, cx)))
     }
 
@@ -486,22 +470,23 @@ impl SettingsWindow {
         cx: &mut Context<Self>,
     ) -> gpui::Stateful<gpui::Div> {
         let (t, ms) = (&self.theme, self.scale);
-        div()
-            .id(SharedString::from(id))
-            .px_2()
-            .flex_none()
-            .cursor_pointer()
-            .text_size(ms.body())
-            .text_color(if on { t.inverted() } else { t.fg() })
-            .when(on, |d| d.bg(t.accent()))
-            .hover(|d| d.bg(t.hover_mark()))
-            .child(label.into())
+        crate::widgets::chip(t, ms, id, label, on)
             .on_click(cx.listener(move |this, _, window, cx| on_press(this, window, cx)))
     }
 
     /// What the main window currently looks like. `None` only if it has gone.
     fn appearance(&self, cx: &gpui::App) -> Option<Appearance> {
         Some(self.workspace.upgrade()?.read(cx).appearance())
+    }
+
+    /// One phrase of the interface.
+    ///
+    /// The language comes off the SNAPSHOT rather than being stored here, so
+    /// there is nothing to keep in step: this window is where the language is
+    /// changed, and the row that changes it is drawn from the same read.
+    fn tr(&self, key: &str, cx: &gpui::App) -> SharedString {
+        let lang = self.appearance(cx).map(|a| a.lang).unwrap_or_default();
+        SharedString::from(lang.tr(key))
     }
 
     fn note(&self, text: impl Into<SharedString>) -> gpui::Div {
@@ -513,14 +498,7 @@ impl SettingsWindow {
     /// a driver CANNOT do is as much worth seeing as what it can — and a list
     /// that only shows the yeses cannot be scanned for a no.
     fn chip(&self, label: &'static str, on: bool) -> gpui::Div {
-        let (t, ms) = (&self.theme, self.scale);
-        div()
-            .px_1()
-            .text_size(ms.tiny())
-            .text_color(if on { t.inverted() } else { t.muted() })
-            .when(on, |d| d.bg(t.accent()))
-            .when(!on, |d| d.border_1().border_color(t.border()))
-            .child(label)
+        crate::widgets::flag(&self.theme, self.scale, label, on)
     }
 
     fn page(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
@@ -536,19 +514,17 @@ impl SettingsWindow {
                     let on = self.driver_shown.as_deref() == Some(d.kind.as_str());
                     let pick = d.kind.clone();
                     names = names.child(
-                        div()
-                            .id(SharedString::from(format!("drv-{}", d.kind)))
-                            .px_1()
-                            .cursor_pointer()
-                            .text_size(ms.tiny())
-                            .text_color(if on { t.inverted() } else { t.muted() })
-                            .when(on, |d2| d2.bg(t.accent()))
-                            .hover(|d2| d2.bg(t.hover_mark()))
-                            .child(SharedString::from(d.display.clone()))
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                this.driver_shown = Some(pick.clone());
-                                cx.notify();
-                            })),
+                        crate::widgets::chip(
+                            &t,
+                            ms,
+                            format!("drv-{}", d.kind),
+                            d.display.clone(),
+                            on,
+                        )
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.driver_shown = Some(pick.clone());
+                            cx.notify();
+                        })),
                     );
                 }
                 out = out.child(names);
@@ -596,20 +572,14 @@ impl SettingsWindow {
                 };
 
                 // ── the theme ───────────────────────────────────────────────
-                out = out.child(self.head("THEME"));
+                out = out.child(self.head(self.tr("settings.theme", cx).to_uppercase()));
                 out = out.child(
-                    div()
-                        .id("themes-rescan")
-                        .px_1()
-                        .cursor_pointer()
-                        .hover(|d| d.bg(t.hover_mark()))
-                        .text_size(ms.small())
-                        .text_color(t.accent())
-                        .child("look again")
-                        .on_click(cx.listener(|this, _, _, cx| {
+                    btn(&t, ms, "themes-rescan", self.tr("panel.rescan", cx), Btn::Quiet).on_click(cx.listener(
+                        |this, _, _, cx| {
                             let _ = this.workspace.update(cx, |w, cx| w.rescan_themes(cx));
                             cx.notify();
-                        })),
+                        },
+                    )),
                 );
                 // WHICH folders were read. "No themes" on its own is something
                 // nobody can act on.
@@ -623,7 +593,7 @@ impl SettingsWindow {
                         div()
                             .text_size(ms.small())
                             .text_color(t.warning())
-                            .child("no theme files were found in those folders"),
+                            .child(self.tr("settings.no_themes", cx)),
                     );
                     out = out.child(self.note("the built-in theme is the generated LvimBase_dark"));
                 }
@@ -684,12 +654,10 @@ impl SettingsWindow {
                 }
 
                 // ── the type ────────────────────────────────────────────────
-                out = out.child(self.head("TEXT AND ICONS"));
-                out = out.child(self.row("Text font", a.font_family.clone()));
-                out = out.child(self.row("Icon font", a.icon_family.clone()));
-                out = out.child(self.note(
-                    "$LODE_FONT and $LODE_ICON_FONT choose these; they are read at startup.",
-                ));
+                out = out.child(self.head(self.tr("settings.text", cx).to_uppercase()));
+                out = out.child(self.row(self.tr("settings.text_font", cx), a.font_family.clone()));
+                out = out.child(self.row(self.tr("settings.icon_font", cx), a.icon_family.clone()));
+                out = out.child(self.note(self.tr("settings.font_env", cx)));
 
                 // One number, and it moves everything: the steps, the grid row
                 // height, the rail. Adjusted while looking at the result, which
@@ -707,7 +675,7 @@ impl SettingsWindow {
                                 .flex_none()
                                 .text_size(ms.small())
                                 .text_color(t.muted())
-                                .child("Text size"),
+                                .child(self.tr("settings.text_size", cx)),
                         )
                         .child(self.step(
                             "text-less".into(),
@@ -738,20 +706,12 @@ impl SettingsWindow {
                             },
                             cx,
                         ))
-                        .child(
-                            div()
-                                .id("size-reset")
-                                .px_2()
-                                .cursor_pointer()
-                                .hover(|d| d.bg(t.hover_mark()))
-                                .text_size(ms.small())
-                                .text_color(t.muted())
-                                .child("reset")
-                                .on_click(cx.listener(|this, _, _, cx| {
-                                    let _ = this.workspace.update(cx, |w, cx| w.reset_scale(cx));
-                                    cx.notify();
-                                })),
-                        ),
+                        .child(btn(&t, ms, "size-reset", self.tr("settings.reset", cx), Btn::Quiet).on_click(
+                            cx.listener(|this, _, _, cx| {
+                                let _ = this.workspace.update(cx, |w, cx| w.reset_scale(cx));
+                                cx.notify();
+                            }),
+                        )),
                 );
                 // The rail is navigation and the text is content; enlarging one
                 // is not a request for the other, so they have their own rows.
@@ -768,7 +728,7 @@ impl SettingsWindow {
                                 .flex_none()
                                 .text_size(ms.small())
                                 .text_color(t.muted())
-                                .child("Icon size"),
+                                .child(self.tr("settings.icon_size", cx)),
                         )
                         .child(self.step(
                             "icon-less".into(),
@@ -815,7 +775,7 @@ impl SettingsWindow {
                 )));
 
                 // ── the language ────────────────────────────────────────────
-                out = out.child(self.head("LANGUAGE"));
+                out = out.child(self.head(self.tr("settings.language", cx).to_uppercase()));
                 let mut langs = div().flex().items_center().gap_2().py_1();
                 for l in crate::i18n::Lang::ALL.iter().copied() {
                     // Its own name, not its English one: somebody looking for
@@ -838,14 +798,14 @@ impl SettingsWindow {
                 ));
 
                 // ── what the window remembers ───────────────────────────────
-                out = out.child(self.head("APPEARANCE"));
+                out = out.child(self.head(self.tr("settings.json_indent", cx).to_uppercase()));
                 let mut inds = div().flex().items_center().gap_2().py_1().child(
                     div()
                         .w(px(ms.base() * 13.0))
                         .flex_none()
                         .text_size(ms.small())
                         .text_color(t.muted())
-                        .child("JSON indent"),
+                        .child(self.tr("settings.json_indent", cx)),
                 );
                 for n in [2u8, 3, 4] {
                     inds = inds.child(self.pick(
@@ -860,10 +820,7 @@ impl SettingsWindow {
                     ));
                 }
                 out = out.child(inds);
-                out = out.child(self.note(
-                    "the theme, the sizes, the language, the open tabs and this window's panel \
-                     are remembered in ~/.local/share/lode/session.json",
-                ));
+                out = out.child(self.note(self.tr("settings.remembers", cx)));
             }
             Category::Tunnels | Category::Proxies => {
                 let (rows, kind) = if self.category == Category::Tunnels {
@@ -878,14 +835,7 @@ impl SettingsWindow {
                     )));
                 }
                 out = out.child(
-                    div()
-                        .id(SharedString::from(format!("prof-new-{kind}")))
-                        .px_1()
-                        .cursor_pointer()
-                        .hover(|d| d.bg(t.hover_mark()))
-                        .text_size(ms.small())
-                        .text_color(t.accent())
-                        .child(SharedString::from(format!("+  new {kind}")))
+                    btn(&t, ms, format!("prof-new-{kind}"), format!("+  new {kind}"), Btn::Secondary)
                         .on_click(cx.listener(|this, _, _, cx| {
                             let _ = this.workspace.update(cx, |w, cx| w.open_profile(None, cx));
                             cx.notify();
@@ -926,15 +876,7 @@ impl SettingsWindow {
                             )
                             .child({
                                 let (n, sp) = (name.clone(), spec.clone());
-                                div()
-                                    .id(SharedString::from(format!("prof-ed-{kind}-{n}")))
-                                    .flex_none()
-                                    .px_1()
-                                    .cursor_pointer()
-                                    .hover(|d| d.bg(t.hover_mark()))
-                                    .text_size(ms.small())
-                                    .text_color(t.fg())
-                                    .child("edit")
+                                btn(&t, ms, format!("prof-ed-{kind}-{n}"), "edit", Btn::Link)
                                     .on_click(cx.listener(move |this, _, _, cx| {
                                         let (n, sp) = (n.clone(), sp.clone());
                                         let _ = this.workspace.update(cx, |w, cx| {
@@ -945,19 +887,11 @@ impl SettingsWindow {
                             })
                             .child({
                                 let n = name.clone();
-                                div()
-                                    .id(SharedString::from(format!("prof-rm-{kind}-{n}")))
-                                    .flex_none()
-                                    .px_1()
-                                    .cursor_pointer()
-                                    .hover(|d| d.bg(t.hover_mark()))
-                                    .text_size(ms.small())
-                                    .text_color(t.muted())
-                                    .child("remove")
-                                    // ASK first. The list of dependants is
-                                    // already here, so the warning can stand
-                                    // where the row is rather than arriving as
-                                    // a toast once it is too late.
+                                // ASK first. The list of dependants is already
+                                // here, so the warning can stand where the row
+                                // is rather than arriving as a toast once it is
+                                // too late.
+                                btn(&t, ms, format!("prof-rm-{kind}-{n}"), "remove", Btn::Quiet)
                                     .on_click(cx.listener(move |this, _, _, cx| {
                                         this.confirm_rm = Some((kind, n.clone()));
                                         cx.notify();
@@ -993,15 +927,7 @@ impl SettingsWindow {
                                 .gap_2()
                                 .py_1()
                                 .child(
-                                    div()
-                                        .id(SharedString::from(format!("prof-yes-{n}")))
-                                        .px_2()
-                                        .cursor_pointer()
-                                        .border_1()
-                                        .border_color(t.error())
-                                        .text_size(ms.small())
-                                        .text_color(t.fg())
-                                        .child("remove it")
+                                    btn(&t, ms, format!("prof-yes-{n}"), "remove it", Btn::Danger)
                                         .on_click(cx.listener({
                                             let n = n.clone();
                                             move |this, _, _, cx| {
@@ -1015,13 +941,7 @@ impl SettingsWindow {
                                         })),
                                 )
                                 .child(
-                                    div()
-                                        .id(SharedString::from(format!("prof-no-{n}")))
-                                        .px_2()
-                                        .cursor_pointer()
-                                        .text_size(ms.small())
-                                        .text_color(t.muted())
-                                        .child("keep it")
+                                    btn(&t, ms, format!("prof-no-{n}"), "keep it", Btn::Quiet)
                                         .on_click(cx.listener(|this, _, _, cx| {
                                             this.confirm_rm = None;
                                             cx.notify();

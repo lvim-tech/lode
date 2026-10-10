@@ -20,6 +20,7 @@ use crate::form::{path_problem, pick_file, tunnel_auth_json, Field, Source};
 use crate::input::TextInput;
 use crate::metrics::Metrics;
 use crate::theme::Theme;
+use crate::widgets::{btn, chip, Btn};
 
 pub struct ProfileForm {
     workspace: WeakEntity<Workspace>,
@@ -47,13 +48,12 @@ pub struct ProfileForm {
 impl ProfileForm {
     pub fn new(
         workspace: WeakEntity<Workspace>,
-        theme: Theme,
-        scale: Metrics,
+        look: crate::widgets::Look,
         existing: Option<(String, Value)>,
         users: Vec<String>,
-        font_family: String,
         cx: &mut Context<Self>,
     ) -> Self {
+        let crate::widgets::Look { theme, scale, text_font: font_family, .. } = look;
         let colors = crate::form::colors_of(&theme);
         let mk = |cx: &mut Context<Self>, ph: &str, val: &str| {
             let (ph, val) = (ph.to_string(), val.to_string());
@@ -252,18 +252,12 @@ impl Render for ProfileForm {
         for a in ["agent", "key", "password"] {
             let on = self.auth == a;
             methods = methods.child(
-                div()
-                    .id(SharedString::from(format!("pauth-{a}")))
-                    .px_1()
-                    .cursor_pointer()
-                    .text_size(ms.tiny())
-                    .text_color(if on { t.inverted() } else { t.muted() })
-                    .when(on, |d| d.bg(t.accent()))
-                    .child(a)
-                    .on_click(cx.listener(move |this, _, _, cx| {
+                chip(&t, ms, format!("pauth-{a}"), a, on).on_click(cx.listener(
+                    move |this, _, _, cx| {
                         this.auth = a.to_string();
                         cx.notify();
-                    })),
+                    },
+                )),
             );
         }
         body = body.child(methods);
@@ -288,17 +282,7 @@ impl Render for ProfileForm {
                     )
                     .child(div().flex_1().text_size(ms.body()).child(self.key_path.clone()))
                     .child(
-                        div()
-                            .id("pick-profile-key")
-                            .flex_none()
-                            .px_2()
-                            .cursor_pointer()
-                            .border_1()
-                            .border_color(t.border())
-                            .hover(|d| d.bg(t.hover_mark()))
-                            .text_size(ms.small())
-                            .text_color(t.fg())
-                            .child("browse\u{2026}")
+                        btn(&t, ms, "pick-profile-key", "browse\u{2026}", Btn::Secondary)
                             .on_click(cx.listener(move |_this, _, _, cx| {
                                 let me = cx.entity().downgrade();
                                 pick_file(
@@ -365,28 +349,15 @@ impl Render for ProfileForm {
             .border_t_1()
             .border_color(t.border())
             .child(
-                div()
-                    .id("profile-save")
-                    .px_2()
-                    .cursor_pointer()
-                    .border_1()
-                    .border_color(t.accent())
-                    .text_size(ms.small())
-                    .text_color(t.fg())
-                    .child("Save")
+                btn(&t, ms, "profile-save", "Save", Btn::Primary)
                     .on_click(cx.listener(|this, _, _, cx| this.save(cx))),
             )
             .child(
-                div()
-                    .id("profile-cancel")
-                    .px_2()
-                    .cursor_pointer()
-                    .text_size(ms.small())
-                    .text_color(t.muted())
-                    .child("Cancel")
-                    .on_click(cx.listener(|this, _, _, cx| {
+                btn(&t, ms, "profile-cancel", "Cancel", Btn::Quiet).on_click(cx.listener(
+                    |this, _, _, cx| {
                         let _ = this.workspace.update(cx, |w, cx| w.close_profile(cx));
-                    })),
+                    },
+                )),
             );
 
         div()

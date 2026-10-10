@@ -112,6 +112,53 @@ impl Lang {
 /// English, and the list of keys every other language must match.
 #[rustfmt::skip]
 const EN: &[(&str, &str)] = &[
+    // The connection and tunnel windows.
+    ("form.required",      "Fields marked * are required"),
+    ("form.name",          "Name"),
+    ("form.tab_main",      "Main"),
+    ("form.tab_access",    "Access (SSH)"),
+    ("form.tab_settings",  "Settings"),
+    ("form.auth",          "Authentication"),
+    ("form.provider",      "Provider"),
+    ("form.token",         "Token"),
+    ("form.password",      "Password"),
+    ("form.ssl_mode",      "SSL mode"),
+    ("form.ca_bundle",     "CA bundle"),
+    ("form.certificate",   "Certificate"),
+    ("form.client_cert",   "Client cert"),
+    ("form.client_key",    "Client key"),
+    ("form.key",           "Key"),
+    ("form.key_file",      "Key file"),
+    ("form.tunnel",        "Tunnel"),
+    ("form.ssh",           "SSH"),
+    ("form.ssh_tunnel",    "SSH tunnel"),
+    ("form.ssh_host",      "SSH host"),
+    ("form.ssh_port",      "SSH port"),
+    ("form.ssh_user",      "SSH user"),
+    ("form.goes_through",  "Goes through"),
+    ("form.method",        "Method"),
+    ("form.own",           "this connection's own"),
+    ("form.browse",        "browse…"),
+    ("form.test_conn",     "Test connection"),
+    ("form.save",          "Save"),
+    ("form.save_profile",  "Save as profile"),
+    ("form.edit_tunnel",   "edit this tunnel"),
+    ("form.policy_heading", "WHAT THIS CONNECTION MAY DO"),
+    ("form.policy_read",   "Read only"),
+    ("form.policy_read_why", "refuses anything that changes the database — an INSERT as firmly as a DROP"),
+    ("form.policy_confirm", "Asks first"),
+    ("form.policy_confirm_why", "writes are allowed; the dangerous ones have to be confirmed"),
+    ("form.policy_open",   "Unrestricted"),
+    ("form.policy_open_why", "everything runs — for a scratch database where the asking is the nuisance"),
+    ("form.policy_note",   "Held by the engine, not by this window: a client that skips its own confirmation still cannot get past it."),
+    ("form.plaintext_note", "the link will be PLAINTEXT — the engine warns on every connect"),
+    ("form.passphrase_note", "Leave the passphrase empty for a key that has none."),
+    ("form.no_tunnels",    "No saved tunnels yet. Fill these in and press \"save as profile\" to reuse them in another connection."),
+    ("form.profile_note",  "These values live in the profile. Changing them there changes every connection that uses it."),
+    ("form.save_over_note", "Saving over a name replaces it — one bastion, one entry, changed in one place."),
+    ("form.no_aws",        "No AWS profiles were found — type a name, or check that ~/.aws/config is where the engine looks."),
+    ("form.token_note",    "The token is what connects. The provider name is stored with the connection and is not resolved by the engine today."),
+    ("form.source_note",   "Literal is stored as typed. Env, Command and Keyring are resolved by the engine at connect time, so the secret never reaches this window."),
     // The icon rail.
     ("rail.connections", "Connections"),
     ("rail.instance",    "Instance"),
@@ -142,7 +189,6 @@ const EN: &[(&str, &str)] = &[
     ("settings.text_size",  "Text size"),
     ("settings.icon_size",  "Icon size"),
     ("tip.edit_conn", "Edit connection"),
-    ("tip.new_conn", "New connection"),
     ("tip.close_tab", "Close tab"),
     ("tip.remove_tile", "Remove this tile"),
     ("tip.close_detail", "Close the detail"),
@@ -150,7 +196,7 @@ const EN: &[(&str, &str)] = &[
     ("tip.new_board", "New dashboard"),
     ("tip.open_board", "Open dashboard"),
     ("tip.reveal", "Show the value"),
-    ("tip.instance", "Instance"),
+    ("tip.hide", "Hide the value"),
     ("tip.link_tls", "encrypted (TLS)"),
     ("tip.stop_task", "Stop this statement"),
     ("result.name_it", "name this"),
@@ -162,14 +208,13 @@ const EN: &[(&str, &str)] = &[
     ("tip.link_tunnel", "encrypted (SSH tunnel)"),
     ("tip.link_plain", "PLAINTEXT — anyone on the wire can read this"),
     ("toast.plaintext", "plaintext connection: credentials and rows go over the wire unencrypted"),
-    ("settings.group_type", "Text and icons"),
-    ("settings.group_view", "Appearance"),
-    ("settings.group_profiles", "Profiles"),
     ("settings.filter_themes", "Filter themes…"),
-    ("tip.remove_profile", "Remove this profile"),
-    ("tip.edit_profile", "Edit this profile"),
     ("panel.rescan",      "Rescan theme folders"),
     ("settings.json_indent", "JSON indent"),
+    ("settings.text_font",  "Text font"),
+    ("settings.icon_font",  "Icon font"),
+    ("settings.remembers",  "the theme, the sizes, the language, the open tabs and this window's panel are remembered in ~/.local/share/lode/session.json"),
+    ("settings.font_env",   "$LODE_FONT and $LODE_ICON_FONT choose these; they are read at startup."),
     ("settings.language",   "Language"),
     ("settings.text",       "Text"),
     ("settings.reset",      "reset"),
@@ -178,6 +223,7 @@ const EN: &[(&str, &str)] = &[
     ("result.empty_title", "Click a table or a collection to open it."),
     ("result.empty_hint",  "Its rows appear here — the statement comes from the driver, not from you."),
     ("result.run",         "Run"),
+    ("result.find",        "Find"),
     ("result.cancel",      "Cancel"),
     ("result.export",      "Export"),
     ("result.save_query",  "Save query"),
@@ -219,6 +265,52 @@ const EN: &[(&str, &str)] = &[
 /// translation.
 #[rustfmt::skip]
 const BG: &[(&str, &str)] = &[
+    ("form.required",      "Полетата с * са задължителни"),
+    ("form.name",          "Име"),
+    ("form.tab_main",      "Основни"),
+    ("form.tab_access",    "Достъп (SSH)"),
+    ("form.tab_settings",  "Настройки"),
+    ("form.auth",          "Удостоверяване"),
+    ("form.provider",      "Доставчик"),
+    ("form.token",         "Токен"),
+    ("form.password",      "Парола"),
+    ("form.ssl_mode",      "SSL режим"),
+    ("form.ca_bundle",     "CA пакет"),
+    ("form.certificate",   "Сертификат"),
+    ("form.client_cert",   "Клиентски сертификат"),
+    ("form.client_key",    "Клиентски ключ"),
+    ("form.key",           "Ключ"),
+    ("form.key_file",      "Файл с ключ"),
+    ("form.tunnel",        "Тунел"),
+    ("form.ssh",           "SSH"),
+    ("form.ssh_tunnel",    "SSH тунел"),
+    ("form.ssh_host",      "SSH хост"),
+    ("form.ssh_port",      "SSH порт"),
+    ("form.ssh_user",      "SSH потребител"),
+    ("form.goes_through",  "Минава през"),
+    ("form.method",        "Метод"),
+    ("form.own",           "собствен на тази връзка"),
+    ("form.browse",        "избери…"),
+    ("form.test_conn",     "Провери връзката"),
+    ("form.save",          "Запази"),
+    ("form.save_profile",  "Запази като профил"),
+    ("form.edit_tunnel",   "редактирай този тунел"),
+    ("form.policy_heading", "КАКВО Е ПОЗВОЛЕНО НА ТАЗИ ВРЪЗКА"),
+    ("form.policy_read",   "Само четене"),
+    ("form.policy_read_why", "отказва всичко, което променя базата — INSERT толкова категорично, колкото DROP"),
+    ("form.policy_confirm", "Пита първо"),
+    ("form.policy_confirm_why", "писането е позволено; опасните неща се потвърждават"),
+    ("form.policy_open",   "Без ограничения"),
+    ("form.policy_open_why", "всичко минава — за черновова база, където питането е пречка"),
+    ("form.policy_note",   "Държи го двигателят, не този прозорец: клиент, който пропусне своето потвърждение, пак не може да го заобиколи."),
+    ("form.plaintext_note", "връзката ще е НЕШИФРОВАНА — двигателят предупреждава при всяко свързване"),
+    ("form.passphrase_note", "Остави паролата на ключа празна, ако ключът няма такава."),
+    ("form.no_tunnels",    "Още няма запазени тунели. Попълни тези полета и натисни „запази като профил“, за да ги ползваш и в друга връзка."),
+    ("form.profile_note",  "Тези стойности живеят в профила. Промяната им там променя всяка връзка, която го ползва."),
+    ("form.save_over_note", "Запазване върху същото име го подменя — един бастион, един запис, сменя се на едно място."),
+    ("form.no_aws",        "Не са намерени AWS профили — напиши име или провери дали ~/.aws/config е там, където двигателят гледа."),
+    ("form.token_note",    "Токенът е това, което свързва. Името на доставчика се пази с връзката и днес двигателят не го разрешава."),
+    ("form.source_note",   "„Literal“ се пази както е въведено. „Env“, „Command“ и „Keyring“ се разрешават от двигателя при свързване, тоест тайната никога не стига до този прозорец."),
     ("rail.connections", "Връзки"),
     ("rail.instance",    "Сървър"),
     ("rail.history",     "История"),
@@ -248,7 +340,6 @@ const BG: &[(&str, &str)] = &[
     ("settings.text_size",  "Размер на текста"),
     ("settings.icon_size",  "Размер на иконите"),
     ("tip.edit_conn", "Редактирай връзката"),
-    ("tip.new_conn", "Нова връзка"),
     ("tip.close_tab", "Затвори таба"),
     ("tip.remove_tile", "Премахни плочката"),
     ("tip.close_detail", "Затвори подробностите"),
@@ -256,7 +347,7 @@ const BG: &[(&str, &str)] = &[
     ("tip.new_board", "Ново табло"),
     ("tip.open_board", "Отвори табло"),
     ("tip.reveal", "Покажи стойността"),
-    ("tip.instance", "Инстанция"),
+    ("tip.hide", "Скрий стойността"),
     ("tip.link_tls", "шифрована (TLS)"),
     ("tip.stop_task", "Спри тази заявка"),
     ("result.name_it", "име на"),
@@ -268,14 +359,13 @@ const BG: &[(&str, &str)] = &[
     ("tip.link_tunnel", "шифрована (SSH тунел)"),
     ("tip.link_plain", "НЕШИФРОВАНА — всеки по пътя може да я чете"),
     ("toast.plaintext", "нешифрована връзка: паролата и редовете минават по мрежата открити"),
-    ("settings.group_type", "Текст и икони"),
-    ("settings.group_view", "Изглед"),
-    ("settings.group_profiles", "Профили"),
     ("settings.filter_themes", "Филтър по теми…"),
-    ("tip.remove_profile", "Премахни профила"),
-    ("tip.edit_profile", "Редактирай профила"),
     ("panel.rescan",      "Опресни списъка с теми"),
     ("settings.json_indent", "Отстъп в JSON"),
+    ("settings.text_font",  "Шрифт за текста"),
+    ("settings.icon_font",  "Шрифт за иконите"),
+    ("settings.remembers",  "темата, размерите, езикът, отворените табове и панелът на този прозорец се помнят в ~/.local/share/lode/session.json"),
+    ("settings.font_env",   "$LODE_FONT и $LODE_ICON_FONT ги избират; четат се при стартиране."),
     ("settings.language",   "Език"),
     ("settings.text",       "Текст"),
     ("settings.reset",      "по подразбиране"),
@@ -284,6 +374,7 @@ const BG: &[(&str, &str)] = &[
     ("result.empty_title", "Щракни върху таблица или колекция, за да я отвориш."),
     ("result.empty_hint",  "Редовете ѝ се появяват тук — заявката идва от драйвера, не от теб."),
     ("result.run",         "Изпълни"),
+    ("result.find",        "Намери"),
     ("result.cancel",      "Отказ"),
     ("result.export",      "Износ"),
     ("result.save_query",  "Запази заявката"),
@@ -353,16 +444,28 @@ mod tests {
     }
 
     /// A translation that is still the English word is usually a line somebody
-    /// forgot. Not an error — "Instance" and some proper nouns legitimately
-    /// stay — but it must be a short, deliberate list rather than a drift.
+    /// forgot. Not an error — a proper noun legitimately stays — but it must be
+    /// a short, DELIBERATE list rather than a drift.
     #[test]
     fn bulgarian_is_actually_translated() {
+        // `SSH` is a protocol's name. It is the same four letters in Bulgarian
+        // prose, and transliterating it would make the Access tab say something
+        // nobody writes.
+        const SAME_ON_PURPOSE: [&str; 1] = ["form.ssh"];
         let same: Vec<&str> = BG
             .iter()
             .filter(|(k, v)| EN.iter().any(|(ek, ev)| ek == k && ev == v))
             .map(|(k, _)| *k)
+            .filter(|k| !SAME_ON_PURPOSE.contains(k))
             .collect();
         assert!(same.is_empty(), "left in English: {same:?}");
+        // And the list stays honest: a key on it that HAS been translated is a
+        // line nobody took off again.
+        for k in SAME_ON_PURPOSE {
+            let en = EN.iter().find(|(ek, _)| *ek == k).map(|(_, v)| *v);
+            let bg = BG.iter().find(|(bk, _)| *bk == k).map(|(_, v)| *v);
+            assert_eq!(en, bg, "{k} is translated now — take it off the list");
+        }
     }
 
     #[test]
