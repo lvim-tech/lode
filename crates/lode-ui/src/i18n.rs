@@ -268,6 +268,11 @@ const EN: &[(&str, &str)] = &[
     ("tasks.clear_finished", "Clear finished"),
     ("tasks.failed",         "failed"),
     ("console.title",        "Command"),
+    ("bottom.log",           "Log"),
+    ("empty.log",            "nothing in the log"),
+    ("empty.log_hint",       "warnings and failures this window could not show anywhere else land here"),
+    ("bottom.running",       "running"),
+    ("bottom.unread",        "unread"),
     ("console.hint",         "dangerous commands ask first"),
 ];
 
@@ -432,6 +437,11 @@ const BG: &[(&str, &str)] = &[
     ("tasks.clear_finished", "Изчисти завършилите"),
     ("tasks.failed",         "провалени"),
     ("console.title",        "Команда"),
+    ("bottom.log",           "Дневник"),
+    ("empty.log",            "дневникът е празен"),
+    ("empty.log_hint",       "предупрежденията и провалите, които прозорецът няма къде друго да каже, идват тук"),
+    ("bottom.running",       "вървят"),
+    ("bottom.unread",        "непрочетени"),
     ("console.hint",         "опасните команди питат първо"),
 ];
 

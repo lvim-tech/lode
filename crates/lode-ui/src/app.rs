@@ -412,12 +412,11 @@ pub fn report_panels(cx: &gpui::App) {
     // lists sharing one height.
     println!("panels that return their own list: connections, instance, history, audit, tasks");
     println!("it cannot see the layout.");
-    println!("LODE_THEMES picks how the theme list is laid out (default: flat):");
-    println!("  outer   [A] panel does NOT scroll; the theme box does — side by side");
-    println!("  flat    [B] every theme in the panel's own list, no box, no cap");
-    println!("  closed  [C] as B, but the theme group starts shut");
-    println!("  nested  [D] panel scrolls AND the box scrolls — the real request");
-    println!("  uniform [E] a uniform_list of fixed height — manages its own window");
+    // `LODE_THEMES` and its five layouts were listed here. They were ways to
+    // arrange a theme list inside a NARROW COLUMN, and the column is gone: the
+    // list lives in the settings window, where it is simply a list.
+    let (dw, dh) = (ms.panel_w(), f32::from(ms.line_h()) * 7.0);
+    println!("bottom drawer {dh:.0} px tall; panel {dw:.0} px wide");
     let _ = cx;
 }
 
@@ -560,6 +559,32 @@ impl NameFor {
         match self {
             NameFor::Query => "query",
             NameFor::Chart => "chart",
+        }
+    }
+}
+
+/// A page of the bottom drawer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Drawer {
+    Tasks,
+    Log,
+    Command,
+}
+
+impl Drawer {
+    fn key(self) -> &'static str {
+        match self {
+            Drawer::Tasks => "tasks.title",
+            Drawer::Log => "bottom.log",
+            Drawer::Command => "console.title",
+        }
+    }
+
+    fn id(self) -> &'static str {
+        match self {
+            Drawer::Tasks => "tasks",
+            Drawer::Log => "log",
+            Drawer::Command => "command",
         }
     }
 }
@@ -858,7 +883,14 @@ pub struct Workspace {
 
     tasks: Vec<Task>,
     next_task: u64,
-    tasks_open: bool,
+    /// Which page of the bottom drawer is open, if any.
+    ///
+    /// ONE strip instead of three. The console had its own bar with its own
+    /// heading, the tasks had another, and the status line a third — so between
+    /// a quarter and a third of the window's height was chrome saying what it
+    /// was rather than showing anything, and all three were there whether they
+    /// held anything or not.
+    drawer: Option<Drawer>,
 
     rail: Rail,
     status: String,
@@ -877,7 +909,6 @@ pub struct Workspace {
 
     /// The console: a line typed straight at a connection.
     console: Entity<TextInput>,
-    console_open: bool,
     history: Vec<HistoryRow>,
     /// The history panel's own search box.
     history_filter: Entity<TextInput>,
@@ -1105,7 +1136,7 @@ impl Workspace {
             call_tasks: HashMap::new(),
             tasks: Vec::new(),
             next_task: 1,
-            tasks_open: true,
+            drawer: None,
             rail: Rail::Connections,
             status: "starting the engine…".into(),
             log: std::collections::VecDeque::new(),
@@ -1113,7 +1144,6 @@ impl Workspace {
             filter,
             inputs: HashMap::new(),
             console,
-            console_open: true,
             history: Vec::new(),
             history_filter,
             audit: Vec::new(),
@@ -3507,7 +3537,12 @@ impl Workspace {
             }
             PaletteAct::ToggleExport => self.export_open = !self.export_open,
             PaletteAct::SaveQuery => self.save_query(cx),
-            PaletteAct::ToggleConsole => self.console_open = !self.console_open,
+            PaletteAct::ToggleConsole => {
+                self.drawer = match self.drawer {
+                    Some(Drawer::Command) => None,
+                    _ => Some(Drawer::Command),
+                }
+            }
             PaletteAct::NewConnection => self.open_form(None, cx),
             PaletteAct::NewProfile => self.open_profile(None, cx),
             PaletteAct::EditProfile(name) => {
@@ -5277,6 +5312,20 @@ impl Workspace {
             }
             Rail::Tasks => {
                 panel = panel.child(self.section(&format!("Tasks ({})", self.tasks.len())));
+                // It lived on the tasks strip, which the bottom drawer replaced.
+                // The panel is where the whole list is, so it is where emptying
+                // it belongs.
+                if self.tasks.iter().any(|x| !x.running()) {
+                    panel = panel.child(
+                        div().px_2().py_1().child(
+                            btn(t, ms, "clear-finished", self.tr("tasks.clear_finished"), Btn::Quiet)
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.clear_finished();
+                                    cx.notify();
+                                })),
+                        ),
+                    );
+                }
                 if self.tasks.is_empty() && self.log.is_empty() {
                     return panel.child(self.empty_state("empty.tasks", "empty.tasks_hint"));
                 }
@@ -8769,184 +8818,207 @@ impl Workspace {
         out.into_any_element()
     }
 
-    fn tasks_el(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let t = self.t();
-        let ms = self.scale;
-        let failed = self.tasks.iter().filter(|x| x.failed()).count();
-        let mut panel = div()
+    /// The bottom: one status line, and a drawer under it when something is
+    /// asked for.
+    ///
+    /// THREE STRIPS BECAME ONE. The console carried its own bar with its own
+    /// heading, the tasks another, the status line a third — all three present
+    /// whether they held anything or not, which at the default text size was
+    /// about a fifth of the window spent saying what the strips were rather
+    /// than showing anything. The counters in the status line are the way in:
+    /// they say how much there is and open the page that holds it.
+    fn bottom_el(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let (t, ms) = (self.t(), self.scale);
+        let mut out = div().flex().flex_col().w_full().flex_none();
+        let Some(which) = self.drawer else {
+            return out.child(self.status_el(cx));
+        };
+
+        // The page chooser, and a way out of it.
+        let mut tabs = div()
             .flex()
-            .flex_col()
+            .items_center()
+            .gap_2()
             .w_full()
+            .px_3()
+            .py_1()
+            .flex_none()
             .bg(t.panel())
             .border_t_1()
             .border_color(t.border());
-
-        panel = panel.child(
-            div()
-                .id("tasks-header")
-                .flex()
-                .items_center()
-                .justify_between()
-                .px_3()
-                .py_1()
-                .cursor_pointer()
-                .child(
-                    div()
-                        .flex()
-                        .gap_2()
-                        .child(self.small(self.tr("tasks.title"), t.title()))
-                        .child(self.small(
-                            format!("{failed} {}", self.lang.tr("tasks.failed")),
-                            if failed > 0 { t.error() } else { t.muted() },
-                        )),
-                )
-                .child(
-                    // It had no `cursor_pointer` and no hover at all, so the
-                    // one thing in this header that DOES something was the one
-                    // thing that did not look like it.
-                    btn(t, ms, "clear-finished", self.tr("tasks.clear_finished"), Btn::Quiet)
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            this.clear_finished();
-                            cx.notify();
-                        })),
-                )
-                .on_click(cx.listener(|this, _, _, cx| {
-                    this.tasks_open = !this.tasks_open;
-                    cx.notify();
-                })),
-        );
-
-        if self.tasks_open {
-            for task in self.tasks.iter().rev().take(6) {
-                panel = panel.child(
-                    div()
-                        .flex()
-                        .flex_col()
-                        .px_3()
-                        .py(px(1.0))
-                        .child(
-                            div()
-                                .flex()
-                                .gap_2()
-                                .child(self.small(
-                                    task.label.clone(),
-                                    if task.failed() { t.error() } else { t.fg() },
-                                ))
-                                .child(self.small(fmt_duration(task.duration()), t.muted())),
-                        )
-                        // A failure keeps its WHOLE message, expanded: the point
-                        // of keeping a failed task is that it is read.
-                        .when_some(task.error.clone(), |d, e| {
-                            d.child(
-                                div()
-                                    .pl_3()
-                                    .text_size(ms.tiny())
-                                    .text_color(t.error())
-                                    .child(SharedString::from(e)),
-                            )
-                        }),
-                );
-            }
-        }
-        panel
-    }
-
-    /// The console: a prompt named after what it runs against, one line, and —
-    /// when the engine says the line destroys something — its reason and two
-    /// buttons. Nothing runs from here without that answer.
-    fn console_el(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let t = self.t();
-        let ms = self.scale;
-        // The same answer the line will be sent to, so the header cannot say one
-        // database while the statement goes to another.
-        let target = self.target_conn().unwrap_or_else(|| "nothing connected".into());
-
-        let mut panel = div()
-            .flex()
-            .flex_col()
-            .w_full()
-            .bg(t.panel())
-            .border_t_1()
-            .border_color(t.border());
-
-        panel = panel.child(
-            div()
-                .id("console-header")
-                .flex()
-                .items_center()
-                .gap_2()
-                .px_3()
-                .py_1()
-                .cursor_pointer()
-                .child(self.small(self.tr("console.title"), t.title()))
-                .child(self.small(
-                    format!("runs against {target}, {}", self.lang.tr("console.hint")),
-                    t.muted(),
-                ))
-                .on_click(cx.listener(|this, _, _, cx| {
-                    this.console_open = !this.console_open;
-                    cx.notify();
-                })),
-        );
-
-        if self.console_open {
-            panel = panel.child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap_2()
-                    .px_3()
-                    .pb_1()
-                    .child(self.small(format!("{target}>"), t.accent()))
-                    .child(div().flex_1().child(self.field(ms.small(), self.console.clone()))),
+        for page in [Drawer::Tasks, Drawer::Log, Drawer::Command] {
+            tabs = tabs.child(
+                chip(t, ms, format!("drawer-{}", page.id()), self.tr(page.key()), page == which)
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.drawer = Some(page);
+                        if page == Drawer::Log {
+                            this.log_unread = 0;
+                        }
+                        cx.notify();
+                    })),
             );
+        }
+        tabs = tabs.child(div().flex_1()).child(
+            btn(t, ms, "drawer-close", "\u{f00d}", Btn::Quiet).on_click(cx.listener(
+                |this, _, _, cx| {
+                    this.drawer = None;
+                    cx.notify();
+                },
+            )),
+        );
+        out = out.child(tabs);
 
-            // The confirmation. The REASON is the sentence, not a title bar.
-            if let Some((_, statement, reason)) = &self.confirm {
-                panel = panel.child(
+        // The page itself, at a FIXED height. A drawer that grows with its
+        // content takes the result's room without being asked, and the result
+        // is what the window is for.
+        let mut body = div()
+            .id("drawer-body")
+            .flex()
+            .flex_col()
+            .w_full()
+            .h(px(f32::from(ms.line_h()) * 7.0))
+            .flex_none()
+            .overflow_y_scroll()
+            .bg(t.panel())
+            .px_3()
+            .py_1();
+        match which {
+            Drawer::Tasks => {
+                if self.tasks.is_empty() {
+                    body = body.child(self.empty_state("empty.tasks", "empty.tasks_hint"));
+                }
+                for task in self.tasks.iter().rev() {
+                    let (id, running, call) = (task.id, task.running(), task.call_id);
+                    let mut row = div()
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .w_full()
+                        .child(self.line_in(
+                            task.label.clone(),
+                            ms.small(),
+                            if task.failed() { t.error() } else { t.fg() },
+                            ms.base() * 20.0,
+                        ))
+                        .child(self.small(fmt_duration(task.duration()), t.muted()));
+                    // Stoppable from here too: this is where somebody looks
+                    // when something is taking too long.
+                    if let (true, Some(call_id)) = (running, call) {
+                        row = row.child(
+                            btn(t, ms, format!("drawer-stop-{id}"), "\u{f00d}", Btn::Quiet)
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.ask(
+                                        Pending::Ignore("cancel"),
+                                        "query.cancel",
+                                        json!({ "call_id": call_id }),
+                                    );
+                                    cx.notify();
+                                })),
+                        );
+                    }
+                    body = body.child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .w_full()
+                            .child(row)
+                            // A failure keeps its WHOLE message: the point of
+                            // keeping a failed task is that it is read.
+                            .when_some(task.error.clone(), |d, e| {
+                                d.child(
+                                    div()
+                                        .pl_3()
+                                        .text_size(ms.tiny())
+                                        .text_color(t.error())
+                                        .child(SharedString::from(e)),
+                                )
+                            }),
+                    );
+                }
+            }
+            Drawer::Log => {
+                if self.log.is_empty() {
+                    body = body.child(self.empty_state("empty.log", "empty.log_hint"));
+                }
+                for (level, text) in self.log.iter().rev() {
+                    let colour = match level.as_str() {
+                        "error" => t.error(),
+                        "warn" => t.warning(),
+                        _ => t.muted(),
+                    };
+                    body = body.child(
+                        div()
+                            .w_full()
+                            .text_size(ms.small())
+                            .text_color(colour)
+                            .child(SharedString::from(text.clone())),
+                    );
+                }
+            }
+            Drawer::Command => {
+                // The same answer the line will be sent to, so the prompt
+                // cannot name one database while the statement goes to another.
+                let target = self.target_conn().unwrap_or_else(|| "nothing connected".into());
+                body = body.child(
                     div()
                         .flex()
-                        .flex_col()
-                        .gap_1()
-                        .mx_3()
-                        .mb_1()
-                        .p_2()
-                        .border_1()
-                        .border_color(t.error())
-                        .child(self.small(reason.clone(), t.error()))
-                        .child(self.small(statement.clone(), t.fg()))
-                        .child(
-                            div()
-                                .flex()
-                                .gap_2()
-                                .child(
-                                    btn(t, ms, "confirm-run", self.tr("write.run_it"), Btn::Danger)
-                                        .on_click(cx.listener(|this, _, _, cx| {
-                                            if let Some((conn, stmt, _)) = this.confirm.take() {
-                                                this.run_statement_approved(&conn, &stmt, cx);
-                                                this.console.update(cx, |i, cx| i.set_text("", cx));
-                                            }
-                                            cx.notify();
-                                        })),
-                                )
-                                .child(
-                                    btn(t, ms, "confirm-cancel", "Cancel", Btn::Quiet)
-                                        .on_click(cx.listener(|this, _, _, cx| {
-                                            this.confirm = None;
-                                            cx.notify();
-                                        })),
-                                ),
-                        ),
+                        .items_center()
+                        .gap_2()
+                        .w_full()
+                        .child(self.small(format!("{target}>"), t.accent()))
+                        .child(div().flex_1().child(self.field(ms.small(), self.console.clone()))),
                 );
+                body = body.child(self.small(
+                    format!("{}", self.lang.tr("console.hint")),
+                    t.muted(),
+                ));
+                // The confirmation. The REASON is the sentence, not a title bar.
+                if let Some((_, statement, reason)) = &self.confirm {
+                    body = body.child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap_1()
+                            .my_1()
+                            .p_2()
+                            .border_1()
+                            .border_color(t.error())
+                            .child(self.small(reason.clone(), t.error()))
+                            .child(self.small(statement.clone(), t.fg()))
+                            .child(
+                                div()
+                                    .flex()
+                                    .gap_2()
+                                    .child(
+                                        btn(t, ms, "confirm-run", self.tr("write.run_it"), Btn::Danger)
+                                            .on_click(cx.listener(|this, _, _, cx| {
+                                                if let Some((conn, stmt, _)) = this.confirm.take() {
+                                                    this.run_statement_approved(&conn, &stmt, cx);
+                                                    this.console
+                                                        .update(cx, |i, cx| i.set_text("", cx));
+                                                }
+                                                cx.notify();
+                                            })),
+                                    )
+                                    .child(
+                                        btn(t, ms, "confirm-cancel", self.tr("result.cancel"), Btn::Quiet)
+                                            .on_click(cx.listener(|this, _, _, cx| {
+                                                this.confirm = None;
+                                                cx.notify();
+                                            })),
+                                    ),
+                            ),
+                    );
+                }
             }
         }
-        panel
+        out.child(body).child(self.status_el(cx))
     }
 
-    fn status_el(&self) -> impl IntoElement {
-        let t = self.t();
-        let _ = self.scale;
+    fn status_el(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let (t, ms) = (self.t(), self.scale);
         let failed = self.tasks.iter().filter(|x| x.failed()).count();
+        let running = self.tasks.iter().filter(|x| x.running()).count();
         let last = self
             .tasks
             .iter()
@@ -8974,24 +9046,69 @@ impl Workspace {
             .child(
                 div()
                     .flex()
+                    .items_center()
                     .gap_3()
                     .child(self.small(
                         if self.store_ok { "store ok" } else { "no store" },
                         if self.store_ok { t.muted() } else { t.warning() },
                     ))
-                    .child(self.small(
-                        format!("{failed} failed"),
-                        if failed > 0 { t.error() } else { t.muted() },
-                    ))
-                    // What the client has to say and had nowhere to say it.
+                    // The three counters, and each one OPENS the page that
+                    // holds what it counts. They used to be three numbers
+                    // nobody could follow: "2 failed" with no way to see which
+                    // two is a number that only worries somebody.
+                    .children((running > 0).then(|| {
+                        btn(
+                            t,
+                            ms,
+                            "st-running",
+                            format!("{running} {}", self.lang.tr("bottom.running")),
+                            Btn::Quiet,
+                        )
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.drawer = Some(Drawer::Tasks);
+                            cx.notify();
+                        }))
+                    }))
+                    .children((failed > 0).then(|| {
+                        btn(
+                            t,
+                            ms,
+                            "st-failed",
+                            format!("{failed} {}", self.lang.tr("tasks.failed")),
+                            Btn::Danger,
+                        )
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.drawer = Some(Drawer::Tasks);
+                            cx.notify();
+                        }))
+                    }))
                     // Zero is not drawn: a permanent "0 unread" teaches the eye
                     // to skip the place where the number appears.
-                    .when(self.log_unread > 0, |d| {
-                        d.child(self.small(
-                            format!("{} unread", self.log_unread),
-                            t.warning(),
-                        ))
-                    }),
+                    .children((self.log_unread > 0).then(|| {
+                        btn(
+                            t,
+                            ms,
+                            "st-unread",
+                            format!("{} {}", self.log_unread, self.lang.tr("bottom.unread")),
+                            Btn::Quiet,
+                        )
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.drawer = Some(Drawer::Log);
+                            this.log_unread = 0;
+                            cx.notify();
+                        }))
+                    }))
+                    .child(
+                        btn(t, ms, "st-command", self.tr("console.title"), Btn::Quiet).on_click(
+                            cx.listener(|this, _, _, cx| {
+                                this.drawer = match this.drawer {
+                                    Some(Drawer::Command) => None,
+                                    _ => Some(Drawer::Command),
+                                };
+                                cx.notify();
+                            }),
+                        ),
+                    ),
             )
     }
 }
@@ -9395,9 +9512,7 @@ impl Render for Workspace {
                         .child(div().flex_1().overflow_hidden().child(self.result_el(cx))),
                 ),
         )
-        .child(self.console_el(cx))
-        .child(self.tasks_el(cx))
-        .child(self.status_el())
+        .child(self.bottom_el(cx))
         .children(self.toasts_el(cx))
         .children(self.palette_el(cx))
     }
