@@ -23,6 +23,7 @@ mod export;
 mod form;
 mod i18n;
 mod input;
+mod menu;
 mod metrics;
 mod session;
 mod settings;

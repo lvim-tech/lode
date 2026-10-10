@@ -61,7 +61,7 @@ fn keys() -> Vec<String> {
 ///
 /// `i18n.rs` itself is not here: that is where a key is defined, and a mention
 /// there is not a use.
-const VIEWS: [&str; 7] = [
+const VIEWS: [&str; 8] = [
     "app.rs",
     "form.rs",
     "settings.rs",
@@ -69,6 +69,9 @@ const VIEWS: [&str; 7] = [
     "board.rs",
     "export.rs",
     "workspace.rs",
+    // Same reason as `workspace.rs`: it draws nothing and names the keys in the
+    // pure function that decides what a menu offers.
+    "menu.rs",
 ];
 
 /// A key defined and never asked for.

@@ -798,6 +798,9 @@ impl Rail {
 
 /// What an outstanding request was for.
 enum Pending {
+    /// `schema.ddl` asked for by the context menu: the answer goes on the
+    /// clipboard rather than into a tab.
+    DdlCopy,
     StoreStatus,
     Connections,
     Connect { name: String, driver: String },
@@ -877,6 +880,8 @@ pub struct Workspace {
     fatal: Option<String>,
     /// How many times the engine has been started again after it exited, and
     /// when the next attempt is due. See [`respawn_delay`].
+    /// The context menu, while one is open — see `menu.rs`.
+    menu: Option<crate::menu::Open>,
     /// Which tabs were visited, most recent first — see `mru_next`. Ctrl-tab
     /// goes along this rather than along the strip, so pressing it twice comes
     /// back to where it started.
@@ -1190,6 +1195,7 @@ impl Workspace {
             engine: None,
             hello: None,
             fatal: None,
+            menu: None,
             mru: Vec::new(),
             panel_hidden: restore.panel_hidden.unwrap_or(false),
             confirm_conn_rm: None,
@@ -1992,6 +1998,17 @@ impl Workspace {
                         .unwrap_or_default();
                 if let Some(t) = self.tabs.iter_mut().find(|t| t.id == tab) {
                     t.indexes = idx;
+                }
+            }
+            Pending::DdlCopy => {
+                // Straight to the clipboard: the menu said "copy the DDL", and
+                // opening a tab to show it would be a different answer.
+                match v.get("ddl").and_then(Value::as_str) {
+                    Some(ddl) if !ddl.trim().is_empty() => {
+                        cx.write_to_clipboard(gpui::ClipboardItem::new_string(ddl.to_string()));
+                        self.toast("DDL copied".to_string(), false);
+                    }
+                    _ => self.toast("this driver answered no DDL".to_string(), true),
                 }
             }
             Pending::Ddl { tab } => {
@@ -3921,6 +3938,20 @@ impl Workspace {
             if as_insert { "row copied as INSERT" } else { "row copied as SELECT" },
             false,
         );
+    }
+
+    /// One row as tab-separated values.
+    ///
+    /// TSV because a spreadsheet and a terminal both understand it, and because
+    /// CSV would have to decide about quoting — a decision that is wrong for
+    /// one of the two. See `menu::row_tsv`.
+    fn copy_row_tsv(&mut self, tab_id: u64, row: usize, cx: &mut Context<Self>) {
+        let Some(tab) = self.tabs.iter().find(|t| t.id == tab_id) else { return };
+        let Some(values) = tab.rows.get(row) else { return };
+        let cols: Vec<String> = tab.columns.iter().map(|c| c.name.clone()).collect();
+        let text = crate::menu::row_tsv(&cols, values);
+        cx.write_to_clipboard(ClipboardItem::new_string(text));
+        self.toast("row copied".to_string(), false);
     }
 
     // ── saved charts ────────────────────────────────────────────────────────
@@ -5951,6 +5982,22 @@ impl Workspace {
                                 }
                             })),
                     )
+                    // The RIGHT button offers everything this row can do, most
+                    // of which had no control at all: rename by opening the
+                    // window, remove from one small x, refresh from nowhere.
+                    .on_mouse_down(
+                        MouseButton::Right,
+                        cx.listener({
+                            let (n, live) = (c.name.clone(), is_live);
+                            move |this, ev: &gpui::MouseDownEvent, _, cx| {
+                                this.open_menu(
+                                    crate::menu::Target::Connection { name: n.clone(), live },
+                                    ev.position,
+                                    cx,
+                                );
+                            }
+                        }),
+                    )
                     // A double click was tried here and taken out again. The
                     // first click of a double click has already fired by the
                     // time the second arrives, so "open the settings" also
@@ -6047,7 +6094,24 @@ impl Workspace {
                                     this.open_chart(&cn, &n, &sql, &m, cx);
                                     cx.notify();
                                 }
-                            })),
+                            }))
+                            .on_mouse_down(
+                                MouseButton::Right,
+                                cx.listener({
+                                    let (cn, n) = (live.name.clone(), c.name.clone());
+                                    move |this, ev: &gpui::MouseDownEvent, _, cx| {
+                                        this.open_menu(
+                                            crate::menu::Target::Saved {
+                                                conn: cn.clone(),
+                                                name: n.clone(),
+                                                kind: crate::menu::SavedKind::Chart,
+                                            },
+                                            ev.position,
+                                            cx,
+                                        );
+                                    }
+                                }),
+                            ),
                     );
                 }
             }
@@ -6095,7 +6159,24 @@ impl Workspace {
                             move |this, _, _, cx| {
                                 this.open_board(&cn, &n, cx);
                             }
-                        })),
+                        }))
+                        .on_mouse_down(
+                            MouseButton::Right,
+                            cx.listener({
+                                let (cn, n) = (live.name.clone(), name.clone());
+                                move |this, ev: &gpui::MouseDownEvent, _, cx| {
+                                    this.open_menu(
+                                        crate::menu::Target::Saved {
+                                            conn: cn.clone(),
+                                            name: n.clone(),
+                                            kind: crate::menu::SavedKind::Board,
+                                        },
+                                        ev.position,
+                                        cx,
+                                    );
+                                }
+                            }),
+                        ),
                 );
             }
             if !live.queries.is_empty() {
@@ -6128,7 +6209,27 @@ impl Workspace {
                                     }
                                     cx.notify();
                                 }
-                            })),
+                            }))
+                            // Removing a saved query was possible from nowhere
+                            // at all: the engine has had the method since
+                            // protocol 2 and no control ever called it.
+                            .on_mouse_down(
+                                MouseButton::Right,
+                                cx.listener({
+                                    let (c, n) = (live.name.clone(), q.name.clone());
+                                    move |this, ev: &gpui::MouseDownEvent, _, cx| {
+                                        this.open_menu(
+                                            crate::menu::Target::Saved {
+                                                conn: c.clone(),
+                                                name: n.clone(),
+                                                kind: crate::menu::SavedKind::Query,
+                                            },
+                                            ev.position,
+                                            cx,
+                                        );
+                                    }
+                                }),
+                            ),
                     );
                 }
                 list = list.child(self.section(self.lang.tr("panel.schema")));
@@ -6258,6 +6359,41 @@ impl Workspace {
                     // about its own layout.
                     this.open_object(&conn_s, &name_s, schema_s.as_deref(), &kind_s, cx);
                     cx.notify();
+                }),
+            )
+            // And the right button: open, look inside, put the name in the
+            // statement, copy the name, copy the DDL. Four of those five had no
+            // control anywhere in the window.
+            .on_mouse_down(
+                MouseButton::Right,
+                cx.listener({
+                    let (c, n, sc, kd) = (
+                        conn.to_string(),
+                        node.name.clone(),
+                        node.schema.clone(),
+                        node.kind.clone(),
+                    );
+                    // Whether the DRIVER has DDL at all — the engine declares
+                    // it, and offering a copy that answers nothing is worse
+                    // than a dimmed line.
+                    let has_ddl = self
+                        .live(conn)
+                        .and_then(|l| self.meta(&l.driver))
+                        .map_or(false, |m| m.caps.ddl)
+                        && is_object;
+                    move |this, ev: &gpui::MouseDownEvent, _, cx| {
+                        this.open_menu(
+                            crate::menu::Target::Node {
+                                conn: c.clone(),
+                                name: n.clone(),
+                                schema: sc.clone(),
+                                kind: kd.clone(),
+                                has_ddl,
+                            },
+                            ev.position,
+                            cx,
+                        );
+                    }
                 }),
             );
 
@@ -6527,8 +6663,22 @@ impl Workspace {
                         cx.listener(move |this, _, _, cx| {
                             if let Some(p) = this.tabs.iter().position(|t| t.id == id) {
                                 this.active = p;
+                                crate::workspace::mru_touch(&mut this.mru, id);
                             }
                             cx.notify();
+                        }),
+                    )
+                    .on_mouse_down(
+                        MouseButton::Right,
+                        cx.listener({
+                            let others = self.tabs.len() > 1;
+                            move |this, ev: &gpui::MouseDownEvent, _, cx| {
+                                this.open_menu(
+                                    crate::menu::Target::Tab { tab: id, others },
+                                    ev.position,
+                                    cx,
+                                );
+                            }
                         }),
                     ),
             );
@@ -8442,6 +8592,28 @@ impl Workspace {
                         .on_click(cx2.listener(move |this, _, _, cx| {
                             this.select_row(tab_id, i, cx);
                         }))
+                        // The right button on a row: show it, copy it three
+                        // ways, edit it, delete it. Copying a row at all was
+                        // possible only as part of an export.
+                        .on_mouse_down(
+                            MouseButton::Right,
+                            cx2.listener(move |this, ev: &gpui::MouseDownEvent, _, cx| {
+                                this.select_row(tab_id, i, cx);
+                                let editable = this
+                                    .tabs
+                                    .iter()
+                                    .find(|t| t.id == tab_id)
+                                    .map_or(false, |t| {
+                                        this.meta(&t.driver).map_or(false, |m| m.caps.edit)
+                                            && t.object.is_some()
+                                    });
+                                this.open_menu(
+                                    crate::menu::Target::Row { tab: tab_id, row: i, editable },
+                                    ev.position,
+                                    cx,
+                                );
+                            }),
+                        )
                         // ONE ROW TALL, whatever is in it. `uniform_list` puts
                         // every row at a fixed offset, so a cell that grows
                         // taller than its row does not push the next one down —
@@ -9600,6 +9772,232 @@ impl Workspace {
         Some(stack.into_any_element())
     }
 
+    /// The context menu, where the pointer opened it.
+    ///
+    /// Drawn LAST and absolutely placed, like the palette — it is the same
+    /// shape of thing, and two overlays with two sets of rules would drift. It
+    /// `occlude`s, so a click on it never also reaches what is beneath.
+    fn menu_el(&self, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
+        let open = self.menu.as_ref()?;
+        let (t, ms) = (self.t(), self.scale);
+        let items = open.items();
+        let mut list = div()
+            .flex()
+            .flex_col()
+            .w(px(ms.base() * 18.0))
+            .bg(t.raised())
+            .border_1()
+            .border_color(t.divider())
+            .py(px(2.0));
+        for (n, item) in items.iter().enumerate() {
+            let on = n == open.sel;
+            let act = item.act.clone();
+            let enabled = item.enabled;
+            list = list.child(
+                div()
+                    .id(SharedString::from(format!("menu-{n}")))
+                    .flex()
+                    .items_center()
+                    .h(px(ms.control_h()))
+                    .px_2()
+                    .text_size(ms.small())
+                    // A line that cannot be used is DIMMED, not missing: a menu
+                    // whose length changes with the state is a menu nobody
+                    // learns the shape of.
+                    .text_color(if !enabled {
+                        t.disabled()
+                    } else if on {
+                        t.fg()
+                    } else {
+                        t.muted()
+                    })
+                    .when(on && enabled, |d| {
+                        d.bg(t.selected_mark()).border_l_2().border_color(t.accent())
+                    })
+                    .when(!(on && enabled), |d| {
+                        d.border_l_2().border_color(gpui::transparent_black())
+                    })
+                    .when(enabled, |d| d.cursor_pointer().hover(|h| h.bg(t.hover_mark())))
+                    .child(self.tr(item.key))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        if enabled {
+                            this.menu = None;
+                            this.run_menu(act.clone(), cx);
+                        }
+                    })),
+            );
+        }
+        Some(
+            div()
+                .absolute()
+                .left(px(open.at.0))
+                .top(px(open.at.1))
+                .occlude()
+                .child(list)
+                .into_any_element(),
+        )
+    }
+
+    /// Open the menu for a target, where the pointer is.
+    fn open_menu(
+        &mut self,
+        target: crate::menu::Target,
+        at: gpui::Point<gpui::Pixels>,
+        cx: &mut Context<Self>,
+    ) {
+        self.menu = Some(crate::menu::Open::new(target, (f32::from(at.x), f32::from(at.y))));
+        cx.notify();
+    }
+
+    /// Carry out one item. Every arm is something that already existed and had
+    /// no way of being asked for.
+    fn run_menu(&mut self, act: crate::menu::Act, cx: &mut Context<Self>) {
+        use crate::menu::{Act, SavedKind};
+        match act {
+            Act::Connect(name) => self.connect(&name),
+            Act::Disconnect(name) => self.disconnect(&name),
+            Act::EditConnection(name) => {
+                if let Some(c) = self.saved.iter().find(|c| c.name == name) {
+                    let (n, d, sp) = (c.name.clone(), c.driver.clone(), c.spec.clone());
+                    self.open_form(Some((n, d, sp)), cx);
+                }
+            }
+            Act::RemoveConnection(name) => {
+                self.confirm_conn_rm = Some((name.clone(), None));
+                self.ask(
+                    Pending::ConnQueryCount { name: name.clone() },
+                    "store.queries.list",
+                    json!({ "conn": name }),
+                );
+            }
+            Act::RefreshConnection(name) => {
+                if let Some(l) = self.live(&name) {
+                    let conn_id = l.conn_id;
+                    self.ask(
+                        Pending::Structure { name: name.clone() },
+                        "schema.structure",
+                        json!({ "conn_id": conn_id }),
+                    );
+                }
+            }
+            Act::CopyText(text) => {
+                cx.write_to_clipboard(gpui::ClipboardItem::new_string(text));
+                self.toast("copied".to_string(), false);
+            }
+            Act::OpenNode { conn, name, schema, kind } => {
+                self.open_object(&conn, &name, schema.as_deref(), &kind, cx)
+            }
+            Act::InsideNode { conn, name, schema, kind } => {
+                let key = format!("{conn}/{kind}/{name}");
+                self.toggle_inside(&key, &conn, &name, schema.as_deref(), &kind);
+                cx.notify();
+            }
+            Act::CopyDdl { conn, name, schema } => {
+                // The DDL is the ENGINE's answer, not a string this client can
+                // assemble: it is asked for, and the reply goes to the
+                // clipboard — see `Pending::DdlCopy`.
+                if let Some(l) = self.live(&conn) {
+                    let conn_id = l.conn_id;
+                    let objref = match &schema {
+                        Some(s) => json!({ "name": name, "schema": s }),
+                        None => json!({ "name": name }),
+                    };
+                    self.ask(
+                        Pending::DdlCopy,
+                        "schema.ddl",
+                        json!({ "conn_id": conn_id, "object": objref }),
+                    );
+                } else {
+                    self.toast(format!("{conn} is not connected"), true);
+                }
+            }
+            Act::InsertIntoEditor(name) => self.insert_into_editor(&name, cx),
+            Act::CopyRowTsv { tab, row } => self.copy_row_tsv(tab, row, cx),
+            // The two SQL forms work off the row in front, which is why the
+            // menu selects it first.
+            Act::CopyRowSelect { tab, row } => {
+                self.select_row(tab, row, cx);
+                self.copy_row(false, cx);
+            }
+            Act::CopyRowInsert { tab, row } => {
+                self.select_row(tab, row, cx);
+                self.copy_row(true, cx);
+            }
+            Act::ShowRow { tab, row } => {
+                if let Some(tb) = self.tabs.iter_mut().find(|t| t.id == tab) {
+                    tb.selected = Some(row);
+                    tb.detail = Some(row);
+                }
+                cx.notify();
+            }
+            Act::EditRow { tab, row } => {
+                self.select_row(tab, row, cx);
+                // The first editable column of that row: the menu says "edit
+                // this row", and which cell it lands in is this client's to
+                // choose.
+                let col = self
+                    .tabs
+                    .iter()
+                    .find(|t| t.id == tab)
+                    .and_then(|t| {
+                        (0..t.columns.len()).find(|c| crate::workspace::column_editable(t, *c))
+                    });
+                if let Some(col) = col {
+                    self.begin_edit(tab, row, col, cx);
+                }
+            }
+            Act::DeleteRow { tab, row } => self.propose_write(tab, row, Vec::new(), true, cx),
+            Act::CloseTab(id) => self.close_tab(id),
+            Act::CloseOtherTabs(id) => {
+                let others: Vec<u64> =
+                    self.tabs.iter().map(|t| t.id).filter(|x| *x != id).collect();
+                for o in others {
+                    self.close_tab(o);
+                }
+                cx.notify();
+            }
+            Act::DuplicateTab(id) => self.run_in_new_tab(id, cx),
+            Act::OpenSaved { conn, name, kind } => match kind {
+                SavedKind::Query => {
+                    let sql = self
+                        .live(&conn)
+                        .and_then(|l| l.queries.iter().find(|q| q.name == name))
+                        .map(|q| q.sql.clone());
+                    if let Some(sql) = sql {
+                        self.open_sql(&conn, &name, &sql, cx);
+                    }
+                }
+                SavedKind::Chart => {
+                    let sql = self
+                        .live(&conn)
+                        .and_then(|l| l.charts.iter().find(|c| c.name == name))
+                        .map(|c| c.sql.clone());
+                    if let Some(sql) = sql {
+                        self.open_sql(&conn, &name, &sql, cx);
+                    }
+                }
+                SavedKind::Board => self.open_board(&conn, &name, cx),
+            },
+            Act::RemoveSaved { conn, name, kind } => {
+                let (method, pend) = match kind {
+                    SavedKind::Query => (
+                        "store.queries.remove",
+                        Pending::SavedQueries { conn: conn.clone() },
+                    ),
+                    SavedKind::Chart => {
+                        ("store.charts.remove", Pending::SavedCharts { conn: conn.clone() })
+                    }
+                    SavedKind::Board => {
+                        ("store.dashboards.remove", Pending::Dashboards { conn: conn.clone() })
+                    }
+                };
+                self.ask(pend, method, json!({ "conn": conn, "name": name }));
+                self.toast(format!("removed: {name}"), false);
+            }
+        }
+        cx.notify();
+    }
+
     /// The command palette: one box, and everything this window can do ranked
     /// against what has been typed. ctrl-p opens it, escape leaves it,
     /// ctrl-n/ctrl-k move, enter or ctrl-y takes the one highlighted.
@@ -9727,8 +10125,6 @@ impl Render for Workspace {
         let root = div()
             .key_context("Workspace")
             .track_focus(&self.focus)
-            .on_action(cx.listener(|this, _: &NextRow, _, cx| this.move_row(1, cx)))
-            .on_action(cx.listener(|this, _: &PrevRow, _, cx| this.move_row(-1, cx)))
             .on_action(cx.listener(|this, _: &PageDown, _, cx| this.move_row(20, cx)))
             .on_action(cx.listener(|this, _: &PageUp, _, cx| this.move_row(-20, cx)))
             .on_action(cx.listener(|this, _: &FirstRow, _, cx| this.move_row(isize::MIN, cx)))
@@ -9752,6 +10148,13 @@ impl Render for Workspace {
                 }
             }))
             .on_action(cx.listener(|this, _: &ToggleDetail, _, cx| {
+                // Enter TAKES the menu's highlighted line when one is open; it
+                // opens the row's detail otherwise.
+                if let Some(act) = this.menu.as_ref().and_then(|m| m.chosen()) {
+                    this.menu = None;
+                    this.run_menu(act, cx);
+                    return;
+                }
                 if let Some(tab) = this.tabs.get_mut(this.active) {
                     tab.detail = match tab.detail {
                         Some(_) => None,
@@ -9770,9 +10173,29 @@ impl Render for Workspace {
                 }
                 cx.notify();
             }))
+            .on_action(cx.listener(|this, _: &NextRow, _, cx| {
+                // In a menu, j and the down arrow move the MENU. Out of one
+                // they move the grid, as before.
+                if let Some(m) = this.menu.as_mut() {
+                    m.step(1);
+                    cx.notify();
+                } else {
+                    this.move_row(1, cx)
+                }
+            }))
+            .on_action(cx.listener(|this, _: &PrevRow, _, cx| {
+                if let Some(m) = this.menu.as_mut() {
+                    m.step(-1);
+                    cx.notify();
+                } else {
+                    this.move_row(-1, cx)
+                }
+            }))
             .on_action(cx.listener(|this, _: &Escape, window, cx| {
                 // Escape leaves whatever is in front, innermost first.
-                if this.palette_open {
+                if this.menu.is_some() {
+                    this.menu = None;
+                } else if this.palette_open {
                     this.palette_open = false;
                 } else if this.export_open {
                     this.export_open = false;
@@ -9972,6 +10395,19 @@ impl Render for Workspace {
         )
         .child(self.bottom_el(cx))
         .children(self.toasts_el(cx))
+        // A click ANYWHERE ELSE closes the menu. The menu itself `occlude`s, so
+        // this never fires for a click on one of its own lines — without that,
+        // choosing an item would close the menu before the item ran.
+        .when(self.menu.is_some(), |d| {
+            d.on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _, _, cx| {
+                    this.menu = None;
+                    cx.notify();
+                }),
+            )
+        })
+        .children(self.menu_el(cx))
         .children(self.palette_el(cx))
     }
 }
