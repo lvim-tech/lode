@@ -1054,6 +1054,41 @@ pub fn column_summary(
     }
 }
 
+/// Which rows of the palette to draw, so the chosen one is among them.
+///
+/// It drew the FIRST fourteen and highlighted the chosen one — so pressing
+/// ctrl-n fifteen times moved a highlight nobody could see, and enter then took
+/// a command that was never on screen. The window slides to keep the selection
+/// inside it, with a row of context above where there is one.
+pub fn palette_window(sel: usize, n: usize, visible: usize) -> std::ops::Range<usize> {
+    if n == 0 || visible == 0 {
+        return 0..0;
+    }
+    let visible = visible.min(n);
+    // Keep one row of context above the selection, so the row before it is
+    // visible and the list does not read as if the selection were the first
+    // thing there is.
+    let start = sel.saturating_sub(visible.saturating_sub(2)).min(n - visible);
+    let start = start.min(sel);
+    start..(start + visible)
+}
+
+/// The mark a tab carries for what its statement is doing.
+///
+/// A tab said nothing about its own state: a query running in the third tab and
+/// one that failed in the fifth looked exactly like the four that were idle, so
+/// the only way to find out was to go and look. `None` for the states that need
+/// no mark — an idle tab and a finished one are the ordinary case, and a mark on
+/// every tab is a row of marks nobody reads.
+pub fn tab_mark(state: RunState) -> Option<&'static str> {
+    match state {
+        RunState::Running => Some("\u{f021}"),
+        RunState::Failed => Some("\u{f00d}"),
+        RunState::Cancelled => Some("\u{f05e}"),
+        RunState::Idle | RunState::Done => None,
+    }
+}
+
 /// Which edge a column's values line up against.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Align {
@@ -1346,7 +1381,46 @@ mod tests {
         assert_eq!(super::respawn_delay(3), None, "a fourth try is a spawn storm");
     }
 
-    /// Numbers line up on the right, and nothing else does.
+    /// The chosen palette row is always on screen.
+    #[test]
+    fn the_palette_shows_the_row_it_has_chosen() {
+        // Everything fits: the whole list, from the top.
+        assert_eq!(super::palette_window(0, 5, 14), 0..5);
+        assert_eq!(super::palette_window(4, 5, 14), 0..5);
+        // More rows than room: the window slides.
+        for sel in 0..40 {
+            let w = super::palette_window(sel, 40, 14);
+            assert!(w.contains(&sel), "sel {sel} fell outside {w:?}");
+            assert_eq!(w.len(), 14, "sel {sel} gave {w:?}");
+            assert!(w.end <= 40);
+        }
+        // The last row puts the window at the bottom, not past it.
+        assert_eq!(super::palette_window(39, 40, 14), 26..40);
+        // Degenerate cases answer rather than panic.
+        assert_eq!(super::palette_window(0, 0, 14), 0..0);
+        assert_eq!(super::palette_window(3, 10, 0), 0..0);
+    }
+
+    /// A tab is marked for what needs saying and nothing else.    /// A tab is marked for what needs saying and nothing else.
+    #[test]
+    fn a_tab_is_marked_only_when_there_is_something_to_say() {
+        assert!(super::tab_mark(super::RunState::Running).is_some());
+        assert!(super::tab_mark(super::RunState::Failed).is_some());
+        assert!(super::tab_mark(super::RunState::Cancelled).is_some());
+        assert_eq!(super::tab_mark(super::RunState::Idle), None);
+        assert_eq!(super::tab_mark(super::RunState::Done), None, "a finished tab is the normal one");
+        // The three marks differ, or they would say the same thing.
+        let marks = [
+            super::tab_mark(super::RunState::Running).unwrap(),
+            super::tab_mark(super::RunState::Failed).unwrap(),
+            super::tab_mark(super::RunState::Cancelled).unwrap(),
+        ];
+        assert_ne!(marks[0], marks[1]);
+        assert_ne!(marks[1], marks[2]);
+        assert_ne!(marks[0], marks[2]);
+    }
+
+    /// Numbers line up on the right, and nothing else does.    /// Numbers line up on the right, and nothing else does.
     #[test]
     fn a_column_of_numbers_lines_up_by_place_value() {
         use super::Align;

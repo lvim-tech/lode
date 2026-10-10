@@ -112,6 +112,17 @@ impl Lang {
 /// English, and the list of keys every other language must match.
 #[rustfmt::skip]
 const EN: &[(&str, &str)] = &[
+    ("empty.connections",  "no connections yet"),
+    ("empty.connections_hint", "press New connection to add one"),
+    ("empty.tasks",        "nothing running"),
+    ("empty.tasks_hint",   "a statement you run appears here while it works"),
+    ("empty.instance",     "nothing read yet"),
+    ("empty.instance_hint", "press now, or choose an interval"),
+    ("empty.rows",         "no rows"),
+    ("empty.rows_hint",    "the statement ran and returned nothing"),
+    ("empty.history",      "nothing in the history yet"),
+    ("empty.audit",        "nothing in the audit log yet"),
+    ("empty.audit_hint",   "reads are not in here — only what changed, and what was stopped"),
     // The connection and tunnel windows.
     ("form.required",      "Fields marked * are required"),
     ("form.name",          "Name"),
@@ -265,6 +276,17 @@ const EN: &[(&str, &str)] = &[
 /// translation.
 #[rustfmt::skip]
 const BG: &[(&str, &str)] = &[
+    ("empty.connections",  "още няма връзки"),
+    ("empty.connections_hint", "натисни „Нова връзка“, за да добавиш"),
+    ("empty.tasks",        "нищо не върви"),
+    ("empty.tasks_hint",   "заявка, която пуснеш, се появява тук, докато работи"),
+    ("empty.instance",     "още нищо не е прочетено"),
+    ("empty.instance_hint", "натисни „сега“ или избери интервал"),
+    ("empty.rows",         "няма редове"),
+    ("empty.rows_hint",    "заявката се изпълни и не върна нищо"),
+    ("empty.history",      "историята е празна"),
+    ("empty.audit",        "одитният дневник е празен"),
+    ("empty.audit_hint",   "четенията не влизат тук — само това, което е променило нещо, и това, което е било спряно"),
     ("form.required",      "Полетата с * са задължителни"),
     ("form.name",          "Име"),
     ("form.tab_main",      "Основни"),

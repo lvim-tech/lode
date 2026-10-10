@@ -210,6 +210,8 @@ const GLYPHS: &[(&str, &str)] = &[
     // The padlock beside an open connection — see `link_label`.
     (crate::workspace::LINK_LOCKED, "L"),
     (crate::workspace::LINK_OPEN, "U"),
+    // The mark a cancelled tab carries — see `workspace::tab_mark`.
+    ("\u{f05e}", "/"),
 ];
 
 /// The advance of one character per pixel of text size, in this font.
@@ -4781,6 +4783,36 @@ impl Workspace {
             .child(text.into())
     }
 
+    /// Nothing to show, said as a sentence and a hint.
+    ///
+    /// Centred, quiet, and ALWAYS BOTH: a panel that says "no connections" and
+    /// stops leaves somebody looking for the button; one that says nothing at
+    /// all is indistinguishable from one that failed to load.
+    fn empty_state(&self, title: &str, hint: &str) -> impl IntoElement {
+        let (t, ms) = (self.t(), self.scale);
+        div()
+            .flex()
+            .flex_col()
+            .w_full()
+            .items_center()
+            .justify_center()
+            .gap_1()
+            .px_3()
+            .py_3()
+            .child(
+                div()
+                    .text_size(ms.body())
+                    .text_color(t.muted())
+                    .child(self.tr(title)),
+            )
+            .child(
+                div()
+                    .text_size(ms.small())
+                    .text_color(t.disabled())
+                    .child(self.tr(hint)),
+            )
+    }
+
     fn section(&self, text: &str) -> impl IntoElement {
         div()
             .px_2()
@@ -4969,6 +5001,12 @@ impl Workspace {
                     panel = panel.child(div().px_2().child(self.small(e.clone(), t.error())));
                 }
 
+                // Before the first read it drew an empty column under a
+                // heading, which reads as a server that answered nothing
+                // rather than as one nobody has asked yet.
+                if self.metrics.is_empty() && self.metrics_error.is_none() {
+                    return panel.child(self.empty_state("empty.instance", "empty.instance_hint"));
+                }
                 let mut group = String::new();
                 let mut list = self.panel_list("instance-list");
                 for row in &self.metrics {
@@ -5022,12 +5060,11 @@ impl Workspace {
                     format!("History ({} of {})", shown.len(), self.history.len())
                 }));
                 if shown.is_empty() {
+                    if self.history.is_empty() {
+                        return panel.child(self.empty_state("empty.history", "panel.reload_history"));
+                    }
                     panel = panel.child(div().px_2().child(self.small(
-                        if self.history.is_empty() {
-                            "nothing yet — press reload"
-                        } else {
-                            "nothing matches"
-                        },
+                        self.lang.tr("panel.nothing_matches"),
                         t.muted(),
                     )));
                 }
@@ -5122,12 +5159,11 @@ impl Workspace {
                     )));
                 }
                 if shown.is_empty() {
+                    if self.audit.is_empty() {
+                        return panel.child(self.empty_state("empty.audit", "empty.audit_hint"));
+                    }
                     panel = panel.child(div().px_2().child(self.small(
-                        if self.audit.is_empty() {
-                            "nothing has changed anything yet — reads are not in here"
-                        } else {
-                            "nothing matches"
-                        },
+                        self.lang.tr("panel.nothing_matches"),
                         t.muted(),
                     )));
                 }
@@ -5239,6 +5275,9 @@ impl Workspace {
             }
             Rail::Tasks => {
                 panel = panel.child(self.section(&format!("Tasks ({})", self.tasks.len())));
+                if self.tasks.is_empty() && self.log.is_empty() {
+                    return panel.child(self.empty_state("empty.tasks", "empty.tasks_hint"));
+                }
                 let mut list = self.panel_list("tasks-list");
                 for task in self.tasks.iter().rev().take(200) {
                     let (id, running, call) = (task.id, task.running(), task.call_id);
@@ -5360,6 +5399,9 @@ impl Workspace {
             self.lang.tr("panel.idle")
         )));
 
+        if self.saved.is_empty() {
+            list = list.child(self.empty_state("empty.connections", "empty.connections_hint"));
+        }
         for c in self
             .saved
             .iter()
@@ -5943,11 +5985,16 @@ impl Workspace {
     fn tabs_el(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let t = self.t();
         let ms = self.scale;
+        // It SCROLLS. Twelve tabs pushed the twelfth off the right edge with no
+        // sign that it was there, and nothing could reach it but the palette.
         let mut strip = div()
+            .id("tab-strip")
             .flex()
             .items_center()
             .w_full()
             .h(px(ms.tab_h()))
+            .flex_none()
+            .overflow_x_scroll()
             .bg(t.panel())
             .border_b_1()
             .border_color(t.border());
@@ -5955,18 +6002,34 @@ impl Workspace {
         for (i, tab) in self.tabs.iter().enumerate() {
             let on = i == self.active;
             let id = tab.id;
+            // What this tab's statement is doing, in one glyph. A tab said
+            // nothing about its own state, so a query running in the third tab
+            // looked exactly like the four that were idle.
+            let mark = crate::workspace::tab_mark(tab.state);
+            let mark_colour = match tab.state {
+                RunState::Failed => t.error(),
+                RunState::Cancelled => t.warning(),
+                _ => t.accent(),
+            };
             strip = strip.child(
                 div()
                     .id(SharedString::from(format!("tab-{}", tab.id)))
+                    .group(SharedString::from(format!("tab-g-{}", tab.id)))
                     .flex()
                     .items_center()
                     .gap_2()
                     .px_3()
                     .h_full()
+                    .flex_none()
                     .cursor_pointer()
                     .border_r_1()
                     .border_color(t.border())
-                    .when(on, |d| d.bg(t.base()))
+                    // The chosen tab is marked by an EDGE as well as a fill: on
+                    // several palettes `base` and `panel` are a hair apart, and
+                    // the fill alone left the strip looking like one block.
+                    .when(on, |d| d.bg(t.base()).border_b_2().border_color(t.accent()))
+                    .when(!on, |d| d.border_b_2().border_color(t.panel()))
+                    .hover(|d| d.bg(t.hover_mark()))
                     .child(
                         // The tab carries its connection's driver, because tabs
                         // from different connections sit side by side — and in
@@ -5974,15 +6037,31 @@ impl Workspace {
                         // of tabs does not look like a row of two sizes.
                         self.icon_inline(DB_GLYPH, t.accent()),
                     )
+                    .children(mark.map(|g| self.icon_inline(g, mark_colour)))
                     .child(
-                        div()
-                            .text_size(ms.body())
-                            .text_color(if on { t.fg() } else { t.muted() })
-                            .child(SharedString::from(tab.title.clone())),
+                        // CUT, with the whole statement on hover. A tab titled
+                        // by the first forty characters of a query made the
+                        // strip as wide as the query.
+                        self.line_tip(
+                            tab.title.clone(),
+                            ms.body(),
+                            if on { t.fg() } else { t.muted() },
+                            ms.base() * 14.0,
+                            format!("tabt-{}", tab.id),
+                        ),
                     )
                     .child(
                         div()
                             .id(SharedString::from(format!("tabx-{}", tab.id)))
+                            // Shown on the chosen tab and under the pointer. On
+                            // every tab at once it is a row of crosses, and the
+                            // one people press by accident is a neighbour's.
+                            .when(!on, |d| {
+                                d.invisible().group_hover(
+                                    SharedString::from(format!("tab-g-{}", tab.id)),
+                                    |d| d.visible(),
+                                )
+                            })
                             .tooltip(self.tip("tip.close_tab", None))
                             .hover(|d| d.bg(t.hover_mark()))
                             .child(self.action_el("\u{f00d}", t.muted()))
@@ -6011,16 +6090,10 @@ impl Workspace {
         let Some(tab) = self.tabs.get(self.active) else {
             return div()
                 .flex()
-                .flex_col()
                 .size_full()
                 .items_center()
                 .justify_center()
-                .gap_2()
-                .child(div().text_color(t.muted()).child(self.tr("result.empty_title")))
-                .child(self.small(
-                    self.lang.tr("result.empty_hint"),
-                    t.muted(),
-                ))
+                .child(self.empty_state("result.empty_title", "result.empty_hint"))
                 .into_any_element();
         };
 
@@ -7607,6 +7680,17 @@ impl Workspace {
         if cols.is_empty() {
             return div().p_3().child(self.small(self.tr("result.no_columns"), t.muted())).into_any_element();
         }
+        // A statement that ran and matched nothing. It drew the headings over
+        // an empty rectangle, which reads as a result still loading.
+        if tab.rows.is_empty() && tab.state == RunState::Done {
+            return div()
+                .flex()
+                .size_full()
+                .items_center()
+                .justify_center()
+                .child(self.empty_state("empty.rows", "empty.rows_hint"))
+                .into_any_element();
+        }
 
         let sort = tab.sort;
         let tab_id = tab.id;
@@ -8848,25 +8932,53 @@ impl Workspace {
     /// The corner messages. They stack upward from the bottom right, newest
     /// nearest the corner, and they do not take clicks: nothing is hidden
     /// behind one for longer than it lasts.
-    fn toasts_el(&self) -> Option<gpui::AnyElement> {
+    fn toasts_el(&self, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
         if self.toasts.is_empty() {
             return None;
         }
         let t = self.t();
         let ms = self.scale;
-        let inset = px(self.scale.toast_inset());
-        let mut stack = div().absolute().right(inset).bottom(inset).flex().flex_col().gap_1();
+        let inset = self.scale.toast_inset();
+        let mut stack = div()
+            .absolute()
+            .right(px(inset))
+            // ABOVE the status bar, not over it. They sat on the bottom edge
+            // and covered the one line that says what the window is doing.
+            .bottom(px(inset + ms.status_h()))
+            .flex()
+            .flex_col()
+            .gap_1();
         for x in self.toasts.iter().rev().take(5) {
+            let id = x.id;
             stack = stack.child(
                 div()
+                    .id(SharedString::from(format!("toast-{id}")))
                     .px_3()
                     .py_1()
-                    .bg(t.panel())
+                    // A width, so a long message WRAPS instead of running off
+                    // the window: an engine's refusal is a sentence, and the
+                    // half of it that mattered was the half off the screen.
+                    .max_w(px(ms.base() * 36.0))
+                    .cursor_pointer()
+                    // A bad one carries the error colour in its background as
+                    // well, faintly: red text on the panel is easy to miss
+                    // when the eye is on the grid.
+                    .bg(if x.bad {
+                        Theme::mix(t.error(), t.panel(), 0.12)
+                    } else {
+                        t.panel()
+                    })
                     .border_l_2()
                     .border_color(if x.bad { t.error() } else { t.accent() })
                     .text_size(ms.body())
                     .text_color(if x.bad { t.error() } else { t.fg() })
-                    .child(SharedString::from(x.text.clone())),
+                    .child(SharedString::from(x.text.clone()))
+                    // Dismissed by a click. A message worth reading is
+                    // sometimes in the way of the thing it is about.
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.toasts.retain(|y| y.id != id);
+                        cx.notify();
+                    })),
             );
         }
         Some(stack.into_any_element())
@@ -8888,7 +9000,15 @@ impl Workspace {
         if matches.is_empty() {
             list = list.child(div().px_3().py_1().child(self.small(self.lang.tr("panel.nothing_matches"), t.muted())));
         }
-        for (n, (idx, it)) in matches.iter().enumerate().take(14) {
+        // The window SLIDES to the selection — see `palette_window`. It drew the
+        // first fourteen, so ctrl-n fifteen times moved a highlight nobody
+        // could see and enter took a command that was never on screen.
+        let shown = crate::workspace::palette_window(sel, matches.len(), 14);
+        let hint_w = ms.base() * 11.0;
+        for (n, (idx, it)) in matches.iter().enumerate() {
+            if !shown.contains(&n) {
+                continue;
+            }
             let on = n == sel;
             let act = it.act.clone();
             list = list.child(
@@ -8904,12 +9024,26 @@ impl Workspace {
                     .when(!on, |d| d.border_l_2().border_color(t.panel()))
                     .hover(|d| d.bg(t.hover_mark()))
                     .child(
-                        div()
-                            .text_size(ms.body())
-                            .text_color(t.fg())
-                            .child(SharedString::from(it.label.clone())),
+                        // Both sides CUT at a real width. A long label pushed
+                        // the shortcut off the right edge of the palette, so
+                        // the one thing the row exists to teach was the first
+                        // thing to go.
+                        self.line_in(
+                            it.label.clone(),
+                            ms.body(),
+                            t.fg(),
+                            ms.base() * 48.5 - hint_w - ms.base() * 2.0,
+                        ),
                     )
-                    .child(self.small(it.hint.clone(), t.muted()))
+                    .child(
+                        div()
+                            .flex_none()
+                            .w(px(hint_w))
+                            .truncate()
+                            .text_size(ms.small())
+                            .text_color(t.muted())
+                            .child(SharedString::from(it.hint.clone())),
+                    )
                     .on_click(cx.listener(move |this, _, _, cx| {
                         this.palette_run(act.clone(), cx);
                         cx.notify();
@@ -8941,7 +9075,10 @@ impl Workspace {
                             div().px_3().py(px(2.0)).child(self.small(
                                 format!(
                                     "{} of {} \u{2014} ctrl-n / ctrl-k move, ctrl-y takes, esc leaves",
-                                    matches.len().min(14),
+                                    // WHICH of them, not how many are drawn: "14
+                                    // of 60" said the same thing at the top of
+                                    // the list and at the bottom.
+                                    sel + 1,
                                     matches.len()
                                 ),
                                 t.muted(),
@@ -9165,7 +9302,7 @@ impl Render for Workspace {
         .child(self.console_el(cx))
         .child(self.tasks_el(cx))
         .child(self.status_el())
-        .children(self.toasts_el())
+        .children(self.toasts_el(cx))
         .children(self.palette_el(cx))
     }
 }

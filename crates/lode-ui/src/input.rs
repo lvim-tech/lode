@@ -724,7 +724,15 @@ impl Element for TextElement {
 }
 
 impl Render for TextInput {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // WHICH FIELD TAKES THE KEYBOARD. Every field drew the same border
+        // whether it had focus or not, so a window with four of them gave no
+        // sign at all of where typing would land — and the caret, which is the
+        // other answer, is only drawn while there is text to put it in.
+        //
+        // The caret's own colour, not a new token: it is the one colour in the
+        // palette that already means "the keyboard is here".
+        let focused = self.focus_handle.is_focused(window);
         div()
             .flex()
             .key_context("TextInput")
@@ -751,7 +759,7 @@ impl Render for TextInput {
             .px_1()
             .bg(self.colors.background)
             .border_1()
-            .border_color(self.colors.border)
+            .border_color(if focused { self.colors.cursor } else { self.colors.border })
             .child(TextElement { input: cx.entity() })
     }
 }
