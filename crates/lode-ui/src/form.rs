@@ -1017,21 +1017,53 @@ impl ConnectionForm {
     ) -> impl IntoElement {
         let t = &self.theme;
         let ms = self.scale;
+        // The label and, under a template source, what the field is now asking
+        // for. ON ITS OWN LINE rather than appended to the label: `Password ·
+        // Environment variable` in a column `label_w` wide was cut to
+        // `Password · Env…` on the English labels and lost the whole second
+        // half on the Bulgarian ones, which is the half that says what to type.
+        let aside = (secret && source != Source::Literal).then(|| source.field_label());
         let mut row = div()
             .flex()
             .items_center()
             .gap_2()
             .py(px(2.0))
-            .child(div().w(px(ms.label_w())).child(self.small(
-                // Under a template source the row is not asking for the
-                // credential, so it stops saying it is.
-                if secret && source != Source::Literal {
-                    format!("{label} · {}", source.field_label())
-                } else {
-                    label.to_string()
-                },
-                t.muted(),
-            )));
+            .child(
+                div()
+                    .id(SharedString::from(format!("lbl-{key}")))
+                    .w(px(ms.label_w()))
+                    .flex_none()
+                    .flex()
+                    .flex_col()
+                    // The whole label on hover, since a translated one is
+                    // longer than the English it replaced and this column does
+                    // not grow.
+                    .tooltip(crate::tip::Tip::build(
+                        match aside {
+                            Some(a) => format!("{label} · {a}"),
+                            None => label.to_string(),
+                        },
+                        None,
+                        self.theme.clone(),
+                        ms,
+                    ))
+                    .child(
+                        div()
+                            .w(px(ms.label_w()))
+                            .truncate()
+                            .text_size(ms.small())
+                            .text_color(t.muted())
+                            .child(SharedString::from(label.to_string())),
+                    )
+                    .children(aside.map(|a| {
+                        div()
+                            .w(px(ms.label_w()))
+                            .truncate()
+                            .text_size(ms.tiny())
+                            .text_color(t.accent())
+                            .child(SharedString::from(a))
+                    })),
+            );
 
         if secret {
             let mut picker = div().flex().gap_1();
@@ -1371,8 +1403,19 @@ impl Render for ConnectionForm {
                 .flex()
                 .items_center()
                 .gap_2()
+                .flex_none()
                 .child(self.small(self.tr("form.name"), t.muted()))
-                .child(div().w(px(ms.field_w())).child(self.name.clone())),
+                .child(
+                    // A real width, and a floor under it: at a large text size
+                    // `field_w` is wider than what the heading leaves, and the
+                    // field then squeezed the heading to nothing rather than
+                    // giving any of its own room back.
+                    div()
+                        .w(px(ms.field_w()))
+                        .min_w(px(ms.base() * 10.0))
+                        .flex_shrink()
+                        .child(self.name.clone()),
+                ),
         );
 
         let mut tabs = div()
@@ -1419,7 +1462,21 @@ impl Render for ConnectionForm {
             );
         }
 
-        let mut body = div().flex().flex_col().flex_1().p_3().gap_1().overflow_hidden();
+        // It SCROLLS. The Access tab with a tunnel open is taller than the
+        // window at any text size over about 16, and `overflow_hidden` simply
+        // cut the bottom off — including the "save as profile" row, which is
+        // the only way a tunnel becomes reusable. `min_h_0` is the half that is
+        // easy to leave out: a flex child refuses to shrink below its content
+        // without it, so the footer went off the bottom instead.
+        let mut body = div()
+            .id("form-body")
+            .flex()
+            .flex_col()
+            .flex_1()
+            .min_h_0()
+            .overflow_y_scroll()
+            .p_3()
+            .gap_1();
         match self.tab {
             FormTab::Main => {
                 // The TYPE comes along, because how a field is drawn is the

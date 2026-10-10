@@ -196,6 +196,8 @@ const GLYPHS: &[(&str, &str)] = &[
     ("\u{f067}", "+"),
     ("\u{f10c}", "o"),
     ("\u{f111}", "*"),
+    // A collection in the schema tree.
+    ("\u{f0c5}", "C"),
     ("\u{f044}", "e"),
     ("\u{f00a}", "#"),
     ("\u{f15c}", "Q"),
@@ -5409,6 +5411,7 @@ impl Workspace {
         {
             let live = self.conns.iter().find(|l| l.name == c.name);
             let is_live = live.is_some();
+            let is_front = self.tabs.get(self.active).map(|x| x.conn_name.as_str()) == Some(c.name.as_str());
             // The padlock, for an OPEN connection only: a saved connection that
             // is not connected has no transport yet, and a lock drawn over a
             // spec would be a promise about something that has not happened.
@@ -5427,10 +5430,21 @@ impl Workspace {
                     .h(px(ms.panel_row_h()))
                     .cursor_pointer()
                     .hover(|d| d.bg(t.hover_mark()))
+                    // The connection the TAB IN FRONT belongs to carries the
+                    // accent edge; being connected is a filled background. Both
+                    // were the same background before, so with four connections
+                    // open nothing said which one the result on screen came
+                    // from.
                     .when(is_live, |d| d.bg(t.selected_mark()))
+                    .when(is_front, |d| d.border_l_2().border_color(t.accent()))
+                    .when(!is_front, |d| {
+                        d.border_l_2().border_color(gpui::transparent_black())
+                    })
                     .child(
                         div()
-                            .text_size(ms.tiny())
+                            // At `small`, not `tiny`: the dot is the one mark in
+                            // this row that is read from across the screen.
+                            .text_size(ms.small())
                             .text_color(if is_live { t.success() } else { t.muted() })
                             .child(SharedString::from(if is_live { "\u{f111}" } else { "\u{f10c}" })),
                     )
@@ -5711,7 +5725,10 @@ impl Workspace {
             "schema" => "\u{f07b}",
             "table" => "\u{f0ce}",
             "view" => "\u{f06e}",
-            "collection" => "\u{f1c0}",
+            // Its own glyph. A collection drew the DATABASE icon, so in a Mongo
+            // tree the database and everything in it were the same mark and the
+            // only difference was the indent.
+            "collection" => "\u{f0c5}",
             _ => "\u{f0ce}",
         };
 
@@ -6716,16 +6733,28 @@ impl Workspace {
                     .items_center()
                     .size_full()
                     .bg(t.base())
-                    .child(div().w_full().h(px(1.0)).bg(if selected { t.accent() } else { t.border() }));
+                    // `divider`, not `border`: a rule drawn in the box-edge
+                    // colour vanishes into the base on half the palettes, and a
+                    // divider nobody can see is a tile that looks empty.
+                    .child(div().w_full().h(px(1.0)).bg(if selected {
+                        t.accent()
+                    } else {
+                        t.divider()
+                    }));
             }
             TileKind::Text => {
+                let empty = tile.text.is_empty();
                 inner = inner.bg(t.base()).child(
                     div()
                         .p_2()
                         .text_size(ms.body())
-                        .text_color(t.fg())
-                        .child(SharedString::from(if tile.text.is_empty() {
-                            "(empty text tile — select it and type a heading)".to_string()
+                        // A tile with nothing in it says what to do, in the
+                        // quiet ink — the hint read as the heading itself when
+                        // it was drawn in the ordinary one.
+                        .text_color(if empty { t.disabled() } else { t.fg() })
+                        .when(empty, |d| d.italic())
+                        .child(SharedString::from(if empty {
+                            self.lang.tr("board.text_hint").to_string()
                         } else {
                             tile.text.clone()
                         })),
@@ -6950,11 +6979,16 @@ impl Workspace {
                     .gap_2()
                     .h(px(ms.chart_row_h()))
                     .child(
-                        div()
-                            .w(px(ms.base() * 11.5))
-                            .text_size(ms.small())
-                            .text_color(t.muted())
-                            .child(SharedString::from(label)),
+                        // CUT, with the whole label on hover. A category whose
+                        // name is longer than the column ran over the bar it
+                        // belongs to, so the chart read as one block of text.
+                        self.line_tip(
+                            label,
+                            ms.small(),
+                            t.muted(),
+                            ms.base() * 11.5,
+                            format!("barl-{}-{r}", tab.id),
+                        ),
                     )
                     .child(
                         div().flex_1().h_full().child(
@@ -6970,8 +7004,15 @@ impl Workspace {
                     .child(
                         div()
                             .w(px(ms.base() * 8.0))
+                            .flex_none()
+                            .truncate()
+                            // To the RIGHT, like every other number in this
+                            // client: a column of measurements lines up by
+                            // place value or it is read one at a time.
+                            .text_right()
                             .text_size(ms.small())
-                            .text_color(if v.is_some() { t.fg() } else { t.muted() })
+                            .text_color(if v.is_some() { t.fg() } else { t.null_fg() })
+                            .when(v.is_none(), |d| d.italic())
                             .child(SharedString::from(match v {
                                 Some(n) => format!("{n}"),
                                 None => "NULL".into(),
@@ -8402,8 +8443,10 @@ impl Workspace {
                         .find(|c| &c.name == k)
                         .map(|c| c.type_name.as_str());
                     let badge = type_badge(val, declared);
+                    let fgroup = SharedString::from(format!("tf-{}-{k}", tab.id));
                     out = out.child(
                         div()
+                            .group(fgroup.clone())
                             .flex()
                             .items_center()
                             .gap_2()
@@ -8474,7 +8517,10 @@ impl Workspace {
                                 }
                             })
                             // A value that can be seen and not taken is half
-                            // useless, and GPUI has no selectable text.
+                            // useless, and GPUI has no selectable text. UNDER
+                            // THE POINTER, though: a document of forty fields
+                            // had forty "copy" links down its right-hand side,
+                            // and the column of them was read before the data.
                             .child({
                                 let raw = match val {
                                     Value::String(s) => s.clone(),
@@ -8489,6 +8535,8 @@ impl Workspace {
                                     )))
                                     .flex_none()
                                     .px_1()
+                                    .invisible()
+                                    .group_hover(fgroup.clone(), |d| d.visible())
                                     .cursor_pointer()
                                     .hover(|d| d.bg(t.hover_mark()))
                                     .text_size(ms.tiny())
@@ -8531,6 +8579,38 @@ impl Workspace {
         out.into_any_element()
     }
 
+    /// JSON, coloured by what each run IS — see `workspace::json_runs`.
+    ///
+    /// `StyledText` with one run per piece rather than a `div` per token: a
+    /// forty-field document is a few hundred tokens, and that many elements per
+    /// document per frame is a layout pass nobody is paying for. The runs are
+    /// byte lengths that cover the text exactly, which is what the text system
+    /// requires — a gap is a panic, not a wrong colour.
+    fn json_text(&self, text: &str) -> gpui::StyledText {
+        let t = self.t();
+        let runs: Vec<gpui::TextRun> = crate::workspace::json_runs(text)
+            .into_iter()
+            .map(|(len, role)| gpui::TextRun {
+                len,
+                font: gpui::Font {
+                    family: self.font_family.clone().into(),
+                    features: Default::default(),
+                    fallbacks: None,
+                    weight: Default::default(),
+                    style: Default::default(),
+                },
+                color: t.json_role(role).into(),
+                background_color: None,
+                underline: None,
+                strikethrough: None,
+            })
+            .collect();
+        // The SIZE comes from the element this sits in, not from the run: a
+        // `TextRun` names a family and a colour, and the parent's `text_size`
+        // is what the layout measures against.
+        gpui::StyledText::new(SharedString::from(text.to_string())).with_runs(runs)
+    }
+
     fn json_el(&self, tab: &Tab, cx: &mut Context<Self>) -> gpui::AnyElement {
         let (t, ms) = (self.t(), self.scale);
         let tab_id = tab.id;
@@ -8556,7 +8636,9 @@ impl Workspace {
         for i in 0..tab.rows.len().min(200) {
             let doc = tab.document(i);
             let editing = tab.editing_doc == Some(i);
+            let group = SharedString::from(format!("jdoc-g-{tab_id}-{i}"));
             let mut block = div()
+                .group(group.clone())
                 .flex()
                 .flex_col()
                 .w_full()
@@ -8564,23 +8646,38 @@ impl Workspace {
                 .border_b_1()
                 .border_color(t.border());
             let text = render(&doc);
+            // The number stays; "copy" and "edit" come out UNDER THE POINTER.
+            // Two hundred documents each carrying two controls is four hundred
+            // links down the view, and the eye reads the column of them before
+            // it reads any of the data.
             let mut head = div()
                 .flex()
                 .items_center()
                 .gap_2()
                 .child(self.small(format!("{}", i + 1), t.row_number()))
-                .child(self.copy_el(
-                    format!("jcopy-{tab_id}-{i}"),
-                    text.clone(),
-                    "copy",
-                    cx,
-                ));
+                .child(
+                    div()
+                        .invisible()
+                        .group_hover(group.clone(), |d| d.visible())
+                        .child(self.copy_el(
+                            format!("jcopy-{tab_id}-{i}"),
+                            text.clone(),
+                            "copy",
+                            cx,
+                        )),
+                );
             if can_edit && !editing {
                 head = head.child(
-                    btn(t, ms, format!("jedit-{tab_id}-{i}"), "edit", Btn::Link)
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            this.begin_doc_edit(tab_id, i, cx);
-                        })),
+                    div()
+                        .invisible()
+                        .group_hover(group.clone(), |d| d.visible())
+                        .child(
+                            btn(t, ms, format!("jedit-{tab_id}-{i}"), "edit", Btn::Link).on_click(
+                                cx.listener(move |this, _, _, cx| {
+                                    this.begin_doc_edit(tab_id, i, cx);
+                                }),
+                            ),
+                        ),
                 );
             }
             block = block.child(head);
@@ -8663,8 +8760,7 @@ impl Workspace {
                             div()
                                 .whitespace_nowrap()
                                 .text_size(ms.small())
-                                .text_color(t.fg())
-                                .child(SharedString::from(text.clone())),
+                                .child(self.json_text(&text)),
                         ),
                 );
             }

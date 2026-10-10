@@ -372,6 +372,24 @@ impl Theme {
         Self::toward(self.muted(), self.fg(), self.base(), 2.0)
     }
 
+    /// The colour one run of JSON is drawn in — see `workspace::json_runs`.
+    ///
+    /// The editor's own syntax colours, which already name these four things:
+    /// the JSON view used one ink for everything, so a document of forty fields
+    /// was forty lines the same colour and finding a value meant reading it.
+    pub fn json_role(&self, role: crate::workspace::JsonRole) -> Rgba {
+        use crate::workspace::JsonRole as R;
+        match role {
+            R::Key => hex(&self.syntax.identifier, self.fg()),
+            R::Str => hex(&self.syntax.string, self.fg()),
+            R::Num => hex(&self.syntax.number, self.fg()),
+            R::Word => hex(&self.syntax.keyword, self.accent()),
+            // The braces and the commas are the SHAPE, not the content: quiet,
+            // so the indentation reads as structure rather than as text.
+            R::Punct => self.disabled(),
+        }
+    }
+
     /// The colour a type badge is drawn in. Mapped from the badge word rather
     /// than from a driver name, so a type this client has never heard of lands
     /// on the neutral ink instead of nothing.

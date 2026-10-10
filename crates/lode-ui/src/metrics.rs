@@ -605,6 +605,14 @@ mod tests {
             let w = longest * f32::from(m.small()) * 0.55;
             assert!(m.label_w() >= w, "base {b}: {} vs {w}", m.label_w());
             assert!(m.field_w() > m.label_w(), "base {b}: a field wants more room than its label");
+            // The SOURCE sits on a second line under the label, not appended to
+            // it, and it is drawn at `tiny` — so it has its own fit to pass.
+            // Appended, `Password · Environment variable` was cut mid-word on
+            // the English labels and lost its whole second half on the
+            // Bulgarian ones, which is the half that says what to type.
+            let aside = "Keyring path".chars().count() as f32;
+            let aw = aside * f32::from(m.tiny()) * 0.55;
+            assert!(m.label_w() >= aw, "base {b}: the source line does not fit: {} vs {aw}", m.label_w());
             b += 1.0;
         }
     }

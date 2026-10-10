@@ -1054,6 +1054,106 @@ pub fn column_summary(
     }
 }
 
+/// What a run of JSON text IS, for colouring it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JsonRole {
+    /// A field's name — the string to the left of a colon.
+    Key,
+    Str,
+    Num,
+    /// `true`, `false`, `null`.
+    Word,
+    /// Braces, brackets, commas, colons, and the whitespace between them.
+    Punct,
+}
+
+/// Split JSON text into coloured runs.
+///
+/// The JSON view was ONE colour: a document of forty fields was forty lines of
+/// the same ink, and finding a value in it meant reading it. A key, a string, a
+/// number and a keyword are four different things and the editor's own syntax
+/// colours already name all four.
+///
+/// A KEY is a string with a colon after it (past any whitespace), which is the
+/// whole of what distinguishes one in JSON — there is no other way to tell.
+///
+/// Lengths are in BYTES and they COVER THE TEXT: the sum of them is the text's
+/// length, with no gap and no overlap, because a highlight range that misses a
+/// byte boundary is a panic in the text system rather than a wrong colour.
+pub fn json_runs(text: &str) -> Vec<(usize, JsonRole)> {
+    let b = text.as_bytes();
+    let mut out: Vec<(usize, JsonRole)> = Vec::new();
+    let mut i = 0usize;
+    while i < b.len() {
+        let start = i;
+        let role = match b[i] {
+            b'"' => {
+                // Over the string, honouring escapes — a `\"` does not end it.
+                i += 1;
+                while i < b.len() {
+                    match b[i] {
+                        b'\\' => i += 2,
+                        b'"' => {
+                            i += 1;
+                            break;
+                        }
+                        _ => i += 1,
+                    }
+                }
+                i = i.min(b.len());
+                // A colon after it, past whitespace, makes it a key.
+                let mut j = i;
+                while j < b.len() && (b[j] as char).is_ascii_whitespace() {
+                    j += 1;
+                }
+                if j < b.len() && b[j] == b':' {
+                    JsonRole::Key
+                } else {
+                    JsonRole::Str
+                }
+            }
+            c if c == b'-' || c.is_ascii_digit() => {
+                i += 1;
+                while i < b.len()
+                    && (b[i].is_ascii_digit()
+                        || b[i] == b'.'
+                        || b[i] == b'e'
+                        || b[i] == b'E'
+                        || b[i] == b'+'
+                        || b[i] == b'-')
+                {
+                    i += 1;
+                }
+                JsonRole::Num
+            }
+            c if c.is_ascii_alphabetic() => {
+                while i < b.len() && b[i].is_ascii_alphabetic() {
+                    i += 1;
+                }
+                JsonRole::Word
+            }
+            _ => {
+                // Everything else, one byte at a time: a multi-byte character
+                // inside no string is not valid JSON, and stepping a byte keeps
+                // the run boundaries on char boundaries for the ASCII that is.
+                i += 1;
+                while i < b.len() && !text.is_char_boundary(i) {
+                    i += 1;
+                }
+                JsonRole::Punct
+            }
+        };
+        let len = i - start;
+        // Merge with the run before it when they say the same thing, so a page
+        // of punctuation is one run rather than two hundred.
+        match out.last_mut() {
+            Some((l, r)) if *r == role => *l += len,
+            _ => out.push((len, role)),
+        }
+    }
+    out
+}
+
 /// Which rows of the palette to draw, so the chosen one is among them.
 ///
 /// It drew the FIRST fourteen and highlighted the chosen one — so pressing
@@ -1381,7 +1481,66 @@ mod tests {
         assert_eq!(super::respawn_delay(3), None, "a fourth try is a spawn storm");
     }
 
-    /// The chosen palette row is always on screen.
+    /// The runs cover the text exactly, and name the four things apart.
+    #[test]
+    fn json_colours_cover_every_byte() {
+        use super::JsonRole::*;
+        let text = "{\n  \"name\": \"ada\",\n  \"n\": -12.5e3,\n  \"ok\": true,\n  \"x\": null\n}";
+        let runs = super::json_runs(text);
+        assert_eq!(
+            runs.iter().map(|(l, _)| *l).sum::<usize>(),
+            text.len(),
+            "the runs must cover the text: {runs:?}"
+        );
+        // Every boundary is a char boundary, which is what the text system
+        // asserts on.
+        let mut at = 0usize;
+        for (l, _) in &runs {
+            at += l;
+            assert!(text.is_char_boundary(at), "{at} is not a boundary");
+        }
+        let roles: Vec<super::JsonRole> = runs.iter().map(|(_, r)| *r).collect();
+        assert!(roles.contains(&Key), "{roles:?}");
+        assert!(roles.contains(&Str));
+        assert!(roles.contains(&Num));
+        assert!(roles.contains(&Word));
+        assert!(roles.contains(&Punct));
+    }
+
+    /// A string holding an escaped quote, a colon or a brace does not confuse
+    /// the scanner — and a key is a string with a colon AFTER it, not one with
+    /// a colon in it.
+    #[test]
+    fn a_quoted_colon_is_not_a_key() {
+        use super::JsonRole::*;
+        let text = r#"{"a:b": "say \"hi\": now"}"#;
+        let runs = super::json_runs(text);
+        assert_eq!(runs.iter().map(|(l, _)| *l).sum::<usize>(), text.len(), "{runs:?}");
+        let keys = runs.iter().filter(|(_, r)| *r == Key).count();
+        assert_eq!(keys, 1, "only `\"a:b\"` is a key: {runs:?}");
+        assert_eq!(runs.iter().filter(|(_, r)| *r == Str).count(), 1);
+    }
+
+    /// Text that is not JSON at all still comes back whole, because an engine
+    /// can answer with anything and this must not drop a byte of it.
+    #[test]
+    fn rubbish_is_still_covered() {
+        for text in ["", "{", "\"unterminated", "привет", "{\"k\": \"стойност\"}", "-", "12e"] {
+            let runs = super::json_runs(text);
+            assert_eq!(
+                runs.iter().map(|(l, _)| *l).sum::<usize>(),
+                text.len(),
+                "{text:?} -> {runs:?}"
+            );
+            let mut at = 0usize;
+            for (l, _) in &runs {
+                at += l;
+                assert!(text.is_char_boundary(at), "{text:?} broke at {at}");
+            }
+        }
+    }
+
+    /// The chosen palette row is always on screen.    /// The chosen palette row is always on screen.
     #[test]
     fn the_palette_shows_the_row_it_has_chosen() {
         // Everything fits: the whole list, from the top.

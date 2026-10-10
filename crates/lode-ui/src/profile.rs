@@ -26,6 +26,8 @@ pub struct ProfileForm {
     workspace: WeakEntity<Workspace>,
     theme: Theme,
     scale: Metrics,
+    /// The interface's language — see `ConnectionForm::lang`.
+    lang: crate::i18n::Lang,
     /// The main window's text font — see `ConnectionForm::font_family`.
     font_family: String,
     /// The name it was opened under, when it already existed. A new profile has
@@ -53,7 +55,7 @@ impl ProfileForm {
         users: Vec<String>,
         cx: &mut Context<Self>,
     ) -> Self {
-        let crate::widgets::Look { theme, scale, text_font: font_family, .. } = look;
+        let crate::widgets::Look { theme, scale, text_font: font_family, lang, .. } = look;
         let colors = crate::form::colors_of(&theme);
         let mk = |cx: &mut Context<Self>, ph: &str, val: &str| {
             let (ph, val) = (ph.to_string(), val.to_string());
@@ -77,6 +79,7 @@ impl ProfileForm {
         ProfileForm {
             workspace,
             theme,
+            lang,
             font_family,
             scale,
             editing: existing.as_ref().map(|(n, _)| n.clone()),
@@ -119,6 +122,11 @@ impl ProfileForm {
                 &self.password.source.wrap(self.password.input.read(cx).text()),
             ),
         })
+    }
+
+    /// One phrase of the interface, in the chosen language.
+    fn tr(&self, key: &str) -> SharedString {
+        SharedString::from(self.lang.tr(key))
     }
 
     /// What is wrong with the typed port, if anything.
@@ -217,7 +225,7 @@ impl Render for ProfileForm {
         let small = |s: SharedString, c: gpui::Rgba| {
             div().text_size(ms.small()).text_color(c).child(s)
         };
-        let row = |label: &'static str, input: Entity<TextInput>| {
+        let row = |label: SharedString, input: Entity<TextInput>| {
             div()
                 .flex()
                 .items_center()
@@ -234,12 +242,23 @@ impl Render for ProfileForm {
                 .child(div().flex_1().text_size(ms.body()).child(input))
         };
 
-        let mut body = div().flex().flex_col().flex_1().p_3().gap_1();
+        // Scrolls, for the same reason the connection window's body does: with
+        // a key path, a passphrase and a warning the content is taller than the
+        // window at a large text size, and what fell off the bottom was Save.
+        let mut body = div()
+            .id("profile-body")
+            .flex()
+            .flex_col()
+            .flex_1()
+            .min_h_0()
+            .overflow_y_scroll()
+            .p_3()
+            .gap_1();
         body = body
-            .child(row("Name", self.name.clone()))
-            .child(row("SSH host", self.host.clone()))
-            .child(row("SSH port", self.port.clone()))
-            .child(row("SSH user", self.user.clone()));
+            .child(row(self.tr("form.name"), self.name.clone()))
+            .child(row(self.tr("form.ssh_host"), self.host.clone()))
+            .child(row(self.tr("form.ssh_port"), self.port.clone()))
+            .child(row(self.tr("form.ssh_user"), self.user.clone()));
 
         let mut methods = div().flex().items_center().gap_2().py_1().child(
             div()
@@ -247,7 +266,7 @@ impl Render for ProfileForm {
                 .flex_none()
                 .text_size(ms.small())
                 .text_color(t.muted())
-                .child("Method"),
+                .child(self.tr("form.method")),
         );
         for a in ["agent", "key", "password"] {
             let on = self.auth == a;
@@ -278,7 +297,7 @@ impl Render for ProfileForm {
                             .flex_none()
                             .text_size(ms.small())
                             .text_color(t.muted())
-                            .child("Key file"),
+                            .child(self.tr("form.key_file")),
                     )
                     .child(div().flex_1().text_size(ms.body()).child(self.key_path.clone()))
                     .child(
@@ -302,10 +321,10 @@ impl Render for ProfileForm {
             if let Some(why) = self.key_problem(cx) {
                 body = body.child(small(why.into(), t.error()));
             }
-            body = body.child(row("Passphrase", self.passphrase.input.clone()));
+            body = body.child(row(self.tr("form.passphrase"), self.passphrase.input.clone()));
         }
         if self.auth == "password" {
-            body = body.child(row("Password", self.password.input.clone()));
+            body = body.child(row(self.tr("form.password"), self.password.input.clone()));
         }
 
         // WHO depends on this, before anything is changed rather than after.

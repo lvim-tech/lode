@@ -133,6 +133,7 @@ const EN: &[(&str, &str)] = &[
     ("form.provider",      "Provider"),
     ("form.token",         "Token"),
     ("form.password",      "Password"),
+    ("form.passphrase",    "Passphrase"),
     ("form.ssl_mode",      "SSL mode"),
     ("form.ca_bundle",     "CA bundle"),
     ("form.certificate",   "Certificate"),
@@ -260,6 +261,7 @@ const EN: &[(&str, &str)] = &[
     ("board.time",         "time"),
     ("board.from",         "from"),
     ("board.to",           "to"),
+    ("board.text_hint",    "select this tile and type a heading"),
     ("board.empty",        "an empty board — press Arrange, then add a chart you have saved"),
     // Tasks and the console.
     ("tasks.title",          "Background tasks"),
@@ -296,6 +298,7 @@ const BG: &[(&str, &str)] = &[
     ("form.provider",      "Доставчик"),
     ("form.token",         "Токен"),
     ("form.password",      "Парола"),
+    ("form.passphrase",    "Парола на ключа"),
     ("form.ssl_mode",      "SSL режим"),
     ("form.ca_bundle",     "CA пакет"),
     ("form.certificate",   "Сертификат"),
@@ -422,6 +425,7 @@ const BG: &[(&str, &str)] = &[
     ("board.time",         "време"),
     ("board.from",         "от"),
     ("board.to",           "до"),
+    ("board.text_hint",    "избери тази плочка и напиши заглавие"),
     ("board.empty",        "празно табло — натисни Подреди и добави запазена диаграма"),
 
     ("tasks.title",          "Задачи на заден план"),
