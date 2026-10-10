@@ -17,6 +17,7 @@
 
 mod app;
 mod board;
+mod editor;
 mod export;
 mod form;
 mod i18n;

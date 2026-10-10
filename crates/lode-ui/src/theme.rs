@@ -372,6 +372,24 @@ impl Theme {
         Self::toward(self.muted(), self.fg(), self.base(), 2.0)
     }
 
+    /// The colour one run of a statement is drawn in — see `editor::sql_runs`.
+    ///
+    /// The seven roles are the seven the 48 themes carry: the generator reads
+    /// the editor's own `syntax.*` groups, so a statement in this window is
+    /// coloured exactly as the same statement is in the editor.
+    pub fn sql_role(&self, role: crate::editor::SqlRole) -> Rgba {
+        use crate::editor::SqlRole as R;
+        match role {
+            R::Keyword => hex(&self.syntax.keyword, self.accent()),
+            R::Str => hex(&self.syntax.string, self.fg()),
+            R::Num => hex(&self.syntax.number, self.fg()),
+            R::Comment => hex(&self.syntax.comment, self.muted()),
+            R::Ident => hex(&self.syntax.identifier, self.fg()),
+            R::Operator => hex(&self.syntax.operator, self.muted()),
+            R::Plain => self.fg(),
+        }
+    }
+
     /// The colour one run of JSON is drawn in — see `workspace::json_runs`.
     ///
     /// The editor's own syntax colours, which already name these four things:
