@@ -53,6 +53,10 @@ pub struct Session {
     /// otherwise silently open somebody else's groups.
     #[serde(default)]
     pub settings_open: Option<Vec<String>>,
+    /// The panel, folded away. `None` means it is open, which is the default
+    /// and what every session written before this field says.
+    #[serde(default)]
+    pub panel_hidden: Option<bool>,
     /// The icon rail's size, when somebody has set one. Its OWN setting: the
     /// rail is navigation and the text is content, and enlarging one is not
     /// asking for the other.
@@ -233,6 +237,7 @@ mod tests {
             lang: Some("bg".into()),
             icon_size: Some(24.0),
             settings_open: Some(vec!["theme".into()]),
+            panel_hidden: None,
             panel_w: Some(320.0),
         };
         let text = serde_json::to_string(&s).unwrap();
@@ -274,6 +279,7 @@ mod tests {
             lang: None,
             icon_size: None,
             settings_open: None,
+            panel_hidden: None,
             panel_w: None,
         };
         let round: Session = serde_json::from_str(&serde_json::to_string(&typed).unwrap()).unwrap();

@@ -1062,6 +1062,43 @@ pub fn column_summary(
     }
 }
 
+/// Which tab is already showing this object, if any.
+///
+/// Clicking a table four times made four tabs of it. The strip filled with
+/// copies of one table, and the copies were not even equivalent — three of them
+/// held a stale result nobody had re-run.
+///
+/// A DASHBOARD tab is never a match: it is named after a board, not an object,
+/// and two boards can be open at once by design.
+pub fn find_tab_for(tabs: &[Tab], conn: &str, name: &str, schema: Option<&str>) -> Option<usize> {
+    tabs.iter().position(|t| {
+        t.board.is_none()
+            && t.conn_name == conn
+            && t.object.as_ref().map_or(false, |(n, s)| {
+                n == name && s.as_deref() == schema
+            })
+    })
+}
+
+/// Move a tab to the front of the most-recently-used list.
+///
+/// The list is how ctrl-tab works: pressing it twice must return to where it
+/// started, which is what "most recent" means and what stepping left and right
+/// through the strip does not do. Twelve tabs and the one you were just in is
+/// three presses of `h` away.
+pub fn mru_touch(mru: &mut Vec<u64>, tab: u64) {
+    mru.retain(|x| *x != tab);
+    mru.insert(0, tab);
+}
+
+/// The tab ctrl-tab should go to: the most recent OTHER one that still exists.
+pub fn mru_next(mru: &[u64], now: u64, alive: &[u64]) -> Option<u64> {
+    mru.iter()
+        .copied()
+        .find(|id| *id != now && alive.contains(id))
+        .or_else(|| alive.iter().copied().find(|id| *id != now))
+}
+
 /// A name for a tab holding a typed statement.
 ///
 /// The first words of it, on one line. Not the whole thing: a tab titled by a
@@ -1506,6 +1543,67 @@ mod tests {
         assert!(super::respawn_delay(1).unwrap() > super::respawn_delay(0).unwrap());
         assert!(super::respawn_delay(2).unwrap() > super::respawn_delay(1).unwrap());
         assert_eq!(super::respawn_delay(3), None, "a fourth try is a spawn storm");
+    }
+
+    /// One tab per object, and a dashboard is not an object.
+    #[test]
+    fn an_object_already_open_is_found() {
+        let mut a = table_tab();
+        a.conn_name = "prod".into();
+        a.object = Some(("users".into(), Some("public".into())));
+        let mut b = table_tab();
+        b.conn_name = "prod".into();
+        b.object = Some(("orders".into(), None));
+        let mut draft = table_tab();
+        draft.conn_name = "prod".into();
+        draft.object = None;
+        let tabs = vec![a, b, draft];
+
+        assert_eq!(super::find_tab_for(&tabs, "prod", "users", Some("public")), Some(0));
+        assert_eq!(super::find_tab_for(&tabs, "prod", "orders", None), Some(1));
+        // The SCHEMA is part of the identity: two tables of one name in two
+        // schemas are two tables.
+        assert_eq!(super::find_tab_for(&tabs, "prod", "users", None), None);
+        assert_eq!(super::find_tab_for(&tabs, "prod", "users", Some("other")), None);
+        // So is the connection: the same table on staging is not this one.
+        assert_eq!(super::find_tab_for(&tabs, "staging", "users", Some("public")), None);
+        // A typed draft is not an object and must not be reused.
+        assert_eq!(super::find_tab_for(&tabs, "prod", "", None), None);
+    }
+
+    /// Ctrl-tab goes to the tab you were last in, and pressing it twice comes
+    /// back — which is the whole difference between a most-recent list and
+    /// stepping along the strip.
+    #[test]
+    fn ctrl_tab_returns_where_it_came_from() {
+        let mut mru = Vec::new();
+        for id in [1, 2, 3] {
+            super::mru_touch(&mut mru, id);
+        }
+        assert_eq!(mru, vec![3, 2, 1]);
+        // Touching one already in the list moves it, never duplicates it.
+        super::mru_touch(&mut mru, 1);
+        assert_eq!(mru, vec![1, 3, 2]);
+
+        let alive = vec![1, 2, 3];
+        let there = super::mru_next(&mru, 1, &alive).unwrap();
+        assert_eq!(there, 3, "the one before this");
+        super::mru_touch(&mut mru, there);
+        assert_eq!(super::mru_next(&mru, there, &alive), Some(1), "and back again");
+    }
+
+    /// A closed tab is not somewhere to go, even while the list still names it.
+    #[test]
+    fn a_closed_tab_is_not_a_destination() {
+        let mru = vec![9, 2, 1];
+        let alive = vec![1, 2];
+        assert_eq!(super::mru_next(&mru, 1, &alive), Some(2));
+        // Nothing in the list is alive: fall back to any other open tab rather
+        // than refusing to move.
+        assert_eq!(super::mru_next(&[], 1, &alive), Some(2));
+        // One tab only: there is nowhere else, and that is an answer.
+        assert_eq!(super::mru_next(&[1], 1, &[1]), None);
+        assert_eq!(super::mru_next(&[], 1, &[]), None);
     }
 
     /// A tab gets a name from its statement, on one line and not too long.

@@ -79,6 +79,40 @@ gpui::actions!(
         PaletteDown,
         PaletteUp,
         PaletteAccept,
+        /// A tab of one's own, on the connection in front: ctrl-t.
+        NewTab,
+        /// Close the tab in front: ctrl-w.
+        CloseTab,
+        /// The tab you were last in — see `mru_next`. Ctrl-tab, and back again.
+        LastTab,
+        /// The panel, out of the way and back: ctrl-shift-b (plain ctrl-b is
+        /// already a page of rows).
+        TogglePanel,
+        /// The settings window: ctrl-comma, as everywhere else.
+        OpenSettings,
+        /// A new connection: ctrl-shift-n.
+        NewConnection,
+        /// The export row: ctrl-e.
+        ToggleExport,
+        /// A page of rows forward and back, `[` and `]`.
+        PrevPage,
+        NextPage,
+        /// Straight to a panel: ctrl-shift-a audit, ctrl-shift-t tasks.
+        ShowAudit,
+        ShowTasks,
+        /// Run the active tab again: f5.
+        Refresh,
+        /// Pick a tab by position: ctrl-1 … ctrl-9. Nine, because the tenth
+        /// would be ctrl-0 and nobody counts the tenth tab.
+        GoTab1,
+        GoTab2,
+        GoTab3,
+        GoTab4,
+        GoTab5,
+        GoTab6,
+        GoTab7,
+        GoTab8,
+        GoTab9,
     ]
 );
 
@@ -117,6 +151,31 @@ pub fn bind_workspace_keys(cx: &mut gpui::App) {
         KeyBinding::new("ctrl-j", PaletteDown, Some("Palette")),
         KeyBinding::new("ctrl-k", PaletteUp, Some("Palette")),
         KeyBinding::new("ctrl-y", PaletteAccept, Some("Palette")),
+        // These hold a modifier, so they are safe INSIDE a field as well — and
+        // have to be: ctrl-w while the cursor is in a statement still means
+        // close the tab. Only the bare letters above are barred.
+        KeyBinding::new("ctrl-t", NewTab, None),
+        KeyBinding::new("ctrl-w", CloseTab, None),
+        KeyBinding::new("ctrl-tab", LastTab, None),
+        KeyBinding::new("ctrl-shift-b", TogglePanel, None),
+        KeyBinding::new("ctrl-,", OpenSettings, None),
+        KeyBinding::new("ctrl-shift-n", NewConnection, None),
+        KeyBinding::new("ctrl-e", ToggleExport, None),
+        KeyBinding::new("ctrl-shift-a", ShowAudit, None),
+        KeyBinding::new("ctrl-shift-t", ShowTasks, None),
+        KeyBinding::new("f5", Refresh, None),
+        // Paging is `[` and `]`, which ARE bare — so they stay outside a field.
+        KeyBinding::new("[", PrevPage, OUTSIDE),
+        KeyBinding::new("]", NextPage, OUTSIDE),
+        KeyBinding::new("ctrl-1", GoTab1, None),
+        KeyBinding::new("ctrl-2", GoTab2, None),
+        KeyBinding::new("ctrl-3", GoTab3, None),
+        KeyBinding::new("ctrl-4", GoTab4, None),
+        KeyBinding::new("ctrl-5", GoTab5, None),
+        KeyBinding::new("ctrl-6", GoTab6, None),
+        KeyBinding::new("ctrl-7", GoTab7, None),
+        KeyBinding::new("ctrl-8", GoTab8, None),
+        KeyBinding::new("ctrl-9", GoTab9, None),
     ]);
 }
 
@@ -620,6 +679,15 @@ pub enum PaletteAct {
     EditProfile(String),
     /// A column's width sideways, signed.
     ScrollGrid(f32),
+    /// The keystrokes, reachable by name as well — the palette is where a
+    /// shortcut is learned.
+    NewTab,
+    CloseTab,
+    LastTab,
+    TogglePanel,
+    OpenSettings,
+    /// A page of rows, signed.
+    Page(i64),
 }
 
 /// Read a typed cell back into a JSON value.
@@ -809,6 +877,13 @@ pub struct Workspace {
     fatal: Option<String>,
     /// How many times the engine has been started again after it exited, and
     /// when the next attempt is due. See [`respawn_delay`].
+    /// Which tabs were visited, most recent first — see `mru_next`. Ctrl-tab
+    /// goes along this rather than along the strip, so pressing it twice comes
+    /// back to where it started.
+    mru: Vec<u64>,
+    /// The panel, folded away. Remembered, because somebody who wants the room
+    /// wants it next time too.
+    panel_hidden: bool,
     /// A connection somebody has asked to remove, and what would go with it:
     /// `(name, saved queries)`. The count is `None` until the engine answers.
     confirm_conn_rm: Option<(String, Option<usize>)>,
@@ -1115,6 +1190,8 @@ impl Workspace {
             engine: None,
             hello: None,
             fatal: None,
+            mru: Vec::new(),
+            panel_hidden: restore.panel_hidden.unwrap_or(false),
             confirm_conn_rm: None,
             naming: None,
             save_name,
@@ -2315,6 +2392,12 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) {
         let Some(live) = self.live(conn_name) else { return };
+        // ALREADY OPEN? Then go to it. Clicking a table four times made four
+        // tabs of it, and three of them held a result nobody had re-run.
+        if let Some(at) = crate::workspace::find_tab_for(&self.tabs, conn_name, name, schema) {
+            self.go_tab_at(at, cx);
+            return;
+        }
         let driver = live.driver.clone();
         let meta = self.meta(&driver).cloned();
         let template = meta
@@ -2875,6 +2958,7 @@ impl Workspace {
             active: self.active,
             theme: Some(self.theme_name.clone()),
             json_indent: Some(self.json_indent),
+            panel_hidden: Some(self.panel_hidden).filter(|x| *x),
             // Nothing opens or closes a settings group any more — the panel
             // became a window with categories. The field stays in the file's
             // shape so a session written by an older build still parses.
@@ -3362,7 +3446,51 @@ impl Workspace {
             self.toast(format!("{conn} is not connected"), true);
             return;
         }
-        self.run_statement_titled(conn, title, sql, false, cx);
+        // **It LOADS, it does not run.** A click in the history ran the
+        // statement straight away, which for a history of writes means a click
+        // in a list repeats a write — and for a slow read it means waiting for
+        // something somebody only wanted to look at. The statement goes into
+        // the editor, where it can be read, changed, and run with ctrl-enter.
+        //
+        // Into the tab IN FRONT when it belongs to this connection and holds
+        // nothing that would be lost; a tab of its own otherwise.
+        let here = self
+            .tabs
+            .get(self.active)
+            .filter(|t| t.conn_name == conn && t.board.is_none() && t.object.is_none())
+            .map(|t| t.id);
+        match here.and_then(|id| self.editors.get(&id).cloned().map(|e| (id, e))) {
+            Some((id, ed)) => {
+                let text = sql.to_string();
+                ed.update(cx, |e, cx| e.set_text(&text, cx));
+                if let Some(tb) = self.tabs.iter_mut().find(|t| t.id == id) {
+                    tb.sql = sql.to_string();
+                    tb.title = title.to_string();
+                }
+                self.status = format!("loaded: {title}");
+                self.remember();
+                cx.notify();
+            }
+            None => self.open_draft_with(conn, title, sql, cx),
+        }
+    }
+
+    /// A tab of its own, holding a statement and NOT running it.
+    fn open_draft_with(&mut self, conn: &str, title: &str, sql: &str, cx: &mut Context<Self>) {
+        let Some(live) = self.live(conn) else { return };
+        let driver = live.driver.clone();
+        let meta = self.meta(&driver).cloned();
+        let id = self.next_tab;
+        self.next_tab += 1;
+        let mut tab = Tab::new(id, conn.to_string(), driver, title.to_string(), meta.as_ref());
+        tab.sql = sql.to_string();
+        self.tabs.push(tab);
+        self.active = self.tabs.len() - 1;
+        let hint = meta.as_ref().map(|m| m.hint.clone()).unwrap_or_default();
+        self.make_editor(id, Some(&hint), sql, cx);
+        crate::workspace::mru_touch(&mut self.mru, id);
+        self.remember();
+        cx.notify();
     }
 
     /// Write what the grid holds. What is written is what is LOADED, and the row
@@ -3430,12 +3558,69 @@ impl Workspace {
         cx.notify();
     }
 
+    /// A DRAFT tab: the connection in front, nothing typed yet.
+    ///
+    /// The only way to get an empty tab before this was to run something and
+    /// then clear the box, which is a strange way to start.
+    fn new_draft_tab(&mut self, cx: &mut Context<Self>) {
+        let Some(conn) = self.target_conn() else {
+            self.toast("nothing connected".to_string(), true);
+            return;
+        };
+        let Some(live) = self.live(&conn) else { return };
+        let driver = live.driver.clone();
+        let meta = self.meta(&driver).cloned();
+        let id = self.next_tab;
+        self.next_tab += 1;
+        let tab = Tab::new(id, conn, driver, "Draft".to_string(), meta.as_ref());
+        self.tabs.push(tab);
+        self.active = self.tabs.len() - 1;
+        let hint = meta.as_ref().map(|m| m.hint.clone()).unwrap_or_default();
+        self.make_editor(id, Some(&hint), "", cx);
+        crate::workspace::mru_touch(&mut self.mru, id);
+        self.remember();
+        cx.notify();
+    }
+
+    fn go_tab_at(&mut self, at: usize, cx: &mut Context<Self>) {
+        if at < self.tabs.len() {
+            self.active = at;
+            let id = self.tabs[at].id;
+            crate::workspace::mru_touch(&mut self.mru, id);
+            self.remember();
+            cx.notify();
+        }
+    }
+
+    fn go_tab_id(&mut self, id: u64, cx: &mut Context<Self>) {
+        if let Some(at) = self.tabs.iter().position(|t| t.id == id) {
+            self.go_tab_at(at, cx);
+        }
+    }
+
+    fn go_rail(&mut self, rail: Rail, cx: &mut Context<Self>) {
+        self.rail = rail;
+        self.panel_hidden = false;
+        if rail == Rail::Audit && self.audit.is_empty() {
+            self.ask(Pending::Audit, "store.audit.list", json!({ "limit": 300 }));
+        }
+        if rail == Rail::Tasks {
+            self.log_unread = 0;
+        }
+        self.remember();
+        cx.notify();
+    }
+
     fn step_tab(&mut self, by: isize, cx: &mut Context<Self>) {
         if self.tabs.is_empty() {
             return;
         }
         let n = self.tabs.len() as isize;
         self.active = (((self.active as isize + by) % n + n) % n) as usize;
+        if let Some(t) = self.tabs.get(self.active) {
+            let id = t.id;
+            crate::workspace::mru_touch(&mut self.mru, id);
+        }
         self.remember();
         cx.notify();
     }
@@ -3512,19 +3697,35 @@ impl Workspace {
             });
         }
         for r in [Rail::Connections, Rail::Instance, Rail::History, Rail::Audit, Rail::Tasks] {
+            // The KEY where there is one. The palette is where a keystroke is
+            // learned: a row that says "panel" teaches nothing, and the whole
+            // point of showing a shortcut here is that next time nobody opens
+            // the palette at all.
+            let hint = match r {
+                Rail::Audit => "ctrl-shift-a",
+                Rail::Tasks => "ctrl-shift-t",
+                _ => "panel",
+            };
             out.push(PaletteItem {
                 label: format!("{} {}", self.lang.tr("panel.look_again").split(' ').next().unwrap_or("Show"), self.lang.tr(r.key())),
-                hint: "panel".into(),
+                hint: hint.into(),
                 act: PaletteAct::Rail(r),
             });
         }
         out.push(PaletteItem { label: "Scroll the grid left".into(), hint: "shift-h".into(), act: PaletteAct::ScrollGrid(1.0) });
         out.push(PaletteItem { label: "Scroll the grid right".into(), hint: "shift-l".into(), act: PaletteAct::ScrollGrid(-1.0) });
-        out.push(PaletteItem { label: "Run this tab".into(), hint: "r".into(), act: PaletteAct::RunActive });
-        out.push(PaletteItem { label: "Export loaded rows".into(), hint: "result".into(), act: PaletteAct::ToggleExport });
+        out.push(PaletteItem { label: "Run this tab".into(), hint: "r / f5".into(), act: PaletteAct::RunActive });
+        out.push(PaletteItem { label: "New tab".into(), hint: "ctrl-t".into(), act: PaletteAct::NewTab });
+        out.push(PaletteItem { label: "Close this tab".into(), hint: "ctrl-w".into(), act: PaletteAct::CloseTab });
+        out.push(PaletteItem { label: "The tab before this".into(), hint: "ctrl-tab".into(), act: PaletteAct::LastTab });
+        out.push(PaletteItem { label: "Hide the panel".into(), hint: "ctrl-shift-b".into(), act: PaletteAct::TogglePanel });
+        out.push(PaletteItem { label: "Settings".into(), hint: "ctrl-,".into(), act: PaletteAct::OpenSettings });
+        out.push(PaletteItem { label: "Next page of rows".into(), hint: "]".into(), act: PaletteAct::Page(1) });
+        out.push(PaletteItem { label: "Previous page of rows".into(), hint: "[".into(), act: PaletteAct::Page(-1) });
+        out.push(PaletteItem { label: "Export loaded rows".into(), hint: "ctrl-e".into(), act: PaletteAct::ToggleExport });
         out.push(PaletteItem { label: "Save this query".into(), hint: "result".into(), act: PaletteAct::SaveQuery });
         out.push(PaletteItem { label: "Toggle console".into(), hint: "window".into(), act: PaletteAct::ToggleConsole });
-        out.push(PaletteItem { label: "New connection".into(), hint: "window".into(), act: PaletteAct::NewConnection });
+        out.push(PaletteItem { label: "New connection".into(), hint: "ctrl-shift-n".into(), act: PaletteAct::NewConnection });
         out.push(PaletteItem { label: "New tunnel profile".into(), hint: "window".into(), act: PaletteAct::NewProfile });
         for p in self.profiles.get("tunnel").into_iter().flatten() {
             out.push(PaletteItem {
@@ -3590,6 +3791,9 @@ impl Workspace {
         match act {
             PaletteAct::Rail(r) => {
                 self.rail = r;
+                // Asking for a panel by name is asking to SEE it: folded away,
+                // the row would have done nothing at all.
+                self.panel_hidden = false;
                 if r == Rail::Tasks {
                     self.log_unread = 0;
                 }
@@ -3637,6 +3841,26 @@ impl Workspace {
             }
             PaletteAct::ToggleExport => self.export_open = !self.export_open,
             PaletteAct::SaveQuery => self.save_query(cx),
+            PaletteAct::NewTab => self.new_draft_tab(cx),
+            PaletteAct::CloseTab => {
+                if let Some(t) = self.tabs.get(self.active) {
+                    let id = t.id;
+                    self.close_tab(id);
+                }
+            }
+            PaletteAct::LastTab => {
+                let alive: Vec<u64> = self.tabs.iter().map(|t| t.id).collect();
+                let now = self.tabs.get(self.active).map(|t| t.id).unwrap_or(0);
+                if let Some(to) = crate::workspace::mru_next(&self.mru, now, &alive) {
+                    self.go_tab_id(to, cx);
+                }
+            }
+            PaletteAct::TogglePanel => {
+                self.panel_hidden = !self.panel_hidden;
+                self.remember();
+            }
+            PaletteAct::OpenSettings => self.open_settings(cx),
+            PaletteAct::Page(by) => self.page_by(by),
             PaletteAct::ToggleConsole => {
                 self.drawer = match self.drawer {
                     Some(Drawer::Command) => None,
@@ -5047,6 +5271,17 @@ impl Workspace {
                     // come out the same optical size whatever the font draws.
                     .child(self.icon_el(mode.glyph(), if on { t.accent() } else { t.muted() }))
                     .on_click(cx.listener(move |this, _, _, cx| {
+                        // The SAME button again folds the panel away. A rail
+                        // where every button only ever opens something gives no
+                        // way to get the room back except a keystroke somebody
+                        // has to know about.
+                        if this.rail == mode && !this.panel_hidden {
+                            this.panel_hidden = true;
+                            this.remember();
+                            cx.notify();
+                            return;
+                        }
+                        this.panel_hidden = false;
                         this.rail = mode;
                         // The log is read here, so the count beside the task
                         // total goes back to nothing.
@@ -5277,11 +5512,20 @@ impl Workspace {
                                 t.muted(),
                                 ms.line_w(),
                             ))
+                            // One click LOADS it; two RUN it. A single click
+                            // used to run, so a history of writes meant a
+                            // click in a list repeated a write.
                             .on_click(cx.listener({
                                 let (c, s) = (conn.clone(), stmt.clone());
-                                move |this, _, _, cx| {
-                                    let title: String = s.chars().take(40).collect();
+                                move |this, ev: &gpui::ClickEvent, _, cx| {
+                                    let title = crate::workspace::draft_title(&s);
                                     this.open_sql(&c, &title, &s, cx);
+                                    if ev.click_count() >= 2 {
+                                        if let Some(tb) = this.tabs.get(this.active) {
+                                            let id = tb.id;
+                                            this.run_tab(id, cx);
+                                        }
+                                    }
                                     cx.notify();
                                 }
                             })),
@@ -5870,10 +6114,18 @@ impl Workspace {
                             .hover(|d| d.bg(t.hover_mark()))
                             .child(self.icon_inline("\u{f15c}", t.accent()))
                             .child(self.line_in(q.name.clone(), ms.small(), t.fg(), ms.line_w() - ms.base() - 14.0))
+                            // The same as the history: one click loads the
+                            // saved query, two run it.
                             .on_click(cx.listener({
                                 let (c, n, s) = (live.name.clone(), q.name.clone(), q.sql.clone());
-                                move |this, _, _, cx| {
+                                move |this, ev: &gpui::ClickEvent, _, cx| {
                                     this.open_sql(&c, &n, &s, cx);
+                                    if ev.click_count() >= 2 {
+                                        if let Some(tb) = this.tabs.get(this.active) {
+                                            let id = tb.id;
+                                            this.run_tab(id, cx);
+                                        }
+                                    }
                                     cx.notify();
                                 }
                             })),
@@ -9543,6 +9795,59 @@ impl Render for Workspace {
                 this.palette_sel = this.palette_sel.saturating_sub(1);
                 cx.notify();
             }))
+            .on_action(cx.listener(|this, _: &NewTab, _, cx| this.new_draft_tab(cx)))
+            .on_action(cx.listener(|this, _: &CloseTab, _, cx| {
+                if let Some(t) = this.tabs.get(this.active) {
+                    let id = t.id;
+                    this.close_tab(id);
+                    cx.notify();
+                }
+            }))
+            .on_action(cx.listener(|this, _: &LastTab, _, cx| {
+                let alive: Vec<u64> = this.tabs.iter().map(|t| t.id).collect();
+                let now = this.tabs.get(this.active).map(|t| t.id).unwrap_or(0);
+                if let Some(to) = crate::workspace::mru_next(&this.mru, now, &alive) {
+                    this.go_tab_id(to, cx);
+                }
+            }))
+            .on_action(cx.listener(|this, _: &TogglePanel, _, cx| {
+                this.panel_hidden = !this.panel_hidden;
+                this.remember();
+                cx.notify();
+            }))
+            .on_action(cx.listener(|this, _: &OpenSettings, _, cx| this.open_settings(cx)))
+            .on_action(cx.listener(|this, _: &NewConnection, _, cx| this.open_form(None, cx)))
+            .on_action(cx.listener(|this, _: &ToggleExport, _, cx| {
+                this.export_open = !this.export_open;
+                cx.notify();
+            }))
+            .on_action(cx.listener(|this, _: &PrevPage, _, cx| {
+                this.page_by(-1);
+                cx.notify();
+            }))
+            .on_action(cx.listener(|this, _: &NextPage, _, cx| {
+                this.page_by(1);
+                cx.notify();
+            }))
+            .on_action(cx.listener(|this, _: &ShowAudit, _, cx| this.go_rail(Rail::Audit, cx)))
+            .on_action(cx.listener(|this, _: &ShowTasks, _, cx| this.go_rail(Rail::Tasks, cx)))
+            .on_action(cx.listener(|this, _: &Refresh, _, cx| {
+                if let Some(t) = this.tabs.get(this.active) {
+                    let id = t.id;
+                    this.sync_tab_from_inputs(id, cx);
+                    this.run_tab(id, cx);
+                    cx.notify();
+                }
+            }))
+            .on_action(cx.listener(|this, _: &GoTab1, _, cx| this.go_tab_at(0, cx)))
+            .on_action(cx.listener(|this, _: &GoTab2, _, cx| this.go_tab_at(1, cx)))
+            .on_action(cx.listener(|this, _: &GoTab3, _, cx| this.go_tab_at(2, cx)))
+            .on_action(cx.listener(|this, _: &GoTab4, _, cx| this.go_tab_at(3, cx)))
+            .on_action(cx.listener(|this, _: &GoTab5, _, cx| this.go_tab_at(4, cx)))
+            .on_action(cx.listener(|this, _: &GoTab6, _, cx| this.go_tab_at(5, cx)))
+            .on_action(cx.listener(|this, _: &GoTab7, _, cx| this.go_tab_at(6, cx)))
+            .on_action(cx.listener(|this, _: &GoTab8, _, cx| this.go_tab_at(7, cx)))
+            .on_action(cx.listener(|this, _: &GoTab9, _, cx| this.go_tab_at(8, cx)))
             .on_action(cx.listener(|this, _: &PaletteAccept, _, cx| {
                 let pick = this.palette_matches(cx).into_iter().nth(this.palette_sel);
                 if let Some((_, it)) = pick {
@@ -9618,13 +9923,15 @@ impl Render for Workspace {
                 .w_full()
                 .overflow_hidden()
                 .child(self.rail_el(cx))
-                .child(self.panel_el(cx))
+                // FOLDED AWAY, with its grip, when the room is wanted for the
+                // result. The rail stays: it is how the panel comes back.
+                .children((!self.panel_hidden).then(|| self.panel_el(cx)))
                 // The handle between the panel and the work. Its own strip, so
                 // a drag never lands on whatever is beneath it; the move and
                 // the release are on the ROOT, because the pointer leaves a
                 // three-pixel strip immediately and a drag that ended there
                 // would be a drag nobody could finish.
-                .child(
+                .children((!self.panel_hidden).then(|| {
                     div()
                         .id("panel-grip")
                         .w(px(3.0))
@@ -9651,8 +9958,8 @@ impl Render for Workspace {
                                 }
                                 cx.notify();
                             }),
-                        ),
-                )
+                        )
+                }))
                 .child(
                     div()
                         .flex()
