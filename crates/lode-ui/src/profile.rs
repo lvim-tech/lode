@@ -76,7 +76,7 @@ impl ProfileForm {
         let (pass_src, pass_arg) = Source::unwrap(&get(&auth_v, "passphrase"));
         let (pw_src, pw_arg) = Source::unwrap(&get(&auth_v, "password"));
 
-        ProfileForm {
+        let me = ProfileForm {
             workspace,
             theme,
             lang,
@@ -104,7 +104,17 @@ impl ProfileForm {
             passphrase: Field::secret(mk(cx, pass_src.hint(), &pass_arg), pass_src),
             password: Field::secret(mk(cx, pw_src.hint(), &pw_arg), pw_src),
             error: None,
+        };
+        // Enter is the dialog's default action, from any field.
+        for field in me.all_inputs() {
+            cx.subscribe(&field, |this, _f, ev: &crate::input::InputEvent, cx| {
+                if matches!(ev, crate::input::InputEvent::Submit) {
+                    this.save(cx);
+                }
+            })
+            .detach();
         }
+        me
     }
 
     /// The `TunnelSpec` this window describes.
@@ -122,6 +132,18 @@ impl ProfileForm {
                 &self.password.source.wrap(self.password.input.read(cx).text()),
             ),
         })
+    }
+
+    /// Tab and shift-tab between the fields — see `ConnectionForm::step_focus`.
+    fn step_focus(&mut self, back: bool, window: &mut Window, cx: &mut Context<Self>) {
+        let fields = self.all_inputs();
+        let now = fields
+            .iter()
+            .position(|i| i.read(cx).focus_handle.is_focused(window));
+        if let Some(next) = crate::widgets::focus_step(fields.len(), now, back) {
+            window.focus(&fields[next].read(cx).focus_handle);
+            cx.notify();
+        }
     }
 
     /// One phrase of the interface, in the chosen language.
@@ -390,6 +412,15 @@ impl Render for ProfileForm {
             // window that opened it.
             .font_family(SharedString::from(self.font_family.clone()))
             .text_size(ms.body())
+            .on_action(cx.listener(|this, _: &crate::input::FocusNext, window, cx| {
+                this.step_focus(false, window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &crate::input::FocusPrev, window, cx| {
+                this.step_focus(true, window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &crate::app::Escape, _, cx| {
+                let _ = this.workspace.update(cx, |w, cx| w.close_profile(cx));
+            }))
             .child(head)
             .child(body)
             .child(footer)

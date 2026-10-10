@@ -422,6 +422,15 @@ impl Render for SettingsWindow {
             .font_family(SharedString::from(self.font_family.clone()))
             .line_height(ms.line_h())
             .text_size(ms.body())
+            .on_action(cx.listener(|this, _: &crate::input::FocusNext, window, cx| {
+                this.step_focus(false, window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &crate::input::FocusPrev, window, cx| {
+                this.step_focus(true, window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &crate::app::Escape, _, cx| {
+                let _ = this.workspace.update(cx, |w, cx| w.close_settings(cx));
+            }))
             .child(head)
             .child(
                 div()
@@ -506,6 +515,20 @@ impl SettingsWindow {
         let (t, ms) = (&self.theme, self.scale);
         crate::widgets::chip(t, ms, id, label, on)
             .on_click(cx.listener(move |this, _, window, cx| on_press(this, window, cx)))
+    }
+
+    /// Tab and shift-tab between the two fields — see
+    /// `ConnectionForm::step_focus`. Two is still worth it: the search box and
+    /// the theme filter are at opposite ends of the header.
+    fn step_focus(&mut self, back: bool, window: &mut Window, cx: &mut Context<Self>) {
+        let fields = self.all_inputs();
+        let now = fields
+            .iter()
+            .position(|i| i.read(cx).focus_handle.is_focused(window));
+        if let Some(next) = crate::widgets::focus_step(fields.len(), now, back) {
+            window.focus(&fields[next].read(cx).focus_handle);
+            cx.notify();
+        }
     }
 
     /// One phrase of the interface, in the language the main window is in.

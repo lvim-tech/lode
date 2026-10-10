@@ -50,6 +50,14 @@ actions!(
         Cut,
         Copy,
         Submit,
+        /// Tab and shift-tab, for moving between the fields of a window.
+        ///
+        /// NOT handled by the field: focusing another one needs a `Window`, and
+        /// a subscription has none. The action bubbles out of the focused field
+        /// to the window's root, which has both the window and the list of
+        /// fields in their order — see `ConnectionForm`.
+        FocusNext,
+        FocusPrev,
     ]
 );
 
@@ -70,6 +78,10 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("ctrl-x", Cut, None),
         KeyBinding::new("ctrl-c", Copy, None),
         KeyBinding::new("enter", Submit, None),
+        // Only inside a field: `tab` in the EDITOR is an indent, and in the
+        // main window it is nothing at all.
+        KeyBinding::new("tab", FocusNext, Some("TextInput")),
+        KeyBinding::new("shift-tab", FocusPrev, Some("TextInput")),
     ]);
 }
 

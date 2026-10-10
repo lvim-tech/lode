@@ -27,7 +27,7 @@ use serde_json::{json, Value};
 
 use crate::app::Workspace;
 use crate::i18n::Lang;
-use crate::input::{InputColors, TextInput};
+use crate::input::{InputColors, InputEvent, TextInput};
 use crate::metrics::Metrics;
 use crate::theme::Theme;
 use crate::widgets::{btn, chip, Btn};
@@ -498,6 +498,28 @@ impl ConnectionForm {
         };
         let stored_params = spec.get("params").cloned().unwrap_or(json!({}));
         form.rebuild_params(&stored_params, cx);
+        // ENTER is the dialog's default action, from any field — which is what
+        // Enter means in a form everywhere else, and the reason somebody fills
+        // one in without ever reaching for the pointer.
+        //
+        // With one exception, and it is not arbitrary: Enter in the PROFILE
+        // NAME field saves the profile, because that field belongs to the
+        // "save as profile" row and saving the connection from it would be the
+        // wrong one of two visible buttons.
+        let name_field = form.profile_name.clone();
+        for field in form.all_inputs() {
+            let is_profile_name = field == name_field;
+            cx.subscribe(&field, move |this, _f, ev: &InputEvent, cx| {
+                if matches!(ev, InputEvent::Submit) {
+                    if is_profile_name {
+                        this.save_tunnel_profile(cx);
+                    } else {
+                        this.save(cx);
+                    }
+                }
+            })
+            .detach();
+        }
         form
     }
 
@@ -983,6 +1005,21 @@ pub fn colors_of(t: &Theme) -> InputColors {
 }
 
 impl ConnectionForm {
+    /// Move the keyboard to the next field, or the previous one.
+    ///
+    /// The ORDER is `all_inputs()`, which is also the order a theme change
+    /// walks — one list, so tab cannot visit a field the palette forgets.
+    fn step_focus(&mut self, back: bool, window: &mut Window, cx: &mut Context<Self>) {
+        let fields = self.all_inputs();
+        let now = fields
+            .iter()
+            .position(|i| i.read(cx).focus_handle.is_focused(window));
+        if let Some(next) = crate::widgets::focus_step(fields.len(), now, back) {
+            window.focus(&fields[next].read(cx).focus_handle);
+            cx.notify();
+        }
+    }
+
     /// One phrase of the interface, in the chosen language.
     fn tr(&self, key: &str) -> SharedString {
         SharedString::from(self.lang.tr(key))
@@ -2042,6 +2079,19 @@ impl Render for ConnectionForm {
             // without that font got whatever the platform fell back to.
             .font_family(SharedString::from(self.font_family.clone()))
             .text_size(ms.body())
+            // The KEYBOARD. Tab and shift-tab walk the fields; escape closes.
+            // The actions bubble out of whichever field has the keyboard, and
+            // are handled here because moving the focus needs a `Window` and a
+            // field's own subscription has none.
+            .on_action(cx.listener(|this, _: &crate::input::FocusNext, window, cx| {
+                this.step_focus(false, window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &crate::input::FocusPrev, window, cx| {
+                this.step_focus(true, window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &crate::app::Escape, _, cx| {
+                let _ = this.workspace.update(cx, |w, cx| w.close_form(cx));
+            }))
             .child(head)
             .child(tabs)
             .child(body)

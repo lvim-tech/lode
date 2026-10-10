@@ -25,6 +25,25 @@ use gpui::{div, px, Div, Rgba, SharedString, Stateful};
 use crate::metrics::Metrics;
 use crate::theme::Theme;
 
+/// Which field to focus when tab or shift-tab is pressed.
+///
+/// A pure function because the awkward cases are the ones nobody tries by hand:
+/// nothing focused yet (the first press of tab should go to the first field),
+/// the last field (wrap to the first, so tab never dead-ends), and a list that
+/// has shrunk since the focus was taken.
+pub fn focus_step(count: usize, now: Option<usize>, back: bool) -> Option<usize> {
+    if count == 0 {
+        return None;
+    }
+    let now = match now {
+        Some(i) if i < count => i,
+        // Nothing has the keyboard: tab takes the first field, shift-tab the
+        // last, which is what both mean when nothing is focused.
+        _ => return Some(if back { count - 1 } else { 0 }),
+    };
+    Some(if back { (now + count - 1) % count } else { (now + 1) % count })
+}
+
 /// Everything a separate window inherits from the main one.
 ///
 /// ONE argument instead of five. `ConnectionForm::new` had grown to eleven
@@ -255,6 +274,22 @@ pub fn icon_inline(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Tab walks the fields round and round, and never dead-ends.
+    #[test]
+    fn tab_goes_round_the_fields() {
+        assert_eq!(focus_step(3, Some(0), false), Some(1));
+        assert_eq!(focus_step(3, Some(2), false), Some(0), "wraps rather than stopping");
+        assert_eq!(focus_step(3, Some(0), true), Some(2));
+        // Nothing focused: the first field, or the last going backwards.
+        assert_eq!(focus_step(3, None, false), Some(0));
+        assert_eq!(focus_step(3, None, true), Some(2));
+        // An index from a list that has since shrunk is not trusted.
+        assert_eq!(focus_step(2, Some(9), false), Some(0));
+        // No fields at all is an answer, not a panic.
+        assert_eq!(focus_step(0, None, false), None);
+        assert_eq!(focus_step(0, Some(0), true), None);
+    }
 
     /// Every button is one height, and that height holds its label.
     ///
