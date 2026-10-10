@@ -18,6 +18,7 @@
 mod app;
 mod board;
 mod editor;
+mod editor_el;
 mod export;
 mod form;
 mod i18n;
@@ -61,6 +62,7 @@ fn main() {
         // The field needs its keys before any window exists.
         input::bind_keys(cx);
         app::bind_workspace_keys(cx);
+        editor_el::bind_editor_keys(cx);
         // From the same scale as everything else, at the default text size:
         // 1288 x 812, which is where the literal 1280 x 820 came from anyway.
         // The session's own size is not known yet — the workspace reads it —

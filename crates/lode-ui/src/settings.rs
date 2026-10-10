@@ -23,10 +23,20 @@ use crate::widgets::{btn, Btn};
 
 /// What the window shows of the MAIN window's state.
 ///
-/// Read fresh on every paint from the workspace rather than copied in at open
-/// time. A copy is a second truth: the text size can be changed from the
-/// keyboard while this window is open, and a stored number would then sit
-/// beside a stepper that moves a different one.
+/// HANDED OVER, and handed over again whenever it changes — never read from the
+/// workspace while this window draws.
+///
+/// It WAS read fresh on every paint, which is the better shape and does not
+/// work: `App::open_window` draws the new window once before it returns ("allow
+/// a window to draw at least once", in its own words), and `open_settings` runs
+/// in a listener — so that draw happens while the workspace is still inside its
+/// own update, and reading an entity that is being updated is a panic in gpui.
+/// The panic was the gear button closing the whole application.
+///
+/// What keeps this in step is that every setter calls
+/// `Workspace::poke_settings`, which pushes a fresh one in. A setter that
+/// forgets leaves a stale number beside the stepper that moves it.
+#[derive(Clone)]
 pub struct Appearance {
     pub theme_name: String,
     pub themes: Vec<String>,
@@ -156,6 +166,10 @@ pub struct SettingsWindow {
     /// The two fonts, so every window is in the same type as the main one.
     font_family: String,
     icon_family: String,
+    /// What the main window looks like — see `Appearance`.
+    look: Appearance,
+    /// Which connections point at each profile, as the engine answered.
+    users: std::collections::BTreeMap<String, Vec<String>>,
     /// Which driver's detail is shown on the Drivers page.
     driver_shown: Option<String>,
     about: Vec<(String, String)>,
@@ -169,6 +183,8 @@ impl SettingsWindow {
         tunnels: Vec<crate::app::ProfileRow>,
         proxies: Vec<crate::app::ProfileRow>,
         about: Vec<(String, String)>,
+        look_now: Appearance,
+        users: std::collections::BTreeMap<String, Vec<String>>,
         cx: &mut Context<Self>,
     ) -> Self {
         let crate::widgets::Look { theme, scale, text_font, icon_font, lang } = look;
@@ -191,7 +207,25 @@ impl SettingsWindow {
             icon_family: icon_font,
             driver_shown,
             about,
+            look: look_now,
+            users,
         }
+    }
+
+    /// The main window's look changed — see `Appearance`.
+    pub fn look_changed(&mut self, look: Appearance, cx: &mut Context<Self>) {
+        self.look = look;
+        cx.notify();
+    }
+
+    /// Who points at each profile, as the engine answered.
+    pub fn users_arrived(
+        &mut self,
+        users: std::collections::BTreeMap<String, Vec<String>>,
+        cx: &mut Context<Self>,
+    ) {
+        self.users = users;
+        cx.notify();
     }
 
     pub fn all_inputs(&self) -> Vec<Entity<TextInput>> {
@@ -474,19 +508,9 @@ impl SettingsWindow {
             .on_click(cx.listener(move |this, _, window, cx| on_press(this, window, cx)))
     }
 
-    /// What the main window currently looks like. `None` only if it has gone.
-    fn appearance(&self, cx: &gpui::App) -> Option<Appearance> {
-        Some(self.workspace.upgrade()?.read(cx).appearance())
-    }
-
-    /// One phrase of the interface.
-    ///
-    /// The language comes off the SNAPSHOT rather than being stored here, so
-    /// there is nothing to keep in step: this window is where the language is
-    /// changed, and the row that changes it is drawn from the same read.
-    fn tr(&self, key: &str, cx: &gpui::App) -> SharedString {
-        let lang = self.appearance(cx).map(|a| a.lang).unwrap_or_default();
-        SharedString::from(lang.tr(key))
+    /// One phrase of the interface, in the language the main window is in.
+    fn tr(&self, key: &str) -> SharedString {
+        SharedString::from(self.look.lang.tr(key))
     }
 
     fn note(&self, text: impl Into<SharedString>) -> gpui::Div {
@@ -567,14 +591,12 @@ impl SettingsWindow {
                 }
             }
             Category::General => {
-                let Some(a) = self.appearance(cx) else {
-                    return out.child(self.note("the main window has gone")).into_any_element();
-                };
+                let a = self.look.clone();
 
                 // ── the theme ───────────────────────────────────────────────
-                out = out.child(self.head(self.tr("settings.theme", cx).to_uppercase()));
+                out = out.child(self.head(self.tr("settings.theme").to_uppercase()));
                 out = out.child(
-                    btn(&t, ms, "themes-rescan", self.tr("panel.rescan", cx), Btn::Quiet).on_click(cx.listener(
+                    btn(&t, ms, "themes-rescan", self.tr("panel.rescan"), Btn::Quiet).on_click(cx.listener(
                         |this, _, _, cx| {
                             let _ = this.workspace.update(cx, |w, cx| w.rescan_themes(cx));
                             cx.notify();
@@ -593,7 +615,7 @@ impl SettingsWindow {
                         div()
                             .text_size(ms.small())
                             .text_color(t.warning())
-                            .child(self.tr("settings.no_themes", cx)),
+                            .child(self.tr("settings.no_themes")),
                     );
                     out = out.child(self.note("the built-in theme is the generated LvimBase_dark"));
                 }
@@ -654,10 +676,10 @@ impl SettingsWindow {
                 }
 
                 // ── the type ────────────────────────────────────────────────
-                out = out.child(self.head(self.tr("settings.text", cx).to_uppercase()));
-                out = out.child(self.row(self.tr("settings.text_font", cx), a.font_family.clone()));
-                out = out.child(self.row(self.tr("settings.icon_font", cx), a.icon_family.clone()));
-                out = out.child(self.note(self.tr("settings.font_env", cx)));
+                out = out.child(self.head(self.tr("settings.text").to_uppercase()));
+                out = out.child(self.row(self.tr("settings.text_font"), a.font_family.clone()));
+                out = out.child(self.row(self.tr("settings.icon_font"), a.icon_family.clone()));
+                out = out.child(self.note(self.tr("settings.font_env")));
 
                 // One number, and it moves everything: the steps, the grid row
                 // height, the rail. Adjusted while looking at the result, which
@@ -675,7 +697,7 @@ impl SettingsWindow {
                                 .flex_none()
                                 .text_size(ms.small())
                                 .text_color(t.muted())
-                                .child(self.tr("settings.text_size", cx)),
+                                .child(self.tr("settings.text_size")),
                         )
                         .child(self.step(
                             "text-less".into(),
@@ -706,7 +728,7 @@ impl SettingsWindow {
                             },
                             cx,
                         ))
-                        .child(btn(&t, ms, "size-reset", self.tr("settings.reset", cx), Btn::Quiet).on_click(
+                        .child(btn(&t, ms, "size-reset", self.tr("settings.reset"), Btn::Quiet).on_click(
                             cx.listener(|this, _, _, cx| {
                                 let _ = this.workspace.update(cx, |w, cx| w.reset_scale(cx));
                                 cx.notify();
@@ -728,7 +750,7 @@ impl SettingsWindow {
                                 .flex_none()
                                 .text_size(ms.small())
                                 .text_color(t.muted())
-                                .child(self.tr("settings.icon_size", cx)),
+                                .child(self.tr("settings.icon_size")),
                         )
                         .child(self.step(
                             "icon-less".into(),
@@ -775,7 +797,7 @@ impl SettingsWindow {
                 )));
 
                 // ── the language ────────────────────────────────────────────
-                out = out.child(self.head(self.tr("settings.language", cx).to_uppercase()));
+                out = out.child(self.head(self.tr("settings.language").to_uppercase()));
                 let mut langs = div().flex().items_center().gap_2().py_1();
                 for l in crate::i18n::Lang::ALL.iter().copied() {
                     // Its own name, not its English one: somebody looking for
@@ -798,14 +820,14 @@ impl SettingsWindow {
                 ));
 
                 // ── what the window remembers ───────────────────────────────
-                out = out.child(self.head(self.tr("settings.json_indent", cx).to_uppercase()));
+                out = out.child(self.head(self.tr("settings.json_indent").to_uppercase()));
                 let mut inds = div().flex().items_center().gap_2().py_1().child(
                     div()
                         .w(px(ms.base() * 13.0))
                         .flex_none()
                         .text_size(ms.small())
                         .text_color(t.muted())
-                        .child(self.tr("settings.json_indent", cx)),
+                        .child(self.tr("settings.json_indent")),
                 );
                 for n in [2u8, 3, 4] {
                     inds = inds.child(self.pick(
@@ -820,7 +842,7 @@ impl SettingsWindow {
                     ));
                 }
                 out = out.child(inds);
-                out = out.child(self.note(self.tr("settings.remembers", cx)));
+                out = out.child(self.note(self.tr("settings.remembers")));
             }
             Category::Tunnels | Category::Proxies => {
                 let (rows, kind) = if self.category == Category::Tunnels {
@@ -842,11 +864,7 @@ impl SettingsWindow {
                         })),
                 );
                 for r in &rows {
-                    let users = self
-                        .workspace
-                        .upgrade()
-                        .map(|w| w.read(cx).profile_users_of(&r.name))
-                        .unwrap_or_default();
+                    let users = self.users.get(&r.name).cloned().unwrap_or_default();
                     let (name, spec) = (r.name.clone(), r.spec.clone());
                     out = out.child(
                         div()

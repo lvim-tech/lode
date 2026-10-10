@@ -90,7 +90,10 @@ gpui::actions!(
 /// nothing is being typed into.
 pub fn bind_workspace_keys(cx: &mut gpui::App) {
     use gpui::KeyBinding;
-    const OUTSIDE: Option<&str> = Some("Workspace && !TextInput");
+    // Not in a field, and not in the EDITOR: `j`, `k`, `r` and `g` are letters
+    // somebody types into a statement, and a grid binding that reaches the
+    // editor makes it impossible to write one.
+    const OUTSIDE: Option<&str> = Some("Workspace && !TextInput && !Editor");
     cx.bind_keys([
         KeyBinding::new("j", NextRow, OUTSIDE),
         KeyBinding::new("down", NextRow, OUTSIDE),
@@ -903,9 +906,15 @@ pub struct Workspace {
 
     /// The sidebar's filter box.
     filter: Entity<TextInput>,
-    /// Every field of every tab's query bar, keyed by (tab, field). The empty
-    /// key is the statement box a typed driver gets instead of a form.
+    /// Every field of every tab's query bar, keyed by (tab, field).
+    ///
+    /// The empty key USED to be the statement box. It is now a multi-line
+    /// editor, which is a different entity — see `editors`.
     inputs: HashMap<(u64, String), Entity<TextInput>>,
+    /// The statement editor of each tab that has one: a driver with a QUERY
+    /// FORM gets fields instead, because what it wants is a filter and a limit
+    /// rather than a language.
+    editors: HashMap<u64, Entity<crate::editor_el::Editor>>,
 
     /// The console: a line typed straight at a connection.
     console: Entity<TextInput>,
@@ -1143,6 +1152,7 @@ impl Workspace {
             restore: restore.clone(),
             filter,
             inputs: HashMap::new(),
+            editors: HashMap::new(),
             console,
             history: Vec::new(),
             history_filter,
@@ -1941,7 +1951,7 @@ impl Workspace {
                 // Read it back rather than patching the grid from what we sent:
                 // a column with a default, a trigger or a type coercion means
                 // the stored row is not always the row that was asked for.
-                self.run_tab(tab);
+                self.run_tab(tab, cx);
             }
             Pending::AwsProfiles => {
                 // Names only. Which of them is usable, and why, is the engine's
@@ -2358,7 +2368,7 @@ impl Workspace {
                 );
             }
         }
-        self.run_tab(id);
+        self.run_tab(id, cx);
         self.remember();
     }
 
@@ -2397,15 +2407,48 @@ impl Workspace {
                 self.inputs.insert((tab_id, f.key.clone()), input);
             }
         } else {
-            let hint = meta.map(|m| m.hint.clone()).unwrap_or_default();
+            // A MULTI-LINE editor, in the driver's own language. This was a
+            // one-line field: a statement longer than the box was typed blind
+            // and a formatted query pasted in lost its newlines.
+            let flavour = match meta.map(|m| m.hint.as_str()) {
+                Some(h) if h.contains("sql") || h.contains("SQL") => crate::editor_el::Flavour::Sql,
+                Some(h) if h.contains("json") || h.contains("JSON") => {
+                    crate::editor_el::Flavour::Json
+                }
+                // The driver declares a HINT and nothing more; where it names no
+                // language this draws in one ink rather than guessing, because a
+                // SQL palette over something that is not SQL reads as a bug.
+                _ => crate::editor_el::Flavour::Plain,
+            };
+            let (theme, scale, font) = (self.theme.clone(), self.scale, self.font_family.clone());
             let text = statement.to_string();
-            let input = cx.new(|cx| {
-                let mut i = TextInput::new(cx, hint, colors);
-                i.set_text(text, cx);
-                i
+            let ed = cx.new(|cx| {
+                crate::editor_el::Editor::new(&text, flavour, colors, theme, scale, font, cx)
             });
-            self.subscribe_run(&input, tab_id, cx);
-            self.inputs.insert((tab_id, String::new()), input);
+            cx.subscribe(&ed, move |this, ed, ev: &crate::editor_el::EditorEvent, cx| {
+                match ev {
+                    // The draft is kept in the TAB, because the session keeps
+                    // the tab: typing and then closing the window must not lose
+                    // what was typed.
+                    crate::editor_el::EditorEvent::Changed => {
+                        let text = ed.read(cx).text();
+                        if let Some(tb) = this.tabs.iter_mut().find(|t| t.id == tab_id) {
+                            tb.sql = text;
+                        }
+                        this.remember();
+                    }
+                    crate::editor_el::EditorEvent::Run => {
+                        this.sync_tab_from_inputs(tab_id, cx);
+                        this.run_tab(tab_id, cx);
+                    }
+                    crate::editor_el::EditorEvent::RunNewTab => {
+                        this.run_in_new_tab(tab_id, cx);
+                    }
+                }
+                cx.notify();
+            })
+            .detach();
+            self.editors.insert(tab_id, ed);
         }
     }
 
@@ -2494,22 +2537,27 @@ impl Workspace {
         // The free-text statement field. A structured driver has named boxes
         // instead, and guessing which of them a column name belongs in would be
         // a guess about somebody's query.
-        let Some(input) = self.inputs.get(&(tab_id, String::new())).cloned() else {
+        let Some(ed) = self.editors.get(&tab_id).cloned() else {
             self.toast(format!("{name} — this tab has no statement to add to"), true);
             return;
         };
         let add = name.to_string();
-        input.update(cx, |i, cx| {
-            let now = i.text().to_string();
-            let joined = if now.trim().is_empty() {
-                add.clone()
-            } else if now.ends_with(' ') || now.ends_with('(') || now.ends_with(',') {
-                format!("{now}{add}")
-            } else {
-                format!("{now} {add}")
+        ed.update(cx, |e, cx| {
+            // AT THE CURSOR, not at the end. The field could only be appended
+            // to, so a column clicked while the cursor sat in the middle of a
+            // SELECT list arrived after the FROM.
+            let before = e.doc.text_before_cursor();
+            let sep = match before.chars().last() {
+                None | Some(' ') | Some('(') | Some(',') | Some('\n') => "",
+                _ => " ",
             };
-            i.set_text(joined, cx);
+            e.doc.insert(&format!("{sep}{add}"));
+            cx.notify();
         });
+        let text = ed.read(cx).text();
+        if let Some(tb) = self.tabs.iter_mut().find(|t| t.id == tab_id) {
+            tb.sql = text;
+        }
         cx.notify();
     }
 
@@ -2518,7 +2566,7 @@ impl Workspace {
         cx.subscribe(input, move |this, _input, ev: &InputEvent, cx| {
             if matches!(ev, InputEvent::Submit) {
                 this.sync_tab_from_inputs(tab_id, cx);
-                this.run_tab(tab_id);
+                this.run_tab(tab_id, cx);
             }
             cx.notify();
         })
@@ -2548,8 +2596,8 @@ impl Workspace {
                 }
             }
             self.tabs[idx].sql = self.tabs[idx].statement(meta.as_ref(), PAGE);
-        } else if let Some(i) = self.inputs.get(&(tab_id, String::new())) {
-            let typed = i.read(cx).text().to_string();
+        } else if let Some(ed) = self.editors.get(&tab_id).cloned() {
+            let typed = ed.read(cx).text();
             // A browse with narrowing fields: read them, and rewrite the box
             // ONLY if nobody has typed in it since we last filled it.
             let browse_keys: Vec<String> = meta
@@ -2578,12 +2626,33 @@ impl Workspace {
                 if typed == self.tabs[idx].rendered || typed.trim().is_empty() {
                     self.tabs[idx].sql = fresh.clone();
                     self.tabs[idx].rendered = fresh.clone();
-                    i.update(cx, |inp, cx| inp.set_text(fresh, cx));
+                    ed.update(cx, |e, cx| e.set_text(&fresh, cx));
                     return;
                 }
             }
             self.tabs[idx].sql = typed;
         }
+    }
+
+    /// Ctrl-Shift-Enter: the same statement, in a tab of its own.
+    ///
+    /// Keeping the result you have while running a variant is most of what two
+    /// tabs are FOR, and doing it by hand means opening a tab and retyping.
+    fn run_in_new_tab(&mut self, from: u64, cx: &mut Context<Self>) {
+        self.sync_tab_from_inputs(from, cx);
+        let Some(src) = self.tabs.iter().find(|t| t.id == from) else { return };
+        let (conn, driver) = (src.conn_name.clone(), src.driver.clone());
+        let sql = self
+            .editors
+            .get(&from)
+            .map(|e| e.read(cx).to_run())
+            .unwrap_or_else(|| src.sql.clone());
+        if sql.trim().is_empty() {
+            return;
+        }
+        let title = crate::workspace::draft_title(&sql);
+        let _ = driver;
+        self.run_statement_titled(&conn, &title, &sql, false, cx);
     }
 
     /// Run a tab — **after asking the engine what the statement means.**
@@ -2592,18 +2661,25 @@ impl Workspace {
     /// same `DROP` typed into the tab's box went through without a word. Only
     /// the engine knows what a statement does in that driver's language, so it
     /// is asked, and a named reason stops the tab the way it stops the console.
-    fn run_tab(&mut self, tab_id: u64) {
+    fn run_tab(&mut self, tab_id: u64, cx: &mut Context<Self>) {
         let Some(idx) = self.tabs.iter().position(|t| t.id == tab_id) else { return };
         self.tabs[idx].confirm = None;
-        let statement = self.tabs[idx].sql.clone();
+        // **The SELECTION, if there is one.** A file of several statements is
+        // only usable this way, and it is the one thing about a query editor
+        // that cannot be worked around by retyping. `to_run` falls back to the
+        // whole text, so a tab with nothing selected behaves as before.
+        let statement = match self.editors.get(&tab_id) {
+            Some(ed) => ed.read(cx).to_run(),
+            None => self.tabs[idx].sql.clone(),
+        };
         if statement.trim().is_empty() {
             return;
         }
         let driver = self.tabs[idx].driver.clone();
         self.ask(
-            Pending::ClassifyTab { tab: tab_id, statement },
+            Pending::ClassifyTab { tab: tab_id, statement: statement.clone() },
             "query.classify",
-            json!({ "driver": driver, "statement": self.tabs[idx].sql.clone() }),
+            json!({ "driver": driver, "statement": statement }),
         );
     }
 
@@ -2815,6 +2891,7 @@ impl Workspace {
             }
             self.tabs.remove(pos);
             self.inputs.retain(|(t, _), _| *t != id);
+            self.editors.remove(&id);
             if self.active >= self.tabs.len() {
                 self.active = self.tabs.len().saturating_sub(1);
             }
@@ -3050,6 +3127,16 @@ impl Workspace {
         let me = cx.entity().downgrade();
         let (tun, prx) = (prof("tunnel"), prof("proxy"));
         let look = self.look();
+        // Taken HERE rather than read by the window as it draws: `open_window`
+        // draws once before it returns, and that draw happens inside this
+        // listener's update of the workspace — where reading the workspace is a
+        // panic. See `settings::Appearance`.
+        let look_now = self.appearance();
+        let users: std::collections::BTreeMap<String, Vec<String>> = self
+            .profile_users
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
         // Derived: at a large text size a window of 900×620 held half a page
         // and put its own Close button off the bottom edge.
         let (w, h) = self.scale.window(crate::metrics::Window::Settings);
@@ -3066,7 +3153,7 @@ impl Workspace {
             |_window, cx| {
                 cx.new(|cx| {
                     crate::settings::SettingsWindow::new(
-                        me, look, drivers, tun, prx, about, cx,
+                        me, look, drivers, tun, prx, about, look_now, users, cx,
                     )
                 })
             },
@@ -3532,7 +3619,7 @@ impl Workspace {
             }
             PaletteAct::RunActive => {
                 if let Some(id) = self.tabs.get(self.active).map(|t| t.id) {
-                    self.run_tab(id);
+                    self.run_tab(id, cx);
                 }
             }
             PaletteAct::ToggleExport => self.export_open = !self.export_open,
@@ -4493,8 +4580,18 @@ impl Workspace {
     /// a window whose own text does not change when it changes everything else.
     fn poke_settings(&mut self, cx: &mut Context<Self>) {
         let ms = self.scale;
+        let look = self.appearance();
+        let users: std::collections::BTreeMap<String, Vec<String>> = self
+            .profile_users
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
         if let Some(h) = self.settings_window.clone() {
-            let _ = h.update(cx, |w, _, cx| w.set_scale(ms, cx));
+            let _ = h.update(cx, |w, _, cx| {
+                w.set_scale(ms, cx);
+                w.look_changed(look, cx);
+                w.users_arrived(users, cx);
+            });
         }
     }
 
@@ -7608,8 +7705,19 @@ impl Workspace {
                         .child(div().w(px(ms.base() * if f.key == "limit" { 4.5 } else { 15.5 })).child(self.field(ms.small(), input.clone()))),
                 );
             }
-        } else if let Some(input) = self.inputs.get(&(tab_id, String::new())) {
-            bar = bar.child(div().flex_1().child(self.field(ms.small(), input.clone())));
+        } else if let Some(ed) = self.editors.get(&tab_id) {
+            // Its own row, full width: an editor three to sixteen lines tall
+            // beside a Run button is a column of buttons down one side.
+            bar = bar
+                .flex_col()
+                .child(
+                    div()
+                        .w_full()
+                        .border_1()
+                        .border_color(t.border())
+                        .text_size(ms.small())
+                        .child(ed.clone()),
+                );
         }
 
         // A browse the tree produced can be narrowed. The fields come from the
@@ -7656,7 +7764,7 @@ impl Workspace {
             btn(t, ms, format!("run-{tab_id}"), format!("{run_label} (↵)"), Btn::Primary)
                 .on_click(cx.listener(move |this, _, _, cx| {
                     this.sync_tab_from_inputs(tab_id, cx);
-                    this.run_tab(tab_id);
+                    this.run_tab(tab_id, cx);
                     cx.notify();
                 })),
         );
@@ -9344,7 +9452,7 @@ impl Render for Workspace {
             .on_action(cx.listener(|this, _: &RunActive, _, cx| {
                 if let Some(id) = this.tabs.get(this.active).map(|x| x.id) {
                     this.sync_tab_from_inputs(id, cx);
-                    this.run_tab(id);
+                    this.run_tab(id, cx);
                     cx.notify();
                 }
             }))

@@ -159,3 +159,41 @@ fn the_walker_can_tell_a_measurement_from_a_hairline() {
     );
     assert_eq!(stray_colours(sample).len(), 1);
 }
+
+/// A separate window must not READ the workspace while it draws.
+///
+/// `App::open_window` draws the new window once before it returns, and the three
+/// windows are opened from listeners — so that first draw happens while the
+/// workspace is still inside its own update, and reading an entity that is being
+/// updated is a panic in gpui. The symptom was not subtle and was invisible
+/// here: pressing the gear closed the whole application.
+///
+/// Updating it is fine, and is how every one of these windows acts: a listener
+/// runs after the draw, not during it. What is forbidden is a READ — `upgrade()`
+/// followed by `read`.
+#[test]
+fn a_window_does_not_read_the_workspace() {
+    const WINDOWS: [&str; 3] = ["settings.rs", "form.rs", "profile.rs"];
+    let mut bad = Vec::new();
+    for name in WINDOWS {
+        let Ok(text) = std::fs::read_to_string(src_dir().join(name)) else { continue };
+        for (n, line) in text.lines().enumerate() {
+            if line.trim_start().starts_with("//") {
+                continue;
+            }
+            // `self.workspace.upgrade()` is only ever wanted so something can be
+            // read off it; the update path does not need it.
+            if line.contains("workspace.upgrade()") {
+                bad.push(format!("{name}:{}  {}", n + 1, line.trim()));
+            }
+        }
+    }
+    assert!(
+        bad.is_empty(),
+        "{} place(s) reading the workspace from a window. `open_window` draws \
+         before it returns, so a read during that draw is a panic — hand the \
+         state over and push it again when it changes (see settings::Appearance):\n{}",
+        bad.len(),
+        bad.join("\n")
+    );
+}

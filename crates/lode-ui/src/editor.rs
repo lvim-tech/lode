@@ -581,6 +581,19 @@ impl Doc {
         true
     }
 
+    /// Everything to the left of the cursor, for deciding whether a separator
+    /// is wanted before what is about to be inserted.
+    pub fn text_before_cursor(&self) -> String {
+        let p = self.clamp(self.cursor);
+        let mut out = String::new();
+        for n in 0..p.line {
+            out.push_str(self.line(n));
+            out.push('\n');
+        }
+        out.push_str(&self.line(p.line)[..p.byte]);
+        out
+    }
+
     /// Put the cursor somewhere, e.g. where a click landed.
     pub fn place(&mut self, p: Pos, extend: bool) {
         self.moving(extend);
@@ -839,6 +852,19 @@ mod tests {
         let d = Doc::new("a\r\nb\rc\nd");
         assert_eq!(d.lines(), ["a", "b", "c", "d"]);
         assert!(!d.text().contains('\r'));
+    }
+
+    /// What is behind the cursor, which is how an inserted name decides
+    /// whether it needs a space in front of it.
+    #[test]
+    fn the_text_behind_the_cursor_is_readable() {
+        let mut d = Doc::new("select \nfrom t");
+        d.place(Pos::new(0, 7), false);
+        assert_eq!(d.text_before_cursor(), "select ");
+        d.place(Pos::new(1, 4), false);
+        assert_eq!(d.text_before_cursor(), "select \nfrom");
+        d.move_doc_start(false);
+        assert_eq!(d.text_before_cursor(), "");
     }
 
     #[test]

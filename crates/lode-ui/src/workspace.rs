@@ -1054,6 +1054,25 @@ pub fn column_summary(
     }
 }
 
+/// A name for a tab holding a typed statement.
+///
+/// The first words of it, on one line. Not the whole thing: a tab titled by a
+/// four-line query makes the tab strip as wide as the query, and not "Draft"
+/// either — three drafts called Draft cannot be told apart, which is the same
+/// fault the saved-query name had.
+pub fn draft_title(sql: &str) -> String {
+    let one_line = sql.split_whitespace().collect::<Vec<_>>().join(" ");
+    if one_line.is_empty() {
+        return "Draft".into();
+    }
+    let cut: String = one_line.chars().take(40).collect();
+    if cut.chars().count() < one_line.chars().count() {
+        format!("{}…", cut.trim_end())
+    } else {
+        cut
+    }
+}
+
 /// What a run of JSON text IS, for colouring it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum JsonRole {
@@ -1479,6 +1498,21 @@ mod tests {
         assert!(super::respawn_delay(1).unwrap() > super::respawn_delay(0).unwrap());
         assert!(super::respawn_delay(2).unwrap() > super::respawn_delay(1).unwrap());
         assert_eq!(super::respawn_delay(3), None, "a fourth try is a spawn storm");
+    }
+
+    /// A tab gets a name from its statement, on one line and not too long.
+    #[test]
+    fn a_draft_is_named_after_what_it_says() {
+        assert_eq!(super::draft_title(""), "Draft");
+        assert_eq!(super::draft_title("   \n  "), "Draft");
+        assert_eq!(super::draft_title("select 1"), "select 1");
+        // Several lines become one: a tab title with a newline in it makes the
+        // strip as tall as the statement.
+        assert_eq!(super::draft_title("select *\n  from t"), "select * from t");
+        let long = "select a, b, c, d, e, f, g, h, i, j, k from a_long_table_name";
+        let got = super::draft_title(long);
+        assert!(got.chars().count() <= 41, "{got:?}");
+        assert!(got.ends_with('…'), "{got:?}");
     }
 
     /// The runs cover the text exactly, and name the four things apart.
