@@ -801,6 +801,9 @@ enum Pending {
     /// `schema.ddl` asked for by the context menu: the answer goes on the
     /// clipboard rather than into a tab.
     DdlCopy,
+    /// What the settings window's Access and MCP pages report.
+    AccessList,
+    Approvals,
     StoreStatus,
     Connections,
     Connect { name: String, driver: String },
@@ -908,6 +911,15 @@ pub struct Workspace {
     respawn_attempts: u32,
     respawn_at: Option<std::time::Instant>,
     store_ok: bool,
+    /// Where the engine's own database is, as it answered — shown on the
+    /// settings window's About page, because "where is my saved connection"
+    /// has no answer anywhere else.
+    store_path: String,
+    /// What the engine found for `access.list` and `approvals.list`, cached for
+    /// the settings window. Asked when that window opens: both cost a round
+    /// trip and neither is wanted until somebody looks.
+    access: Vec<Value>,
+    approvals: Vec<Value>,
 
     saved: Vec<SavedConnection>,
     conns: Vec<Live>,
@@ -1207,6 +1219,9 @@ impl Workspace {
             respawn_attempts: 0,
             respawn_at: None,
             store_ok: false,
+            store_path: String::new(),
+            access: Vec::new(),
+            approvals: Vec::new(),
             saved: Vec::new(),
             conns: Vec::new(),
             open_nodes: HashSet::new(),
@@ -1713,6 +1728,11 @@ impl Workspace {
         match what {
             Pending::StoreStatus => {
                 self.store_ok = v.get("available").and_then(Value::as_bool).unwrap_or(false);
+                self.store_path = v
+                    .get("path")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string();
                 // Warm the saved tunnels as soon as the store answers, so the
                 // FIRST connection window already knows about them. Asking when
                 // the window opens is too late: the answer arrives after it is
@@ -1999,6 +2019,16 @@ impl Workspace {
                 if let Some(t) = self.tabs.iter_mut().find(|t| t.id == tab) {
                     t.indexes = idx;
                 }
+            }
+            Pending::AccessList => {
+                self.access =
+                    v.get("providers").and_then(|x| x.as_array()).cloned().unwrap_or_default();
+                self.poke_settings(cx);
+            }
+            Pending::Approvals => {
+                self.approvals =
+                    v.get("approvals").and_then(|x| x.as_array()).cloned().unwrap_or_default();
+                self.poke_settings(cx);
             }
             Pending::DdlCopy => {
                 // Straight to the clipboard: the menu said "copy the DDL", and
@@ -3246,6 +3276,16 @@ impl Workspace {
         // listener's update of the workspace — where reading the workspace is a
         // panic. See `settings::Appearance`.
         let look_now = self.appearance();
+        let facts = self.facts();
+        // Both cost a round trip and neither is wanted until somebody looks at
+        // the page that reports it — so they are asked for HERE, when the
+        // window opens, rather than at startup.
+        if self.hello.as_ref().map_or(false, |h| h.proto >= 11) {
+            self.ask(Pending::AccessList, "access.list", json!({}));
+        }
+        if self.hello.as_ref().map_or(false, |h| h.proto >= 12) {
+            self.ask(Pending::Approvals, "approvals.list", json!({}));
+        }
         let users: std::collections::BTreeMap<String, Vec<String>> = self
             .profile_users
             .iter()
@@ -3267,7 +3307,7 @@ impl Workspace {
             |_window, cx| {
                 cx.new(|cx| {
                     crate::settings::SettingsWindow::new(
-                        me, look, drivers, tun, prx, about, look_now, users, cx,
+                        me, look, drivers, tun, prx, about, look_now, users, facts, cx,
                     )
                 })
             },
@@ -4838,10 +4878,6 @@ impl Workspace {
         self.profiles.get(kind).cloned().unwrap_or_default()
     }
 
-    pub fn profile_users_of(&self, name: &str) -> Vec<String> {
-        self.profile_users.get(name).cloned().unwrap_or_default()
-    }
-
     /// What a separate window inherits from this one: the palette, the scale,
     /// the two fonts and the language. See `widgets::Look`.
     pub fn look(&self) -> crate::widgets::Look {
@@ -4851,6 +4887,67 @@ impl Workspace {
             text_font: self.font_family.clone(),
             icon_font: self.icon_family.clone(),
             lang: self.lang,
+        }
+    }
+
+    /// What the engine has said, for the settings window's reporting pages.
+    pub fn facts(&self) -> crate::settings::Facts {
+        let pair = |v: &Value, k: &str| v.get(k).and_then(Value::as_str).unwrap_or("").to_string();
+        crate::settings::Facts {
+            proto: self.hello.as_ref().map(|h| h.proto).unwrap_or(0),
+            version: self
+                .hello
+                .as_ref()
+                .and_then(|h| h.version.clone())
+                .unwrap_or_default(),
+            engine_binary: self
+                .engine
+                .as_ref()
+                .map(|e| e.binary().display().to_string())
+                .unwrap_or_default(),
+            store_path: self.store_path.clone(),
+            store_ok: self.store_ok,
+            audit_mode: self.audit_mode.clone(),
+            external: self
+                .hello
+                .as_ref()
+                .map(|h| h.external.clone())
+                .unwrap_or_default()
+                .iter()
+                .map(|e| {
+                    (
+                        pair(e, "name"),
+                        pair(e, "kind"),
+                        e.get("ok").and_then(Value::as_bool).unwrap_or(false),
+                        pair(e, "error"),
+                    )
+                })
+                .collect(),
+            access: self
+                .access
+                .iter()
+                .map(|a| {
+                    (
+                        pair(a, "name"),
+                        pair(a, "kind"),
+                        a.get("usable").and_then(Value::as_bool).unwrap_or(false),
+                        pair(a, "why"),
+                    )
+                })
+                .collect(),
+            approvals: self
+                .approvals
+                .iter()
+                .map(|a| {
+                    (
+                        a.get("id")
+                            .map(|x| x.to_string().trim_matches('"').to_string())
+                            .unwrap_or_default(),
+                        pair(a, "statement"),
+                        pair(a, "state"),
+                    )
+                })
+                .collect(),
         }
     }
 
@@ -4878,11 +4975,13 @@ impl Workspace {
             .iter()
             .map(|(k, v)| (k.clone(), v.clone()))
             .collect();
+        let facts = self.facts();
         if let Some(h) = self.settings_window.clone() {
             let _ = h.update(cx, |w, _, cx| {
                 w.set_scale(ms, cx);
                 w.look_changed(look, cx);
                 w.users_arrived(users, cx);
+                w.facts_arrived(facts, cx);
             });
         }
     }

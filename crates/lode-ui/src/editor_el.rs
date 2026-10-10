@@ -33,7 +33,7 @@ use gpui::{
     ShapedLine, SharedString, Style, TextRun, UTF16Selection, Window,
 };
 
-use crate::editor::{sql_runs, Doc, Pos, SqlRole};
+use crate::editor::{sql_runs, Doc, Pos};
 use crate::input::{InputColors, InputEvent};
 use crate::metrics::Metrics;
 use crate::theme::Theme;

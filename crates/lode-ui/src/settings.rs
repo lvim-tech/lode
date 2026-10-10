@@ -49,6 +49,96 @@ pub struct Appearance {
     pub icon_family: String,
 }
 
+/// What the keyboard does, grouped as somebody would look for it.
+///
+/// A LIST, written here rather than read from the bindings: `gpui` does not
+/// offer its key map back, and a table generated from nothing is a table that
+/// can only be wrong. It is checked by a test against the bindings' own file,
+/// so a key added there and not here fails the build rather than quietly
+/// disagreeing.
+const KEYS: &[(&str, &[(&str, &str)])] = &[
+    (
+        "THE WINDOW",
+        &[
+            ("Everything, by name", "ctrl-p"),
+            ("Leave what is in front", "escape"),
+            ("Settings", "ctrl-,"),
+            ("Hide the panel", "ctrl-shift-b"),
+            ("New connection", "ctrl-shift-n"),
+            ("Audit", "ctrl-shift-a"),
+            ("Tasks", "ctrl-shift-t"),
+        ],
+    ),
+    (
+        "TABS",
+        &[
+            ("A tab of its own", "ctrl-t"),
+            ("Close it", "ctrl-w"),
+            ("The one before this", "ctrl-tab"),
+            ("By position", "ctrl-1 \u{2026} ctrl-9"),
+            ("Left, right", "h, l"),
+        ],
+    ),
+    (
+        "THE RESULT",
+        &[
+            ("Run this tab", "r, f5"),
+            ("Run what is in the editor", "ctrl-enter"),
+            ("Run it in a new tab", "ctrl-shift-enter"),
+            ("A row down, up", "j, k"),
+            ("First row, last", "g, shift-g"),
+            ("A page down, up", "ctrl-f, ctrl-b"),
+            ("The grid sideways", "shift-h, shift-l"),
+            ("A page of rows", "[, ]"),
+            ("Show the row", "enter"),
+            ("Export", "ctrl-e"),
+        ],
+    ),
+    (
+        "THE EDITOR",
+        &[
+            ("A new line", "enter"),
+            ("Indent, unindent", "tab, shift-tab"),
+            ("Comment the block", "ctrl-/"),
+            ("Duplicate the line", "ctrl-d"),
+            ("Undo, redo", "ctrl-z, ctrl-shift-z"),
+            ("A word left, right", "ctrl-left, ctrl-right"),
+        ],
+    ),
+    (
+        "A WINDOW OF ITS OWN",
+        &[
+            ("The next field, the last", "tab, shift-tab"),
+            ("Save", "enter"),
+            ("Close", "escape"),
+        ],
+    ),
+];
+
+/// What the ENGINE has said, for the pages that report rather than set.
+///
+/// Separate from `Appearance` because it changes for a different reason and at
+/// a different time: the look changes when somebody moves a stepper, and these
+/// change when the engine answers. Pushed the same way, for the same reason —
+/// see `Appearance`.
+#[derive(Clone, Default)]
+pub struct Facts {
+    pub proto: u32,
+    pub version: String,
+    pub engine_binary: String,
+    pub store_path: String,
+    pub store_ok: bool,
+    /// How much of a statement the audit keeps: `full`, `shape` or `off`.
+    pub audit_mode: String,
+    /// Each registered driver program: name, kind, whether it loaded, why not.
+    pub external: Vec<(String, String, bool, String)>,
+    /// Each sign-in the engine found: name, kind, whether it can be used, why
+    /// not.
+    pub access: Vec<(String, String, bool, String)>,
+    /// The MCP approval queue: id, statement, what it is waiting for.
+    pub approvals: Vec<(String, String, String)>,
+}
+
 /// One page of the window.
 ///
 /// Grouped the way somebody looks for a thing rather than the way the code is
@@ -170,6 +260,8 @@ pub struct SettingsWindow {
     look: Appearance,
     /// Which connections point at each profile, as the engine answered.
     users: std::collections::BTreeMap<String, Vec<String>>,
+    /// What the engine has said — see `Facts`.
+    facts: Facts,
     /// Which driver's detail is shown on the Drivers page.
     driver_shown: Option<String>,
     about: Vec<(String, String)>,
@@ -185,6 +277,7 @@ impl SettingsWindow {
         about: Vec<(String, String)>,
         look_now: Appearance,
         users: std::collections::BTreeMap<String, Vec<String>>,
+        facts: Facts,
         cx: &mut Context<Self>,
     ) -> Self {
         let crate::widgets::Look { theme, scale, text_font, icon_font, lang } = look;
@@ -209,7 +302,14 @@ impl SettingsWindow {
             about,
             look: look_now,
             users,
+            facts,
         }
+    }
+
+    /// The engine answered something one of these pages reports.
+    pub fn facts_arrived(&mut self, facts: Facts, cx: &mut Context<Self>) {
+        self.facts = facts;
+        cx.notify();
     }
 
     /// The main window's look changed — see `Appearance`.
@@ -1000,43 +1100,140 @@ impl SettingsWindow {
                 for (k, v) in &self.about {
                     out = out.child(self.row(k.clone(), v.clone()));
                 }
+                // WHERE things are. "Where is my saved connection" and "which
+                // binary is this" had no answer anywhere in the window.
+                let f = &self.facts;
+                out = out.child(self.head("THE ENGINE"));
+                out = out.child(self.row("Version", f.version.clone()));
+                out = out.child(self.row("Protocol", f.proto.to_string()));
+                out = out.child(self.row("Binary", f.engine_binary.clone()));
+                out = out.child(self.head("THE STORE"));
+                out = out.child(self.row(
+                    "State",
+                    if f.store_ok { "open" } else { "NOT available" },
+                ));
+                out = out.child(self.row("Path", f.store_path.clone()));
+                out = out.child(self.note(
+                    "The saved connections, queries, charts, dashboards, scripts, history and \
+                     audit are all in that one file, and it is the engine's — two clients share it.",
+                ));
             }
-            // Pages whose content is still in the engine and not yet given a
-            // face. Named rather than hidden: a category that exists and says
-            // what it will hold is a promise; one that is missing is a feature
-            // nobody knows about — which is what these have been.
-            other => {
-                out = out.child(self.note(match other {
-                    Category::Keys => {
-                        "The palette is ctrl-p and the grid has its own keys. None of the rail's \
-                         panels has a key yet, which is the gap this page is for."
+            Category::Keys => {
+                // SHOWN, not editable. Editing them means a keymap stored
+                // somewhere and read at startup, which is its own step; a list
+                // nobody can find is the bigger gap, and this closes it.
+                out = out.child(self.note(
+                    "What the keyboard does. Changing them is not built yet.",
+                ));
+                for (group, rows) in KEYS {
+                    out = out.child(self.head(*group));
+                    for (action, key) in *rows {
+                        out = out.child(self.row(*action, *key));
                     }
-                    Category::Audit => {
-                        "The engine records every statement, with the grammar-based redaction, \
-                         and LODE_AUDIT_STATEMENTS chooses how much. It belongs here as a \
-                         setting rather than an environment variable."
-                    }
-                    Category::Access => {
-                        "The engine reads ~/.aws/config and reports what is usable. This page is \
-                         where that belongs, including saying plainly which provider kinds are \
-                         not implemented."
-                    }
-                    Category::Hooks => {
-                        "The engine runs commands, scripts and Lua around connect and disconnect. \
-                         They can only be set per connection today."
-                    }
-                    Category::Rpc => {
-                        "The engine starts external drivers over RPC and they register like any \
-                         other. There is no way to add one from here yet."
-                    }
-                    Category::Mcp => {
-                        "The engine has roles, approvals and an audit of every tool call. \
-                         Execution classes — metadata, read, write, destructive, admin — are a \
-                         better shape than the present yes/no and are not built."
-                    }
-                    _ => "",
+                }
+            }
+            Category::Audit => {
+                let f = &self.facts;
+                out = out.child(self.row("Keeping", match f.audit_mode.as_str() {
+                    "shape" => "the SHAPE of each statement, not its text",
+                    "off" => "no statement text at all",
+                    _ => "the whole statement, with credentials redacted",
                 }));
+                out = out.child(self.note(
+                    "$LODE_AUDIT_STATEMENTS chooses this, and the engine reads it at startup: \
+                     `full` (the default), `shape`, or `off`. It is the ENGINE's setting, not this \
+                     window's — a client that could turn the record down would not be a record.",
+                ));
+                out = out.child(self.note(
+                    "What is written: every statement that changed anything, every refusal, and \
+                     every connect and disconnect. Reads are not in it. There is no method to \
+                     delete from it.",
+                ));
+                out = out.child(self.note(
+                    "The rail's Audit panel is the log itself — ctrl-shift-a.",
+                ));
             }
+            Category::Rpc => {
+                let f = &self.facts;
+                if f.external.is_empty() {
+                    out = out.child(self.note(
+                        "No driver programs are registered. One is a `driver` profile holding a \
+                         command line; the engine asks it to describe itself at startup and it \
+                         then appears like any other driver.",
+                    ));
+                }
+                for (name, kind, ok, why) in &f.external {
+                    out = out.child(self.row(
+                        name.clone(),
+                        if *ok {
+                            format!("loaded as `{kind}`")
+                        } else {
+                            // WHY it is absent. Without this an installed
+                            // driver that failed to describe itself is simply
+                            // missing, which is a mystery rather than a fault.
+                            format!("NOT loaded \u{2014} {why}")
+                        },
+                    ));
+                }
+                out = out.child(self.note("Changes take effect when the engine restarts."));
+            }
+            Category::Access => {
+                let f = &self.facts;
+                if f.access.is_empty() {
+                    out = out.child(self.note(
+                        "Nothing found. The engine reads ~/.aws/config and ~/.aws/credentials.",
+                    ));
+                }
+                for (name, kind, usable, why) in &f.access {
+                    out = out.child(self.row(
+                        name.clone(),
+                        if *usable {
+                            format!("{kind} \u{2014} usable")
+                        } else {
+                            format!("{kind} \u{2014} {why}")
+                        },
+                    ));
+                }
+                out = out.child(self.note(
+                    "The whole list is shown and the ones that will not work are marked, rather \
+                     than offering eight of which three fail only when picked. An import stores \
+                     the profile's NAME, never its key: the credential stays where the AWS tools \
+                     rotate it.",
+                ));
+            }
+            Category::Mcp => {
+                let f = &self.facts;
+                if f.approvals.is_empty() {
+                    out = out.child(self.note("Nothing is waiting for an answer."));
+                }
+                for (id, statement, state) in &f.approvals {
+                    out = out.child(self.row(format!("{id} \u{2014} {state}"), statement.clone()));
+                }
+                out = out.child(self.note(
+                    "An agent speaking MCP runs against the SAME engine: same drivers, same \
+                     store, same classify, same connection policy, same audit log. What differs \
+                     only ever restricts \u{2014} a role (`reader` by default, $LODE_MCP_ROLE), an \
+                     unrestricted policy read as `confirm`, and an agent that CANNOT confirm. A \
+                     statement classify names is not run: it is filed here for a person.",
+                ));
+                out = out.child(self.note("Deciding one from this window is not built yet."));
+            }
+            Category::Hooks => {
+                out = out.child(self.note(
+                    "A hook is your own code run at one of four moments: before and after a \
+                     connect, before and after a disconnect. A PreConnect hook that fails stops \
+                     the connection, which is the only reason to have one before rather than \
+                     after.",
+                ));
+                out = out.child(self.note(
+                    "The environment a child gets carries CONTEXT and never a credential \u{2014} a \
+                     child's environment is readable from `ps` and `/proc`.",
+                ));
+                out = out.child(self.note(
+                    "They are set per connection, in its own window. Global hooks are not built.",
+                ));
+            }
+
         }
         out.into_any_element()
     }
@@ -1087,6 +1284,46 @@ mod tests {
             assert!(!c.keywords().is_empty(), "{} has nothing to search on", c.title());
             assert!(!c.blurb().is_empty(), "{} does not say what it is for", c.title());
         }
+    }
+
+    /// The key table says what the bindings actually say.
+    ///
+    /// Written by hand, because gpui does not offer its key map back — so the
+    /// only thing that can keep it honest is reading the file the bindings are
+    /// in. A key bound there and missing here is a page that teaches something
+    /// untrue, which is worse than a page that teaches nothing.
+    #[test]
+    fn the_key_table_agrees_with_the_bindings() {
+        let src = |name: &str| {
+            std::fs::read_to_string(
+                std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src").join(name),
+            )
+            .unwrap_or_default()
+        };
+        let bound = format!("{}{}{}", src("app.rs"), src("input.rs"), src("editor_el.rs"));
+        let mut missing = Vec::new();
+        for (_, rows) in KEYS {
+            for (action, keys) in *rows {
+                // A row may list two ways to do one thing ("r, f5"); each has
+                // to be bound somewhere. Split on COMMA-SPACE, not on comma:
+                // `ctrl-,` is a key whose name ends in one.
+                for key in keys.split(", ").map(str::trim) {
+                    // The ranges and the words are not literal bindings.
+                    if key.contains('\u{2026}') {
+                        continue;
+                    }
+                    if !bound.contains(&format!("KeyBinding::new(\"{key}\"")) {
+                        missing.push(format!("{action}: {key}"));
+                    }
+                }
+            }
+        }
+        assert!(
+            missing.is_empty(),
+            "{} key(s) on the Keybindings page that nothing binds:\n  {}",
+            missing.len(),
+            missing.join("\n  ")
+        );
     }
 
     /// A proxy is not a tunnel, and its line must not invent a port 22 or a

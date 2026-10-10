@@ -62,6 +62,16 @@ pub struct Hello {
     pub proto: u32,
     #[serde(default)]
     pub drivers: Vec<DriverMeta>,
+    /// What became of each registered driver PROGRAM (`proto >= 13`): its name,
+    /// the kind it claimed, whether it loaded, and the reason if it did not.
+    ///
+    /// Carried as JSON rather than typed, because this is a REPORT and not a
+    /// contract: the engine may add a field to it, and a client that has to be
+    /// rebuilt to keep reading a diagnostic is a client that stops showing the
+    /// diagnostic. An older engine sends none, and an empty list reads as
+    /// "none registered" — which is what it means.
+    #[serde(default)]
+    pub external: Vec<serde_json::Value>,
 }
 
 /// A driver as the engine describes it. This is what a connection form is built
