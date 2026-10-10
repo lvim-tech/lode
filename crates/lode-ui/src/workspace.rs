@@ -207,6 +207,13 @@ pub struct Tab {
     /// The node kind it was opened as — kept because the browse template is
     /// chosen by kind, so reopening the tab has to ask the same question again.
     pub kind: String,
+    /// The text that was actually SENT, which is not always `sql`.
+    ///
+    /// With a selection the editor holds a whole file and only part of it is
+    /// run. The engine's refusal, the history row and the confirmation card all
+    /// have to be about the part that ran, or they are about something that
+    /// never reached the database.
+    pub ran: String,
     /// Whether this run is already in the engine's history.
     ///
     /// The record used to be written when the state arrived, which is BEFORE
@@ -743,6 +750,7 @@ impl Tab {
             ms: 0,
             error: None,
             confirm: None,
+            ran: String::new(),
             recorded: false,
             selected: None,
             view: ResultView::default_for(meta),

@@ -1568,7 +1568,7 @@ impl Workspace {
                             // confirmation, not a red line to read twice.
                             match st.error.as_deref().and_then(needs_confirm_from_error) {
                                 Some(reason) => {
-                                    tab.confirm = Some((tab.sql.clone(), reason));
+                                    tab.confirm = Some((tab.ran.clone(), reason));
                                     tab.error = None;
                                 }
                                 None => tab.error = st.error.clone(),
@@ -2113,7 +2113,7 @@ impl Workspace {
                             t.confirm = Some((statement, reason.to_string()));
                         }
                     }
-                    None => self.run_tab_confirmed(tab, false),
+                    None => self.run_tab_confirmed(tab, &statement, false),
                 }
             }
             Pending::Rename { to, driver, spec } => {
@@ -2407,49 +2407,63 @@ impl Workspace {
                 self.inputs.insert((tab_id, f.key.clone()), input);
             }
         } else {
-            // A MULTI-LINE editor, in the driver's own language. This was a
-            // one-line field: a statement longer than the box was typed blind
-            // and a formatted query pasted in lost its newlines.
-            let flavour = match meta.map(|m| m.hint.as_str()) {
-                Some(h) if h.contains("sql") || h.contains("SQL") => crate::editor_el::Flavour::Sql,
-                Some(h) if h.contains("json") || h.contains("JSON") => {
-                    crate::editor_el::Flavour::Json
-                }
-                // The driver declares a HINT and nothing more; where it names no
-                // language this draws in one ink rather than guessing, because a
-                // SQL palette over something that is not SQL reads as a bug.
-                _ => crate::editor_el::Flavour::Plain,
-            };
-            let (theme, scale, font) = (self.theme.clone(), self.scale, self.font_family.clone());
-            let text = statement.to_string();
-            let ed = cx.new(|cx| {
-                crate::editor_el::Editor::new(&text, flavour, colors, theme, scale, font, cx)
-            });
-            cx.subscribe(&ed, move |this, ed, ev: &crate::editor_el::EditorEvent, cx| {
-                match ev {
-                    // The draft is kept in the TAB, because the session keeps
-                    // the tab: typing and then closing the window must not lose
-                    // what was typed.
-                    crate::editor_el::EditorEvent::Changed => {
-                        let text = ed.read(cx).text();
-                        if let Some(tb) = this.tabs.iter_mut().find(|t| t.id == tab_id) {
-                            tb.sql = text;
-                        }
-                        this.remember();
-                    }
-                    crate::editor_el::EditorEvent::Run => {
-                        this.sync_tab_from_inputs(tab_id, cx);
-                        this.run_tab(tab_id, cx);
-                    }
-                    crate::editor_el::EditorEvent::RunNewTab => {
-                        this.run_in_new_tab(tab_id, cx);
-                    }
-                }
-                cx.notify();
-            })
-            .detach();
-            self.editors.insert(tab_id, ed);
+            self.make_editor(tab_id, meta.map(|m| m.hint.as_str()), statement, cx);
         }
+    }
+
+    /// Give a tab a MULTI-LINE statement editor.
+    ///
+    /// One place, because there are two ways a tab gets one — the tree opening
+    /// an object and a statement run by name — and when they were two pieces of
+    /// code one of them got the editor and the other kept a one-line field, so
+    /// half the tabs had no statement box drawn at all.
+    fn make_editor(
+        &mut self,
+        tab_id: u64,
+        hint: Option<&str>,
+        statement: &str,
+        cx: &mut Context<Self>,
+    ) {
+        // The language, from the driver's own HINT. Where it names none this
+        // draws in one ink rather than guessing: a SQL palette over something
+        // that is not SQL is a lie that reads as a bug.
+        let hint_lower = hint.unwrap_or_default().to_ascii_lowercase();
+        let flavour = if hint_lower.contains("sql") {
+            crate::editor_el::Flavour::Sql
+        } else if hint_lower.contains("json") || hint_lower.contains("mongo") {
+            crate::editor_el::Flavour::Json
+        } else {
+            crate::editor_el::Flavour::Plain
+        };
+        let (theme, scale, font) = (self.theme.clone(), self.scale, self.font_family.clone());
+        let colors = input_colors(&self.theme);
+        let text = statement.to_string();
+        let ed = cx.new(|cx| {
+            crate::editor_el::Editor::new(&text, flavour, colors, theme, scale, font, cx)
+        });
+        cx.subscribe(&ed, move |this, ed, ev: &crate::editor_el::EditorEvent, cx| {
+            match ev {
+                // The draft is kept in the TAB, because the session keeps the
+                // tab: typing and then closing the window must not lose it.
+                crate::editor_el::EditorEvent::Changed => {
+                    let text = ed.read(cx).text();
+                    if let Some(tb) = this.tabs.iter_mut().find(|t| t.id == tab_id) {
+                        tb.sql = text;
+                    }
+                    this.remember();
+                }
+                crate::editor_el::EditorEvent::Run => {
+                    this.sync_tab_from_inputs(tab_id, cx);
+                    this.run_tab(tab_id, cx);
+                }
+                crate::editor_el::EditorEvent::RunNewTab => {
+                    this.run_in_new_tab(tab_id, cx);
+                }
+            }
+            cx.notify();
+        })
+        .detach();
+        self.editors.insert(tab_id, ed);
     }
 
     /// Open or shut a table's insides, asking for them the first time only.
@@ -2688,7 +2702,7 @@ impl Workspace {
     /// The `confirm` goes to the ENGINE, which is where the policy lives. This
     /// client asks first anyway; the flag is how it reports that it did, and the
     /// engine refuses when it did not.
-    fn run_tab_confirmed(&mut self, tab_id: u64, confirm: bool) {
+    fn run_tab_confirmed(&mut self, tab_id: u64, statement: &str, confirm: bool) {
         let Some(idx) = self.tabs.iter().position(|t| t.id == tab_id) else { return };
         let (conn_name, title) = (self.tabs[idx].conn_name.clone(), self.tabs[idx].title.clone());
         let Some(live) = self.live(&conn_name) else {
@@ -2696,10 +2710,15 @@ impl Workspace {
             return;
         };
         let conn_id = live.conn_id;
-        let statement = self.tabs[idx].sql.clone();
+        // The statement is PASSED, not re-read from the tab: with a selection
+        // the tab holds the whole text and only part of it is being run, and
+        // classifying one statement and executing another is exactly the gap
+        // the confirmation exists to close.
+        let statement = statement.to_string();
         if statement.trim().is_empty() {
             return;
         }
+        self.tabs[idx].ran = statement.clone();
         let old = self.tabs[idx].call_id.take();
         let old_running = self.tabs[idx].state == RunState::Running;
         self.tabs[idx].reset_result();
@@ -2972,20 +2991,14 @@ impl Workspace {
         self.tabs.push(tab);
         self.active = self.tabs.len() - 1;
         // A console statement is free text whatever the driver is: it was typed,
-        // not assembled, so the tab gets a statement box rather than a form.
-        let colors = input_colors(&self.theme);
-        let text = statement.to_string();
-        let input = cx.new(|cx| {
-            let mut i = TextInput::new(cx, "", colors);
-            i.set_text(text, cx);
-            i
-        });
-        self.subscribe_run(&input, id, cx);
-        self.inputs.insert((id, String::new()), input);
+        // not assembled, so the tab gets an editor rather than a form.
+        let hint = meta.as_ref().map(|m| m.hint.clone()).unwrap_or_default();
+        self.make_editor(id, Some(&hint), statement, cx);
         // The approval travels with the run. Without it the engine refuses a
         // destructive statement that the person has just been asked about and
         // said yes to — the console would look broken, correctly but uselessly.
-        self.run_tab_confirmed(id, confirm);
+        let stmt = statement.to_string();
+        self.run_tab_confirmed(id, &stmt, confirm);
     }
 
     /// Open the connection window. Editing passes what is stored; adding passes
@@ -4389,7 +4402,8 @@ impl Workspace {
                 return None;
             }
             t.recorded = true;
-            Some((t.sql.trim().to_string(), t.conn_name.clone(), t.driver.clone()))
+            let what = if t.ran.trim().is_empty() { t.sql.clone() } else { t.ran.clone() };
+            Some((what.trim().to_string(), t.conn_name.clone(), t.driver.clone()))
         });
         let Some((sql, conn, driver)) = found else { return };
         self.ask(
@@ -4463,6 +4477,15 @@ impl Workspace {
                 if let Some(h) = self.settings_window.clone() {
                     let _ = h.update(cx, |f, _, cx| f.set_theme(th.clone(), cx));
                 }
+                // And every open statement editor: it draws the statement in
+                // the theme's own syntax colours, so a theme change that missed
+                // it would leave the one place with the most colour in it
+                // wearing the old palette.
+                let eds: Vec<_> = self.editors.values().cloned().collect();
+                for ed in eds {
+                    let (th, co) = (self.theme.clone(), colors);
+                    ed.update(cx, |e, cx| e.set_colors(co, th, cx));
+                }
                 self.remember();
                 self.toast(format!("theme: {name}"), false);
                 cx.notify();
@@ -4510,6 +4533,7 @@ impl Workspace {
     pub fn set_base(&mut self, base: f32, cx: &mut Context<Self>) {
         self.scale = self.scale.with_base(base);
         self.remember();
+        self.poke_editors(cx);
         self.poke_settings(cx);
         cx.notify();
     }
@@ -4517,6 +4541,7 @@ impl Workspace {
     pub fn set_icon(&mut self, size: f32, cx: &mut Context<Self>) {
         self.scale = self.scale.with_icon(size);
         self.remember();
+        self.poke_editors(cx);
         self.poke_settings(cx);
         cx.notify();
     }
@@ -4524,6 +4549,7 @@ impl Workspace {
     pub fn reset_scale(&mut self, cx: &mut Context<Self>) {
         self.scale = Metrics::new(crate::metrics::DEFAULT_BASE);
         self.remember();
+        self.poke_editors(cx);
         self.poke_settings(cx);
         cx.notify();
     }
@@ -4570,6 +4596,17 @@ impl Workspace {
             text_font: self.font_family.clone(),
             icon_font: self.icon_family.clone(),
             lang: self.lang,
+        }
+    }
+
+    /// Hand the open editors the new sizes. Their line height is the scale's,
+    /// and an editor still laying lines out at the old one draws them over each
+    /// other.
+    fn poke_editors(&mut self, cx: &mut Context<Self>) {
+        let ms = self.scale;
+        let eds: Vec<_> = self.editors.values().cloned().collect();
+        for ed in eds {
+            ed.update(cx, |e, cx| e.set_scale(ms, cx));
         }
     }
 
@@ -6479,14 +6516,20 @@ impl Workspace {
                             .child(
                                 btn(t, ms, "tab-confirm-run", self.tr("write.run_it"), Btn::Danger)
                                     .on_click(cx.listener(move |this, _, _, _cx| {
+                                        // The statement the card is ABOUT, which
+                                        // is the one that was classified — not
+                                        // whatever the editor holds now.
+                                        let mut asked = None;
                                         if let Some(tab) =
                                             this.tabs.iter_mut().find(|t| t.id == id)
                                         {
-                                            tab.confirm = None;
+                                            asked = tab.confirm.take().map(|(s, _)| s);
                                         }
                                         // Confirmed by a person, and the engine
                                         // is told so — it refuses when it was not.
-                                        this.run_tab_confirmed(id, true);
+                                        if let Some(s) = asked {
+                                            this.run_tab_confirmed(id, &s, true);
+                                        }
                                     })),
                             )
                             .child(
