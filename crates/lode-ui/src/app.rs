@@ -102,6 +102,10 @@ gpui::actions!(
         ShowTasks,
         /// Run the active tab again: f5.
         Refresh,
+        /// The console's own history, up and down. Its own actions, in its own
+        /// key context: `up` in the console is not `up` in the grid.
+        ConsolePrev,
+        ConsoleNext,
         /// The cell cursor sideways, and what to do with the cell it is on.
         NextCol,
         PrevCol,
@@ -170,6 +174,8 @@ pub fn bind_workspace_keys(cx: &mut gpui::App) {
         KeyBinding::new("ctrl-shift-a", ShowAudit, None),
         KeyBinding::new("ctrl-shift-t", ShowTasks, None),
         KeyBinding::new("f5", Refresh, None),
+        KeyBinding::new("up", ConsolePrev, Some("Console")),
+        KeyBinding::new("down", ConsoleNext, Some("Console")),
         // The CELL cursor. `,` and `.` because shift-h and shift-l are already
         // the grid's horizontal scroll, and a cursor that also scrolled would
         // be two things on one key.
@@ -911,6 +917,11 @@ pub struct Workspace {
     /// The panel, folded away. Remembered, because somebody who wants the room
     /// wants it next time too.
     panel_hidden: bool,
+    /// A connection somebody asked to close while it was still working, and
+    /// what it is working on.
+    confirm_disconnect: Option<(String, Vec<String>)>,
+    /// How far back in the console's history the prompt is showing, if at all.
+    console_hist: Option<usize>,
     /// A connection somebody has asked to remove, and what would go with it:
     /// `(name, saved queries)`. The count is `None` until the engine answers.
     confirm_conn_rm: Option<(String, Option<usize>)>,
@@ -1214,6 +1225,7 @@ impl Workspace {
             if matches!(ev, InputEvent::Submit) {
                 let line = input.read(cx).text().trim().to_string();
                 if !line.is_empty() {
+                    this.console_hist = None;
                     this.console_submit(line, cx);
                 }
             }
@@ -1226,6 +1238,8 @@ impl Workspace {
             engine: None,
             hello: None,
             fatal: None,
+            confirm_disconnect: None,
+            console_hist: None,
             menu: None,
             mru: Vec::new(),
             panel_hidden: restore.panel_hidden.unwrap_or(false),
@@ -1535,6 +1549,7 @@ impl Workspace {
             self.tile_text.update(cx, |i, cx| i.set_text(words, cx));
         }
         self.poll_metrics();
+        self.poll_board();
         loop {
             let Some(engine) = &self.engine else { break };
             let Some(msg) = engine.try_recv() else { break };
@@ -2436,7 +2451,61 @@ impl Workspace {
         );
     }
 
+    /// May the window close?
+    ///
+    /// NO while something is still running, and the question goes up instead —
+    /// closing the window ends every statement under it, which is a way to
+    /// abandon a write by reaching for the corner of a title bar. Answering
+    /// "disconnect anyway" and pressing the corner again closes it.
+    ///
+    /// This is the only moment gpui lets a client say no: `on_app_quit` runs
+    /// when the decision has already been taken.
+    pub fn may_close(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> bool {
+        let busy: Vec<String> = self
+            .tabs
+            .iter()
+            .filter(|t| t.state == RunState::Running)
+            .map(|t| t.title.clone())
+            .collect();
+        if busy.is_empty() {
+            return true;
+        }
+        // The card names a CONNECTION, so it is the one the running tabs belong
+        // to — whichever that is, stopping its statements is the thing being
+        // offered.
+        let conn = self
+            .tabs
+            .iter()
+            .find(|t| t.state == RunState::Running)
+            .map(|t| t.conn_name.clone())
+            .unwrap_or_default();
+        self.confirm_disconnect = Some((conn, busy));
+        cx.notify();
+        false
+    }
+
+    /// Close a connection — ASKING first if something of its own is still
+    /// running.
+    ///
+    /// A disconnect used to go straight out. The engine drops the connection,
+    /// which kills the statement under it, so a click meant to tidy up could
+    /// end a write halfway: one of those three things is what somebody wanted
+    /// and the window had no way to find out which.
     fn disconnect(&mut self, name: &str) {
+        let busy: Vec<String> = self
+            .tabs
+            .iter()
+            .filter(|t| t.conn_name == name && t.state == RunState::Running)
+            .map(|t| t.title.clone())
+            .collect();
+        if !busy.is_empty() {
+            self.confirm_disconnect = Some((name.to_string(), busy));
+            return;
+        }
+        self.disconnect_now(name);
+    }
+
+    fn disconnect_now(&mut self, name: &str) {
         let Some(live) = self.live(name) else { return };
         let (conn_id, name) = (live.conn_id, live.name.clone());
         self.ask(
@@ -2444,6 +2513,19 @@ impl Workspace {
             "conn.disconnect",
             json!({ "conn_id": conn_id }),
         );
+    }
+
+    /// Stop whatever this connection is running, and stay connected.
+    fn cancel_running_on(&mut self, name: &str) {
+        let calls: Vec<u64> = self
+            .tabs
+            .iter()
+            .filter(|t| t.conn_name == name && t.state == RunState::Running)
+            .filter_map(|t| t.call_id)
+            .collect();
+        for call_id in calls {
+            self.ask(Pending::Ignore("cancel"), "query.cancel", json!({ "call_id": call_id }));
+        }
     }
 
     /// Open a tab on an object and RUN it. This is the whole point of the
@@ -4014,6 +4096,36 @@ impl Workspace {
         );
     }
 
+    /// Up and down through the console's history.
+    ///
+    /// The history is the ENGINE's, so what was typed into the editor is in it
+    /// too — which is right: this is "what has been run here", not "what I
+    /// typed in this box". Narrowed to the connection the console is pointed
+    /// at, because a statement from another database is not a suggestion.
+    fn step_console_history(&mut self, back: bool, cx: &mut Context<Self>) {
+        let target = self.target_conn();
+        let lines: Vec<String> = self
+            .history
+            .iter()
+            .filter(|h| match (&target, &h.conn) {
+                (Some(t), Some(c)) => c == t,
+                // An engine that did not say which connection it was: shown
+                // rather than hidden, because the alternative is a history that
+                // looks empty.
+                (_, None) => true,
+                _ => false,
+            })
+            .map(|h| h.statement.clone())
+            .collect();
+        self.console_hist = crate::workspace::history_step(self.console_hist, back, lines.len());
+        let text = match self.console_hist {
+            Some(i) => lines.get(i).cloned().unwrap_or_default(),
+            None => String::new(),
+        };
+        self.console.update(cx, |i, cx| i.set_text(text, cx));
+        cx.notify();
+    }
+
     /// The cell cursor sideways.
     fn step_col(&mut self, by: isize, cx: &mut Context<Self>) {
         let Some(tab) = self.tabs.get_mut(self.active) else { return };
@@ -4222,6 +4334,57 @@ impl Workspace {
         }
         // The ENGINE decides whether those are timestamps. Saving is how it is
         // asked — the answer comes back canonicalised, or refused with a reason.
+        self.save_board(tab, cx);
+        self.run_board(tab);
+        cx.notify();
+    }
+
+    /// Run the board in FRONT again, if its interval has come round.
+    ///
+    /// Only the front one. A board left open in a background tab refreshing
+    /// every ten seconds is a query every ten seconds against a database
+    /// nobody is looking at — and the person paying for it is whoever runs the
+    /// server.
+    fn poll_board(&mut self) {
+        let Some(tab) = self.tabs.get(self.active) else { return };
+        let tab_id = tab.id;
+        let Some(b) = tab.board.as_ref() else { return };
+        let Some(every) = b.refresh_every else { return };
+        let due = b.refreshed_at.map_or(true, |at| at.elapsed() >= every);
+        if !due {
+            return;
+        }
+        // Not while it is still working: a board whose charts take longer than
+        // the interval would queue runs on top of each other for ever.
+        if b.panes.values().any(|p| p.state == RunState::Running) {
+            return;
+        }
+        if let Some(bd) = self.board_mut(tab_id) {
+            bd.refreshed_at = Some(Instant::now());
+        }
+        self.run_board(tab_id);
+    }
+
+    /// A time window ending NOW, from a preset.
+    ///
+    /// The column is still the board's own — only the driver knows which of its
+    /// columns is a time, and a preset that guessed one would be guessing about
+    /// somebody's schema. What the preset saves is the two timestamps, which
+    /// are the part nobody should be typing.
+    fn board_preset_time(&mut self, tab: u64, seconds: u64, cx: &mut Context<Self>) {
+        let col = self.board_time_col.read(cx).text().trim().to_string();
+        if col.is_empty() {
+            self.toast("name the time column first".to_string(), true);
+            return;
+        }
+        let (from, to) =
+            crate::workspace::window_ending_now(seconds, std::time::SystemTime::now());
+        self.board_time_from.update(cx, |i, cx| i.set_text(from.clone(), cx));
+        self.board_time_to.update(cx, |i, cx| i.set_text(to.clone(), cx));
+        if let Some(b) = self.board_mut(tab) {
+            b.dash.time = Some(TimeRange { column: col, from, to });
+            b.dirty = true;
+        }
         self.save_board(tab, cx);
         self.run_board(tab);
         cx.notify();
@@ -7328,6 +7491,46 @@ impl Workspace {
                         this.board_apply_time(tab_id, cx);
                     })),
             );
+        // The windows anybody actually asks for. Typing two timestamps to see
+        // the last hour is how the wrong hour gets asked for.
+        for (label, secs) in [
+            ("15m", 900u64),
+            ("1h", 3_600),
+            ("6h", 21_600),
+            ("24h", 86_400),
+            ("7d", 604_800),
+        ] {
+            timebar = timebar.child(
+                btn(t, ms, format!("board-win-{label}"), label, Btn::Quiet).on_click(cx.listener(
+                    move |this, _, _, cx| {
+                        this.board_preset_time(tab_id, secs, cx);
+                    },
+                )),
+            );
+        }
+        timebar = timebar.child(self.small(self.tr("board.every"), t.muted()));
+        for (label, every) in [
+            ("off", None),
+            ("10s", Some(Duration::from_secs(10))),
+            ("60s", Some(Duration::from_secs(60))),
+            ("5m", Some(Duration::from_secs(300))),
+        ] {
+            let on = b.refresh_every == every;
+            timebar = timebar.child(
+                chip(t, ms, format!("board-every-{label}"), label, on).on_click(cx.listener(
+                    move |this, _, _, cx| {
+                        if let Some(bd) = this.board_mut(tab_id) {
+                            bd.refresh_every = every;
+                            // From NOW, so choosing an interval does not fire
+                            // one immediately on top of the run that is already
+                            // on screen.
+                            bd.refreshed_at = Some(Instant::now());
+                        }
+                        cx.notify();
+                    },
+                )),
+            );
+        }
         if b.dash.time.is_some() {
             timebar = timebar.child(
                 btn(t, ms, "board-time-clear", self.tr("board.clear"), Btn::Quiet)
@@ -9737,6 +9940,17 @@ impl Workspace {
                 let target = self.target_conn().unwrap_or_else(|| "nothing connected".into());
                 body = body.child(
                     div()
+                        // Its OWN key context, so `up` here walks the history
+                        // and `up` in the grid still moves a row. The field
+                        // inside carries `TextInput`; both are on the path, and
+                        // a binding named for either one matches.
+                        .key_context("Console")
+                        .on_action(cx.listener(|this, _: &ConsolePrev, _, cx| {
+                            this.step_console_history(true, cx)
+                        }))
+                        .on_action(cx.listener(|this, _: &ConsoleNext, _, cx| {
+                            this.step_console_history(false, cx)
+                        }))
                         .flex()
                         .items_center()
                         .gap_2()
@@ -9971,6 +10185,83 @@ impl Workspace {
             );
         }
         Some(stack.into_any_element())
+    }
+
+    /// "It is still working" — the three answers, and what each one does.
+    ///
+    /// A card rather than a toast: a toast expires, and this is a question.
+    /// Three buttons rather than two, because "cancel" is ambiguous here —
+    /// cancel the disconnect, or cancel the query? Both are real answers, so
+    /// both are offered by name.
+    fn busy_el(&self, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
+        let (name, busy) = self.confirm_disconnect.clone()?;
+        let (t, ms) = (self.t(), self.scale);
+        let title = self
+            .lang
+            .tr("busy.title")
+            .replace("{name}", &name)
+            .replace("{n}", &busy.len().to_string());
+        let (a, b) = (name.clone(), name);
+        Some(
+            div()
+                .absolute()
+                .top(px(ms.palette_top()))
+                .left_0()
+                .right_0()
+                .flex()
+                .justify_center()
+                .child(
+                    div()
+                        .occlude()
+                        .w(px(ms.base() * 40.0))
+                        .flex()
+                        .flex_col()
+                        .gap_1()
+                        .p_3()
+                        .bg(t.raised())
+                        .border_1()
+                        .border_color(t.warning())
+                        .child(div().text_size(ms.body()).text_color(t.fg()).child(title))
+                        // WHICH statements, by the names their tabs carry: a
+                        // count alone leaves somebody guessing whether it is
+                        // the one they care about.
+                        .children(busy.iter().take(5).map(|b| {
+                            self.small(format!("\u{2022} {b}"), t.muted())
+                        }))
+                        .child(self.small(self.lang.tr("busy.note"), t.muted()))
+                        .child(
+                            div()
+                                .flex()
+                                .gap_2()
+                                .pt_1()
+                                .child(
+                                    btn(t, ms, "busy-wait", self.tr("busy.wait"), Btn::Secondary)
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            this.confirm_disconnect = None;
+                                            cx.notify();
+                                        })),
+                                )
+                                .child(
+                                    btn(t, ms, "busy-cancel", self.tr("busy.cancel"), Btn::Primary)
+                                        .on_click(cx.listener(move |this, _, _, cx| {
+                                            this.cancel_running_on(&a);
+                                            this.disconnect_now(&a);
+                                            this.confirm_disconnect = None;
+                                            cx.notify();
+                                        })),
+                                )
+                                .child(
+                                    btn(t, ms, "busy-anyway", self.tr("busy.anyway"), Btn::Danger)
+                                        .on_click(cx.listener(move |this, _, _, cx| {
+                                            this.disconnect_now(&b);
+                                            this.confirm_disconnect = None;
+                                            cx.notify();
+                                        })),
+                                ),
+                        ),
+                )
+                .into_any_element(),
+        )
     }
 
     /// The context menu, where the pointer opened it.
@@ -10396,6 +10687,10 @@ impl Render for Workspace {
                 // Escape leaves whatever is in front, innermost first.
                 if this.menu.is_some() {
                     this.menu = None;
+                } else if this.confirm_disconnect.is_some() {
+                    // Escape on a question means the answer that CHANGES
+                    // NOTHING, which here is to keep waiting.
+                    this.confirm_disconnect = None;
                 } else if this.palette_open {
                     this.palette_open = false;
                 } else if this.export_open {
@@ -10609,6 +10904,7 @@ impl Render for Workspace {
                 ),
         )
         .child(self.bottom_el(cx))
+        .children(self.busy_el(cx))
         .children(self.toasts_el(cx))
         // A click ANYWHERE ELSE closes the menu. The menu itself `occlude`s, so
         // this never fires for a click on one of its own lines — without that,

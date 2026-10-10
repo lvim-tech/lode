@@ -1069,6 +1069,75 @@ pub fn column_summary(
     }
 }
 
+/// A time window ending now, as the two timestamps the engine wants.
+///
+/// The engine canonicalises the FORMAT — `time_filter` is each driver's own
+/// template over `{col}`, `{from}` and `{to}` — but somebody asking for "the
+/// last hour" should not have to type two timestamps to get it, and typing them
+/// is how the wrong hour gets asked for.
+///
+/// UTC, always, and said so in the text: a board shared between two people in
+/// two places must mean one window, and a local time in a stored dashboard
+/// means two.
+pub fn window_ending_now(seconds: u64, now: std::time::SystemTime) -> (String, String) {
+    let end = now;
+    let start = end - std::time::Duration::from_secs(seconds);
+    (stamp(start), stamp(end))
+}
+
+/// `YYYY-MM-DDThh:mm:ss`, in UTC, from a `SystemTime`.
+///
+/// Written out rather than taken from a date crate: this is the one place the
+/// client needs a calendar, the arithmetic is fixed by the Gregorian rules, and
+/// a dependency for twenty lines is a dependency to keep up to date for ever.
+pub fn stamp(at: std::time::SystemTime) -> String {
+    let secs = at
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let (days, rest) = (secs / 86_400, secs % 86_400);
+    let (h, m, s) = (rest / 3600, (rest % 3600) / 60, rest % 60);
+    let (y, mo, d) = civil_from_days(days as i64);
+    format!("{y:04}-{mo:02}-{d:02}T{h:02}:{m:02}:{s:02}")
+}
+
+/// Days since 1970-01-01 to a calendar date.
+///
+/// Howard Hinnant's `civil_from_days`, which is the algorithm every date
+/// library uses: it shifts the year to start in March so the leap day is the
+/// last day of the year and the month lengths become one linear expression.
+fn civil_from_days(z: i64) -> (i64, u32, u32) {
+    let z = z + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = (z - era * 146_097) as u64;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
+    (if m <= 2 { y + 1 } else { y }, m, d)
+}
+
+/// Walk a console history.
+///
+/// `at` is how far BACK from the prompt: `None` is the empty prompt, `Some(0)`
+/// the line before it. Up goes further back and stops at the oldest; down comes
+/// forward and returns to the empty prompt rather than to the newest line,
+/// because the way out of a history is a prompt with nothing in it.
+pub fn history_step(at: Option<usize>, back: bool, len: usize) -> Option<usize> {
+    if len == 0 {
+        return None;
+    }
+    match (at, back) {
+        (None, true) => Some(0),
+        (None, false) => None,
+        (Some(i), true) => Some((i + 1).min(len - 1)),
+        (Some(0), false) => None,
+        (Some(i), false) => Some(i - 1),
+    }
+}
+
 /// Move the cell cursor sideways, within the columns there are.
 ///
 /// It STOPS at the ends rather than wrapping. A row cursor wraps harmlessly —
@@ -1563,6 +1632,56 @@ mod tests {
         assert!(super::respawn_delay(1).unwrap() > super::respawn_delay(0).unwrap());
         assert!(super::respawn_delay(2).unwrap() > super::respawn_delay(1).unwrap());
         assert_eq!(super::respawn_delay(3), None, "a fourth try is a spawn storm");
+    }
+
+    /// A timestamp this client writes is one the engine's templates accept, and
+    /// it is in UTC.
+    #[test]
+    fn a_stamp_is_utc_and_the_right_shape() {
+        use std::time::{Duration, UNIX_EPOCH};
+        assert_eq!(super::stamp(UNIX_EPOCH), "1970-01-01T00:00:00");
+        // A leap year, and the day after the leap day.
+        assert_eq!(
+            super::stamp(UNIX_EPOCH + Duration::from_secs(951_868_800)),
+            "2000-03-01T00:00:00"
+        );
+        // 2026-10-10T12:34:56 — a date in the ordinary range, worked out by
+        // hand from the epoch so the test does not use the thing it checks.
+        let d = 20_736 * 86_400 + 12 * 3600 + 34 * 60 + 56;
+        assert_eq!(super::stamp(UNIX_EPOCH + Duration::from_secs(d)), "2026-10-10T12:34:56");
+        // The shape, whatever the instant: nineteen characters and a `T`.
+        let s = super::stamp(UNIX_EPOCH + Duration::from_secs(1_700_000_000));
+        assert_eq!(s.len(), 19, "{s}");
+        assert_eq!(&s[10..11], "T");
+    }
+
+    /// A preset is a window that ENDS NOW and starts the asked-for distance
+    /// back, in that order.
+    #[test]
+    fn a_preset_window_runs_backwards_from_now() {
+        use std::time::{Duration, UNIX_EPOCH};
+        let now = UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        let (from, to) = super::window_ending_now(3600, now);
+        assert_eq!(to, super::stamp(now));
+        assert_eq!(from, super::stamp(now - Duration::from_secs(3600)));
+        assert!(from < to, "{from} .. {to}");
+        // A week is a week.
+        let (w, _) = super::window_ending_now(7 * 86_400, now);
+        assert_eq!(w, super::stamp(now - Duration::from_secs(604_800)));
+    }
+
+    /// Up walks back through the console's history; down comes out of it.
+    #[test]
+    fn the_console_history_has_a_way_out() {
+        assert_eq!(super::history_step(None, true, 3), Some(0), "the line before the prompt");
+        assert_eq!(super::history_step(Some(0), true, 3), Some(1));
+        assert_eq!(super::history_step(Some(2), true, 3), Some(2), "stops at the oldest");
+        // Forward, and out to an EMPTY prompt rather than to the newest line.
+        assert_eq!(super::history_step(Some(1), false, 3), Some(0));
+        assert_eq!(super::history_step(Some(0), false, 3), None);
+        assert_eq!(super::history_step(None, false, 3), None);
+        // Nothing to walk.
+        assert_eq!(super::history_step(None, true, 0), None);
     }
 
     /// The cell cursor stops at the edges of the table.

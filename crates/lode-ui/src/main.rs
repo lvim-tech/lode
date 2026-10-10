@@ -70,7 +70,7 @@ fn main() {
         // so this is the default, and the window manager has the last word.
         let (w, h) = metrics::Metrics::default().window(metrics::Window::Main);
         let bounds = Bounds::centered(None, size(px(w), px(h)), cx);
-        cx.open_window(
+        let handle = cx.open_window(
             WindowOptions {
                 window_bounds: Some(WindowBounds::Windowed(bounds)),
                 titlebar: Some(gpui::TitlebarOptions {
@@ -82,6 +82,18 @@ fn main() {
             |_window, cx| cx.new(app::Workspace::new),
         )
         .expect("a window");
+        // CLOSING THE WINDOW is also a way to end a running statement, so it
+        // asks the same question the disconnect does — and it is the only
+        // moment that can be vetoed, which is why it is wired here rather than
+        // in `on_app_quit`: a quit handler cannot say no.
+        if let Ok(h) = handle.update(cx, |_, window, cx| {
+            let entity = cx.entity();
+            window.on_window_should_close(cx, move |window, cx| {
+                entity.update(cx, |w: &mut app::Workspace, cx| w.may_close(window, cx))
+            });
+        }) {
+            let _ = h;
+        }
         cx.activate(true);
     });
 }

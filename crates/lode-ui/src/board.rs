@@ -50,6 +50,15 @@ pub struct Board {
     /// headings, and the two tiles are then showing the same data and must not
     /// share one slot of state.
     pub panes: HashMap<usize, Pane>,
+    /// How often to run the board again, if at all.
+    ///
+    /// Only while its tab is in FRONT. A board left open in a background tab
+    /// refreshing every ten seconds is a query every ten seconds against a
+    /// database nobody is looking at, which is a cost somebody else pays.
+    pub refresh_every: Option<std::time::Duration>,
+    /// When it was last run, so the interval is an interval and not a race with
+    /// the frame rate.
+    pub refreshed_at: Option<std::time::Instant>,
     /// Whether tiles can be moved and resized. Off by default: a board is for
     /// reading, and a layout that rearranges itself because somebody dragged
     /// across it to select a number is a layout that fights its reader.
@@ -172,6 +181,8 @@ impl Board {
             columns: if columns == 0 { COLUMNS } else { columns },
             charts: Vec::new(),
             panes: HashMap::new(),
+            refresh_every: None,
+            refreshed_at: None,
             editing: false,
             drag: None,
             dirty: false,

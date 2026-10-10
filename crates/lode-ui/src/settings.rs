@@ -110,6 +110,10 @@ const KEYS: &[(&str, &[(&str, &str)])] = &[
         ],
     ),
     (
+        "THE COMMAND LINE",
+        &[("The line before / after", "up / down"), ("Run it", "enter")],
+    ),
+    (
         "A WINDOW OF ITS OWN",
         &[
             ("The next / previous field", "tab / shift-tab"),
