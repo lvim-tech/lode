@@ -581,6 +581,51 @@ impl Doc {
         true
     }
 
+    /// The word the cursor is at the end of, and where it starts.
+    ///
+    /// A WORD here includes dots, because `users.na` is one thing to complete
+    /// and two words to a lexer. It stops at whitespace, at a bracket, at a
+    /// comma — anywhere a name cannot continue.
+    ///
+    /// `None` when the cursor is not at the end of one: completing while the
+    /// cursor sits in the middle of a name would replace the half in front of
+    /// it, which is never what the keystroke meant.
+    pub fn word_before_cursor(&self) -> Option<(String, usize)> {
+        let p = self.clamp(self.cursor);
+        let line = self.line(p.line);
+        // Not at the end of a word: the character to the RIGHT is one a name
+        // can continue with.
+        if let Some(next) = line[p.byte..].chars().next() {
+            if next.is_alphanumeric() || next == '_' || next == '.' {
+                return None;
+            }
+        }
+        let head = &line[..p.byte];
+        let start = head
+            .char_indices()
+            .rev()
+            .take_while(|(_, c)| c.is_alphanumeric() || *c == '_' || *c == '.')
+            .last()
+            .map(|(i, _)| i)?;
+        let word = head[start..].to_string();
+        if word.is_empty() {
+            return None;
+        }
+        Some((word, start))
+    }
+
+    /// Replace the word the cursor is at the end of.
+    pub fn replace_word_before_cursor(&mut self, with: &str) {
+        let Some((word, start)) = self.word_before_cursor() else {
+            self.insert(with);
+            return;
+        };
+        let line = self.cursor.line;
+        self.place(Pos::new(line, start), false);
+        self.place(Pos::new(line, start + word.len()), true);
+        self.insert(with);
+    }
+
     /// Everything to the left of the cursor, for deciding whether a separator
     /// is wanted before what is about to be inserted.
     pub fn text_before_cursor(&self) -> String {
@@ -626,7 +671,7 @@ pub enum SqlRole {
 /// rewrite. The engine is the only thing that decides what a statement MEANS —
 /// see `query.classify` — and this is deliberately too dumb to disagree with it
 /// about anything that matters.
-const KEYWORDS: &[&str] = &[
+pub const KEYWORDS: &[&str] = &[
     "add", "all", "alter", "and", "any", "as", "asc", "begin", "between", "by", "case", "cast",
     "check", "collate", "column", "commit", "constraint", "create", "cross", "current", "database",
     "default", "delete", "desc", "distinct", "drop", "else", "end", "escape", "except", "exists",
@@ -865,6 +910,53 @@ mod tests {
         assert_eq!(d.text_before_cursor(), "select \nfrom");
         d.move_doc_start(false);
         assert_eq!(d.text_before_cursor(), "");
+    }
+
+    /// The word under the cursor, and what counts as one.
+    #[test]
+    fn the_word_at_the_cursor_is_the_one_being_typed() {
+        let mut d = Doc::new("select us");
+        d.move_end(false);
+        assert_eq!(d.word_before_cursor(), Some(("us".into(), 7)));
+
+        // A dot is part of it: `users.na` is ONE thing to complete.
+        let mut d = Doc::new("where users.na");
+        d.move_end(false);
+        assert_eq!(d.word_before_cursor().map(|(w, _)| w), Some("users.na".into()));
+
+        // Not at the END of a word: completing here would replace the half in
+        // front of the cursor.
+        let mut d = Doc::new("select name");
+        d.place(Pos::new(0, 9), false);
+        assert_eq!(d.word_before_cursor(), None);
+
+        // After a space, a bracket or a comma there is no word.
+        for text in ["select ", "count(", "a, "] {
+            let mut d = Doc::new(text);
+            d.move_end(false);
+            assert_eq!(d.word_before_cursor(), None, "{text:?}");
+        }
+        // An empty document has none either.
+        assert_eq!(Doc::new("").word_before_cursor(), None);
+    }
+
+    #[test]
+    fn accepting_a_completion_replaces_the_word() {
+        let mut d = Doc::new("select * from us");
+        d.move_end(false);
+        d.replace_word_before_cursor("users");
+        assert_eq!(d.text(), "select * from users");
+        assert_eq!(d.cursor(), Pos::new(0, 19));
+
+        // A qualified one replaces the whole thing, dot and all.
+        let mut d = Doc::new("where users.na");
+        d.move_end(false);
+        d.replace_word_before_cursor("users.name");
+        assert_eq!(d.text(), "where users.name");
+
+        // And it is ONE undo step, not two.
+        assert!(d.undo());
+        assert_eq!(d.text(), "where users.na");
     }
 
     #[test]

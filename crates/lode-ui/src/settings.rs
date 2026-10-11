@@ -107,6 +107,8 @@ const KEYS: &[(&str, &[(&str, &str)])] = &[
             ("Duplicate the line", "ctrl-d"),
             ("Undo / redo", "ctrl-z / ctrl-shift-z"),
             ("A word left / right", "ctrl-left / ctrl-right"),
+            ("Take the suggestion", "tab / enter"),
+            ("Dismiss it", "escape"),
         ],
     ),
     (

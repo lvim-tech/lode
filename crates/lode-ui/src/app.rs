@@ -647,6 +647,20 @@ impl NameFor {
     }
 }
 
+/// Every name in a schema tree, at every depth.
+///
+/// Flattened, because a statement names a table without naming the schema it
+/// is in as often as not, and a completion that only offered the top level
+/// would offer the one thing nobody types.
+fn collect_names(nodes: &[Node], out: &mut Vec<String>) {
+    for n in nodes {
+        if !out.iter().any(|x| x == &n.name) {
+            out.push(n.name.clone());
+        }
+        collect_names(&n.children, out);
+    }
+}
+
 /// An export walking the whole result.
 struct Exporting {
     tab: u64,
@@ -922,6 +936,9 @@ pub struct Workspace {
     fatal: Option<String>,
     /// How many times the engine has been started again after it exited, and
     /// when the next attempt is due. See [`respawn_delay`].
+    /// Something asked for the keyboard back, from a place that had no
+    /// `Window` to give it. Acted on by `pump`, which has one.
+    focus_back: bool,
     /// The context menu, while one is open — see `menu.rs`.
     menu: Option<crate::menu::Open>,
     /// Which tabs were visited, most recent first — see `mru_next`. Ctrl-tab
@@ -1261,6 +1278,7 @@ impl Workspace {
             exporting: None,
             confirm_disconnect: None,
             console_hist: None,
+            focus_back: false,
             menu: None,
             mru: Vec::new(),
             panel_hidden: restore.panel_hidden.unwrap_or(false),
@@ -2719,6 +2737,18 @@ impl Workspace {
                 crate::editor_el::EditorEvent::RunNewTab => {
                     this.run_in_new_tab(tab_id, cx);
                 }
+                // Escape in the editor with nothing of its own in front: the
+                // keyboard comes back to the window, where the grid's keys are.
+                crate::editor_el::EditorEvent::Escaped => {
+                    this.focus_back = true;
+                }
+                // The editor asks what the word under its cursor could be; the
+                // schema is here, so the answer is.
+                crate::editor_el::EditorEvent::WordAt(word) => {
+                    let list = this.complete_word(tab_id, word, cx);
+                    let word = word.clone();
+                    ed.update(cx, |e, cx| e.set_candidates(&word, list, cx));
+                }
             }
             cx.notify();
         })
@@ -3709,6 +3739,45 @@ impl Workspace {
             _ => "nothing loaded to export".to_string(),
         };
         self.status = msg;
+    }
+
+    /// What the word under a tab's cursor could become.
+    ///
+    /// The names come from the OPEN connection's tree and from the fields the
+    /// engine has already answered for — never from a guess about what a
+    /// database might contain. Where a collection's fields have not been asked
+    /// for yet, it offers nothing for that name rather than offering the
+    /// keywords as if they were its columns.
+    fn complete_word(&mut self, tab_id: u64, word: &str, cx: &mut Context<Self>) -> Vec<String> {
+        let _ = cx;
+        if word.is_empty() {
+            return Vec::new();
+        }
+        let Some(tab) = self.tabs.iter().find(|t| t.id == tab_id) else { return Vec::new() };
+        let conn = tab.conn_name.clone();
+        let Some(live) = self.live(&conn) else { return Vec::new() };
+        // Every name in the tree, at every depth: a schema's tables are two
+        // levels down and are exactly what somebody is typing towards.
+        let mut objects: Vec<String> = Vec::new();
+        collect_names(&live.nodes, &mut objects);
+        // And the columns of whatever has been looked inside. The key the
+        // fields are stored under is `conn/kind/name`, so the NAME is its last
+        // part — which is the word a statement uses.
+        let columns: Vec<(String, Vec<String>)> = self
+            .node_fields
+            .iter()
+            .filter(|(k, _)| k.starts_with(&format!("{conn}/")))
+            .filter_map(|(k, cols)| {
+                let name = k.rsplit('/').next()?.to_string();
+                Some((name, cols.iter().map(|c| c.name.clone()).collect()))
+            })
+            .collect();
+        let schema = crate::workspace::Schema { objects: &objects, columns: &columns };
+        // The language's own words, from the same list the highlighter uses —
+        // one dictionary, so a word that is coloured as a keyword is a word
+        // that can be completed to.
+        let keywords = crate::editor::KEYWORDS;
+        crate::workspace::completions(word, &schema, keywords)
     }
 
     /// Write the WHOLE result to the chosen file, a page at a time.
@@ -10792,6 +10861,12 @@ impl Render for Workspace {
         // often enough that nothing sits there after its time.
         let now = Instant::now();
         self.toasts.retain(|x| !x.expired(now));
+
+        // Somebody asked for the keyboard back from a place with no `Window` —
+        // the editor's escape. Here is the first moment there is one.
+        if std::mem::take(&mut self.focus_back) {
+            window.focus(&self.focus);
+        }
 
         let t = self.t();
 

@@ -1069,6 +1069,93 @@ pub fn column_summary(
     }
 }
 
+/// What this connection has, for completing a word against it.
+///
+/// Names rather than the tree itself: the tree is a `Node` with children and a
+/// kind, and a completion needs none of that. Handing over the names makes the
+/// decision a pure function of what is on offer, which is the only way to test
+/// the awkward part — the dot.
+pub struct Schema<'a> {
+    /// Tables, collections, views, schemas: anything a statement can name.
+    pub objects: &'a [String],
+    /// Each object's columns, where they have been asked for. A document store
+    /// has none until a collection is expanded, and an absent entry means "not
+    /// known", never "none".
+    pub columns: &'a [(String, Vec<String>)],
+}
+
+/// How many candidates to offer at once.
+///
+/// Twelve. A list longer than the eye takes in at a glance is a list somebody
+/// reads instead of typing, and typing one more letter is faster than reading
+/// forty names.
+pub const COMPLETE_MAX: usize = 12;
+
+/// What the word under the cursor could become.
+///
+/// Returns the WHOLE replacement, not the tail: a word of `users.na` completing
+/// to `name` comes back as `users.name`, so accepting is a replacement of the
+/// word and nothing has to reason about where the dot was.
+///
+/// The dot is the interesting part. Before one, the candidates are the things a
+/// statement can NAME and the language's own words. After one, they are the
+/// columns of whatever is on its left — and ONLY those: offering the keyword
+/// `select` after `users.` would be offering something that cannot go there.
+pub fn completions(word: &str, schema: &Schema, keywords: &[&str]) -> Vec<String> {
+    if let Some((owner, rest)) = word.rsplit_once('.') {
+        let bare = owner.rsplit('.').next().unwrap_or(owner);
+        let cols = schema
+            .columns
+            .iter()
+            .find(|(o, _)| o.eq_ignore_ascii_case(bare))
+            .map(|(_, c)| c.as_slice())
+            .unwrap_or(&[]);
+        return cols
+            .iter()
+            .filter(|c| starts(c, rest))
+            .take(COMPLETE_MAX)
+            .map(|c| format!("{owner}.{c}"))
+            .collect();
+    }
+    // Two letters at least. One letter matches a third of everything, and a
+    // popup that opens on the first keystroke is a popup in the way.
+    if word.chars().count() < 2 {
+        return Vec::new();
+    }
+    let mut out: Vec<String> = Vec::new();
+    // What this database HAS comes first: a name is something only this
+    // connection can tell you, and a keyword is in everybody's fingers.
+    for o in schema.objects.iter().filter(|o| starts(o, word)) {
+        if !out.iter().any(|x| x == o) {
+            out.push(o.clone());
+        }
+    }
+    for k in keywords.iter().filter(|k| starts(k, word)) {
+        if out.len() >= COMPLETE_MAX {
+            break;
+        }
+        // The case somebody is typing in, not the case of the list: a statement
+        // written in lower case should stay in lower case.
+        let shaped = if word.chars().next().map_or(false, |c| c.is_uppercase()) {
+            k.to_uppercase()
+        } else {
+            k.to_string()
+        };
+        if !out.iter().any(|x| x == &shaped) {
+            out.push(shaped);
+        }
+    }
+    out.truncate(COMPLETE_MAX);
+    out
+}
+
+fn starts(candidate: &str, prefix: &str) -> bool {
+    prefix.is_empty()
+        || candidate
+            .get(..prefix.len().min(candidate.len()))
+            .map_or(false, |head| head.eq_ignore_ascii_case(prefix))
+}
+
 /// A time window ending now, as the two timestamps the engine wants.
 ///
 /// The engine canonicalises the FORMAT — `time_filter` is each driver's own
@@ -1632,6 +1719,66 @@ mod tests {
         assert!(super::respawn_delay(1).unwrap() > super::respawn_delay(0).unwrap());
         assert!(super::respawn_delay(2).unwrap() > super::respawn_delay(1).unwrap());
         assert_eq!(super::respawn_delay(3), None, "a fourth try is a spawn storm");
+    }
+
+    /// A name this database has beats a word every SQL has.
+    #[test]
+    fn what_the_database_has_comes_first() {
+        let objects = vec!["users".to_string(), "user_roles".to_string()];
+        let schema = super::Schema { objects: &objects, columns: &[] };
+        let got = super::completions("us", &schema, &["using", "update"]);
+        assert_eq!(got, vec!["users", "user_roles", "using"], "{got:?}");
+
+        // One letter offers nothing: a popup on the first keystroke is a popup
+        // in the way.
+        assert!(super::completions("u", &schema, &["update"]).is_empty());
+        // And a word that matches nothing is nothing, not everything.
+        assert!(super::completions("zz", &schema, &["update"]).is_empty());
+    }
+
+    /// After a dot, the columns of what is on its left — and nothing else.
+    #[test]
+    fn a_dot_asks_for_columns() {
+        let objects = vec!["users".to_string()];
+        let columns = vec![(
+            "users".to_string(),
+            vec!["id".to_string(), "name".to_string(), "nickname".to_string()],
+        )];
+        let schema = super::Schema { objects: &objects, columns: &columns };
+
+        // The WHOLE replacement comes back, so accepting is a replacement of
+        // the word and nothing reasons about where the dot was.
+        let got = super::completions("users.n", &schema, &["null"]);
+        assert_eq!(got, vec!["users.name", "users.nickname"], "{got:?}");
+        assert!(!got.iter().any(|c| c.contains("null")), "no keywords after a dot");
+
+        // A bare dot offers all of them — one character is enough here, because
+        // the dot itself is the request.
+        assert_eq!(super::completions("users.", &schema, &[]).len(), 3);
+
+        // A qualified name keeps its qualifier.
+        let got = super::completions("public.users.na", &schema, &[]);
+        assert_eq!(got, vec!["public.users.name"], "{got:?}");
+
+        // An object nobody has asked about yet offers nothing, rather than
+        // offering the keywords as if they were its columns.
+        assert!(super::completions("orders.x", &schema, &["null"]).is_empty());
+    }
+
+    /// The case being typed is the case that comes back.
+    #[test]
+    fn a_keyword_follows_the_case_of_the_typing() {
+        let schema = super::Schema { objects: &[], columns: &[] };
+        assert_eq!(super::completions("sel", &schema, &["select"]), vec!["select"]);
+        assert_eq!(super::completions("Sel", &schema, &["select"]), vec!["SELECT"]);
+    }
+
+    /// Twelve at most, whatever is on offer.
+    #[test]
+    fn the_list_stays_short_enough_to_read() {
+        let objects: Vec<String> = (0..50).map(|i| format!("table_{i:02}")).collect();
+        let schema = super::Schema { objects: &objects, columns: &[] };
+        assert_eq!(super::completions("ta", &schema, &[]).len(), super::COMPLETE_MAX);
     }
 
     /// A timestamp this client writes is one the engine's templates accept, and

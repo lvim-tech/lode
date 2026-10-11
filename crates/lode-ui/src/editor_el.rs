@@ -112,10 +112,17 @@ pub enum EditorEvent {
     /// The text changed — the draft is kept in the tab, and the session keeps
     /// the draft.
     Changed,
+    /// The word under the cursor changed, and this is it. The workspace answers
+    /// with `set_candidates`; an empty word means "there is nothing to
+    /// complete", which closes the list.
+    WordAt(String),
     /// Ctrl-Enter: run what is in here.
     Run,
     /// Ctrl-Shift-Enter: run it in a tab of its own.
     RunNewTab,
+    /// Escape with nothing of the editor's own in front: the workspace takes
+    /// the keyboard back.
+    Escaped,
 }
 
 /// Which language the highlighter should read the text as.
@@ -147,6 +154,16 @@ pub struct Editor {
     selecting: bool,
     /// The range an input method is composing, within the CURRENT LINE.
     marked: Option<std::ops::Range<usize>>,
+    /// What the word under the cursor could become, and which one is chosen.
+    ///
+    /// The LIST comes from the workspace, which is the only thing that knows
+    /// what this connection has; the word, the keys and the drawing are here,
+    /// which is the only place that knows where the caret is.
+    candidates: Vec<String>,
+    candidate: usize,
+    /// The word the candidates are FOR. A list that outlived the word it was
+    /// asked about would complete to something nobody typed towards.
+    asked_for: String,
 }
 
 /// How tall the box is, in lines.
@@ -202,7 +219,40 @@ impl Editor {
             last_rows: MIN_ROWS,
             selecting: false,
             marked: None,
+            candidates: Vec::new(),
+            candidate: 0,
+            asked_for: String::new(),
         }
+    }
+
+    /// What the word under the cursor could become, as the workspace answered.
+    pub fn set_candidates(&mut self, word: &str, list: Vec<String>, cx: &mut Context<Self>) {
+        // Only if the word is still the one that was asked about: the answer
+        // arrives a frame later, and by then another letter may have been
+        // typed.
+        let now = self.doc.word_before_cursor().map(|(w, _)| w).unwrap_or_default();
+        if now != word {
+            return;
+        }
+        self.asked_for = word.to_string();
+        self.candidates = list;
+        self.candidate = 0;
+        cx.notify();
+    }
+
+    fn close_candidates(&mut self) {
+        self.candidates.clear();
+        self.candidate = 0;
+        self.asked_for.clear();
+    }
+
+    /// Take the chosen candidate. `true` when there was one.
+    fn accept_candidate(&mut self, cx: &mut Context<Self>) -> bool {
+        let Some(pick) = self.candidates.get(self.candidate).cloned() else { return false };
+        self.close_candidates();
+        self.doc.replace_word_before_cursor(&pick);
+        self.after_change(cx);
+        true
     }
 
     pub fn text(&self) -> String {
@@ -249,6 +299,16 @@ impl Editor {
         self.follow_cursor();
         self.marked = None;
         cx.emit(EditorEvent::Changed);
+        // ASK about the word under the cursor. The workspace has the schema;
+        // this has the word. An empty answer closes the list, which is what
+        // moving off the end of a name should do.
+        let word = self.doc.word_before_cursor().map(|(w, _)| w).unwrap_or_default();
+        if word != self.asked_for {
+            if word.is_empty() {
+                self.close_candidates();
+            }
+            cx.emit(EditorEvent::WordAt(word));
+        }
         cx.notify();
     }
 
@@ -269,10 +329,23 @@ impl Editor {
     // ── the keys ────────────────────────────────────────────────────────────
 
     fn on_up(&mut self, _: &Up, _: &mut Window, cx: &mut Context<Self>) {
+        // The LIST first, when one is open: up and down are how a popup is
+        // driven everywhere, and the cursor is still reachable by escaping it.
+        if !self.candidates.is_empty() {
+            let n = self.candidates.len();
+            self.candidate = (self.candidate + n - 1) % n;
+            cx.notify();
+            return;
+        }
         self.doc.move_up(false);
         self.after_move(cx);
     }
     fn on_down(&mut self, _: &Down, _: &mut Window, cx: &mut Context<Self>) {
+        if !self.candidates.is_empty() {
+            self.candidate = (self.candidate + 1) % self.candidates.len();
+            cx.notify();
+            return;
+        }
         self.doc.move_down(false);
         self.after_move(cx);
     }
@@ -327,10 +400,19 @@ impl Editor {
         self.after_move(cx);
     }
     fn on_newline(&mut self, _: &Newline, _: &mut Window, cx: &mut Context<Self>) {
+        // Enter TAKES the candidate when the list is open. A new line is one
+        // escape away, and taking the name is what Enter means with a list in
+        // front of it.
+        if self.accept_candidate(cx) {
+            return;
+        }
         self.doc.newline();
         self.after_change(cx);
     }
     fn on_tab(&mut self, _: &Tab, _: &mut Window, cx: &mut Context<Self>) {
+        if self.accept_candidate(cx) {
+            return;
+        }
         self.doc.tab();
         self.after_change(cx);
     }
@@ -527,6 +609,19 @@ impl Render for Editor {
             .key_context("Editor")
             .track_focus(&self.focus_handle(cx))
             .cursor(gpui::CursorStyle::IBeam)
+            .on_action(cx.listener(|this, _: &crate::app::Escape, window, cx| {
+                // The LIST first: escape is how a popup is dismissed, and the
+                // window's own escape still works once there is none.
+                if !this.candidates.is_empty() {
+                    this.close_candidates();
+                    cx.notify();
+                    return;
+                }
+                // Nothing of ours to dismiss: give the keyboard back, so the
+                // grid's keys work again without reaching for the pointer.
+                let _ = window;
+                cx.emit(EditorEvent::Escaped);
+            }))
             .on_action(cx.listener(Self::on_up))
             .on_action(cx.listener(Self::on_down))
             .on_action(cx.listener(Self::on_select_up))
@@ -567,7 +662,66 @@ impl Render for Editor {
             .on_mouse_up_out(MouseButton::Left, cx.listener(Self::on_mouse_up))
             .on_mouse_move(cx.listener(Self::on_mouse_move))
             .size_full()
+            .relative()
             .child(EditorElement { editor: cx.entity() })
+            .children(self.candidates_el(cx))
+    }
+}
+
+impl Editor {
+    /// The candidate list, under the caret.
+    ///
+    /// Positioned from the CARET rather than from the element's corner: a
+    /// popup at the corner is a popup somebody has to look away to read, and
+    /// the word it is about is where the caret is. The x comes from the shaped
+    /// line, which is the same measurement the caret itself is drawn from, so
+    /// the two cannot disagree.
+    fn candidates_el(&self, cx: &mut Context<Self>) -> Option<gpui::Div> {
+        if self.candidates.is_empty() {
+            return None;
+        }
+        let (t, ms) = (&self.theme, self.scale);
+        let cursor = self.doc.cursor();
+        let row = cursor.line.checked_sub(self.scroll_top)?;
+        let x = self
+            .last_lines
+            .get(row)
+            .map(|l| f32::from(l.x_for_index(cursor.byte)))
+            .unwrap_or(0.0);
+        let line_h = f32::from(ms.line_h());
+        let mut list = gpui::div()
+            .absolute()
+            .left(px(self.gutter_w() + x))
+            // Under the line the caret is on, not over it.
+            .top(px(line_h * (row + 1) as f32))
+            .w(px(ms.base() * 20.0))
+            .flex()
+            .flex_col()
+            .bg(t.raised())
+            .border_1()
+            .border_color(t.accent())
+            .occlude();
+        for (n, c) in self.candidates.iter().enumerate() {
+            let on = n == self.candidate;
+            let pick = c.clone();
+            list = list.child(
+                gpui::div()
+                    .id(gpui::SharedString::from(format!("cand-{n}")))
+                    .px_1()
+                    .text_size(ms.small())
+                    .text_color(if on { t.fg() } else { t.muted() })
+                    .when(on, |d| d.bg(t.selected_mark()))
+                    .cursor_pointer()
+                    .hover(|d| d.bg(t.hover_mark()))
+                    .child(gpui::SharedString::from(c.clone()))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.close_candidates();
+                        this.doc.replace_word_before_cursor(&pick);
+                        this.after_change(cx);
+                    })),
+            );
+        }
+        Some(list)
     }
 }
 
