@@ -942,8 +942,9 @@ impl SettingsWindow {
                 }
                 out = out.child(
                     btn(&t, ms, format!("prof-new-{kind}"), format!("+  new {kind}"), Btn::Secondary)
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            let _ = this.workspace.update(cx, |w, cx| w.open_profile(None, cx));
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            let _ =
+                                this.workspace.update(cx, |w, cx| w.open_profile(kind, None, cx));
                             cx.notify();
                         })),
                 );
@@ -982,7 +983,7 @@ impl SettingsWindow {
                                     .on_click(cx.listener(move |this, _, _, cx| {
                                         let (n, sp) = (n.clone(), sp.clone());
                                         let _ = this.workspace.update(cx, |w, cx| {
-                                            w.open_profile(Some((n, sp)), cx)
+                                            w.open_profile(kind, Some((n, sp)), cx)
                                         });
                                         cx.notify();
                                     }))

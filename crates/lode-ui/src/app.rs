@@ -3472,6 +3472,7 @@ impl Workspace {
             .get("tunnel")
             .map(|v| v.iter().map(|p| (p.name.clone(), p.spec.clone())).collect())
             .unwrap_or_default();
+        let proxy_profiles = self.profile_names("proxy");
         let aws_profiles = self.aws_profiles.clone();
         // Asked on the way in, so a profile added to the file since the last
         // window is offered by this one.
@@ -3508,6 +3509,7 @@ impl Workspace {
                         drivers,
                         tunnel_profiles,
                         tunnel_profile_specs,
+                        proxy_profiles,
                         aws_profiles,
                         existing,
                         cx,
@@ -3527,7 +3529,12 @@ impl Workspace {
     /// and the connection window would make somebody fill in a driver and a
     /// database the profile has no use for. That is why "save over the same
     /// name" was never editing — it was re-creating.
-    pub fn open_profile(&mut self, existing: Option<(String, Value)>, cx: &mut Context<Self>) {
+    pub fn open_profile(
+        &mut self,
+        kind: &'static str,
+        existing: Option<(String, Value)>,
+        cx: &mut Context<Self>,
+    ) {
         if self.profile_window.is_some() {
             return;
         }
@@ -3537,7 +3544,7 @@ impl Workspace {
             self.ask(
                 Pending::ProfileUsers { name: name.clone() },
                 "store.profiles.users",
-                json!({ "kind": "tunnel", "name": name }),
+                json!({ "kind": kind, "name": name }),
             );
         }
         let users = existing
@@ -3546,8 +3553,8 @@ impl Workspace {
             .unwrap_or_default();
         let me = cx.entity().downgrade();
         let title = match &existing {
-            Some((n, _)) => format!("lode — Tunnel {n}"),
-            None => "lode — New tunnel".to_string(),
+            Some((n, _)) => format!("lode — {kind} {n}"),
+            None => format!("lode — New {kind}"),
         };
         let look = self.look();
         let (w, h) = self.scale.window(crate::metrics::Window::Profile);
@@ -3560,7 +3567,7 @@ impl Workspace {
             },
             |_window, cx| {
                 cx.new(|cx| {
-                    crate::profile::ProfileForm::new(me, look, existing, users, cx)
+                    crate::profile::ProfileForm::new(me, look, kind, existing, users, cx)
                 })
             },
         );
@@ -4462,7 +4469,7 @@ impl Workspace {
                 }
             }
             PaletteAct::NewConnection => self.open_form(None, cx),
-            PaletteAct::NewProfile => self.open_profile(None, cx),
+            PaletteAct::NewProfile => self.open_profile("tunnel", None, cx),
             PaletteAct::EditProfile(name) => {
                 let found = self
                     .profiles
@@ -4470,7 +4477,7 @@ impl Workspace {
                     .and_then(|v| v.iter().find(|p| p.name == name))
                     .map(|p| (p.name.clone(), p.spec.clone()));
                 if let Some(found) = found {
-                    self.open_profile(Some(found), cx);
+                    self.open_profile("tunnel", Some(found), cx);
                 }
             }
             PaletteAct::EditConnection(name) => {

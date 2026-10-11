@@ -274,6 +274,14 @@ pub struct ConnectionForm {
     /// it, and writing its host, user and key into twenty specs means changing
     /// twenty of them when the key rotates.
     tunnel_profile: Option<String>,
+    /// Which saved PROXY this connection goes through, if any.
+    ///
+    /// A profile only. A proxy spelled out in the spec is a shape this window
+    /// does not edit — it reports it and leaves it alone, the way it treats
+    /// hooks and a client certificate it did not write.
+    proxy_profile: Option<String>,
+    /// The saved proxies to choose from, handed over when the window opens.
+    proxy_profiles: Vec<String>,
     /// The names the workspace knows about, handed over when the window opens.
     tunnel_profiles: Vec<String>,
     /// Their specs too, so a chosen one can SHOW what it is. A name alone tells
@@ -372,6 +380,9 @@ impl ConnectionForm {
         drivers: Vec<DriverMeta>,
         tunnel_profiles: Vec<String>,
         tunnel_profile_specs: std::collections::BTreeMap<String, Value>,
+        // The saved proxies to offer. Names only: the window picks a PROFILE
+        // and never spells a proxy out, so it has no use for the specs.
+        proxy_profiles: Vec<String>,
         aws_profiles: Vec<String>,
         existing: Option<(String, String, Value)>,
         cx: &mut Context<Self>,
@@ -481,6 +492,11 @@ impl ConnectionForm {
                 .and_then(Value::as_str)
                 .map(str::to_string),
             tunnel_profiles,
+            proxy_profiles,
+            proxy_profile: spec
+                .get("proxy_profile")
+                .and_then(Value::as_str)
+                .map(str::to_string),
             tunnel_profile_specs,
             aws_profiles,
             profile_name: mk(cx, "name this tunnel", ""),
@@ -620,7 +636,7 @@ impl ConnectionForm {
             let text = input.read(cx).text().trim().to_string();
             if text.is_empty() { Value::Null } else { json!(text) }
         };
-        let edited = json!({
+        let mut edited = json!({
             "driver": self.driver,
             "params": Value::Object(params),
             "auth": auth,
@@ -634,6 +650,21 @@ impl ConnectionForm {
             "tunnel_profile": tunnel_profile,
             "policy": self.policy
         });
+        // The PROXY, and only ever as a profile.
+        //
+        // Choosing one takes a spelled-out `proxy` off, because the engine
+        // refuses a spec carrying both rather than picking between them. Having
+        // chosen NONE is different from never having had one: `proxy_profile`
+        // goes to null, which takes the key off, while a spelled-out `proxy` is
+        // left exactly as it was — this window did not write it and does not
+        // show it, so it is not this window's to delete.
+        match self.proxy_profile.clone() {
+            Some(name) => {
+                edited["proxy_profile"] = json!(name);
+                edited["proxy"] = Value::Null;
+            }
+            None => edited["proxy_profile"] = Value::Null,
+        }
         merge_spec(&self.existing_spec, edited)
     }
 
@@ -1924,6 +1955,68 @@ impl Render for ConnectionForm {
                 body = body.child(self.stage_row("tls", cx));
                 }
 
+                // THE PROXY, above the tunnel, because that is the order the
+                // two happen in: a proxy is how this machine reaches anything
+                // at all, and a tunnel rides on top of a reachable SSH server.
+                //
+                // Drawn for every driver, unlike the tunnel: a proxy carries
+                // the TCP dial itself, so it applies wherever there is one.
+                let mut pxp = div().flex().items_center().gap_2().py_1().child(
+                    div().w(px(ms.label_w())).child(self.small(self.tr("form.proxy"), t.muted())),
+                );
+                pxp = pxp.child(
+                    chip(&t, ms, "px-none", self.tr("form.none"), self.proxy_profile.is_none())
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.proxy_profile = None;
+                            cx.notify();
+                        })),
+                );
+                for name in self.proxy_profiles.clone() {
+                    let on = self.proxy_profile.as_deref() == Some(name.as_str());
+                    let n = name.clone();
+                    pxp = pxp.child(
+                        chip(&t, ms, format!("px-p-{name}"), name.clone(), on).on_click(
+                            cx.listener(move |this, _, _, cx| {
+                                this.proxy_profile = Some(n.clone());
+                                cx.notify();
+                            }),
+                        ),
+                    );
+                }
+                // TEST it on its own, before the connection: a proxy that
+                // cannot be reached fails every stage above it, and all of
+                // them would say the database was unreachable.
+                if self.proxy_profile.is_some() {
+                    pxp = pxp.child(
+                        btn(&t, ms, "test-proxy", self.tr("form.test_proxy"), Btn::Secondary)
+                            .on_click(cx.listener(|this, _, _, cx| this.run_test("proxy", cx))),
+                    );
+                }
+                body = body.child(pxp);
+                // The engine's own answer, verbatim, in the same shape the
+                // other stages report theirs.
+                match self.tests.get("proxy") {
+                    Some(Ok(detail)) => {
+                        body = body.child(self.small(detail.clone(), t.success()))
+                    }
+                    Some(Err(e)) => body = body.child(self.small(e.clone(), t.error())),
+                    None => {}
+                }
+                if self.proxy_profiles.is_empty() && self.proxy_profile.is_none() {
+                    body = body.child(self.small(self.tr("form.no_proxies"), t.muted()));
+                }
+                // A proxy WRITTEN OUT in the spec, which this window does not
+                // edit. Said rather than hidden, and said plainly: choosing a
+                // profile above would replace it.
+                if let Some(px) = self.existing_spec.get("proxy").filter(|v| !v.is_null()) {
+                    let how = px.get("kind").and_then(Value::as_str).unwrap_or("proxy");
+                    let host = px.get("host").and_then(Value::as_str).unwrap_or("?");
+                    body = body.child(self.small(
+                        format!("{} {how} \u{2192} {host}", self.tr("form.proxy_written_out")),
+                        t.warning(),
+                    ));
+                }
+
                 if !has_tunnel {
                     body = body.child(self.small(
                         format!("{display} cannot be reached through an SSH tunnel."),
@@ -2055,7 +2148,7 @@ impl Render for ConnectionForm {
                                                 .unwrap_or(json!({}));
                                             let n2 = n.clone();
                                             let _ = this.workspace.update(cx, move |w, cx| {
-                                                w.open_profile(Some((n2, sp)), cx);
+                                                w.open_profile("tunnel", Some((n2, sp)), cx);
                                             });
                                         }
                                     })),
@@ -2313,6 +2406,39 @@ mod tests {
         assert_eq!(out["tls"]["client_cert"], json!("/etc/ssl/c.pem"));
         assert_eq!(out["proxy_profile"], json!("office"));
         assert_eq!(out["hooks"]["before_connect"], json!("notify"));
+    }
+
+    /// Naming a proxy profile takes a spelled-out proxy OFF, and choosing none
+    /// leaves one alone.
+    ///
+    /// The engine refuses a spec carrying both rather than picking between
+    /// them, so the two are exclusive. But "none chosen" and "never had one"
+    /// are different: this window does not show a spelled-out proxy and so has
+    /// no business deleting it — only an actual choice replaces it.
+    #[test]
+    fn a_proxy_is_a_profile_or_written_out_but_never_both() {
+        let spelled = json!({
+            "driver": "mysql",
+            "proxy": { "kind": "socks5", "host": "socks.example", "port": 1080 },
+            "tls": { "mode": "disable" }
+        });
+        // NONE chosen: the spelled-out one survives, because the form neither
+        // showed it nor replaced it.
+        let out = merge_spec(&spelled, json!({ "proxy_profile": Value::Null }));
+        assert_eq!(out["proxy"]["host"], json!("socks.example"));
+        assert!(out.get("proxy_profile").is_none(), "{out}");
+
+        // A profile CHOSEN: the spelled-out one goes, or the engine would
+        // refuse the connection for carrying two answers.
+        let out = merge_spec(&spelled, json!({ "proxy_profile": "office", "proxy": Value::Null }));
+        assert_eq!(out["proxy_profile"], json!("office"));
+        assert!(out.get("proxy").is_none(), "{out}");
+
+        // And a profile UNCHOSEN goes off the spec rather than being written
+        // as null, the same way a tunnel does.
+        let with_profile = json!({ "driver": "mysql", "proxy_profile": "office" });
+        let out = merge_spec(&with_profile, json!({ "proxy_profile": Value::Null }));
+        assert!(out.get("proxy_profile").is_none(), "{out}");
     }
 
     /// A tunnel switched off is REMOVED, not written as null: the engine reads

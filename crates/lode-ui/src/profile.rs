@@ -1,4 +1,4 @@
-//! The window for one saved tunnel.
+//! The window for one saved tunnel or one saved proxy.
 //!
 //! Its own window, and deliberately not the connection window: a profile is a
 //! host, a port, a user, a method and a key. Nothing about a driver, nothing
@@ -6,10 +6,17 @@
 //! a driver and a database that the profile has no use for, which is why
 //! "save over the same name" was never really editing — it was re-creating.
 //!
-//! The shape it reads and writes is the engine's `TunnelSpec`, built by the
-//! SAME code the connection window uses (`tunnel_fields`). Two builders of one
-//! shape is how a passphrase ended up in a key path, and that lesson is not
-//! being relearned here.
+//! ONE window for both kinds, because they are the same window: a name, a host,
+//! a port, and how to sign in. A second file would have been this one with the
+//! SSH half deleted, and the two would then drift — the save, the rename
+//! refusal, the dependants warning, tab order, theming and Escape are the same
+//! behaviour whichever kind is being edited, and that is the part worth not
+//! writing twice. What differs is a handful of fields, and `kind` decides them.
+//!
+//! The shapes it reads and writes are the engine's `TunnelSpec` and
+//! `ProxySpec`, and the tunnel half is built by the SAME code the connection
+//! window uses (`tunnel_fields`). Two builders of one shape is how a passphrase
+//! ended up in a key path, and that lesson is not being relearned here.
 
 use gpui::prelude::*;
 use gpui::{div, px, Context, Entity, SharedString, WeakEntity, Window};
@@ -24,6 +31,9 @@ use crate::widgets::{btn, chip, Btn};
 
 pub struct ProfileForm {
     workspace: WeakEntity<Workspace>,
+    /// `"tunnel"` or `"proxy"` — which shape this window is editing. It is the
+    /// engine's own word for the kind, so it goes out on the save untouched.
+    kind: &'static str,
     theme: Theme,
     scale: Metrics,
     /// The interface's language — see `ConnectionForm::lang`.
@@ -44,6 +54,8 @@ pub struct ProfileForm {
     key_path: Entity<TextInput>,
     passphrase: Field,
     password: Field,
+    /// A proxy's protocol: `socks5` or `http_connect`. Unused by a tunnel.
+    proxy_kind: String,
     error: Option<String>,
 }
 
@@ -51,10 +63,12 @@ impl ProfileForm {
     pub fn new(
         workspace: WeakEntity<Workspace>,
         look: crate::widgets::Look,
+        kind: &'static str,
         existing: Option<(String, Value)>,
         users: Vec<String>,
         cx: &mut Context<Self>,
     ) -> Self {
+        let proxy = kind == "proxy";
         let crate::widgets::Look { theme, scale, text_font: font_family, lang, .. } = look;
         let colors = crate::form::colors_of(&theme);
         let mk = |cx: &mut Context<Self>, ph: &str, val: &str| {
@@ -76,33 +90,51 @@ impl ProfileForm {
         let (pass_src, pass_arg) = Source::unwrap(&get(&auth_v, "passphrase"));
         let (pw_src, pw_arg) = Source::unwrap(&get(&auth_v, "password"));
 
+        // A proxy keeps its sign-in in `auth: { user, password }`; a tunnel
+        // keeps the user at the top and the method under `auth`. Read from
+        // wherever the kind puts it, so an edit shows what was saved.
+        let (px_user, px_pw) = {
+            let (u, p) = (get(&auth_v, "user"), get(&auth_v, "password"));
+            (u, Source::unwrap(&p))
+        };
         let me = ProfileForm {
             workspace,
+            kind,
             theme,
             lang,
             font_family,
             scale,
             editing: existing.as_ref().map(|(n, _)| n.clone()),
             users,
-            name: mk(cx, "name this tunnel", &name_v),
-            host: mk(cx, "bastion.example", &get(&spec, "host")),
+            name: mk(cx, if proxy { "name this proxy" } else { "name this tunnel" }, &name_v),
+            host: mk(cx, if proxy { "socks.example" } else { "bastion.example" }, &get(&spec, "host")),
             port: mk(
                 cx,
-                "22",
+                if proxy { "1080" } else { "22" },
                 &spec
                     .get("port")
                     .and_then(Value::as_u64)
                     .map(|p| p.to_string())
                     .unwrap_or_default(),
             ),
-            user: mk(cx, "user", &get(&spec, "user")),
+            user: mk(cx, "user", &if proxy { px_user } else { get(&spec, "user") }),
             auth: {
                 let k = get(&auth_v, "kind");
                 if k.is_empty() { "agent".into() } else { k }
             },
             key_path: mk(cx, "~/.ssh/id_ed25519", &get(&auth_v, "path")),
             passphrase: Field::secret(mk(cx, pass_src.hint(), &pass_arg), pass_src),
-            password: Field::secret(mk(cx, pw_src.hint(), &pw_arg), pw_src),
+            password: if proxy {
+                Field::secret(mk(cx, px_pw.0.hint(), &px_pw.1), px_pw.0)
+            } else {
+                Field::secret(mk(cx, pw_src.hint(), &pw_arg), pw_src)
+            },
+            proxy_kind: {
+                let k = get(&spec, "kind");
+                // SOCKS5 by default, because it is the one that tunnels any TCP
+                // connection; HTTP CONNECT only does what the proxy allows.
+                if k.is_empty() { "socks5".into() } else { k }
+            },
             error: None,
         };
         // Enter is the dialog's default action, from any field.
@@ -117,8 +149,42 @@ impl ProfileForm {
         me
     }
 
-    /// The `TunnelSpec` this window describes.
+    /// The default port for the protocol in front of somebody.
+    ///
+    /// Only used when the box is EMPTY. A proxy's port is not optional in the
+    /// engine's shape, and 1080 and 8080 are what the two protocols are reached
+    /// on when nobody says otherwise.
+    fn default_port(&self) -> u16 {
+        match (self.kind, self.proxy_kind.as_str()) {
+            ("proxy", "http_connect") => 8080,
+            ("proxy", _) => 1080,
+            _ => 22,
+        }
+    }
+
+    /// The `TunnelSpec` or `ProxySpec` this window describes.
     fn spec(&self, cx: &Context<Self>) -> Value {
+        if self.kind == "proxy" {
+            let user = self.user.read(cx).text().trim().to_string();
+            let pw = self.password.source.wrap(self.password.input.read(cx).text());
+            return json!({
+                "kind": self.proxy_kind,
+                "host": self.host.read(cx).text().trim(),
+                "port": crate::workspace::parse_port(
+                    &self.port.read(cx).text(),
+                    self.default_port(),
+                )
+                .unwrap_or_else(|_| self.default_port()),
+                // ABSENT, not an empty pair: the engine's `auth` is an Option,
+                // and a proxy with a blank user and a blank password is a proxy
+                // with no sign-in, not one whose sign-in is two empty strings.
+                "auth": if user.is_empty() && pw.is_empty() {
+                    Value::Null
+                } else {
+                    json!({ "user": user, "password": pw })
+                },
+            });
+        }
         json!({
             "host": self.host.read(cx).text(),
             // Checked by `port_problem` before a save gets this far; the
@@ -153,11 +219,12 @@ impl ProfileForm {
 
     /// What is wrong with the typed port, if anything.
     fn port_problem(&self, cx: &Context<Self>) -> Option<String> {
-        crate::workspace::parse_port(&self.port.read(cx).text(), 22).err()
+        crate::workspace::parse_port(&self.port.read(cx).text(), self.default_port()).err()
     }
 
     fn key_problem(&self, cx: &Context<Self>) -> Option<String> {
-        if self.auth != "key" {
+        // A proxy has no SSH key — the question does not arise.
+        if self.kind == "proxy" || self.auth != "key" {
             return None;
         }
         let raw = self.key_path.read(cx).text();
@@ -202,9 +269,18 @@ impl ProfileForm {
                 return;
             }
         }
+        // A proxy with no HOST is a proxy that resolves to nothing, and the
+        // engine would refuse it at connect time with the connection's name in
+        // the error instead of the profile's.
+        if self.host.read(cx).text().trim().is_empty() {
+            self.error = Some(format!("a {} needs a host", self.kind));
+            cx.notify();
+            return;
+        }
         let spec = self.spec(cx);
+        let kind = self.kind;
         let _ = self.workspace.update(cx, |w, cx| {
-            w.save_profile("tunnel", name, spec);
+            w.save_profile(kind, name, spec);
             w.close_profile(cx);
         });
     }
@@ -276,8 +352,57 @@ impl Render for ProfileForm {
             .overflow_y_scroll()
             .p_3()
             .gap_1();
+        body = body.child(row(self.tr("form.name"), self.name.clone()));
+
+        if self.kind == "proxy" {
+            let mut kinds = div().flex().items_center().gap_2().py_1().child(
+                div()
+                    .w(px(ms.label_w()))
+                    .flex_none()
+                    .text_size(ms.small())
+                    .text_color(t.muted())
+                    .child(self.tr("form.proxy_kind")),
+            );
+            for (k, label) in [("socks5", "SOCKS5"), ("http_connect", "HTTP CONNECT")] {
+                let on = self.proxy_kind == k;
+                kinds = kinds.child(chip(&t, ms, format!("pk-{k}"), label, on).on_click(
+                    cx.listener(move |this, _, _, cx| {
+                        this.proxy_kind = k.to_string();
+                        cx.notify();
+                    }),
+                ));
+            }
+            body = body
+                .child(kinds)
+                .child(row(self.tr("form.proxy_host"), self.host.clone()))
+                .child(row(self.tr("form.proxy_port"), self.port.clone()));
+            if let Some(why) = self.port_problem(cx) {
+                body = body.child(small(why.into(), t.error()));
+            }
+            // The sign-in is OPTIONAL, and saying so is the point: an empty
+            // pair here means no sign-in, not a sign-in with empty values.
+            body = body
+                .child(small(self.tr("form.proxy_auth_opt"), t.muted()))
+                .child(row(self.tr("form.ssh_user"), self.user.clone()))
+                .child(row(self.tr("form.password"), self.password.input.clone()));
+            if !self.users.is_empty() {
+                body = body.child(small(
+                    format!(
+                        "{} connection(s) use this profile: {}",
+                        self.users.len(),
+                        self.users.join(", ")
+                    )
+                    .into(),
+                    t.muted(),
+                ));
+            }
+            if let Some(e) = &self.error {
+                body = body.child(small(e.clone().into(), t.error()));
+            }
+            return self.frame(body, cx);
+        }
+
         body = body
-            .child(row(self.tr("form.name"), self.name.clone()))
             .child(row(self.tr("form.ssh_host"), self.host.clone()))
             .child(row(self.tr("form.ssh_port"), self.port.clone()))
             .child(row(self.tr("form.ssh_user"), self.user.clone()));
@@ -365,6 +490,16 @@ impl Render for ProfileForm {
             body = body.child(small(e.clone().into(), t.error()));
         }
 
+        self.frame(body, cx)
+    }
+}
+
+impl ProfileForm {
+    /// The title, the buttons and the key handling — the same for both kinds,
+    /// which is why they are in one place rather than in each branch.
+    fn frame(&self, body: gpui::Stateful<gpui::Div>, cx: &mut Context<Self>) -> gpui::Div {
+        let t = self.theme.clone();
+        let ms = self.scale;
         let head = div()
             .flex()
             .items_center()
@@ -376,8 +511,8 @@ impl Render for ProfileForm {
             .border_color(t.border())
             .text_color(t.fg())
             .child(SharedString::from(match &self.editing {
-                Some(n) => format!("Edit the tunnel \"{n}\""),
-                None => "New tunnel".to_string(),
+                Some(n) => format!("Edit the {} \"{n}\"", self.kind),
+                None => format!("New {}", self.kind),
             }));
 
         let footer = div()
