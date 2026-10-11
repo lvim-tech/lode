@@ -934,6 +934,8 @@ enum Pending {
     AccessImport { profile: String },
     /// An older client's database, read in.
     StoreImport,
+    /// The saved scripts, for the names a hook can point at.
+    ScriptNames,
     StoreStatus,
     Connections,
     Connect { name: String, driver: String },
@@ -1072,6 +1074,8 @@ pub struct Workspace {
     /// Asked when that window opens: it costs a round trip and is not wanted
     /// until somebody looks.
     access: Vec<Value>,
+    /// The saved scripts' names, for a hook that points at one by name.
+    script_names: Vec<String>,
     /// The MCP approval queue — what an agent has asked a PERSON to allow.
     ///
     /// Kept in the window rather than only in the settings page, because it is
@@ -1394,6 +1398,7 @@ impl Workspace {
             store_ok: false,
             store_path: String::new(),
             access: Vec::new(),
+            script_names: Vec::new(),
             approvals: Vec::new(),
             approvals_at: None,
             saved: Vec::new(),
@@ -1896,6 +1901,31 @@ impl Workspace {
                 let message = params.get("message").and_then(Value::as_str).unwrap_or("").to_string();
                 self.log_push(&level, message);
             }
+            // What somebody's own code PRINTS, as it prints it.
+            //
+            // A hook's output carries the moment it ran at (`hook`), and it
+            // goes in the log for the same reason the engine's own lines do: a
+            // PreConnect hook that is about to refuse the connection should be
+            // readable WHILE it runs, not only once the connection has failed
+            // with a message about an exit code.
+            //
+            // `stderr` is a WARNING, not an error: a script writing to stderr
+            // is a script talking, and only its exit status says whether it
+            // went wrong. Colouring every line red would make a chatty hook
+            // look like a broken one.
+            "script.output" => {
+                let text = params.get("text").and_then(Value::as_str).unwrap_or("").to_string();
+                if text.trim().is_empty() {
+                    return;
+                }
+                let err = params.get("stream").and_then(Value::as_str) == Some("stderr");
+                match params.get("hook").and_then(Value::as_str) {
+                    Some(when) => {
+                        self.log_push(if err { "warn" } else { "info" }, format!("{when}: {text}"))
+                    }
+                    None => self.log_push(if err { "warn" } else { "info" }, text),
+                }
+            }
             _ => {}
         }
     }
@@ -2244,6 +2274,18 @@ impl Workspace {
                 // It became a profile; the lists that show profiles are asked
                 // again rather than left to be refreshed by hand.
                 self.ask_profiles();
+            }
+            Pending::ScriptNames => {
+                self.script_names = v
+                    .get("scripts")
+                    .and_then(Value::as_array)
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(|s| s.get("name").and_then(Value::as_str))
+                            .map(str::to_string)
+                            .collect()
+                    })
+                    .unwrap_or_default();
             }
             Pending::StoreImport => {
                 let n = |k: &str| v.get(k).and_then(Value::as_u64).unwrap_or(0);
@@ -3473,6 +3515,16 @@ impl Workspace {
             .map(|v| v.iter().map(|p| (p.name.clone(), p.spec.clone())).collect())
             .unwrap_or_default();
         let proxy_profiles = self.profile_names("proxy");
+        // The saved scripts a hook can name. Asked for on the way in, so a
+        // script saved since the last window is offered by this one.
+        let scripts = self.script_names.clone();
+        if let Some((n, _, _)) = &existing {
+            self.ask(
+                Pending::ScriptNames,
+                "store.scripts.list",
+                json!({ "conn": n }),
+            );
+        }
         let aws_profiles = self.aws_profiles.clone();
         // Asked on the way in, so a profile added to the file since the last
         // window is offered by this one.
@@ -3510,6 +3562,7 @@ impl Workspace {
                         tunnel_profiles,
                         tunnel_profile_specs,
                         proxy_profiles,
+                        scripts,
                         aws_profiles,
                         existing,
                         cx,

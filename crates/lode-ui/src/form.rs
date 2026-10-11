@@ -81,6 +81,62 @@ impl Source {
     }
 }
 
+/// One hook as this window edits it.
+///
+/// The engine's `Hook` is the shape that goes out; this is the same thing with
+/// live fields in it. Kept apart because a `TextInput` cannot be serialised and
+/// because the three kinds share one `source` box — switching kind must not
+/// carry a command line into a script name, which is the same mistake the
+/// secret sources make and the same cure: one stash per kind.
+pub struct HookRow {
+    /// `pre_connect`, `post_connect`, `pre_disconnect`, `post_disconnect`.
+    pub on: String,
+    /// `command`, `script` or `inline`.
+    pub kind: String,
+    /// A command line or a script's name. The INLINE body lives in `body`,
+    /// because one line is not where somebody writes a script.
+    pub source: Entity<TextInput>,
+    pub body: Entity<crate::editor_el::Editor>,
+    /// For an inline hook: `bash`, `python` or `lua`.
+    pub lang: String,
+    pub timeout: Entity<TextInput>,
+    /// What was typed under the OTHER kinds, so switching back and forth does
+    /// not lose it. See `Stash`.
+    pub stash: std::collections::HashMap<String, String>,
+}
+
+/// The four moments, in the order they happen.
+pub const HOOK_EVENTS: &[&str] =
+    &["pre_connect", "post_connect", "pre_disconnect", "post_disconnect"];
+
+/// Does a failure at this moment stop what was about to happen?
+///
+/// Only before the dial. The other three run after the thing they are named
+/// for, so there is nothing left to stop — and refusing to disconnect because
+/// a hook failed would leave open a connection somebody asked to close. The
+/// engine decides this; the window only has to say it, and saying the wrong
+/// thing is worse than saying nothing.
+pub fn hook_blocks(on: &str) -> bool {
+    on == "pre_connect"
+}
+
+/// The hooks a spec carries, as rows, and what was in the spec that this window
+/// cannot show.
+///
+/// A hook whose `on` or `kind` the engine does not know is NOT dropped: it is
+/// returned as a leftover and written back untouched. A client that silently
+/// deleted what it failed to parse would turn "lode is older than this spec"
+/// into "the spec lost half its hooks".
+pub fn read_hooks(spec: &Value) -> (Vec<Value>, Vec<Value>) {
+    let all = spec.get("hooks").and_then(Value::as_array).cloned().unwrap_or_default();
+    let known = |h: &Value| {
+        let on = h.get("on").and_then(Value::as_str).unwrap_or_default();
+        let kind = h.get("kind").and_then(Value::as_str).unwrap_or("command");
+        HOOK_EVENTS.contains(&on) && ["command", "script", "inline"].contains(&kind)
+    };
+    all.iter().cloned().partition(known)
+}
+
 /// What a secret is called in the wallet.
 ///
 /// `db/<connection>` for the password, which is the name lvim-db uses — so the
@@ -167,6 +223,8 @@ impl Source {
 pub enum FormTab {
     Main,
     Access,
+    /// The person's own code, run when this connection opens or closes.
+    Hooks,
     Settings,
 }
 
@@ -178,6 +236,7 @@ impl FormTab {
         match self {
             FormTab::Main => "form.tab_main",
             FormTab::Access => "form.tab_access",
+            FormTab::Hooks => "form.tab_hooks",
             FormTab::Settings => "form.tab_settings",
         }
     }
@@ -188,6 +247,7 @@ impl FormTab {
         match self {
             FormTab::Main => "main",
             FormTab::Access => "access",
+            FormTab::Hooks => "hooks",
             FormTab::Settings => "settings",
         }
     }
@@ -274,11 +334,18 @@ pub struct ConnectionForm {
     /// it, and writing its host, user and key into twenty specs means changing
     /// twenty of them when the key rotates.
     tunnel_profile: Option<String>,
+    /// The person's own code, run when this connection opens or closes.
+    hooks: Vec<HookRow>,
+    /// Hooks this window could not read, kept whole and written back out.
+    hooks_kept: Vec<Value>,
+    /// The saved scripts a `script` hook can name, handed over when the window
+    /// opens. Names only — the window does not run them.
+    scripts: Vec<String>,
     /// Which saved PROXY this connection goes through, if any.
     ///
     /// A profile only. A proxy spelled out in the spec is a shape this window
-    /// does not edit — it reports it and leaves it alone, the way it treats
-    /// hooks and a client certificate it did not write.
+    /// does not edit — it reports it and leaves it alone, the way it treats a
+    /// client certificate it did not write.
     proxy_profile: Option<String>,
     /// The saved proxies to choose from, handed over when the window opens.
     proxy_profiles: Vec<String>,
@@ -315,10 +382,11 @@ pub struct ConnectionForm {
     /// The spec this form opened on, kept whole.
     ///
     /// **A form edits the fields it knows; it must not delete the ones it does
-    /// not.** A spec can carry `tls.ca`, a client certificate, `proxy`,
-    /// `proxy_profile` and `hooks` — written by the Neovim client, by hand, or
-    /// by an older version of this window — and saving used to send only what
-    /// these inputs hold, which silently dropped the rest. Everything edited
+    /// not.** A spec can carry `tls.ca`, a client certificate, a spelled-out
+    /// `proxy` and a hook of a kind this build never heard of — written by the
+    /// Neovim client, by hand, or by a newer version of this window — and
+    /// saving used to send only what these inputs hold, which silently dropped
+    /// the rest. Everything edited
     /// here is merged ONTO this (see [`merge_spec`]); empty for a new one.
     existing_spec: Value,
 
@@ -383,6 +451,8 @@ impl ConnectionForm {
         // The saved proxies to offer. Names only: the window picks a PROFILE
         // and never spells a proxy out, so it has no use for the specs.
         proxy_profiles: Vec<String>,
+        // The saved scripts a hook can name.
+        scripts: Vec<String>,
         aws_profiles: Vec<String>,
         existing: Option<(String, String, Value)>,
         cx: &mut Context<Self>,
@@ -493,6 +563,9 @@ impl ConnectionForm {
                 .map(str::to_string),
             tunnel_profiles,
             proxy_profiles,
+            scripts,
+            hooks: Vec::new(),
+            hooks_kept: Vec::new(),
             proxy_profile: spec
                 .get("proxy_profile")
                 .and_then(Value::as_str)
@@ -541,6 +614,13 @@ impl ConnectionForm {
         };
         let stored_params = spec.get("params").cloned().unwrap_or(json!({}));
         form.rebuild_params(&stored_params, cx);
+        // The hooks the spec already carries, and whatever this window cannot
+        // read kept aside to be written back.
+        let (known, kept) = read_hooks(&spec);
+        form.hooks_kept = kept;
+        for h in known {
+            form.push_hook(&h, cx);
+        }
         // ENTER is the dialog's default action, from any field — which is what
         // Enter means in a form everywhere else, and the reason somebody fills
         // one in without ever reaching for the pointer.
@@ -665,6 +745,11 @@ impl ConnectionForm {
             }
             None => edited["proxy_profile"] = Value::Null,
         }
+        // The HOOKS, now that this window edits them. An empty array means
+        // there are none, which is different from the key being absent only in
+        // that `merge_spec` would keep the old ones — so the array goes out
+        // even when it is empty.
+        edited["hooks"] = self.hooks_json(cx);
         merge_spec(&self.existing_spec, edited)
     }
 
@@ -1314,6 +1399,272 @@ impl ConnectionForm {
         });
     }
 
+    /// One hook, drawn.
+    ///
+    /// The MOMENT first, because it is the thing that changes what the hook
+    /// means: a failure before the dial stops the connection and a failure
+    /// anywhere else does not, and that is said under the row rather than left
+    /// to be discovered.
+    fn hook_el(&self, i: usize, cx: &mut Context<Self>) -> gpui::Div {
+        let t = self.theme.clone();
+        let ms = self.scale;
+        let h = &self.hooks[i];
+        let mut card = div()
+            .flex()
+            .flex_col()
+            .gap_1()
+            .py_1()
+            .px_2()
+            .mb_1()
+            .border_1()
+            .border_color(t.border());
+
+        let mut when = div().flex().items_center().gap_1().child(
+            div().w(px(ms.label_w())).child(self.small(self.tr("hook.when"), t.muted())),
+        );
+        for ev in HOOK_EVENTS {
+            let on = h.on == *ev;
+            when = when.child(
+                chip(&t, ms, format!("hk-{i}-{ev}"), ev.replace('_', " "), on).on_click(
+                    cx.listener(move |this, _, _, cx| {
+                        if let Some(h) = this.hooks.get_mut(i) {
+                            h.on = ev.to_string();
+                        }
+                        cx.notify();
+                    }),
+                ),
+            );
+        }
+        card = card.child(when);
+
+        let mut what = div().flex().items_center().gap_1().child(
+            div().w(px(ms.label_w())).child(self.small(self.tr("hook.what"), t.muted())),
+        );
+        for kind in ["command", "script", "inline"] {
+            let on = h.kind == kind;
+            what = what.child(
+                chip(&t, ms, format!("hkk-{i}-{kind}"), kind, on).on_click(cx.listener(
+                    move |this, _, _, cx| {
+                        this.set_hook_kind(i, kind, cx);
+                        cx.notify();
+                    },
+                )),
+            );
+        }
+        // The LANGUAGE, only for an inline body: a command line goes through a
+        // shell and a saved script carries its own language.
+        if h.kind == "inline" {
+            for l in ["bash", "python", "lua"] {
+                let on = h.lang == l;
+                what = what.child(
+                    chip(&t, ms, format!("hkl-{i}-{l}"), l, on).on_click(cx.listener(
+                        move |this, _, _, cx| {
+                            if let Some(h) = this.hooks.get_mut(i) {
+                                h.lang = l.to_string();
+                            }
+                            cx.notify();
+                        },
+                    )),
+                );
+            }
+        }
+        what = what.child(div().flex_1()).child(
+            btn(&t, ms, format!("hkrm-{i}"), self.tr("hook.remove"), Btn::Quiet).on_click(
+                cx.listener(move |this, _, _, cx| {
+                    if i < this.hooks.len() {
+                        this.hooks.remove(i);
+                    }
+                    cx.notify();
+                }),
+            ),
+        );
+        card = card.child(what);
+
+        if h.kind == "inline" {
+            card = card.child(div().text_size(ms.body()).child(h.body.clone()));
+        } else if h.kind == "script" {
+            card = card.child(div().text_size(ms.body()).child(h.source.clone()));
+            // WHICH scripts there are. A box wanting a name with no way to
+            // learn the names is a box nobody can fill correctly.
+            if self.scripts.is_empty() {
+                card = card.child(self.small(self.tr("hook.no_scripts"), t.muted()));
+            } else {
+                let mut pick = div().flex().flex_wrap().gap_1();
+                for name in self.scripts.clone() {
+                    let on = h.source.read(cx).text().trim() == name;
+                    let (n, target) = (name.clone(), h.source.clone());
+                    pick = pick.child(
+                        chip(&t, ms, format!("hks-{i}-{name}"), name.clone(), on).on_click(
+                            cx.listener(move |_this, _, _, cx| {
+                                let n = n.clone();
+                                target.update(cx, |x, cx| x.set_text(n, cx));
+                                cx.notify();
+                            }),
+                        ),
+                    );
+                }
+                card = card.child(pick);
+            }
+        } else {
+            card = card.child(div().text_size(ms.body()).child(h.source.clone()));
+        }
+
+        card = card.child(
+            div()
+                .flex()
+                .items_center()
+                .gap_1()
+                .child(
+                    div()
+                        .w(px(ms.label_w()))
+                        .child(self.small(self.tr("hook.timeout"), t.muted())),
+                )
+                .child(div().w(px(ms.base() * 6.0)).text_size(ms.body()).child(h.timeout.clone())),
+        );
+        card = card.child(self.small(
+            if hook_blocks(&h.on) {
+                self.tr("hook.blocking")
+            } else {
+                self.tr("hook.not_blocking")
+            },
+            if hook_blocks(&h.on) { t.warning() } else { t.muted() },
+        ));
+        card
+    }
+
+    /// One hook row, from what the spec says.
+    fn push_hook(&mut self, h: &Value, cx: &mut Context<Self>) {
+        let colors = colors_of(&self.theme);
+        let get = |k: &str| h.get(k).and_then(Value::as_str).unwrap_or_default().to_string();
+        let kind = {
+            let k = get("kind");
+            if k.is_empty() { "command".to_string() } else { k }
+        };
+        let source = get("source");
+        let mk = |ph: &str, val: &str, cx: &mut Context<Self>| {
+            let (ph, val) = (ph.to_string(), val.to_string());
+            cx.new(|cx| {
+                let mut i = TextInput::new(cx, ph, colors);
+                if !val.is_empty() {
+                    i.set_text(val, cx);
+                }
+                i
+            })
+        };
+        let lang = {
+            let l = get("lang");
+            // BASH by default, because a shell line is what a hook usually is
+            // and because it is the one interpreter that is always there.
+            if l.is_empty() { "bash".to_string() } else { l }
+        };
+        let (theme, scale, font) = (self.theme.clone(), self.scale, self.font_family.clone());
+        let body = cx.new(|cx| {
+            crate::editor_el::Editor::new(
+                if kind == "inline" { &source } else { "" },
+                crate::editor_el::Flavour::Plain,
+                colors,
+                theme,
+                scale,
+                font,
+                cx,
+            )
+        });
+        let row = HookRow {
+            on: {
+                let o = get("on");
+                if HOOK_EVENTS.contains(&o.as_str()) { o } else { "pre_connect".into() }
+            },
+            source: mk(
+                self.lang.tr(match kind.as_str() {
+                    "script" => "hook.script_hint",
+                    _ => "hook.cmd_hint",
+                }),
+                if kind == "inline" { "" } else { &source },
+                cx,
+            ),
+            body,
+            lang,
+            timeout: mk(
+                "",
+                &h.get("timeout_ms").and_then(Value::as_u64).map(|t| t.to_string()).unwrap_or_default(),
+                cx,
+            ),
+            kind,
+            stash: std::collections::HashMap::new(),
+        };
+        self.hooks.push(row);
+    }
+
+    /// A new, empty hook. Before the dial, a shell line: the common case, and
+    /// the only moment where failing means anything.
+    fn add_hook(&mut self, cx: &mut Context<Self>) {
+        self.push_hook(&json!({ "on": "pre_connect", "kind": "command", "source": "" }), cx);
+    }
+
+    /// Switch a hook's kind, keeping what was typed under the old one.
+    ///
+    /// The same cure as the secret sources: a command line carried into a
+    /// script name would be saved as the name of a script that does not exist.
+    fn set_hook_kind(&mut self, i: usize, kind: &str, cx: &mut Context<Self>) {
+        let Some(h) = self.hooks.get_mut(i) else { return };
+        if h.kind == kind {
+            return;
+        }
+        if h.kind == "inline" {
+            h.stash.insert("inline".into(), h.body.read(cx).text());
+        } else {
+            h.stash.insert(h.kind.clone(), h.source.read(cx).text().to_string());
+        }
+        h.kind = kind.to_string();
+        let back = h.stash.get(kind).cloned().unwrap_or_default();
+        if kind == "inline" {
+            h.body.update(cx, |e, cx| e.set_text(&back, cx));
+        } else {
+            let hint = self.lang.tr(if kind == "script" {
+                "hook.script_hint"
+            } else {
+                "hook.cmd_hint"
+            });
+            let f = h.source.clone();
+            f.update(cx, |i, cx| {
+                i.set_text(back, cx);
+                i.set_placeholder(hint, cx);
+            });
+        }
+    }
+
+    /// The `hooks` array this window describes, plus whatever it could not read.
+    fn hooks_json(&self, cx: &Context<Self>) -> Value {
+        let mut out: Vec<Value> = Vec::new();
+        for h in &self.hooks {
+            let source = if h.kind == "inline" {
+                h.body.read(cx).text()
+            } else {
+                h.source.read(cx).text().trim().to_string()
+            };
+            // An EMPTY hook is not saved. A hook with nothing to run is a row
+            // somebody started and left, and writing it out would mean the
+            // engine running an empty shell line on every connect.
+            if source.trim().is_empty() {
+                continue;
+            }
+            let mut o = json!({ "on": h.on, "kind": h.kind, "source": source });
+            if h.kind == "inline" {
+                o["lang"] = json!(h.lang);
+            }
+            // A blank timeout is the ENGINE's default, not forever, so the key
+            // is left off rather than written as null.
+            if let Ok(ms) = h.timeout.read(cx).text().trim().parse::<u64>() {
+                if ms > 0 {
+                    o["timeout_ms"] = json!(ms);
+                }
+            }
+            out.push(o);
+        }
+        out.extend(self.hooks_kept.iter().cloned());
+        Value::Array(out)
+    }
+
     /// Hand the typed secret to the engine, to be put in the wallet.
     ///
     /// The field is NOT switched here. It is switched when the engine says the
@@ -1665,7 +2016,7 @@ impl Render for ConnectionForm {
             .bg(t.panel())
             .border_b_1()
             .border_color(t.border());
-        for ft in [FormTab::Main, FormTab::Access, FormTab::Settings] {
+        for ft in [FormTab::Main, FormTab::Access, FormTab::Hooks, FormTab::Settings] {
             let on = self.tab == ft;
             tabs = tabs.child(
                 div()
@@ -2246,6 +2597,36 @@ impl Render for ConnectionForm {
                 }
                 }
             }
+            FormTab::Hooks => {
+                body = body.child(self.small(self.tr("hook.output_goes"), t.muted()));
+                if self.hooks.is_empty() {
+                    body = body.child(self.small(self.tr("hook.none"), t.muted()));
+                }
+                for i in 0..self.hooks.len() {
+                    body = body.child(self.hook_el(i, cx));
+                }
+                body = body.child(
+                    btn(&t, ms, "hook-add", self.tr("hook.add"), Btn::Secondary).on_click(
+                        cx.listener(|this, _, _, cx| {
+                            this.add_hook(cx);
+                            cx.notify();
+                        }),
+                    ),
+                );
+                // What this window could NOT read, said plainly and kept. A
+                // client that quietly dropped it would turn "lode is older
+                // than this spec" into "the spec lost half its hooks".
+                if !self.hooks_kept.is_empty() {
+                    body = body.child(self.small(
+                        format!(
+                            "{} hook(s) in this spec use something this window does not know; \
+                             they are left exactly as they are.",
+                            self.hooks_kept.len()
+                        ),
+                        t.warning(),
+                    ));
+                }
+            }
             FormTab::Settings => {
                 body = body.child(
                     div()
@@ -2370,10 +2751,12 @@ mod tests {
     use super::*;
 
     /// **Saving a connection must not delete what the form cannot see.** A spec
-    /// written elsewhere — by the Neovim client, by hand — carries a CA bundle,
-    /// a proxy profile, hooks. The form edits none of those, and it used to
-    /// send only the keys it knew, so opening such a connection and pressing
-    /// Save silently stripped them.
+    /// written elsewhere — by the Neovim client, by hand — carries a CA bundle
+    /// and a client certificate, and used to carry a proxy profile and hooks
+    /// this window had no face for. The form used to send only the keys it
+    /// knew, so opening such a connection and pressing Save silently stripped
+    /// them. It edits the proxy profile and the hooks now; what it still does
+    /// not show it still keeps, which is what this checks.
     #[test]
     fn a_save_keeps_the_keys_the_form_never_shows() {
         let existing = json!({
@@ -2406,6 +2789,54 @@ mod tests {
         assert_eq!(out["tls"]["client_cert"], json!("/etc/ssl/c.pem"));
         assert_eq!(out["proxy_profile"], json!("office"));
         assert_eq!(out["hooks"]["before_connect"], json!("notify"));
+    }
+
+    /// A hook this window cannot read is KEPT, not dropped.
+    ///
+    /// The engine will grow moments and kinds this build has never heard of,
+    /// and the Neovim client may already write one. A client that quietly
+    /// deleted what it failed to parse would turn "lode is older than this
+    /// spec" into "the spec lost half its hooks" — and the person would find
+    /// out when the hook stopped running, not when it was dropped.
+    #[test]
+    fn a_hook_this_window_cannot_read_survives_it() {
+        let spec = json!({ "hooks": [
+            { "on": "pre_connect", "kind": "command", "source": "vpn up" },
+            // A moment this build does not know.
+            { "on": "pre_query", "kind": "command", "source": "echo hi" },
+            // A kind it does not know.
+            { "on": "post_connect", "kind": "webhook", "source": "https://x" },
+            // No kind at all, which the engine reads as a command.
+            { "on": "post_disconnect", "source": "vpn down" },
+        ]});
+        let (known, kept) = super::read_hooks(&spec);
+        assert_eq!(known.len(), 2, "{known:?}");
+        assert_eq!(known[0]["source"], json!("vpn up"));
+        assert_eq!(known[1]["source"], json!("vpn down"));
+        assert_eq!(kept.len(), 2, "{kept:?}");
+        assert_eq!(kept[0]["on"], json!("pre_query"));
+        assert_eq!(kept[1]["kind"], json!("webhook"));
+        // Nothing is lost between the two halves.
+        assert_eq!(known.len() + kept.len(), 4);
+        // And a spec with no hooks is no rows, not one empty row.
+        assert_eq!(super::read_hooks(&json!({})), (vec![], vec![]));
+    }
+
+    /// Only ONE moment stops anything, and the window must say which.
+    ///
+    /// The other three run after the thing they are named for, so there is
+    /// nothing left to stop. Telling somebody that a post-disconnect hook can
+    /// refuse a disconnect would be telling them something the engine does not
+    /// do.
+    #[test]
+    fn only_a_hook_before_the_dial_stops_it() {
+        assert!(super::hook_blocks("pre_connect"));
+        for other in ["post_connect", "pre_disconnect", "post_disconnect"] {
+            assert!(!super::hook_blocks(other), "{other}");
+        }
+        // Every moment the window offers is one the engine knows.
+        assert_eq!(super::HOOK_EVENTS.len(), 4);
+        assert!(super::HOOK_EVENTS.contains(&"pre_connect"));
     }
 
     /// Naming a proxy profile takes a spelled-out proxy OFF, and choosing none
