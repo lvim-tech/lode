@@ -25,6 +25,23 @@ pub enum Target {
     /// A saved connection, whether it is open, and whether the engine is new
     /// enough to file it in a folder.
     Connection { name: String, live: bool, folders: bool },
+    /// One COLUMN of an object, or one of its indexes.
+    ///
+    /// Carries what the statement will be built from and the labels the DRIVER
+    /// declared. The labels travel with the target because the menu must not
+    /// invent them: a dialect with no `RENAME COLUMN` has a different word for
+    /// it, and this window is not the place that knows which.
+    Field {
+        conn: String,
+        table: String,
+        schema: Option<String>,
+        /// The column, or the index's name when `index` is set.
+        field: String,
+        /// Whether this is an index rather than a column.
+        index: bool,
+        /// `(op, label)` for each change this driver can write out.
+        ops: Vec<(String, String)>,
+    },
     /// A node of the schema tree.
     Node { conn: String, name: String, schema: Option<String>, kind: String, has_ddl: bool },
     /// A row of the grid: which tab, which row, and whether this result can be
@@ -54,6 +71,16 @@ pub enum Act {
     RefreshConnection(String),
     /// Ask which folder to file it in. An empty answer takes it out of one.
     MoveToFolder(String),
+    /// Write a schema change into the editor. The OP is the driver's word for
+    /// it, and the statement comes from the driver's template.
+    Ddl {
+        conn: String,
+        table: String,
+        schema: Option<String>,
+        field: String,
+        op: String,
+        index: bool,
+    },
     /// Put a name on the clipboard. The commonest thing anybody wants from a
     /// tree and the one thing it could not do.
     CopyText(String),
@@ -80,7 +107,15 @@ pub enum Act {
 pub struct Item {
     /// The catalogue key, not the words — the menu is chrome like everything
     /// else.
+    ///
+    /// Empty when the words come from the ENGINE instead: a driver's own label
+    /// for a schema change is not in this client's catalogue, and cannot be —
+    /// the dialects this build has never met have labels too. `words` carries
+    /// it in that case.
     pub key: &'static str,
+    /// The words themselves, when they are the engine's rather than this
+    /// client's. Empty whenever `key` is set.
+    pub words: String,
     pub act: Act,
     /// False when the item belongs on this target but cannot be used now. SHOWN
     /// and dimmed rather than hidden: a menu whose length changes with the
@@ -91,10 +126,14 @@ pub struct Item {
 
 impl Item {
     fn on(key: &'static str, act: Act) -> Self {
-        Item { key, act, enabled: true }
+        Item { key, words: String::new(), act, enabled: true }
     }
     fn off(key: &'static str, act: Act) -> Self {
-        Item { key, act, enabled: false }
+        Item { key, words: String::new(), act, enabled: false }
+    }
+    /// An item whose words came from the engine. See `Item::key`.
+    fn named(words: String, act: Act) -> Self {
+        Item { key: "", words, act, enabled: true }
     }
 }
 
@@ -154,6 +193,40 @@ pub fn menu_for(target: &Target) -> Vec<Item> {
                     Item::off("menu.copy_ddl", ddl)
                 },
             ]
+        }
+        Target::Field { conn, table, schema, field, index, ops } => {
+            let mut out = vec![
+                Item::on("menu.insert_name", Act::InsertIntoEditor(field.clone())),
+                Item::on("menu.copy_name", Act::CopyText(field.clone())),
+            ];
+            // Only the ones that make sense for what was clicked: an index has
+            // no type to add and a column is not dropped with `DROP INDEX`.
+            for (op, label) in ops {
+                let fits = if *index {
+                    op == "drop_index"
+                } else {
+                    op != "drop_index"
+                };
+                if !fits {
+                    continue;
+                }
+                // The DRIVER's label, pushed through rather than looked up:
+                // the catalogue here has no word for a dialect it has never
+                // met, and inventing one is how a client ends up offering
+                // `RENAME COLUMN` on a server that has no such statement.
+                out.push(Item::named(
+                    label.clone(),
+                    Act::Ddl {
+                        conn: conn.clone(),
+                        table: table.clone(),
+                        schema: schema.clone(),
+                        field: field.clone(),
+                        op: op.clone(),
+                        index: *index,
+                    },
+                ));
+            }
+            out
         }
         Target::Row { tab, row, editable } => {
             let (tab, row) = (*tab, *row);
@@ -280,6 +353,74 @@ pub fn cell_text(v: &Value) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A COLUMN's menu offers what the driver said it can write, and an
+    /// index's offers only the one thing that applies to an index.
+    ///
+    /// The labels come from the ENGINE and are pushed through rather than
+    /// looked up: this catalogue has no word for a dialect it has never met,
+    /// and inventing one is how a client offers `RENAME COLUMN` on a server
+    /// that has no such statement.
+    #[test]
+    fn a_field_offers_the_changes_its_driver_can_write() {
+        let ops = vec![
+            ("add_column".to_string(), "Add a column…".to_string()),
+            ("rename_column".to_string(), "Rename this column…".to_string()),
+            ("drop_column".to_string(), "Drop this column".to_string()),
+            ("create_index".to_string(), "Index this column…".to_string()),
+            ("drop_index".to_string(), "Drop this index".to_string()),
+        ];
+        let col = menu_for(&Target::Field {
+            conn: "c".into(),
+            table: "users".into(),
+            schema: None,
+            field: "email".into(),
+            index: false,
+            ops: ops.clone(),
+        });
+        // The two that are always there, then the four that apply to a column.
+        let words: Vec<String> = col
+            .iter()
+            .map(|i| if i.key.is_empty() { i.words.clone() } else { i.key.to_string() })
+            .collect();
+        assert_eq!(words.len(), 6, "{words:?}");
+        assert!(words.contains(&"Add a column…".to_string()));
+        assert!(
+            !words.contains(&"Drop this index".to_string()),
+            "a column is not dropped with DROP INDEX"
+        );
+
+        let idx = menu_for(&Target::Field {
+            conn: "c".into(),
+            table: "users".into(),
+            schema: None,
+            field: "idx_users_email".into(),
+            index: true,
+            ops: ops.clone(),
+        });
+        let words: Vec<String> = idx
+            .iter()
+            .map(|i| if i.key.is_empty() { i.words.clone() } else { i.key.to_string() })
+            .collect();
+        assert_eq!(words.len(), 3, "{words:?}");
+        assert!(words.contains(&"Drop this index".to_string()));
+        assert!(
+            !words.contains(&"Add a column…".to_string()),
+            "an index has no type to add"
+        );
+
+        // A driver that declares NOTHING offers nothing but the two that need
+        // no dialect: the name, and a copy of it.
+        let none = menu_for(&Target::Field {
+            conn: "c".into(),
+            table: "t".into(),
+            schema: None,
+            field: "k".into(),
+            index: false,
+            ops: Vec::new(),
+        });
+        assert_eq!(none.len(), 2, "{:?}", none.iter().map(|i| i.key).collect::<Vec<_>>());
+    }
 
     #[test]
     fn a_connection_offers_what_it_can_do_now() {

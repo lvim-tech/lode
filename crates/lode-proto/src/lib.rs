@@ -121,6 +121,16 @@ pub struct DriverMeta {
     /// is the right answer for both: no time filter here.
     #[serde(default)]
     pub time_filter: String,
+    /// The schema changes this dialect can be asked to WRITE OUT
+    /// (`proto >= 23`), as templates — `ALTER TABLE … RENAME COLUMN` is
+    /// standard, MySQL before 8 wanted `CHANGE`, and SQL Server wants
+    /// `sp_rename`, so the words come from the driver rather than from here.
+    ///
+    /// Empty from an older engine and empty where the idea does not apply, and
+    /// a client that has none offers nothing rather than a statement it made
+    /// up.
+    #[serde(default)]
+    pub ddl_ops: Vec<DdlOp>,
     /// The live views this engine can be asked about (`proto >= 20`): who is
     /// connected, what is locked, what is running.
     ///
@@ -130,6 +140,14 @@ pub struct DriverMeta {
     /// client that guessed would ask for a view that is not there.
     #[serde(default)]
     pub inspectors: Vec<Inspector>,
+}
+
+/// One schema change a driver can write out.
+#[derive(Debug, Clone, Deserialize)]
+pub struct DdlOp {
+    pub op: String,
+    pub label: String,
+    pub template: String,
 }
 
 /// One live view a driver offers.
@@ -305,6 +323,48 @@ pub fn render_browse(
         })
         .collect();
     render_with(meta.browse_for(kind), name, schema, limit, &[], &clauses)
+}
+
+/// Write out a schema change, in the words the DRIVER declared.
+///
+/// Generated, never run: the statement goes into the editor where it can be
+/// read and changed first. A schema change that happens because somebody
+/// picked a menu item is a schema change nobody reviewed.
+///
+/// `None` when this driver has no such operation — which is how a key/value
+/// store answers "add a column" and how SQL Server would answer an operation
+/// it has no spelling for. A client draws nothing rather than a statement it
+/// made up.
+pub fn render_ddl(
+    meta: &DriverMeta,
+    op: &str,
+    name: &str,
+    schema: Option<&str>,
+    column: &str,
+    type_name: &str,
+    to: &str,
+    index: &str,
+    columns: &str,
+) -> Option<String> {
+    let t = meta.ddl_ops.iter().find(|d| d.op == op)?;
+    let schema = schema.filter(|s| !s.is_empty());
+    let qualified = match schema {
+        Some(s) => format!("{s}.{name}"),
+        None => name.to_string(),
+    };
+    Some(
+        t.template
+            // `{qualified}` BEFORE `{table}`, or the substitution of the
+            // shorter name would eat the longer one's braces.
+            .replace("{qualified}", &qualified)
+            .replace("{table}", name)
+            .replace("{schema}", schema.unwrap_or(""))
+            .replace("{column}", column)
+            .replace("{type}", type_name)
+            .replace("{to}", to)
+            .replace("{index}", index)
+            .replace("{columns}", if columns.is_empty() { column } else { columns }),
+    )
 }
 
 /// Assemble a structured query bar's values into a statement, using only what

@@ -89,6 +89,7 @@ const META: DriverMeta = DriverMeta {
     browse_form: &[],
     time_filter: "",
     builder_ops: &[],
+    ddl_ops: &[],
     inspectors: REDIS_INSPECTORS,
 };
 

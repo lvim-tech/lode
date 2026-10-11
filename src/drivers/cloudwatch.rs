@@ -56,6 +56,7 @@ const META: DriverMeta = DriverMeta {
     // somebody chooses — and the template says so by not using it.
     time_filter: "since {from} until {to}",
     builder_ops: &[],
+    ddl_ops: &[],
     inspectors: &[],
 };
 

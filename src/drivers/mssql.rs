@@ -74,8 +74,44 @@ const META: DriverMeta = DriverMeta {
     browse_form: crate::spec::SQL_BROWSE_FORM,
     time_filter: crate::spec::SQL_TIME_FILTER,
     builder_ops: crate::spec::SQL_BUILDER_OPS,
+    ddl_ops: MSSQL_DDL_OPS,
     inspectors: &[],
 };
+
+/// SQL Server's own spellings, which differ in three of the five.
+///
+/// There is no `ADD COLUMN` — the keyword is just `ADD`. There is no
+/// `RENAME COLUMN` at all: renaming goes through `sp_rename` with a quoted
+/// `table.column` triple and the word `'COLUMN'`, which is the kind of thing a
+/// client must not invent. And `DROP INDEX` wants the table, because an index
+/// name is only unique within one.
+const MSSQL_DDL_OPS: &[crate::spec::DdlOp] = &[
+    crate::spec::DdlOp {
+        op: "add_column",
+        label: "Add a column\u{2026}",
+        template: "ALTER TABLE {qualified} ADD {column} {type};",
+    },
+    crate::spec::DdlOp {
+        op: "rename_column",
+        label: "Rename this column\u{2026}",
+        template: "EXEC sp_rename '{table}.{column}', '{to}', 'COLUMN';",
+    },
+    crate::spec::DdlOp {
+        op: "drop_column",
+        label: "Drop this column",
+        template: "ALTER TABLE {qualified} DROP COLUMN {column};",
+    },
+    crate::spec::DdlOp {
+        op: "create_index",
+        label: "Index this column\u{2026}",
+        template: "CREATE INDEX {index} ON {qualified} ({columns});",
+    },
+    crate::spec::DdlOp {
+        op: "drop_index",
+        label: "Drop this index",
+        template: "DROP INDEX {index} ON {qualified};",
+    },
+];
 
 /// The SQL Server driver.
 pub struct MssqlDriver;

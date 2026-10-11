@@ -58,8 +58,49 @@ const META: DriverMeta = DriverMeta {
     browse_form: crate::spec::SQL_BROWSE_FORM,
     time_filter: crate::spec::SQL_TIME_FILTER,
     builder_ops: crate::spec::SQL_BUILDER_OPS,
+    ddl_ops: SQLITE_DDL_OPS,
     inspectors: &[],
 };
+
+/// SQLite's own spellings.
+///
+/// It has `ALTER TABLE … ADD COLUMN`, and since 3.25 `RENAME COLUMN`, and
+/// since 3.35 `DROP COLUMN` — so the standard three are right. What it does
+/// NOT have is a qualified index name in `DROP INDEX`: an index belongs to the
+/// schema, not to the table, and `DROP INDEX t.i` is a syntax error.
+///
+/// `ADD COLUMN` also carries a warning worth its line: SQLite cannot add a
+/// NOT NULL column without a default to a table that has rows. The template
+/// does not try to say that — it is the server's objection and the server
+/// phrases it better — but it is why the generated statement is for reading
+/// rather than for running blind.
+const SQLITE_DDL_OPS: &[crate::spec::DdlOp] = &[
+    crate::spec::DdlOp {
+        op: "add_column",
+        label: "Add a column\u{2026}",
+        template: "ALTER TABLE {qualified} ADD COLUMN {column} {type};",
+    },
+    crate::spec::DdlOp {
+        op: "rename_column",
+        label: "Rename this column\u{2026}",
+        template: "ALTER TABLE {qualified} RENAME COLUMN {column} TO {to};",
+    },
+    crate::spec::DdlOp {
+        op: "drop_column",
+        label: "Drop this column",
+        template: "ALTER TABLE {qualified} DROP COLUMN {column};",
+    },
+    crate::spec::DdlOp {
+        op: "create_index",
+        label: "Index this column\u{2026}",
+        template: "CREATE INDEX {index} ON {qualified} ({columns});",
+    },
+    crate::spec::DdlOp {
+        op: "drop_index",
+        label: "Drop this index",
+        template: "DROP INDEX {index};",
+    },
+];
 
 /// The SQLite driver.
 pub struct SqliteDriver;

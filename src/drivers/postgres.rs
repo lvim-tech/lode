@@ -94,6 +94,7 @@ const PG_META: DriverMeta = DriverMeta {
     browse_form: crate::spec::SQL_BROWSE_FORM,
     time_filter: crate::spec::SQL_TIME_FILTER,
     builder_ops: PG_BUILDER_OPS,
+    ddl_ops: crate::spec::SQL_DDL_OPS,
     inspectors: PG_INSPECTORS,
 };
 
@@ -129,6 +130,7 @@ const CRDB_META: DriverMeta = DriverMeta {
     builder_ops: PG_BUILDER_OPS,
     // The same wire, so the same statistics views: this IS the postgres driver
     // underneath, and a view that works through it works through the alias.
+    ddl_ops: crate::spec::SQL_DDL_OPS,
     inspectors: PG_INSPECTORS,
 };
 
@@ -167,6 +169,7 @@ const REDSHIFT_META: DriverMeta = DriverMeta {
     builder_ops: PG_BUILDER_OPS,
     // The same wire, so the same statistics views: this IS the postgres driver
     // underneath, and a view that works through it works through the alias.
+    ddl_ops: crate::spec::SQL_DDL_OPS,
     inspectors: PG_INSPECTORS,
 };
 

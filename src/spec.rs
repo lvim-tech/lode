@@ -182,6 +182,10 @@ pub struct DriverMeta {
     /// means this engine has no builder, which is the right answer for a
     /// key/value store.
     pub builder_ops: &'static [BuilderOp],
+    /// The schema changes this dialect can be asked to write out, as
+    /// templates. Empty where the idea does not apply — a key/value store has
+    /// no columns to add.
+    pub ddl_ops: &'static [DdlOp],
     /// The live views this engine can be ASKED about: who is connected, what
     /// is locked, what is running.
     ///
@@ -226,6 +230,59 @@ pub struct QueryFieldSpec {
     /// How many lines the input gets. 1 is a single-line field.
     pub rows: u8,
 }
+
+/// One schema change this dialect can be asked to WRITE OUT.
+///
+/// A template, exactly like `browse` and `time_filter`, and for the same
+/// reason: the client holds every value, and a round trip to format a string
+/// is a round trip to format a string. What a client must not do is INVENT the
+/// words — `ALTER TABLE … RENAME COLUMN` is standard, MySQL before 8 wanted
+/// `CHANGE`, and SQL Server wants `sp_rename` with a quoted triple — so this
+/// is where the words come from.
+///
+/// It is GENERATED, never run. The statement goes into the editor where it can
+/// be read, changed and then run like anything else, which is the lvim-db
+/// model: a schema change that happens because somebody picked a menu item is
+/// a schema change nobody reviewed.
+#[derive(Debug, Clone, Copy, Serialize)]
+pub struct DdlOp {
+    /// What it does, as a stable word: `add_column`, `rename_column`,
+    /// `drop_column`, `create_index`, `drop_index`.
+    pub op: &'static str,
+    /// What a person reads in the menu.
+    pub label: &'static str,
+    /// The statement, with `{qualified}`, `{table}`, `{column}`, `{type}`,
+    /// `{to}`, `{index}` and `{columns}` filled in by the client.
+    pub template: &'static str,
+}
+
+/// What nearly every SQL dialect spells the same way.
+///
+/// A driver with a different spelling starts from this and replaces the one
+/// line that differs, rather than writing out five.
+pub const SQL_DDL_OPS: &[DdlOp] = &[
+    DdlOp {
+        op: "add_column",
+        label: "Add a column\u{2026}",
+        template: "ALTER TABLE {qualified} ADD COLUMN {column} {type};",
+    },
+    DdlOp {
+        op: "rename_column",
+        label: "Rename this column\u{2026}",
+        template: "ALTER TABLE {qualified} RENAME COLUMN {column} TO {to};",
+    },
+    DdlOp {
+        op: "drop_column",
+        label: "Drop this column",
+        template: "ALTER TABLE {qualified} DROP COLUMN {column};",
+    },
+    DdlOp {
+        op: "create_index",
+        label: "Index this column\u{2026}",
+        template: "CREATE INDEX {index} ON {qualified} ({columns});",
+    },
+    DdlOp { op: "drop_index", label: "Drop this index", template: "DROP INDEX {index};" },
+];
 
 /// One live view of a server, offered by name.
 ///
@@ -1342,6 +1399,50 @@ mod tests {
         // ORDER: `timestamp` before `time`, `datetime64` before `date`.
         assert_eq!(kind_of("timestamp"), "timestamp");
         assert_eq!(kind_of("DateTime64"), "timestamp");
+    }
+
+    /// Every DDL template a driver declares can be filled in, and none of them
+    /// is a statement with a hole left in it.
+    ///
+    /// The placeholders are the contract: a client substitutes `{qualified}`,
+    /// `{table}`, `{column}`, `{type}`, `{to}`, `{index}` and `{columns}` and
+    /// nothing else. A template with a `{something}` nobody fills in would
+    /// reach the editor with braces in it, and a person would run it.
+    #[test]
+    fn a_ddl_template_has_no_placeholder_nobody_fills() {
+        const KNOWN: &[&str] =
+            &["{qualified}", "{table}", "{schema}", "{column}", "{type}", "{to}", "{index}", "{columns}"];
+        let mut seen = 0;
+        for m in crate::registry::Registry::new().metas() {
+            let mut ops = std::collections::BTreeSet::new();
+            for d in m.ddl_ops {
+                assert!(!d.op.is_empty(), "{}: an op with no name", m.kind);
+                assert!(!d.label.is_empty(), "{}: {} has no label", m.kind, d.op);
+                assert!(ops.insert(d.op), "{}: {} twice", m.kind, d.op);
+                // A statement, not a fragment: it ends in a semicolon, so
+                // pasting two of them into an editor gives two statements.
+                assert!(
+                    d.template.trim_end().ends_with(';'),
+                    "{}: {} does not end a statement: {:?}",
+                    m.kind,
+                    d.op,
+                    d.template
+                );
+                let mut rest = d.template.to_string();
+                for k in KNOWN {
+                    rest = rest.replace(k, "");
+                }
+                assert!(
+                    !rest.contains('{'),
+                    "{}: {} has a placeholder nothing fills: {:?}",
+                    m.kind,
+                    d.op,
+                    d.template
+                );
+                seen += 1;
+            }
+        }
+        assert!(seen > 0, "no driver in this build declares a schema change");
     }
 
     /// A driver that OFFERS acting on a view says what acting is called.

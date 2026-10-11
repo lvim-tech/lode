@@ -142,6 +142,7 @@ const MONGO_META: DriverMeta = DriverMeta {
     browse_form: &[],
     time_filter: "{\"{col}\": {\"$gte\": {\"$date\": \"{from}\"}, \"$lt\": {\"$date\": \"{to}\"}}}",
     builder_ops: &[],
+    ddl_ops: &[],
     inspectors: MONGO_INSPECTORS,
 };
 

@@ -136,6 +136,7 @@ const META: DriverMeta = DriverMeta {
     // template is how a driver says it has none.
     time_filter: "",
     builder_ops: &[],
+    ddl_ops: &[],
     inspectors: &[],
 };
 

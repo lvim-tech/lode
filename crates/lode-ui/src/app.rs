@@ -6332,6 +6332,104 @@ impl Workspace {
         .detach();
     }
 
+    /// The schema changes this connection's driver can write out, as
+    /// `(op, label)`.
+    fn ddl_ops(&self, conn: &str) -> Vec<(String, String)> {
+        self.live(conn)
+            .and_then(|l| self.meta(&l.driver))
+            .map(|m| m.ddl_ops.iter().map(|d| (d.op.clone(), d.label.clone())).collect())
+            .unwrap_or_default()
+    }
+
+    /// Write a schema change into the editor.
+    ///
+    /// GENERATED, never run. It lands in the active tab's statement box where
+    /// it can be read, edited and then run through everything a statement goes
+    /// through — the policy, the classification, the audit log. A menu item
+    /// that altered a table directly would be a schema change nobody reviewed,
+    /// and the one thing every client of a database gets wrong once.
+    ///
+    /// The placeholders a person has to fill in are left as WORDS in angle
+    /// brackets rather than prompted for: `<name> <type>` in a statement says
+    /// what is missing better than two dialogs, and it is already in the place
+    /// where it has to be typed.
+    fn write_ddl(
+        &mut self,
+        conn: &str,
+        table: &str,
+        schema: Option<&str>,
+        field: &str,
+        op: &str,
+        index: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(driver) = self.live(conn).map(|l| l.driver.clone()) else { return };
+        let Some(meta) = self.meta(&driver).cloned() else { return };
+        let (column, idx) = if index { ("<column>", field) } else { (field, "") };
+        // A new column and a new index have no name yet; a rename has no
+        // target yet. Angle brackets, which no dialect uses, so the statement
+        // cannot be run by accident while it still has a hole in it.
+        let (column, type_name) = match op {
+            "add_column" => ("<name>", "<type>"),
+            _ => (column, ""),
+        };
+        let index_name = match op {
+            "create_index" => format!("idx_{table}_{field}"),
+            _ => idx.to_string(),
+        };
+        let Some(stmt) = lode_proto::render_ddl(
+            &meta,
+            op,
+            table,
+            schema,
+            column,
+            type_name,
+            "<new name>",
+            &index_name,
+            if index { "" } else { field },
+        ) else {
+            self.toast(format!("the {driver} driver has no {op}"), true);
+            return;
+        };
+        // INTO THE ACTIVE TAB, or a new one when there is nothing to put it
+        // in: a statement written into a tab that is showing a result replaces
+        // what was being read, which is somebody's place in a page of rows.
+        let target = self
+            .tabs
+            .get(self.active)
+            .filter(|t| t.conn_name == conn && t.board.is_none() && t.script.is_none())
+            .map(|t| t.id);
+        match target {
+            Some(id) => {
+                if let Some(ed) = self.editors.get(&id).cloned() {
+                    ed.update(cx, |e, cx| e.set_text(&stmt, cx));
+                }
+                if let Some(t) = self.tabs.iter_mut().find(|t| t.id == id) {
+                    t.sql = stmt.clone();
+                }
+            }
+            None => {
+                let title = crate::workspace::draft_title(&stmt);
+                let Some(live) = self.live(conn) else { return };
+                let driver = live.driver.clone();
+                let meta = self.meta(&driver).cloned();
+                let id = self.next_tab;
+                self.next_tab += 1;
+                let mut tab =
+                    Tab::new(id, conn.to_string(), driver, title, meta.as_ref());
+                tab.sql = stmt.clone();
+                self.tabs.push(tab);
+                self.active = self.tabs.len() - 1;
+                let hint = meta.as_ref().map(|m| m.hint.clone()).unwrap_or_default();
+                self.make_editor(id, Some(&hint), &stmt, cx);
+                crate::workspace::mru_touch(&mut self.mru, id);
+            }
+        }
+        self.status = "written into the editor \u{2014} read it before you run it".into();
+        self.remember();
+        cx.notify();
+    }
+
     /// Change what a key does, or put its default back.
     ///
     /// REBOUND at once, not on the next start: a setting that needs a restart
@@ -8300,7 +8398,7 @@ impl Workspace {
             }
         }
         if is_object && open {
-            out = out.child(self.node_inside(&key, depth + 1, cx));
+            out = out.child(self.node_inside(&key, conn, node, depth + 1, cx));
         }
         out.into_any_element()
     }
@@ -8312,7 +8410,14 @@ impl Workspace {
     /// field is the same word the grid's headers and the Tree's badges use,
     /// because one dictionary serving three places is the whole point of having
     /// written it.
-    fn node_inside(&self, key: &str, depth: usize, cx: &mut Context<Self>) -> gpui::AnyElement {
+    fn node_inside(
+        &self,
+        key: &str,
+        conn: &str,
+        node: &Node,
+        depth: usize,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
         let (t, ms) = (self.t(), self.scale);
         let pad = 16.0 + depth as f32 * 12.0;
         let w = (ms.line_w() - pad - ms.base() * 3.0).max(ms.base() * 4.0);
@@ -8453,7 +8558,39 @@ impl Workspace {
                         })
                         .on_click(cx.listener(move |this, _, _, cx| {
                             this.insert_into_editor(&name, cx);
-                        })),
+                        }))
+                        // RIGHT-CLICK offers the schema changes this dialect
+                        // can write out. On the column, because that is what
+                        // "add a column beside this one" is about.
+                        .on_mouse_down(
+                            MouseButton::Right,
+                            cx.listener({
+                                let (cn, tbl, sch, fld) = (
+                                    conn.to_string(),
+                                    node.name.clone(),
+                                    node.schema.clone(),
+                                    c.name.clone(),
+                                );
+                                move |this, ev: &gpui::MouseDownEvent, _, cx| {
+                                    let ops = this.ddl_ops(&cn);
+                                    if ops.is_empty() {
+                                        return;
+                                    }
+                                    this.open_menu(
+                                        crate::menu::Target::Field {
+                                            conn: cn.clone(),
+                                            table: tbl.clone(),
+                                            schema: sch.clone(),
+                                            field: fld.clone(),
+                                            index: false,
+                                            ops,
+                                        },
+                                        ev.position,
+                                        cx,
+                                    );
+                                }
+                            }),
+                        ),
                 );
             }
         }
@@ -10559,7 +10696,41 @@ impl Workspace {
                         })),
                 );
             }
-            body = body.child(row);
+            // The same menu as the tree's, from the same target: a column is
+            // a column wherever it is drawn, and two menus with two shapes
+            // over one thing is how one of them falls behind.
+            let (cn, tbl, sch, fld) = (
+                conn.clone(),
+                tab.object.as_ref().map(|(n, _)| n.clone()).unwrap_or_default(),
+                tab.object.as_ref().and_then(|(_, s)| s.clone()),
+                c.name.clone(),
+            );
+            body = body.child(
+                div()
+                    .id(SharedString::from(format!("schcol-{}-{}", tab.id, c.name)))
+                    .on_mouse_down(
+                        MouseButton::Right,
+                        cx.listener(move |this, ev: &gpui::MouseDownEvent, _, cx| {
+                            let ops = this.ddl_ops(&cn);
+                            if ops.is_empty() || tbl.is_empty() {
+                                return;
+                            }
+                            this.open_menu(
+                                crate::menu::Target::Field {
+                                    conn: cn.clone(),
+                                    table: tbl.clone(),
+                                    schema: sch.clone(),
+                                    field: fld.clone(),
+                                    index: false,
+                                    ops,
+                                },
+                                ev.position,
+                                cx,
+                            );
+                        }),
+                    )
+                    .child(row),
+            );
         }
 
         let keyed = tab.meta_columns.iter().any(|c| c.primary);
@@ -10582,8 +10753,15 @@ impl Workspace {
                 if i.unique {
                     tags.push("unique");
                 }
+                let (cn, tbl, sch, idx_name) = (
+                    conn.clone(),
+                    tab.object.as_ref().map(|(n, _)| n.clone()).unwrap_or_default(),
+                    tab.object.as_ref().and_then(|(_, s)| s.clone()),
+                    i.name.clone(),
+                );
                 body = body.child(
                     div()
+                        .id(SharedString::from(format!("schidx-{}-{}", tab.id, i.name)))
                         .flex()
                         .items_center()
                         .gap_2()
@@ -10591,7 +10769,31 @@ impl Workspace {
                             SharedString::from(i.name.clone()),
                         ))
                         .child(div().w(px(ms.base() * 18.5)).child(self.small(i.columns.join(", "), t.muted())))
-                        .child(self.small(tags.join(" · "), t.accent())),
+                        .child(self.small(tags.join(" · "), t.accent()))
+                        // An index has ONE change worth offering: dropping it.
+                        // Creating one is a change to a COLUMN, which is where
+                        // that item lives.
+                        .on_mouse_down(
+                            MouseButton::Right,
+                            cx.listener(move |this, ev: &gpui::MouseDownEvent, _, cx| {
+                                let ops = this.ddl_ops(&cn);
+                                if ops.is_empty() || tbl.is_empty() {
+                                    return;
+                                }
+                                this.open_menu(
+                                    crate::menu::Target::Field {
+                                        conn: cn.clone(),
+                                        table: tbl.clone(),
+                                        schema: sch.clone(),
+                                        field: idx_name.clone(),
+                                        index: true,
+                                        ops,
+                                    },
+                                    ev.position,
+                                    cx,
+                                );
+                            }),
+                        ),
                 );
             }
         }
@@ -12663,7 +12865,14 @@ impl Workspace {
                         d.border_l_2().border_color(gpui::transparent_black())
                     })
                     .when(enabled, |d| d.cursor_pointer().hover(|h| h.bg(t.hover_mark())))
-                    .child(self.tr(item.key))
+                    // The catalogue's words, or the ENGINE's where the item
+                    // carries its own — a driver's label for a schema change
+                    // is not in this client's catalogue and cannot be.
+                    .child(if item.key.is_empty() {
+                        SharedString::from(item.words.clone())
+                    } else {
+                        self.tr(item.key)
+                    })
                     .on_click(cx.listener(move |this, _, _, cx| {
                         if enabled {
                             this.menu = None;
@@ -12714,6 +12923,9 @@ impl Workspace {
                     "store.queries.list",
                     json!({ "conn": name }),
                 );
+            }
+            Act::Ddl { conn, table, schema, field, op, index } => {
+                self.write_ddl(&conn, &table, schema.as_deref(), &field, &op, index, cx);
             }
             Act::MoveToFolder(name) => {
                 // The naming row again, with the folder it is in now as the

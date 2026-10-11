@@ -202,7 +202,22 @@ use serde_json::json;
 ///     `sys.foreign_key_columns`); absent where a driver has no way to ask,
 ///     because saying nothing is the honest answer rather than saying no. A
 ///     failure to read them is not a failure of the column list.
-pub const PROTO: u32 = 22;
+/// 23. `DriverMeta.ddl_ops`: the schema changes a dialect can be asked to
+///     WRITE OUT, as templates — `add_column`, `rename_column`,
+///     `drop_column`, `create_index`, `drop_index`.
+///
+///     A template rather than a method, exactly as `browse` and `time_filter`
+///     are, and for the same reason: the client holds every value, and a
+///     round trip to format a string is a round trip to format a string. What
+///     a client must not do is INVENT the words — standard SQL renames a
+///     column one way, MySQL before 8 wanted `CHANGE`, and SQL Server wants
+///     `sp_rename` with a quoted triple — and this is where the words come
+///     from.
+///
+///     GENERATED, never run. The statement goes into the editor to be read
+///     and changed first: a schema change that happens because somebody
+///     picked a menu item is a schema change nobody reviewed.
+pub const PROTO: u32 = 23;
 
 /// One decoded incoming request.
 #[derive(Debug, Deserialize)]

@@ -218,6 +218,22 @@ check "columns say their kind" \
 check "and the driver's own word is still there" \
     "$(printf '%s' "$PAGE" | jq -r '.result.columns[0].type')" "INTEGER"
 
+# The schema changes a dialect can WRITE OUT are declared, as templates, and
+# the client fills them in — so what is checkable here is that they arrive and
+# that each dialect carries its own spelling. SQLite names an index without the
+# table in DROP INDEX; SQL Server needs it. Both are in the handshake.
+check "sqlite declares its schema changes" \
+    "$(printf '%s' "$HELLO" | jq -r '[.result.drivers[] | select(.kind == "sqlite") | .ddl_ops | length] | add')" \
+    "5"
+check "and renames a column the standard way" \
+    "$(printf '%s' "$HELLO" | jq -r '[.result.drivers[] | select(.kind == "sqlite") | .ddl_ops[] | select(.op == "rename_column") | .template] | join("")')" \
+    "ALTER TABLE {qualified} RENAME COLUMN {column} TO {to};"
+# A driver with no columns declares no column changes: offering "add a column"
+# on a key/value store would be offering a statement it has no words for.
+check "redis declares none" \
+    "$(printf '%s' "$HELLO" | jq -r '[.result.drivers[] | select(.kind == "redis") | .ddl_ops | length] | add')" \
+    "0"
+
 # WHAT POINTS WHERE. `customer_id` looks like a reference and `parent` does
 # not, and both guesses are wrong about half the schemas in the world — so the
 # server is asked. This is the one driver here whose foreign keys can be checked

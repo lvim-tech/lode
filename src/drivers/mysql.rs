@@ -77,6 +77,7 @@ const MARIADB_META: DriverMeta = DriverMeta {
     browse_form: crate::spec::SQL_BROWSE_FORM,
     time_filter: crate::spec::SQL_TIME_FILTER,
     builder_ops: crate::spec::SQL_BUILDER_OPS,
+    ddl_ops: crate::spec::SQL_DDL_OPS,
     inspectors: MY_INSPECTORS,
 };
 
@@ -95,6 +96,7 @@ const MYSQL_META: DriverMeta = DriverMeta {
     browse_form: crate::spec::SQL_BROWSE_FORM,
     time_filter: crate::spec::SQL_TIME_FILTER,
     builder_ops: crate::spec::SQL_BUILDER_OPS,
+    ddl_ops: crate::spec::SQL_DDL_OPS,
     inspectors: MY_INSPECTORS,
 };
 

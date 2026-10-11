@@ -147,6 +147,20 @@ warning and returns `encrypted: false`.
 key/value store has neither, and several SQL engines expose indexes but no
 server-side `CREATE` statement.
 
+`DriverMeta.ddl_ops` (`proto >= 23`) declares the schema changes a dialect can
+be asked to **write out**: `add_column`, `rename_column`, `drop_column`,
+`create_index`, `drop_index`. Each is a template, exactly as `browse` and
+`time_filter` are, and for the same reason — the client holds every value, and a
+round trip to format a string is a round trip to format a string. What a client
+must not do is **invent the words**: standard SQL renames a column one way,
+MySQL before 8 wanted `CHANGE`, and SQL Server wants `sp_rename` with a quoted
+triple, so the words come from the driver.
+
+It is **generated, never run**. The statement goes into the editor to be read
+and changed first, and then runs through everything a statement runs through —
+the connection's policy, the classification, the audit log. A menu item that
+altered a table directly would be a schema change nobody reviewed.
+
 A column of `schema.columns` carries `references` (`proto >= 22`) when it is a
 **foreign key**: `{ table, schema?, column }`. It is the one thing about a
 column that a client cannot work out for itself — `customer_id` looks like a
