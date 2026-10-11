@@ -82,7 +82,7 @@ notification   {"method":"…","params":{…}}
 
 `proto` grows **additively**: a client accepts any engine reporting
 `proto >= its minimum`, so a newer engine keeps working with an older client.
-The current protocol is **17**. What each version added is listed in
+The current protocol is **18**. What each version added is listed in
 `src/rpc.rs` beside the constant.
 
 ### Handshake
@@ -165,6 +165,17 @@ Rows are buffered on the engine as they are pulled, so paging **backwards** is
 free and a cell's full value is always retrievable even when the grid truncated
 it. `query.release` drops a finished call's buffer; a client that keeps the last
 N calls alive gets an instant re-open of their results.
+
+Each column is `{ name, type, kind }`. `type` is the driver's own word for it;
+`kind` (`proto >= 18`) is which of eight things the values are — `timestamp`,
+`integer`, `float`, `text`, `bool`, `json`, `binary` or `unknown`. Eighteen
+drivers have eighteen vocabularies for the same eight ideas, and a client asking
+"can this column go on a time axis" should not have to know that `int8`,
+`BIGINT`, `Int64` and `NUMBER(38,0)` are one answer. It is derived from the type
+name in ONE table in the engine rather than filled in by each driver, so there
+is one answer rather than eighteen to keep in step; a driver that declares no
+type says `unknown` rather than guessing, and a client then has the values as
+before.
 
 ### Saved state (`proto >= 2`)
 

@@ -223,7 +223,7 @@ mod tests {
     fn named(names: &[&str]) -> Vec<Column> {
         names
             .iter()
-            .map(|n| Column { name: n.to_string(), type_name: String::new() })
+            .map(|n| Column { name: n.to_string(), type_name: String::new(), kind: String::new() })
             .collect()
     }
 
@@ -302,8 +302,8 @@ mod tests {
 
     fn cols() -> Vec<Column> {
         vec![
-            Column { name: "id".into(), type_name: "INTEGER".into() },
-            Column { name: "note".into(), type_name: "TEXT".into() },
+            Column { name: "id".into(), type_name: "INTEGER".into(), kind: "integer".into() },
+            Column { name: "note".into(), type_name: "TEXT".into(), kind: "text".into() },
         ]
     }
 

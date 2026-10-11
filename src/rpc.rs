@@ -162,7 +162,17 @@ use serde_json::json;
 ///     of being kept in it. The value travels the engine's stdin pipe, which
 ///     is the same path a literal credential already takes on `conn.connect`;
 ///     it is never written to the store, the audit log or an error message.
-pub const PROTO: u32 = 17;
+/// 18. Every result `Column` carries `kind`: what its values ARE, as opposed
+///     to what its driver calls them — `timestamp`, `integer`, `float`,
+///     `text`, `bool`, `json`, `binary` or `unknown`. Eighteen drivers have
+///     eighteen vocabularies for the same eight ideas, and a client deciding
+///     whether a column can go on a time axis should not have to learn
+///     `int8`, `BIGINT`, `Int64` and `NUMBER(38,0)`. Derived in ONE table from
+///     the type name rather than filled in by each driver, so there is one
+///     answer rather than eighteen; a driver that declares no type says
+///     `unknown` rather than guessing. Additive — a client that ignores it
+///     behaves exactly as before.
+pub const PROTO: u32 = 18;
 
 /// One decoded incoming request.
 #[derive(Debug, Deserialize)]

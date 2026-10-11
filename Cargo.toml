@@ -92,7 +92,11 @@ mongodb = { version = "3", optional = true }
 # rusqlite is NOT optional: besides the sqlite DRIVER it backs the engine's own
 # saved state (src/store.rs — connections, saved queries, history), which every
 # build has, so a --no-default-features engine still carries it.
-rusqlite = { version = "0.32", features = ["bundled"] }
+# `column_decltype` is what lets the SQLite driver report a column's DECLARED
+# type, which the engine then derives a `kind` from. Without it every column of
+# every SQLite query reads as `unknown` and a client is back to guessing from
+# the page. It is a feature of a dependency already here, not a new one.
+rusqlite = { version = "0.32", features = ["bundled", "column_decltype"] }
 duckdb = { version = "1", optional = true, features = ["bundled"] }
 # Redis (tokio async multiplexed connection).
 redis = { version = "0.27", optional = true, features = [

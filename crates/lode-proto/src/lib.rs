@@ -406,6 +406,15 @@ pub struct Column {
     pub name: String,
     #[serde(rename = "type", default)]
     pub type_name: String,
+    /// What the values ARE, as opposed to what the driver calls them:
+    /// `timestamp`, `integer`, `float`, `text`, `bool`, `json`, `binary` or
+    /// `unknown` (`proto >= 18`).
+    ///
+    /// Empty from an older engine, which is why nothing here may require it:
+    /// everything that reads it falls back to deciding from the values, which
+    /// is what this client did before the field existed.
+    #[serde(default)]
+    pub kind: String,
 }
 
 /// One column of an object, as `schema.columns` returns it.

@@ -80,6 +80,19 @@ impl ChartShape {
         }
         let numeric: Vec<usize> = (0..columns.len())
             .filter(|&i| {
+                // The ENGINE's word first, where it says one (`proto >= 18`):
+                // a column the driver declares as a number is a measurement
+                // even on a page where every row happens to be NULL, and a
+                // column declared as text is not one even if this page holds
+                // nothing but digits.
+                match columns[i].kind.as_str() {
+                    "integer" | "float" => return true,
+                    // `unknown` is not an answer, so it falls through to the
+                    // values — which is what this did before the field
+                    // existed, and what an older engine still gets.
+                    "" | "unknown" => {}
+                    _ => return false,
+                }
                 // A column counts as numeric when every value in it that is not
                 // NULL is a number. One stray string means the column is not a
                 // measurement, and drawing it as one would invent a zero.
@@ -1797,6 +1810,45 @@ mod tests {
         assert_eq!(super::respawn_delay(3), None, "a fourth try is a spawn storm");
     }
 
+    /// The ENGINE's word about a column beats what one page of it looks like.
+    ///
+    /// Two ways to be wrong without it. A declared number whose first page is
+    /// all NULL would not be offered as a measurement, because nothing on the
+    /// page is a number; and a text column holding digits — a version string,
+    /// a postcode — would be, because everything on the page parses. The
+    /// engine knows which it is, and says so from `proto >= 18`.
+    #[test]
+    fn a_declared_type_beats_what_the_page_happens_to_hold() {
+        let c = |name: &str, kind: &str| Column {
+            name: name.into(),
+            type_name: String::new(),
+            kind: kind.into(),
+        };
+        // A number declared, and a page with nothing in it.
+        let cols = vec![c("label", "text"), c("n", "integer")];
+        let rows = vec![vec![json!("a"), Value::Null], vec![json!("b"), Value::Null]];
+        let shape = ChartShape::of(&cols, &rows).expect("the declared number is a measurement");
+        assert_eq!(shape.values, vec![1]);
+        assert_eq!(shape.label, 0);
+
+        // Digits in a text column are still text.
+        let cols = vec![c("version", "text"), c("n", "float")];
+        let rows = vec![vec![json!("8"), json!(1.5)]];
+        let shape = ChartShape::of(&cols, &rows).unwrap();
+        assert_eq!(shape.values, vec![1], "a version string is not a measurement");
+
+        // An engine that says nothing leaves it to the values, exactly as
+        // before the field existed.
+        let old = vec![c("a", ""), c("b", "")];
+        let rows = vec![vec![json!("x"), json!(3)]];
+        let shape = ChartShape::of(&old, &rows).unwrap();
+        assert_eq!(shape.values, vec![1]);
+        // And so does `unknown`, which is not an answer.
+        let dunno = vec![c("a", "unknown"), c("b", "unknown")];
+        let shape = ChartShape::of(&dunno, &rows).unwrap();
+        assert_eq!(shape.values, vec![1]);
+    }
+
     /// A script that prints forever does not grow the window forever.
     ///
     /// The OLDEST go, because the newest are the ones somebody is watching —
@@ -2548,8 +2600,8 @@ mod tests {
         let m = meta("mongodb", false, true);
         let mut t = Tab::new(1, "c".into(), "mongodb".into(), "x".into(), Some(&m));
         t.columns = vec![
-            Column { name: "name".into(), type_name: String::new() },
-            Column { name: "_document".into(), type_name: "json".into() },
+            Column { name: "name".into(), type_name: String::new(), kind: String::new() },
+            Column { name: "_document".into(), type_name: "json".into(), kind: "json".into() },
         ];
         t.rows = vec![vec![json!("ada"), json!("{\"name\":\"ada\",\"deep\":{\"x\":1}}")]];
         let doc = t.document(0);
@@ -2564,8 +2616,8 @@ mod tests {
         let m = meta("postgres", true, false);
         let mut t = Tab::new(1, "c".into(), "postgres".into(), "x".into(), Some(&m));
         t.columns = vec![
-            Column { name: "id".into(), type_name: "int4".into() },
-            Column { name: "note".into(), type_name: "text".into() },
+            Column { name: "id".into(), type_name: "int4".into(), kind: "integer".into() },
+            Column { name: "note".into(), type_name: "text".into(), kind: "text".into() },
         ];
         t.rows = vec![vec![json!(1), Value::Null]];
         assert_eq!(t.document(0), json!({ "id": 1, "note": null }));
@@ -2800,7 +2852,7 @@ mod tests {
     }
 
     fn col(name: &str) -> Column {
-        Column { name: name.into(), type_name: String::new() }
+        Column { name: name.into(), type_name: String::new(), kind: String::new() }
     }
 
     #[test]

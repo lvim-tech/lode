@@ -206,6 +206,14 @@ send "{\"id\":5,\"method\":\"query.page\",\"params\":{\"call_id\":$CALL,\"from\"
 PAGE=$(await '.id == 5')
 check "page ready" "$(printf '%s' "$PAGE" | jq -r '.result.ready')" "true"
 check "page columns" "$(printf '%s' "$PAGE" | jq -r '[.result.columns[].name] | join(",")')" "id,name"
+# And what each column's values ARE, not only what the driver calls them. The
+# table is `t(id INTEGER PRIMARY KEY, name TEXT)`, and the kind is derived in
+# ONE table in the engine rather than by each driver — a client asking "can
+# this go on a time axis" should not have to learn eighteen vocabularies.
+check "columns say their kind" \
+    "$(printf '%s' "$PAGE" | jq -r '[.result.columns[].kind] | join(",")')" "integer,text"
+check "and the driver's own word is still there" \
+    "$(printf '%s' "$PAGE" | jq -r '.result.columns[0].type')" "INTEGER"
 check "page rows" "$(printf '%s' "$PAGE" | jq -r '.result.rows | length')" "2"
 check "page has_more" "$(printf '%s' "$PAGE" | jq -r '.result.has_more')" "true"
 report "first row" "$(printf '%s' "$PAGE" | jq -c '.result.rows[0]')"

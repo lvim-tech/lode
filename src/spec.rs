@@ -769,8 +769,76 @@ pub enum TunnelAuth {
 
 // ── result model (uniform across every driver) ───────────────────────────────
 
+/// What a column's values ARE, as opposed to what its driver calls them.
+///
+/// Eighteen drivers have eighteen vocabularies for the same eight ideas:
+/// `int8`, `BIGINT`, `Int64` and `NUMBER(38,0)` are one kind, and a client that
+/// wants to know whether it can put a column on a time axis should not have to
+/// learn all four. So the engine says which of the eight it is.
+///
+/// Derived from the TYPE NAME rather than filled in by each driver, and in one
+/// table rather than eighteen: the names are the drivers' own words, one table
+/// can be read and tested at once, and a driver that declares nothing — SQLite
+/// often, Mongo always — gets `unknown` instead of a guess. A client that
+/// wants more than this still has the values.
+pub fn kind_of(type_name: &str) -> &'static str {
+    let t = type_name.trim().to_ascii_lowercase();
+    if t.is_empty() {
+        return "unknown";
+    }
+    // The part before a size or a precision: `varchar(255)`, `numeric(38,0)`,
+    // `Nullable(Int64)` — the inside of a ClickHouse wrapper is the type, so
+    // the brackets are peeled rather than cut.
+    let bare = t
+        .trim_start_matches("nullable(")
+        .trim_start_matches("lowcardinality(")
+        .trim_end_matches(')');
+    let head = bare.split(['(', '[', '<', ' ']).next().unwrap_or(bare);
+    // ORDER MATTERS: `timestamp` must be met before `time`, and `datetime64`
+    // before `date`, or a timestamp column would be filed as a date.
+    const TIMESTAMP: &[&str] = &[
+        "timestamp", "timestamptz", "datetime", "datetime2", "datetime64", "smalldatetime",
+        "date", "time", "timetz", "datetimeoffset", "interval", "year",
+    ];
+    const INTEGER: &[&str] = &[
+        "int", "int2", "int4", "int8", "int16", "int32", "int64", "int128", "int256", "integer",
+        "smallint", "bigint", "tinyint", "mediumint", "serial", "serial2", "serial4", "serial8",
+        "smallserial", "bigserial", "uint8", "uint16", "uint32", "uint64", "uint128", "uint256",
+        "long", "counter", "number", "hugeint", "ubigint", "usmallint", "utinyint", "uinteger",
+    ];
+    const FLOAT: &[&str] = &[
+        "float", "float4", "float8", "float32", "float64", "double", "real", "numeric",
+        "decimal", "money", "smallmoney", "dec", "fixed",
+    ];
+    const BOOL: &[&str] = &["bool", "boolean", "bit"];
+    const JSON: &[&str] = &["json", "jsonb", "document", "object", "map", "variant"];
+    const BINARY: &[&str] =
+        &["bytea", "blob", "binary", "varbinary", "bytes", "image", "fixedstring", "raw"];
+    const TEXT: &[&str] = &[
+        "text", "varchar", "char", "nchar", "nvarchar", "ntext", "character", "string", "uuid",
+        "name", "citext", "clob", "enum", "set", "inet", "cidr", "macaddr", "xml", "ascii",
+        "varchar2", "nvarchar2", "lowcardinality",
+    ];
+    for (names, kind) in [
+        (TIMESTAMP, "timestamp"),
+        (INTEGER, "integer"),
+        (FLOAT, "float"),
+        (BOOL, "bool"),
+        (JSON, "json"),
+        (BINARY, "binary"),
+        (TEXT, "text"),
+    ] {
+        if names.contains(&head) {
+            return kind;
+        }
+    }
+    // A name nothing matched: `unknown`, not `text`. Calling an unrecognised
+    // type text is how a client ends up charting a geometry column.
+    "unknown"
+}
+
 /// One result column.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct Column {
     pub name: String,
     /// What the engine calls this column's type, or empty when it does not say.
@@ -782,6 +850,23 @@ pub struct Column {
     /// decided from the VALUES rather than from this.
     #[serde(rename = "type", default)]
     pub type_name: String,
+}
+
+/// Written by hand, so `kind` goes out beside the type without every driver
+/// having to fill it in.
+///
+/// Eighteen drivers build this struct, several of them in two places. Adding a
+/// field would have meant touching all of them and giving each one a chance to
+/// disagree about what `int8` is; deriving it here means one answer.
+impl Serialize for Column {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeStruct;
+        let mut o = s.serialize_struct("Column", 3)?;
+        o.serialize_field("name", &self.name)?;
+        o.serialize_field("type", &self.type_name)?;
+        o.serialize_field("kind", kind_of(&self.type_name))?;
+        o.end()
+    }
 }
 
 /// One column of a browsable OBJECT — what the drawer's `Columns` facet lists.
@@ -1150,6 +1235,74 @@ impl Serialize for Value {
 
 #[cfg(test)]
 mod tests {
+
+    /// Eighteen vocabularies, eight ideas.
+    ///
+    /// The point of `kind_of` is that a client asking "can this go on a time
+    /// axis" does not have to know that Postgres says `timestamptz`, MySQL
+    /// `datetime`, ClickHouse `DateTime64(3)` and SQL Server
+    /// `datetimeoffset`. Each line here is one of those words from a real
+    /// driver.
+    #[test]
+    fn one_kind_for_every_name_the_drivers_use() {
+        use super::kind_of;
+        for t in [
+            "timestamp",
+            "timestamptz",
+            "timestamp with time zone",
+            "DateTime64(3)",
+            "datetimeoffset",
+            "DATE",
+            "time",
+            "interval",
+        ] {
+            assert_eq!(kind_of(t), "timestamp", "{t}");
+        }
+        for t in ["int4", "BIGINT", "Int64", "smallserial", "tinyint", "NUMBER", "UInt8"] {
+            assert_eq!(kind_of(t), "integer", "{t}");
+        }
+        for t in ["float8", "double precision", "Float32", "numeric(38,2)", "money", "REAL"] {
+            assert_eq!(kind_of(t), "float", "{t}");
+        }
+        for t in ["bool", "BOOLEAN", "bit"] {
+            assert_eq!(kind_of(t), "bool", "{t}");
+        }
+        for t in ["json", "jsonb", "Map(String, UInt64)", "variant"] {
+            assert_eq!(kind_of(t), "json", "{t}");
+        }
+        for t in ["bytea", "BLOB", "varbinary(max)", "FixedString(16)"] {
+            assert_eq!(kind_of(t), "binary", "{t}");
+        }
+        for t in ["text", "varchar(255)", "uuid", "NVARCHAR(50)", "String", "citext"] {
+            assert_eq!(kind_of(t), "text", "{t}");
+        }
+        // A WRAPPER is peeled rather than cut: the inside is the type.
+        assert_eq!(kind_of("Nullable(Int64)"), "integer");
+        assert_eq!(kind_of("LowCardinality(String)"), "text");
+        // Nothing declared is UNKNOWN, and so is a name nothing matched:
+        // calling an unrecognised type text is how a client charts a geometry
+        // column.
+        assert_eq!(kind_of(""), "unknown");
+        assert_eq!(kind_of("   "), "unknown");
+        assert_eq!(kind_of("geometry"), "unknown");
+        assert_eq!(kind_of("tsvector"), "unknown");
+        // ORDER: `timestamp` before `time`, `datetime64` before `date`.
+        assert_eq!(kind_of("timestamp"), "timestamp");
+        assert_eq!(kind_of("DateTime64"), "timestamp");
+    }
+
+    /// The kind goes out WITH the column, without eighteen drivers filling it.
+    #[test]
+    fn a_column_says_its_kind_on_the_wire() {
+        let c = super::Column { name: "ts".into(), type_name: "timestamptz".into() };
+        let v = serde_json::to_value(&c).unwrap();
+        assert_eq!(v["name"], serde_json::json!("ts"));
+        assert_eq!(v["type"], serde_json::json!("timestamptz"));
+        assert_eq!(v["kind"], serde_json::json!("timestamp"));
+        // And a driver that declares nothing says so rather than guessing.
+        let bare = super::Column { name: "x".into(), type_name: String::new() };
+        assert_eq!(serde_json::to_value(&bare).unwrap()["kind"], serde_json::json!("unknown"));
+    }
 
     /// A field is drawn from what the driver DECLARES, not from its key.
     ///

@@ -236,12 +236,25 @@ impl SqliteConnection {
                 return Ok((Vec::new(), Vec::new(), Some(conn.changes())));
             }
             let mut stmt = stmt;
+            // The DECLARED type, where SQLite has one.
+            //
+            // It said nothing at all before, which was defensible while the
+            // type was only ever shown — SQLite's types are advisory, and a
+            // column declared INTEGER can hold a string. It is not defensible
+            // now that the engine derives a `kind` from it: saying nothing
+            // means every column of every SQLite query reads as `unknown`,
+            // and a client that could have put a declared INTEGER on a value
+            // axis has to go back to guessing from the page.
+            //
+            // `decl_type` is None for an expression (`COUNT(*)`, `a + b`),
+            // which is correct: that column has no declared type, and an
+            // empty string is how this struct says so.
             let columns: Vec<Column> = stmt
-                .column_names()
-                .into_iter()
-                .map(|n| Column {
-                    name: n.to_string(),
-                    type_name: String::new(),
+                .columns()
+                .iter()
+                .map(|c| Column {
+                    name: c.name().to_string(),
+                    type_name: c.decl_type().unwrap_or_default().to_string(),
                 })
                 .collect();
             let mut out: Vec<Vec<Value>> = Vec::new();
