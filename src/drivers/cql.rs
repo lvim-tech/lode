@@ -92,6 +92,7 @@ const CASSANDRA_META: DriverMeta = DriverMeta {
     browse_form: crate::spec::SQL_BROWSE_FORM,
     time_filter: crate::spec::SQL_TIME_FILTER,
     builder_ops: CQL_BUILDER_OPS,
+    inspectors: &[],
 };
 
 const SCYLLA_META: DriverMeta = DriverMeta {
@@ -109,6 +110,7 @@ const SCYLLA_META: DriverMeta = DriverMeta {
     browse_form: crate::spec::SQL_BROWSE_FORM,
     time_filter: crate::spec::SQL_TIME_FILTER,
     builder_ops: CQL_BUILDER_OPS,
+    inspectors: &[],
 };
 
 /// The CQL driver, serving both the `cassandra` and `scylla` kinds.

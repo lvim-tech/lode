@@ -94,7 +94,22 @@ const PG_META: DriverMeta = DriverMeta {
     browse_form: crate::spec::SQL_BROWSE_FORM,
     time_filter: crate::spec::SQL_TIME_FILTER,
     builder_ops: PG_BUILDER_OPS,
+    inspectors: PG_INSPECTORS,
 };
+
+/// What a PostgreSQL server will say about itself, live.
+///
+/// Both are reads of the statistics views. `activity` can also TERMINATE a
+/// session, which is `pg_terminate_backend` and nothing else — the one
+/// destructive thing these views are for.
+const PG_INSPECTORS: &[crate::spec::Inspector] = &[
+    crate::spec::Inspector {
+        name: "activity",
+        label: "Who is connected",
+        act: "terminate",
+    },
+    crate::spec::Inspector { name: "locks", label: "What is locked", act: "" },
+];
 
 #[cfg(feature = "cockroachdb")]
 const CRDB_META: DriverMeta = DriverMeta {
@@ -112,6 +127,9 @@ const CRDB_META: DriverMeta = DriverMeta {
     browse_form: crate::spec::SQL_BROWSE_FORM,
     time_filter: crate::spec::SQL_TIME_FILTER,
     builder_ops: PG_BUILDER_OPS,
+    // The same wire, so the same statistics views: this IS the postgres driver
+    // underneath, and a view that works through it works through the alias.
+    inspectors: PG_INSPECTORS,
 };
 
 /// Amazon Redshift, which speaks the PostgreSQL wire protocol.
@@ -147,6 +165,9 @@ const REDSHIFT_META: DriverMeta = DriverMeta {
     browse_form: crate::spec::SQL_BROWSE_FORM,
     time_filter: crate::spec::SQL_TIME_FILTER,
     builder_ops: PG_BUILDER_OPS,
+    // The same wire, so the same statistics views: this IS the postgres driver
+    // underneath, and a view that works through it works through the alias.
+    inspectors: PG_INSPECTORS,
 };
 
 /// The Postgres-wire driver. One impl serves the `postgres`, `cockroachdb` and
@@ -435,6 +456,65 @@ impl Connection for PgConnection {
             }
         }
         Ok(schemas)
+    }
+
+    /// `pg_stat_activity` and `pg_locks`, as tables.
+    ///
+    /// Read as they are rather than summarised: this is the view somebody
+    /// opens to answer "what is that query doing and whose is it", and a
+    /// summary would be the answer to a different question.
+    ///
+    /// UNVERIFIED against a server, like `metrics` below: written from the
+    /// documented shape of the views. Both are reads, and a wrong column name
+    /// shows as an error in the panel rather than as wrong numbers.
+    async fn inspect(
+        &mut self,
+        name: &str,
+    ) -> anyhow::Result<(Vec<Column>, Vec<Vec<Value>>)> {
+        let sql = match name {
+            // `pid` FIRST, because that is the key `act` is given — a view
+            // whose key is not in it cannot be acted on from the row.
+            "activity" => {
+                "SELECT pid, usename AS user, application_name AS application,                  client_addr::text AS client, state,                  to_char(now() - query_start, 'HH24:MI:SS') AS running_for,                  wait_event_type AS waiting_on, left(query, 200) AS query                  FROM pg_stat_activity                  WHERE datname = current_database()                  ORDER BY query_start NULLS LAST"
+            }
+            "locks" => {
+                "SELECT l.pid, l.locktype AS kind, l.mode, l.granted,                  coalesce(c.relname, '') AS relation, a.usename AS user,                  left(a.query, 200) AS query                  FROM pg_locks l                  LEFT JOIN pg_class c ON c.oid = l.relation                  LEFT JOIN pg_stat_activity a ON a.pid = l.pid                  ORDER BY l.granted, l.pid"
+            }
+            other => anyhow::bail!("this driver has no live view called '{other}'"),
+        };
+        let (columns, rows, _) = self.simple(sql).await?;
+        Ok((columns, rows))
+    }
+
+    /// Terminate a session, by its backend pid.
+    ///
+    /// `pg_terminate_backend` rather than `pg_cancel_backend`: the view offers
+    /// "terminate", and cancelling a statement while leaving the session open
+    /// is a different act with a different name. Doing the gentler thing under
+    /// the harsher word would be lying about what was done.
+    async fn act(&mut self, name: &str, key: &str) -> anyhow::Result<String> {
+        if name != "activity" {
+            anyhow::bail!("nothing can be done to a row of '{name}'");
+        }
+        // The key comes back from a row this engine itself produced, but it is
+        // going into a statement, so it is checked rather than trusted: a pid
+        // is digits.
+        let pid: i64 = key
+            .trim()
+            .parse()
+            .map_err(|_| anyhow::anyhow!("a backend id is a number, not {key:?}"))?;
+        let (_, rows, _) = self
+            .simple(&format!("SELECT pg_terminate_backend({pid})"))
+            .await?;
+        let ok = matches!(rows.first().and_then(|r| r.first()), Some(Value::Bool(true)))
+            || matches!(rows.first().and_then(|r| r.first()), Some(Value::Text(t)) if t == "t");
+        Ok(if ok {
+            format!("terminated backend {pid}")
+        } else {
+            // It answers false when the pid is already gone, which is not a
+            // failure and must not be reported as success either.
+            format!("backend {pid} was not there to terminate")
+        })
     }
 
     async fn metrics(&mut self) -> anyhow::Result<Vec<crate::spec::Metric>> {

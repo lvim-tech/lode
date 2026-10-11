@@ -147,6 +147,31 @@ warning and returns `encrypted: false`.
 key/value store has neither, and several SQL engines expose indexes but no
 server-side `CREATE` statement.
 
+### The server itself
+
+| method | params | result |
+|---|---|---|
+| `instance.metrics` | `{ conn_id }` | `{ metrics }` — `{ group, name, value }` each |
+| `instance.inspect` | `{ conn_id, name }` | `{ columns, rows }` (`proto >= 20`) |
+| `instance.action` | `{ conn_id, name, key, confirm }` | `{ applied, what, dangerous, reason }`, then `{ applied, detail }` |
+
+`metrics` is numbers about the server; an **inspector** is a live TABLE of what
+it is doing — who is connected, what is locked, what is running. Which ones
+exist is `DriverMeta.inspectors`, declared per driver and never guessed at:
+`pg_stat_activity`, `SHOW PROCESSLIST`, `currentOp` and `CLIENT LIST` are four
+shapes with four names, and an engine with nothing to show says so with an
+empty list. The first column of every view is the key — the backend pid, the
+connection id, the opid, the client address — so that acting on a row is not a
+guess about which column identifies it.
+
+`instance.action` is **two-step**, like `row.write`: without `confirm` it says
+what it would do and nothing happens. Ending somebody else's session rolls back
+whatever they were in the middle of, which is not something to do on one click
+in a list that refreshes every five seconds. Both steps are audited, because
+"who ended that session" is the question asked immediately afterwards, and a
+**read-only** connection refuses it — it changes no data, but it stops another
+person's work, which is what read-only is for.
+
 ### Queries
 
 | method | params | result |

@@ -178,7 +178,16 @@ use serde_json::json;
 ///     client can save a kind this engine never heard of. Additive: a client
 ///     that sends none keeps the empty string, which means "the client's
 ///     default".
-pub const PROTO: u32 = 19;
+/// 20. Live views of a server. `DriverMeta.inspectors` declares them —
+///     `pg_stat_activity`, `SHOW PROCESSLIST`, `currentOp`, `CLIENT LIST` —
+///     `instance.inspect {conn_id, name}` returns one as `{columns, rows}`,
+///     and `instance.action {conn_id, name, key, confirm}` acts on a row.
+///     Declared per driver rather than guessed at, because the four
+///     catalogues have nothing in common; empty where an engine has nothing
+///     to show. The action is two-step like `row.write` and audited either
+///     way: ending somebody's session rolls back what they were doing, and
+///     "who ended that session" is the question asked straight afterwards.
+pub const PROTO: u32 = 20;
 
 /// One decoded incoming request.
 #[derive(Debug, Deserialize)]

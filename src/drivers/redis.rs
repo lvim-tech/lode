@@ -89,7 +89,20 @@ const META: DriverMeta = DriverMeta {
     browse_form: &[],
     time_filter: "",
     builder_ops: &[],
+    inspectors: REDIS_INSPECTORS,
 };
+
+/// What a Redis server will say about itself, live.
+///
+/// `CLIENT LIST` answers "who is connected and what are they doing", and
+/// `CLIENT KILL` is what disconnects one. The reply is field=value pairs per
+/// line, so it is parsed into columns here rather than shown as one long
+/// string — a page somebody has to read with their finger is not a view.
+const REDIS_INSPECTORS: &[crate::spec::Inspector] = &[crate::spec::Inspector {
+    name: "clients",
+    label: "Who is connected",
+    act: "terminate",
+}];
 
 /// The Redis driver.
 pub struct RedisDriver;
@@ -391,6 +404,99 @@ impl Connection for RedisConnection {
     async fn columns(&mut self, _obj: &ObjRef) -> anyhow::Result<Vec<TableColumn>> {
         // A key/value store has no columns to describe, and therefore no key to address a "row" by.
         Ok(Vec::new())
+    }
+
+    /// `CLIENT LIST`, parsed into columns.
+    ///
+    /// The reply is one line per client, each line `field=value` pairs
+    /// separated by spaces. Only the fields worth reading at a glance are kept
+    /// — all of them would be twenty columns and the useful four are the same
+    /// four every time.
+    ///
+    /// UNVERIFIED against a server, like `metrics` below: written from the
+    /// documented shape of the reply.
+    async fn inspect(
+        &mut self,
+        name: &str,
+    ) -> anyhow::Result<(Vec<Column>, Vec<Vec<Value>>)> {
+        if name != "clients" {
+            anyhow::bail!("this driver has no live view called '{name}'");
+        }
+        let reply = self.command(&["CLIENT".to_string(), "LIST".to_string()]).await?;
+        let text = match reply {
+            RValue::BulkString(b) => String::from_utf8_lossy(&b).to_string(),
+            RValue::SimpleString(s) => s,
+            other => format!("{other:?}"),
+        };
+        // `addr` FIRST, because that is the key `act` is handed: Redis kills a
+        // client by its address, not by the numeric id.
+        let want = ["addr", "id", "name", "age", "idle", "db", "cmd"];
+        let columns = want
+            .iter()
+            .map(|c| Column { name: c.to_string(), type_name: String::new() })
+            .collect();
+        let mut rows = Vec::new();
+        for line in text.lines().filter(|l| !l.trim().is_empty()) {
+            let mut got: std::collections::BTreeMap<&str, &str> = Default::default();
+            for pair in line.split(' ') {
+                if let Some((k, v)) = pair.split_once('=') {
+                    got.insert(k, v);
+                }
+            }
+            rows.push(
+                want.iter()
+                    .map(|k| match got.get(k) {
+                        // A number stays a number, so the grid can sort by it:
+                        // an age of "9" and an age of "100" sort the wrong way
+                        // round as text.
+                        Some(v) => match v.parse::<i64>() {
+                            Ok(n) if matches!(*k, "id" | "age" | "idle" | "db") => Value::Int(n),
+                            _ => Value::Text(v.to_string()),
+                        },
+                        None => Value::Null,
+                    })
+                    .collect(),
+            );
+        }
+        Ok((columns, rows))
+    }
+
+    /// Disconnect a client, by its address.
+    ///
+    /// `CLIENT KILL ADDR <addr>` — the address, because that is the form every
+    /// Redis since 2.8.12 understands, where `ID` arrived later. The address
+    /// comes back from a row this server itself produced and goes out as an
+    /// ARGUMENT rather than as text in a command line, so there is nothing for
+    /// it to be injected into.
+    async fn act(&mut self, name: &str, key: &str) -> anyhow::Result<String> {
+        if name != "clients" {
+            anyhow::bail!("nothing can be done to a row of '{name}'");
+        }
+        let addr = key.trim();
+        if addr.is_empty() {
+            anyhow::bail!("that row carries no address to kill");
+        }
+        let reply = self
+            .command(&[
+                "CLIENT".to_string(),
+                "KILL".to_string(),
+                "ADDR".to_string(),
+                addr.to_string(),
+            ])
+            .await?;
+        // It answers with a COUNT of clients killed, and zero is not a
+        // failure — the client had already gone — but it is not a success
+        // either, and saying so is the difference.
+        let killed = match reply {
+            RValue::Int(n) => n,
+            RValue::SimpleString(ref s) if s == "OK" => 1,
+            _ => 0,
+        };
+        Ok(if killed > 0 {
+            format!("disconnected {addr}")
+        } else {
+            format!("{addr} was not there to disconnect")
+        })
     }
 
     async fn metrics(&mut self) -> anyhow::Result<Vec<crate::spec::Metric>> {

@@ -142,7 +142,21 @@ const MONGO_META: DriverMeta = DriverMeta {
     browse_form: &[],
     time_filter: "{\"{col}\": {\"$gte\": {\"$date\": \"{from}\"}, \"$lt\": {\"$date\": \"{to}\"}}}",
     builder_ops: &[],
+    inspectors: MONGO_INSPECTORS,
 };
+
+/// What a MongoDB server will say about itself, live.
+///
+/// `currentOp` is the one that answers "what is running and whose is it", and
+/// `killOp` is what stops one. Both need `clusterMonitor`/`killop` rights, and
+/// a server that refuses them says so in the panel rather than here: whether
+/// this user may is the SERVER's answer, not something to guess from the
+/// connection.
+const MONGO_INSPECTORS: &[crate::spec::Inspector] = &[crate::spec::Inspector {
+    name: "currentop",
+    label: "What is running",
+    act: "terminate",
+}];
 
 /// The MongoDB driver.
 pub struct MongoDriver;
@@ -526,6 +540,80 @@ fn bson_key_suffix(v: &Bson) -> String {
 
 #[async_trait]
 impl Connection for MongoConnection {
+    /// `currentOp`, as a table of operations.
+    ///
+    /// Run against the ADMIN database, which is where the command lives — the
+    /// connection's own database would answer "no such command" and that reads
+    /// as a broken client rather than as a missing right.
+    ///
+    /// UNVERIFIED against a server: written from the documented shape of the
+    /// reply. It is a read, and a wrong field name shows as an empty column
+    /// rather than as a wrong number.
+    async fn inspect(
+        &mut self,
+        name: &str,
+    ) -> anyhow::Result<(Vec<Column>, Vec<Vec<Value>>)> {
+        if name != "currentop" {
+            anyhow::bail!("this driver has no live view called '{name}'");
+        }
+        let reply = self
+            .client
+            .database("admin")
+            .run_command(mongodb::bson::doc! { "currentOp": 1 })
+            .await
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        let ops = reply.get_array("inprog").map(|a| a.to_vec()).unwrap_or_default();
+        // `opid` FIRST, because that is the key `act` is handed. The rest are
+        // the fields worth reading at a glance; the whole document is one
+        // `db.currentOp()` away for anybody who wants it.
+        let cols = ["opid", "op", "ns", "secs_running", "client", "appName", "desc"];
+        let columns = cols
+            .iter()
+            .map(|c| Column { name: c.to_string(), type_name: String::new() })
+            .collect();
+        let rows = ops
+            .iter()
+            .filter_map(|o| o.as_document())
+            .map(|d| {
+                cols.iter()
+                    .map(|c| match d.get(c) {
+                        Some(Bson::Int32(i)) => Value::Int(*i as i64),
+                        Some(Bson::Int64(i)) => Value::Int(*i),
+                        Some(Bson::Double(f)) => Value::Float(*f),
+                        Some(Bson::Boolean(b)) => Value::Bool(*b),
+                        Some(Bson::String(s)) => Value::Text(s.clone()),
+                        Some(Bson::Null) | None => Value::Null,
+                        Some(other) => Value::Text(other.to_string()),
+                    })
+                    .collect()
+            })
+            .collect();
+        Ok((columns, rows))
+    }
+
+    /// Stop an operation, by its opid.
+    ///
+    /// The opid is passed back AS THE SERVER GAVE IT: mongo's opids are not
+    /// always numbers (a sharded cluster's carry a shard name), so parsing it
+    /// as one would refuse exactly the rows where terminating matters most.
+    /// It is a value in a document rather than text in a statement, so there
+    /// is nothing for it to be injected into.
+    async fn act(&mut self, name: &str, key: &str) -> anyhow::Result<String> {
+        if name != "currentop" {
+            anyhow::bail!("nothing can be done to a row of '{name}'");
+        }
+        let op: Bson = match key.trim().parse::<i64>() {
+            Ok(n) => Bson::Int64(n),
+            Err(_) => Bson::String(key.trim().to_string()),
+        };
+        self.client
+            .database("admin")
+            .run_command(mongodb::bson::doc! { "killOp": 1, "op": op })
+            .await
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        Ok(format!("asked the server to kill op {}", key.trim()))
+    }
+
     async fn databases(&mut self) -> anyhow::Result<Vec<String>> {
         self.client
             .list_database_names()

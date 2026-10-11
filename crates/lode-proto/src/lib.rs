@@ -121,6 +121,26 @@ pub struct DriverMeta {
     /// is the right answer for both: no time filter here.
     #[serde(default)]
     pub time_filter: String,
+    /// The live views this engine can be asked about (`proto >= 20`): who is
+    /// connected, what is locked, what is running.
+    ///
+    /// Empty from an older engine, and empty for an engine that has nothing to
+    /// show — which is the honest answer for SQLite. Nothing may be guessed
+    /// from the driver's name: the catalogues have nothing in common, and a
+    /// client that guessed would ask for a view that is not there.
+    #[serde(default)]
+    pub inspectors: Vec<Inspector>,
+}
+
+/// One live view a driver offers.
+#[derive(Debug, Clone, Deserialize)]
+pub struct Inspector {
+    pub name: String,
+    pub label: String,
+    /// What acting on a row does, as a word a person reads — `terminate`, or
+    /// empty where nothing can be done.
+    #[serde(default)]
+    pub act: String,
 }
 
 /// One input of a structured query bar, as the engine declares it.

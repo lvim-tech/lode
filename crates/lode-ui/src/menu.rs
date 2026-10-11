@@ -268,7 +268,7 @@ pub fn page_tsv(columns: &[String], rows: &[Vec<Value>]) -> String {
 /// A tab or a newline INSIDE a value would break the format it is being put
 /// into, so they become spaces. Lossy, and deliberately: a paste that moves a
 /// column over by one is worse than a paste that loses a line break.
-fn cell_text(v: &Value) -> String {
+pub fn cell_text(v: &Value) -> String {
     let raw = match v {
         Value::Null => String::new(),
         Value::String(s) => s.clone(),

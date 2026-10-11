@@ -77,6 +77,7 @@ const MARIADB_META: DriverMeta = DriverMeta {
     browse_form: crate::spec::SQL_BROWSE_FORM,
     time_filter: crate::spec::SQL_TIME_FILTER,
     builder_ops: crate::spec::SQL_BUILDER_OPS,
+    inspectors: MY_INSPECTORS,
 };
 
 const MYSQL_META: DriverMeta = DriverMeta {
@@ -94,7 +95,20 @@ const MYSQL_META: DriverMeta = DriverMeta {
     browse_form: crate::spec::SQL_BROWSE_FORM,
     time_filter: crate::spec::SQL_TIME_FILTER,
     builder_ops: crate::spec::SQL_BUILDER_OPS,
+    inspectors: MY_INSPECTORS,
 };
+
+/// What a MySQL or MariaDB server will say about itself, live.
+///
+/// One view, not two: `information_schema.processlist` already carries the
+/// state and what each connection is waiting on, and MySQL has no lock view
+/// readable without `performance_schema` being turned on — offering a page
+/// that is empty on most servers would be offering a page that looks broken.
+const MY_INSPECTORS: &[crate::spec::Inspector] = &[crate::spec::Inspector {
+    name: "processlist",
+    label: "Who is connected",
+    act: "terminate",
+}];
 
 /// The MySQL-wire driver, serving both the `mariadb` and `mysql` kinds.
 pub struct MysqlDriver {
@@ -283,6 +297,49 @@ impl MysqlConnection {
 
 #[async_trait]
 impl Connection for MysqlConnection {
+    /// `information_schema.processlist`, as a table.
+    ///
+    /// UNVERIFIED against a server: written from the documented shape of the
+    /// view. It is a read, and a wrong column name shows as an error in the
+    /// panel rather than as wrong numbers.
+    async fn inspect(
+        &mut self,
+        name: &str,
+    ) -> anyhow::Result<(Vec<Column>, Vec<Vec<Value>>)> {
+        if name != "processlist" {
+            anyhow::bail!("this driver has no live view called '{name}'");
+        }
+        // `ID` first, because that is the key `act` is handed.
+        let (columns, rows, _) = self
+            .run(
+                "SELECT ID, USER AS user, HOST AS host, DB AS db, COMMAND AS command, \
+                 TIME AS seconds, STATE AS state, LEFT(COALESCE(INFO, ''), 200) AS query \
+                 FROM information_schema.processlist ORDER BY TIME DESC",
+            )
+            .await?;
+        Ok((columns, rows))
+    }
+
+    /// Terminate a connection, by its id.
+    ///
+    /// `KILL CONNECTION` rather than `KILL QUERY`: the view offers "terminate",
+    /// and stopping the statement while leaving the connection open is a
+    /// different act with its own name.
+    async fn act(&mut self, name: &str, key: &str) -> anyhow::Result<String> {
+        if name != "processlist" {
+            anyhow::bail!("nothing can be done to a row of '{name}'");
+        }
+        // Checked rather than trusted, because it goes into a statement.
+        let id: u64 = key
+            .trim()
+            .parse()
+            .map_err(|_| anyhow::anyhow!("a connection id is a number, not {key:?}"))?;
+        // MySQL FAILS the statement when the id is gone rather than answering
+        // false, so there is nothing to read back — the error is the answer.
+        self.run(&format!("KILL CONNECTION {id}")).await?;
+        Ok(format!("terminated connection {id}"))
+    }
+
     async fn databases(&mut self) -> anyhow::Result<Vec<String>> {
         let (_c, rows, _a) = self
             .run("SELECT schema_name FROM information_schema.schemata ORDER BY schema_name")

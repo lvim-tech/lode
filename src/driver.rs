@@ -262,6 +262,38 @@ pub trait Connection: Send {
         Ok(Vec::new())
     }
 
+    /// One of the live views this driver declared in `meta().inspectors`.
+    ///
+    /// A table, not a list of numbers: "who is connected" has a row per
+    /// session with a dozen things to say about each, and squeezing that into
+    /// `Metric { group, name, value }` would lose the row.
+    ///
+    /// Default: nothing. A driver that declares no inspectors is never asked,
+    /// so this is only reached by a driver that declared one and did not
+    /// implement it — which is a bug in that driver and says so.
+    async fn inspect(
+        &mut self,
+        name: &str,
+    ) -> anyhow::Result<(Vec<crate::spec::Column>, Vec<Vec<crate::spec::Value>>)> {
+        anyhow::bail!("this driver has no live view called '{name}'")
+    }
+
+    /// Act on one row of a live view: terminate a session, and nothing else so
+    /// far.
+    ///
+    /// `key` is what the view itself said identifies the row — a backend pid,
+    /// a connection id, an opid. The DRIVER decides what acting means, because
+    /// `pg_terminate_backend`, `KILL CONNECTION`, `killOp` and `CLIENT KILL`
+    /// are four different statements and none of them is composable from the
+    /// others.
+    ///
+    /// Returns what happened, as a sentence for a person: this is reported
+    /// rather than counted, because "it did nothing" and "it killed the
+    /// session" need telling apart and a boolean cannot.
+    async fn act(&mut self, name: &str, _key: &str) -> anyhow::Result<String> {
+        anyhow::bail!("nothing can be done to a row of '{name}'")
+    }
+
     /// Execute a statement, returning a paged result stream.
     async fn execute(&mut self, stmt: &str) -> anyhow::Result<Box<dyn ResultStream>>;
 

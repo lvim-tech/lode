@@ -950,6 +950,10 @@ enum Pending {
     StoreImport,
     /// The saved scripts, for the names a hook can point at.
     ScriptNames,
+    /// One of the driver's live views.
+    Inspect { name: String },
+    /// A row of one, asked about and then acted on.
+    InstanceAct { name: String, key: String, confirm: bool },
     /// A script started: the answer carries the `run_id` its output arrives
     /// under.
     ScriptRun { tab: u64 },
@@ -1098,6 +1102,14 @@ pub struct Workspace {
     /// The saved scripts themselves, for the panel that lists them: the
     /// connection's and the global ones, as the engine returned them.
     scripts: Vec<Value>,
+    /// Which live view is open, by the name the driver gave it.
+    inspecting: Option<String>,
+    /// What that view answered: its columns and its rows.
+    inspected: Option<(Vec<lode_proto::Column>, Vec<Vec<Value>>)>,
+    inspect_error: Option<String>,
+    /// A row the engine has described and a person has not yet agreed to:
+    /// `(view, key, what the engine said it would do)`.
+    act_confirm: Option<(String, String, String)>,
     /// Which point of which tab's chart the pointer is over.
     ///
     /// On the workspace rather than worked out while painting, because a paint
@@ -1440,6 +1452,10 @@ impl Workspace {
             scripts_reopened: false,
             chart_hover: None,
             chart_bounds: None,
+            inspecting: None,
+            inspected: None,
+            inspect_error: None,
+            act_confirm: None,
             approvals: Vec::new(),
             approvals_at: None,
             saved: Vec::new(),
@@ -2360,6 +2376,43 @@ impl Workspace {
                 // It became a profile; the lists that show profiles are asked
                 // again rather than left to be refreshed by hand.
                 self.ask_profiles();
+            }
+            Pending::Inspect { name } => {
+                // Only when it is still the view being looked at: an answer
+                // that arrives after somebody pressed another chip would
+                // otherwise fill that one's table with this one's rows.
+                if self.inspecting.as_deref() == Some(name.as_str()) {
+                    let columns: Vec<lode_proto::Column> =
+                        serde_json::from_value(v.get("columns").cloned().unwrap_or(json!([])))
+                            .unwrap_or_default();
+                    let rows: Vec<Vec<Value>> =
+                        serde_json::from_value(v.get("rows").cloned().unwrap_or(json!([])))
+                            .unwrap_or_default();
+                    self.inspected = Some((columns, rows));
+                    self.inspect_error = None;
+                }
+            }
+            Pending::InstanceAct { name, key, confirm } => {
+                if confirm {
+                    let said = v
+                        .get("detail")
+                        .and_then(Value::as_str)
+                        .unwrap_or("done")
+                        .to_string();
+                    self.toast(said, false);
+                    // ASKED AGAIN, because the view has changed: a session
+                    // that is gone must not stay in the list with a button
+                    // that now does nothing.
+                    self.inspect(&name);
+                } else {
+                    // The engine has said what it would do. A person decides.
+                    let why = v
+                        .get("reason")
+                        .and_then(Value::as_str)
+                        .unwrap_or("this cannot be undone")
+                        .to_string();
+                    self.act_confirm = Some((name, key, why));
+                }
             }
             Pending::ScriptRun { tab } => {
                 let run_id = v.get("run_id").and_then(Value::as_u64);
@@ -5382,6 +5435,163 @@ impl Workspace {
 
     // ── instance metrics ────────────────────────────────────────────────────
 
+    /// Ask for one of the driver's live views.
+    pub fn inspect(&mut self, name: &str) {
+        let Some(conn) = self.metrics_conn.clone().or_else(|| self.target_conn()) else {
+            self.toast("nothing connected".to_string(), true);
+            return;
+        };
+        let Some(conn_id) = self.live(&conn).map(|l| l.conn_id) else { return };
+        self.inspecting = Some(name.to_string());
+        self.inspect_error = None;
+        self.ask(
+            Pending::Inspect { name: name.to_string() },
+            "instance.inspect",
+            json!({ "conn_id": conn_id, "name": name }),
+        );
+    }
+
+    /// Act on one row of a live view. TWO-STEP, like a row edit: the first ask
+    /// comes back with what it would do and nothing has happened yet.
+    fn act_on_row(&mut self, name: &str, key: &str, confirm: bool) {
+        let Some(conn) = self.metrics_conn.clone().or_else(|| self.target_conn()) else { return };
+        let Some(conn_id) = self.live(&conn).map(|l| l.conn_id) else { return };
+        self.ask(
+            Pending::InstanceAct { name: name.to_string(), key: key.to_string(), confirm },
+            "instance.action",
+            json!({ "conn_id": conn_id, "name": name, "key": key, "confirm": confirm }),
+        );
+    }
+
+    /// One live view, as a table, with what can be done to a row.
+    fn inspect_el(
+        &self,
+        panel: gpui::Div,
+        name: &str,
+        views: &[lode_proto::Inspector],
+        cx: &mut Context<Self>,
+    ) -> gpui::Div {
+        let t = self.t();
+        let ms = self.scale;
+        if let Some(e) = &self.inspect_error {
+            return panel.child(div().px_2().child(self.small(e.clone(), t.error())));
+        }
+        let Some((columns, rows)) = self.inspected.as_ref() else {
+            return panel.child(div().px_2().child(self.small("asking\u{2026}", t.muted())));
+        };
+        if rows.is_empty() {
+            return panel.child(div().px_2().child(self.small(
+                "the server reports nothing here just now",
+                t.muted(),
+            )));
+        }
+        // What acting on a row is called, and whether it is offered at all.
+        let act = views.iter().find(|v| v.name == name).map(|v| v.act.clone()).unwrap_or_default();
+        let mut list = div().flex().flex_col();
+        for (n, row) in rows.iter().enumerate() {
+            // The FIRST column is the key: every driver's view is written with
+            // the identifying column first, precisely so this is not a guess.
+            let key = row
+                .first()
+                .map(|v| match v {
+                    Value::String(s) => s.clone(),
+                    other => other.to_string().trim_matches('"').to_string(),
+                })
+                .unwrap_or_default();
+            let mut card = div()
+                .flex()
+                .flex_col()
+                .gap(px(1.0))
+                .px_2()
+                .py_1()
+                .border_b_1()
+                .border_color(t.divider());
+            for (i, col) in columns.iter().enumerate() {
+                let v = row.get(i).map(crate::menu::cell_text).unwrap_or_default();
+                if v.is_empty() {
+                    // A blank field is not worth a line of its own in a narrow
+                    // panel: eight fields of which three are empty reads as a
+                    // broken view.
+                    continue;
+                }
+                card = card.child(
+                    div()
+                        .flex()
+                        .items_start()
+                        .gap_1()
+                        .child(
+                            div()
+                                .w(px(ms.base() * 5.5))
+                                .flex_none()
+                                .text_size(ms.tiny())
+                                .text_color(t.muted())
+                                .child(SharedString::from(col.name.clone())),
+                        )
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .text_size(ms.small())
+                                .text_color(if i == 0 { t.accent() } else { t.fg() })
+                                .child(SharedString::from(v)),
+                        ),
+                );
+            }
+            if !act.is_empty() && !key.is_empty() {
+                let waiting = self.act_confirm.as_ref().filter(|(nm, k, _)| nm == name && *k == key);
+                match waiting {
+                    // The engine has said what it would do; now a person says
+                    // yes. The REASON is the engine's sentence, because that is
+                    // the thing that makes somebody stop.
+                    Some((_, _, why)) => {
+                        let (n1, k1) = (name.to_string(), key.clone());
+                        card = card
+                            .child(self.small(why.clone(), t.warning()))
+                            .child(
+                                div()
+                                    .flex()
+                                    .gap_1()
+                                    .child(
+                                        btn(
+                                            t,
+                                            ms,
+                                            format!("act-yes-{n}"),
+                                            act.clone(),
+                                            Btn::Danger,
+                                        )
+                                        .on_click(cx.listener(move |this, _, _, cx| {
+                                            this.act_on_row(&n1, &k1, true);
+                                            this.act_confirm = None;
+                                            cx.notify();
+                                        })),
+                                    )
+                                    .child(
+                                        btn(t, ms, format!("act-no-{n}"), "leave it", Btn::Quiet)
+                                            .on_click(cx.listener(|this, _, _, cx| {
+                                                this.act_confirm = None;
+                                                cx.notify();
+                                            })),
+                                    ),
+                            );
+                    }
+                    None => {
+                        let (n2, k2) = (name.to_string(), key.clone());
+                        card = card.child(
+                            btn(t, ms, format!("act-{n}"), act.clone(), Btn::Quiet).on_click(
+                                cx.listener(move |this, _, _, cx| {
+                                    this.act_on_row(&n2, &k2, false);
+                                    cx.notify();
+                                }),
+                            ),
+                        );
+                    }
+                }
+            }
+            list = list.child(card);
+        }
+        panel.child(list)
+    }
+
     /// Ask the server what it is doing. One round trip, when asked.
     fn ask_metrics(&mut self) {
         // The instance being looked at, not the first one that connected.
@@ -6790,6 +7000,47 @@ impl Workspace {
                 // Before the first read it drew an empty column under a
                 // heading, which reads as a server that answered nothing
                 // rather than as one nobody has asked yet.
+                // The LIVE VIEWS this driver offers, above the numbers: a
+                // metric says the server has 212 connections, and this says
+                // whose they are. Which views exist is the DRIVER's answer —
+                // `pg_stat_activity`, `SHOW PROCESSLIST`, `currentOp` and
+                // `CLIENT LIST` have nothing in common and a client that
+                // guessed would ask for one that is not there.
+                let views = self
+                    .metrics_conn
+                    .as_deref()
+                    .and_then(|c| self.live(c))
+                    .and_then(|l| self.meta(&l.driver))
+                    .map(|m| m.inspectors.clone())
+                    .unwrap_or_default();
+                if !views.is_empty() {
+                    let mut row = div().flex().flex_wrap().items_center().gap_1().px_2().py_1();
+                    for v in &views {
+                        let on = self.inspecting.as_deref() == Some(v.name.as_str());
+                        let name = v.name.clone();
+                        row = row.child(
+                            chip(t, ms, format!("insp-{}", v.name), v.label.clone(), on).on_click(
+                                cx.listener(move |this, _, _, cx| {
+                                    // Pressing the one that is open CLOSES it:
+                                    // a table of sessions is tall, and the
+                                    // numbers below it are why somebody opened
+                                    // the panel.
+                                    if this.inspecting.as_deref() == Some(name.as_str()) {
+                                        this.inspecting = None;
+                                        this.inspected = None;
+                                    } else {
+                                        this.inspect(&name);
+                                    }
+                                    cx.notify();
+                                }),
+                            ),
+                        );
+                    }
+                    panel = panel.child(row);
+                }
+                if let Some(name) = self.inspecting.clone() {
+                    panel = self.inspect_el(panel, &name, &views, cx);
+                }
                 if self.metrics.is_empty() && self.metrics_error.is_none() {
                     return panel.child(self.empty_state("empty.instance", "empty.instance_hint"));
                 }

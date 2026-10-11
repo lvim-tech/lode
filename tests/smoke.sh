@@ -214,6 +214,22 @@ check "columns say their kind" \
     "$(printf '%s' "$PAGE" | jq -r '[.result.columns[].kind] | join(",")')" "integer,text"
 check "and the driver's own word is still there" \
     "$(printf '%s' "$PAGE" | jq -r '.result.columns[0].type')" "INTEGER"
+
+# A live VIEW is declared per driver, and asking for one that was not declared
+# is refused rather than reaching the driver. SQLite declares none — it is a
+# file, and there is nobody connected to it to list — so the refusal is the
+# whole of what can be checked here without a server.
+check "sqlite declares no live views" \
+    "$(printf '%s' "$HELLO" | jq -r '[.result.drivers[] | select(.kind == "sqlite") | .inspectors | length] | add')" \
+    "0"
+send "{\"id\":57,\"method\":\"instance.inspect\",\"params\":{\"conn_id\":$CID,\"name\":\"activity\"}}"
+check "a view the driver never offered is refused" \
+    "$(await '.id == 57' | jq -r 'if (.error | test("no live view")) then "yes" else .error end')" \
+    "yes"
+send "{\"id\":58,\"method\":\"instance.action\",\"params\":{\"conn_id\":$CID,\"name\":\"activity\",\"key\":\"1\"}}"
+check "and so is acting on one" \
+    "$(await '.id == 58' | jq -r 'if (.error | test("no live view")) then "yes" else .error end')" \
+    "yes"
 check "page rows" "$(printf '%s' "$PAGE" | jq -r '.result.rows | length')" "2"
 check "page has_more" "$(printf '%s' "$PAGE" | jq -r '.result.has_more')" "true"
 report "first row" "$(printf '%s' "$PAGE" | jq -c '.result.rows[0]')"

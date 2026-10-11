@@ -721,6 +721,8 @@ impl Server {
             "query.classify" => self.classify(params),
             "row.write" => self.row_write(params).await,
             "instance.metrics" => self.metrics(params).await,
+            "instance.inspect" => self.inspect(params).await,
+            "instance.action" => self.instance_action(params).await,
             // ── saved state (proto 2) ───────────────────────────────────────
             "store.status" => self.store_status(),
             "store.connections.list" => self.store_conn_list().await,
@@ -1647,6 +1649,111 @@ impl Server {
         let conn = self.conn(p.conn_id)?;
         let metrics = conn.lock().await.metrics().await?;
         Ok(json!({ "metrics": metrics }))
+    }
+
+    /// One of the live views a driver declared.
+    ///
+    /// A table, like a query's result but not paged: these views are tens of
+    /// rows, not millions, and a paged one would mean a call id to release and
+    /// a buffer to hold for a panel somebody closes a second later.
+    async fn inspect(&self, params: Json) -> anyhow::Result<Json> {
+        #[derive(Deserialize)]
+        struct P {
+            conn_id: u64,
+            name: String,
+        }
+        let p: P = serde_json::from_value(params)?;
+        let kind = self.conn_driver(p.conn_id)?;
+        let driver = self.inner.registry.get(&kind)?;
+        // ASKED FOR BY NAME, and checked against what the driver declared: a
+        // name the driver never offered reaching `inspect` would be a client
+        // guessing at a catalogue, which is the thing `meta().inspectors`
+        // exists to stop.
+        if !driver.meta().inspectors.iter().any(|i| i.name == p.name) {
+            anyhow::bail!("the {kind} driver has no live view called '{}'", p.name);
+        }
+        let conn = self.conn(p.conn_id)?;
+        let (columns, rows) = conn.lock().await.inspect(&p.name).await?;
+        Ok(json!({ "columns": columns, "rows": rows }))
+    }
+
+    /// Act on one row of a live view — terminate a session, so far.
+    ///
+    /// TWO-STEP, like `row.write`: without `confirm` it says what it would do
+    /// and nothing happens. Ending somebody else's session rolls back whatever
+    /// they were in the middle of, and that is not something to do on one
+    /// click of a row in a list that refreshes every five seconds.
+    ///
+    /// Audited either way, because "who ended that session" is the question
+    /// asked immediately afterwards.
+    async fn instance_action(&self, params: Json) -> anyhow::Result<Json> {
+        #[derive(Deserialize)]
+        struct P {
+            conn_id: u64,
+            name: String,
+            key: String,
+            #[serde(default)]
+            confirm: bool,
+        }
+        let p: P = serde_json::from_value(params)?;
+        let kind = self.conn_driver(p.conn_id)?;
+        let driver = self.inner.registry.get(&kind)?;
+        let Some(view) = driver.meta().inspectors.iter().find(|i| i.name == p.name) else {
+            anyhow::bail!("the {kind} driver has no live view called '{}'", p.name);
+        };
+        if view.act.is_empty() {
+            anyhow::bail!("nothing can be done to a row of '{}'", p.name);
+        }
+        // What is about to happen, in the engine's own words, so the audit log
+        // and the client's confirmation card say the same thing.
+        let what = format!("{} {} {}", view.act, p.name, p.key);
+        // A READ-ONLY connection refuses this, and the policy is read HERE
+        // rather than through `allowed`.
+        //
+        // `allowed` decides by asking the driver whether a STATEMENT writes,
+        // and this is not a statement — "terminate activity 1234" parses as no
+        // SQL at all, so `writes` would answer false and a read-only
+        // connection would let it through. Terminating a session changes
+        // nothing in the database but it stops somebody else's work, which is
+        // exactly what a connection marked read-only is marked read-only to
+        // prevent.
+        if self.conn_policy(p.conn_id)? == Policy::ReadOnly {
+            let e = anyhow::anyhow!(
+                "this connection is read only \u{2014} it refuses to end a session on the \
+                 server, which stops somebody else's work even though it changes no data"
+            );
+            let mut r = self.audit_for(p.conn_id, "instance.action", &what, p.confirm, "refused");
+            r.because(e.to_string());
+            self.audit(r).await;
+            return Err(e);
+        }
+        if !p.confirm {
+            return Ok(json!({
+                "applied": false,
+                "what": what,
+                // ALWAYS dangerous, said plainly: there is one action and it
+                // ends somebody's session.
+                "dangerous": true,
+                "reason": format!(
+                    "this ends a session on the server and rolls back whatever it was doing"
+                ),
+            }));
+        }
+        let conn = self.conn(p.conn_id)?;
+        let said = match conn.lock().await.act(&p.name, &p.key).await {
+            Ok(s) => s,
+            Err(e) => {
+                let mut r =
+                    self.audit_for(p.conn_id, "instance.action", &what, true, "failed");
+                r.because(e.to_string());
+                self.audit(r).await;
+                return Err(e);
+            }
+        };
+        let mut r = self.audit_for(p.conn_id, "instance.action", &what, true, "applied");
+        r.because(said.clone());
+        self.audit(r).await;
+        Ok(json!({ "applied": true, "detail": said }))
     }
 
     async fn cell(&self, params: Json) -> anyhow::Result<Json> {

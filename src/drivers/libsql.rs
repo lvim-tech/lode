@@ -85,6 +85,7 @@ const META: DriverMeta = DriverMeta {
     browse_form: SQL_BROWSE_FORM,
     time_filter: SQL_TIME_FILTER,
     builder_ops: SQL_BUILDER_OPS,
+    inspectors: &[],
 };
 
 /// Which half a spec asks for.

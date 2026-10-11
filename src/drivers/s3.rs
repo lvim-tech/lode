@@ -111,6 +111,7 @@ const META: DriverMeta = DriverMeta {
     // driver says it has none, and the dashboard says so on the tile.
     time_filter: "",
     builder_ops: &[],
+    inspectors: &[],
 };
 
 /// One parsed command.

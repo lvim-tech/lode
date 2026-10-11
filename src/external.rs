@@ -182,6 +182,10 @@ impl MetaOwned {
             browse_form: &[],
             time_filter: s(self.time_filter),
             builder_ops: &[],
+            // An external driver has no live views: `instance.inspect` is a
+            // trait method the child protocol has no verb for, so offering one
+            // would be offering a button that cannot be pressed.
+            inspectors: &[],
         };
         Box::leak(Box::new(meta))
     }

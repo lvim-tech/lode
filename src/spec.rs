@@ -182,6 +182,15 @@ pub struct DriverMeta {
     /// means this engine has no builder, which is the right answer for a
     /// key/value store.
     pub builder_ops: &'static [BuilderOp],
+    /// The live views this engine can be ASKED about: who is connected, what
+    /// is locked, what is running.
+    ///
+    /// Declared per driver because the catalogues have nothing in common —
+    /// `pg_stat_activity`, `SHOW PROCESSLIST`, `currentOp` and `CLIENT LIST`
+    /// are four shapes with four names — and because a client must not guess
+    /// at them. Empty means this engine has nothing to show, which is the
+    /// honest answer for SQLite and a file in S3.
+    pub inspectors: &'static [Inspector],
 }
 
 /// One comparison the builder can offer.
@@ -216,6 +225,23 @@ pub struct QueryFieldSpec {
     pub default: &'static str,
     /// How many lines the input gets. 1 is a single-line field.
     pub rows: u8,
+}
+
+/// One live view of a server, offered by name.
+///
+/// `name` is what the client sends back to `instance.inspect`; `label` is what
+/// a person reads. `act` says whether a row can be ACTED on — terminating a
+/// session is the one thing these views are for besides reading, and a view
+/// that offers it on a catalogue that cannot be written to would be a button
+/// that always fails.
+#[derive(Debug, Clone, Copy, Serialize)]
+pub struct Inspector {
+    pub name: &'static str,
+    pub label: &'static str,
+    /// What acting on a row DOES, as a word a person reads: `terminate`, or
+    /// empty where nothing can be done. The engine decides what that word
+    /// means per driver; the client only shows it and asks.
+    pub act: &'static str,
 }
 
 /// The comparisons nearly every SQL dialect spells the same way. A driver with
@@ -1289,6 +1315,37 @@ mod tests {
         // ORDER: `timestamp` before `time`, `datetime64` before `date`.
         assert_eq!(kind_of("timestamp"), "timestamp");
         assert_eq!(kind_of("DateTime64"), "timestamp");
+    }
+
+    /// A driver that OFFERS acting on a view says what acting is called.
+    ///
+    /// An empty `act` means "this view is read only", and that is a different
+    /// thing from a view whose action is nameless: a button with no word on it
+    /// is a button nobody presses twice. The rule is checked here because it
+    /// is the one invariant a client relies on — it draws the word.
+    #[test]
+    fn a_live_view_names_its_action_or_offers_none() {
+        let mut seen = 0;
+        for m in crate::registry::Registry::new().metas() {
+            let mut names = std::collections::BTreeSet::new();
+            for i in m.inspectors {
+                assert!(!i.name.is_empty(), "{}: a view with no name", m.kind);
+                assert!(!i.label.is_empty(), "{}: {} has no label", m.kind, i.name);
+                assert!(
+                    i.name.chars().all(|c| c.is_ascii_lowercase() || c == '_'),
+                    "{}: {:?} is not a stable name",
+                    m.kind,
+                    i.name
+                );
+                // One name per driver: two views answering to one name is one
+                // view, and which one is whichever the search found first.
+                assert!(names.insert(i.name), "{}: {} twice", m.kind, i.name);
+                seen += 1;
+            }
+        }
+        // The drivers that have views are built in this configuration; if none
+        // were, this test would pass by saying nothing.
+        assert!(seen > 0, "no driver in this build declares a live view");
     }
 
     /// The kind goes out WITH the column, without eighteen drivers filling it.
