@@ -1098,6 +1098,15 @@ pub struct Workspace {
     /// The saved scripts themselves, for the panel that lists them: the
     /// connection's and the global ones, as the engine returned them.
     scripts: Vec<Value>,
+    /// Which point of which tab's chart the pointer is over.
+    ///
+    /// On the workspace rather than worked out while painting, because a paint
+    /// closure cannot read the entity it is painting for — the same rule that
+    /// keeps a child window from reading this one.
+    chart_hover: Option<(u64, usize)>,
+    /// Where the plot area is and how wide: a mouse event carries a window
+    /// coordinate, and the nearest point needs one relative to the plot.
+    chart_bounds: Option<(f32, f32)>,
     /// Which tab a running script's output belongs to, by the engine's run id.
     script_runs: HashMap<u64, u64>,
     /// Whether the remembered script tabs have been reopened. Once, and not on
@@ -1429,6 +1438,8 @@ impl Workspace {
             scripts: Vec::new(),
             script_runs: HashMap::new(),
             scripts_reopened: false,
+            chart_hover: None,
+            chart_bounds: None,
             approvals: Vec::new(),
             approvals_at: None,
             saved: Vec::new(),
@@ -4946,7 +4957,15 @@ impl Workspace {
     /// if the statement has changed and that column is gone, the chart falls
     /// back to the first measurement rather than drawing a different column
     /// under the old name.
-    fn open_chart(&mut self, conn: &str, name: &str, sql: &str, measure: &str, cx: &mut Context<Self>) {
+    fn open_chart(
+        &mut self,
+        conn: &str,
+        name: &str,
+        sql: &str,
+        measure: &str,
+        kind: &str,
+        cx: &mut Context<Self>,
+    ) {
         if self.live(conn).is_none() {
             self.toast(format!("{conn} is not connected"), true);
             return;
@@ -4955,6 +4974,9 @@ impl Workspace {
         if let Some(tab) = self.tabs.last_mut() {
             tab.view = ResultView::Chart;
             tab.chart_measure = Some(measure.to_string());
+            // A kind this build cannot draw opens as bars rather than failing
+            // — see `chart::Kind::from_key`.
+            tab.chart_kind = crate::chart::Kind::from_key(kind);
         }
     }
 
@@ -5336,10 +5358,19 @@ impl Workspace {
             .map(|c| c.name.clone())
             .unwrap_or_default();
         let (sql, conn2) = (tab.sql.clone(), conn.clone());
+        // HOW it is drawn goes with it. A chart saved as a line that reopened
+        // as bars is a chart somebody has to fix every time they open it.
+        let kind = tab.chart_kind.key();
         self.ask(
             Pending::SavedCharts { conn: conn.clone() },
             "store.charts.save",
-            json!({ "conn": conn, "name": name, "sql": sql, "measure": measure }),
+            json!({
+                "conn": conn,
+                "name": name,
+                "sql": sql,
+                "measure": measure,
+                "kind": kind
+            }),
         );
         self.ask(
             Pending::SavedCharts { conn: conn2.clone() },
@@ -7539,10 +7570,15 @@ impl Workspace {
                             .child(self.icon_inline("\u{f080}", t.accent()))
                             .child(self.line_in(c.name.clone(), ms.small(), t.fg(), ms.line_w() - ms.base() - 14.0))
                             .on_click(cx.listener({
-                                let (cn, n, sql, m) =
-                                    (live.name.clone(), c.name.clone(), c.sql.clone(), c.measure.clone());
+                                let (cn, n, sql, m, k) = (
+                                    live.name.clone(),
+                                    c.name.clone(),
+                                    c.sql.clone(),
+                                    c.measure.clone(),
+                                    c.kind.clone(),
+                                );
                                 move |this, _, _, cx| {
-                                    this.open_chart(&cn, &n, &sql, &m, cx);
+                                    this.open_chart(&cn, &n, &sql, &m, &k, cx);
                                     cx.notify();
                                 }
                             }))
@@ -8984,7 +9020,24 @@ impl Workspace {
                         );
                     }
                 }
-                inner = inner.child(head).child(self.tile_chart_el(pane, ms, &t));
+                // HOW the saved chart is drawn, looked up by the name the
+                // tile points at. A chart saved as a line that appeared on a
+                // board as bars would be the same chart twice over in two
+                // shapes, and the board is the place somebody chose the shape
+                // for.
+                let conn = self
+                    .tabs
+                    .iter()
+                    .find(|t| t.id == tab_id)
+                    .map(|t| t.conn_name.clone())
+                    .unwrap_or_default();
+                let kind = self
+                    .charts_for(&conn)
+                    .iter()
+                    .find(|c| c.name == tile.chart)
+                    .map(|c| crate::chart::Kind::from_key(&c.kind))
+                    .unwrap_or_default();
+                inner = inner.child(head).child(self.tile_chart_el(pane, kind, ms, &t));
             }
         }
 
@@ -9026,11 +9079,22 @@ impl Workspace {
         el.into_any_element()
     }
 
-    /// The bars inside a chart tile. The same rules as the chart view: a
+    /// The saved charts of one connection, or nothing when it is not open.
+    fn charts_for(&self, conn: &str) -> &[SavedChart] {
+        self.live(conn).map(|l| l.charts.as_slice()).unwrap_or(&[])
+    }
+
+    /// What is inside a chart tile. The same rules as the chart view: a
     /// measurement is a column whose every non-null value is a number, a missing
     /// value is drawn as NOTHING rather than as a bar of zero, and the axis
     /// includes zero.
-    fn tile_chart_el(&self, pane: Option<&Pane>, ms: Metrics, t: &Theme) -> gpui::AnyElement {
+    fn tile_chart_el(
+        &self,
+        pane: Option<&Pane>,
+        kind: crate::chart::Kind,
+        ms: Metrics,
+        t: &Theme,
+    ) -> gpui::AnyElement {
         let Some(pane) = pane else {
             return div()
                 .flex_1()
@@ -9066,6 +9130,18 @@ impl Workspace {
         };
         let col = shape.values[0];
         let (lo, hi) = value_range(&pane.rows, col);
+        // A TILE is a few centimetres tall, so it gets the shape and nothing
+        // else: no axis labels, no ticks, no hover. Those need room, and a
+        // ruler drawn in a space too small to read it is just noise over the
+        // data. The full chart in a tab has all three.
+        if kind != crate::chart::Kind::Bars {
+            let values: Vec<Option<f64>> = pane
+                .rows
+                .iter()
+                .map(|r| r.get(col).and_then(|x| x.as_f64()))
+                .collect();
+            return self.spark_el(values, kind, lo, hi, t);
+        }
         let span = hi - lo;
         let mut bars = div().flex().flex_col().flex_1().overflow_hidden().px_2().py_1().gap(px(1.0));
         for r in 0..pane.rows.len().min(24) {
@@ -9137,8 +9213,22 @@ impl Workspace {
             .or(by_name)
             .unwrap_or(shape.values[0]);
 
-        // Which measurement is being drawn, when there is more than one.
+        // HOW it is drawn, and then WHICH measurement.
         let mut picker = div().flex().items_center().gap_2().px_3().py_1();
+        for k in crate::chart::Kind::all() {
+            let on = tab.chart_kind == k;
+            picker = picker.child(
+                chip(t, ms, format!("ck-{tab_id}-{}", k.key()), k.key(), on).on_click(
+                    cx.listener(move |this, _, _, cx| {
+                        if let Some(tb) = this.tabs.iter_mut().find(|x| x.id == tab_id) {
+                            tb.chart_kind = k;
+                        }
+                        cx.notify();
+                    }),
+                ),
+            );
+        }
+        picker = picker.child(div().w(px(ms.base())));
         if shape.values.len() > 1 {
             picker = picker.child(self.small("measure", t.muted()));
             for &i in &shape.values {
@@ -9157,6 +9247,17 @@ impl Workspace {
         }
 
         let (lo, hi) = value_range(&tab.rows, chosen);
+        // Everything but bars is drawn on a canvas: the shapes are lines,
+        // areas, points and arcs, and a `div` cannot be any of those.
+        if tab.chart_kind != crate::chart::Kind::Bars {
+            return div()
+                .flex()
+                .flex_col()
+                .size_full()
+                .child(picker)
+                .child(self.chart_canvas(tab, &shape, chosen, lo, hi, cx))
+                .into_any_element();
+        }
         let span = hi - lo;
         let mut bars = div().flex().flex_col().flex_1().overflow_hidden().px_3().py_1().gap(px(2.0));
         // Only what fits is drawn, and the count below says how many there are:
@@ -9232,6 +9333,464 @@ impl Workspace {
             .child(picker)
             .child(bars)
             .child(div().px_3().py_1().child(footer))
+            .into_any_element()
+    }
+
+    /// The shape alone, for a tile: no axis, no ticks, no hover.
+    fn spark_el(
+        &self,
+        values: Vec<Option<f64>>,
+        kind: crate::chart::Kind,
+        lo: f64,
+        hi: f64,
+        t: &Theme,
+    ) -> gpui::AnyElement {
+        let picked = crate::chart::sample(values.len(), crate::chart::MAX_POINTS);
+        let vals: Vec<Option<f64>> = picked.iter().filter_map(|&i| values.get(i).copied()).collect();
+        let (axis_lo, axis_hi) = if lo >= 0.0 { (0.0, hi.max(0.0)) } else { (lo, hi) };
+        let span = if (axis_hi - axis_lo).abs() < f64::EPSILON { 1.0 } else { axis_hi - axis_lo };
+        let linec = t.series(0);
+        let fillc = Theme::mix(t.series(0), t.base(), 0.75);
+        let slice_colors: Vec<gpui::Rgba> = (0..vals.len().min(64)).map(|i| t.series(i)).collect();
+        div()
+            .flex_1()
+            .min_h_0()
+            .p_1()
+            .child(
+                gpui::canvas(
+                    move |_b, _w, _cx| {},
+                    move |bounds, _p, window, _cx| {
+                        let (w, h) =
+                            (f32::from(bounds.size.width), f32::from(bounds.size.height));
+                        if w <= 1.0 || h <= 1.0 {
+                            return;
+                        }
+                        let x0 = f32::from(bounds.origin.x);
+                        let y0 = f32::from(bounds.origin.y);
+                        let y_of =
+                            |v: f64| y0 + h - ((v - axis_lo) / span * h as f64) as f32;
+                        if kind == crate::chart::Kind::Pie {
+                            let nums: Vec<f64> = vals.iter().map(|v| v.unwrap_or(0.0)).collect();
+                            let (cx0, cy0) = (x0 + w / 2.0, y0 + h / 2.0);
+                            let r = (w.min(h) / 2.0) * 0.9;
+                            for (i, (start, sweep)) in
+                                crate::chart::slices(&nums).iter().enumerate()
+                            {
+                                if *sweep <= 0.0 {
+                                    continue;
+                                }
+                                let colour = slice_colors
+                                    .get(i % slice_colors.len().max(1))
+                                    .copied()
+                                    .unwrap_or(linec);
+                                let mut pb = gpui::PathBuilder::fill();
+                                pb.move_to(gpui::point(px(cx0), px(cy0)));
+                                let steps = ((*sweep * 180.0).ceil() as usize).max(2);
+                                for s in 0..=steps {
+                                    let turn = start + sweep * (s as f32 / steps as f32);
+                                    let a = (turn - 0.25) * std::f32::consts::TAU;
+                                    pb.line_to(gpui::point(
+                                        px(cx0 + r * a.cos()),
+                                        px(cy0 + r * a.sin()),
+                                    ));
+                                }
+                                pb.close();
+                                if let Ok(path) = pb.build() {
+                                    window.paint_path(path, colour);
+                                }
+                            }
+                            return;
+                        }
+                        let n = vals.len();
+                        let gap = if n > 1 { w / (n - 1) as f32 } else { 0.0 };
+                        let x_of =
+                            |i: usize| if n > 1 { x0 + gap * i as f32 } else { x0 + w / 2.0 };
+                        if kind == crate::chart::Kind::Area {
+                            let mut pb = gpui::PathBuilder::fill();
+                            let base = y_of(axis_lo.max(0.0).min(axis_hi));
+                            let mut open = false;
+                            for (i, v) in vals.iter().enumerate() {
+                                match v {
+                                    Some(num) => {
+                                        let p = gpui::point(px(x_of(i)), px(y_of(*num)));
+                                        if open {
+                                            pb.line_to(p);
+                                        } else {
+                                            pb.move_to(gpui::point(px(x_of(i)), px(base)));
+                                            pb.line_to(p);
+                                            open = true;
+                                        }
+                                    }
+                                    None => {
+                                        if open {
+                                            pb.line_to(gpui::point(
+                                                px(x_of(i.saturating_sub(1))),
+                                                px(base),
+                                            ));
+                                            pb.close();
+                                            open = false;
+                                        }
+                                    }
+                                }
+                            }
+                            if open {
+                                pb.line_to(gpui::point(px(x_of(n - 1)), px(base)));
+                                pb.close();
+                            }
+                            if let Ok(path) = pb.build() {
+                                window.paint_path(path, fillc);
+                            }
+                        }
+                        if matches!(kind, crate::chart::Kind::Line | crate::chart::Kind::Area) {
+                            let mut pb = gpui::PathBuilder::stroke(px(2.0));
+                            let mut open = false;
+                            for (i, v) in vals.iter().enumerate() {
+                                match v {
+                                    Some(num) => {
+                                        let p = gpui::point(px(x_of(i)), px(y_of(*num)));
+                                        if open {
+                                            pb.line_to(p);
+                                        } else {
+                                            pb.move_to(p);
+                                            open = true;
+                                        }
+                                    }
+                                    None => open = false,
+                                }
+                            }
+                            if let Ok(path) = pb.build() {
+                                window.paint_path(path, linec);
+                            }
+                        }
+                        if kind == crate::chart::Kind::Scatter {
+                            for (i, v) in vals.iter().enumerate() {
+                                let Some(num) = v else { continue };
+                                window.paint_quad(gpui::fill(
+                                    gpui::Bounds {
+                                        origin: gpui::point(
+                                            px(x_of(i) - 2.0),
+                                            px(y_of(*num) - 2.0),
+                                        ),
+                                        size: gpui::size(px(3.0), px(3.0)),
+                                    },
+                                    linec,
+                                ));
+                            }
+                        }
+                    },
+                )
+                .size_full(),
+            )
+            .into_any_element()
+    }
+
+    /// A line, an area, a scatter or a pie, drawn on a canvas.
+    ///
+    /// One function for the four of them because they share everything but the
+    /// shape: the same sampling, the same axis, the same ticks, the same
+    /// hover. Four functions would be four copies of the arithmetic, and the
+    /// arithmetic is the part that has to agree with itself.
+    fn chart_canvas(
+        &self,
+        tab: &Tab,
+        shape: &ChartShape,
+        chosen: usize,
+        lo: f64,
+        hi: f64,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let t = self.t();
+        let ms = self.scale;
+        let kind = tab.chart_kind;
+        let tab_id = tab.id;
+        // The rows that will be drawn. Sampled, and the LAST one always kept:
+        // a line that stops short of the right edge reads as missing data.
+        let picked = crate::chart::sample(tab.rows.len(), crate::chart::MAX_POINTS);
+        let values: Vec<Option<f64>> = picked
+            .iter()
+            .map(|&r| tab.rows.get(r).and_then(|row| row.get(chosen)).and_then(|x| x.as_f64()))
+            .collect();
+        let labels: Vec<String> =
+            picked.iter().map(|&r| crate::workspace::bar_label(tab, shape, r)).collect();
+
+        // The AXIS. From zero where the values are all positive, because a bar
+        // or an area that does not start at zero overstates every difference
+        // in it; from `lo` otherwise, where zero is not on the picture at all.
+        let (axis_lo, axis_hi) = if lo >= 0.0 && kind != crate::chart::Kind::Scatter {
+            (0.0, hi.max(0.0))
+        } else {
+            (lo, hi)
+        };
+        let ticks = crate::chart::axis_ticks(axis_lo, axis_hi, 4);
+        let span = if (axis_hi - axis_lo).abs() < f64::EPSILON { 1.0 } else { axis_hi - axis_lo };
+
+        // What the pointer is over, if anything. Kept on the WORKSPACE rather
+        // than recomputed while painting: the paint closure cannot read the
+        // entity it is painting for.
+        let at = self.chart_hover.filter(|(id, _)| *id == tab_id).map(|(_, i)| i);
+
+        let (gridc, linec, fillc, dotc) =
+            (t.divider(), t.series(0), Theme::mix(t.series(0), t.base(), 0.75), t.series(0));
+        let slice_colors: Vec<gpui::Rgba> = (0..values.len().min(64)).map(|i| t.series(i)).collect();
+        let vals = values.clone();
+        let tickv = ticks.clone();
+        let canvas = gpui::canvas(
+            move |_bounds, _window, _cx| {},
+            move |bounds, _prepaint, window, _cx| {
+                let (w, h) = (f32::from(bounds.size.width), f32::from(bounds.size.height));
+                if w <= 1.0 || h <= 1.0 {
+                    return;
+                }
+                let x0 = f32::from(bounds.origin.x);
+                let y0 = f32::from(bounds.origin.y);
+                let y_of = |v: f64| y0 + h - ((v - axis_lo) / span * h as f64) as f32;
+
+                // The GRID, so a value can be read off the picture at all.
+                for tv in &tickv {
+                    let y = y_of(*tv);
+                    if y < y0 - 1.0 || y > y0 + h + 1.0 {
+                        continue;
+                    }
+                    window.paint_quad(gpui::fill(
+                        gpui::Bounds {
+                            origin: gpui::point(px(x0), px(y)),
+                            size: gpui::size(px(w), px(1.0)),
+                        },
+                        gridc,
+                    ));
+                }
+
+                if kind == crate::chart::Kind::Pie {
+                    // A disc of sectors, each approximated by a fan of
+                    // triangles: gpui draws filled paths, and an arc is a path
+                    // with enough straight pieces that nobody can tell.
+                    let nums: Vec<f64> = vals.iter().map(|v| v.unwrap_or(0.0)).collect();
+                    let cx0 = x0 + w / 2.0;
+                    let cy0 = y0 + h / 2.0;
+                    let r = (w.min(h) / 2.0) * 0.86;
+                    for (i, (start, sweep)) in crate::chart::slices(&nums).iter().enumerate() {
+                        if *sweep <= 0.0 {
+                            continue;
+                        }
+                        let colour = slice_colors
+                            .get(i % slice_colors.len().max(1))
+                            .copied()
+                            .unwrap_or(linec);
+                        let mut pb = gpui::PathBuilder::fill();
+                        pb.move_to(gpui::point(px(cx0), px(cy0)));
+                        // One straight piece per two degrees, and never fewer
+                        // than two: a thin slice must still be a wedge.
+                        let steps = ((*sweep * 180.0).ceil() as usize).max(2);
+                        for s in 0..=steps {
+                            let turn = start + sweep * (s as f32 / steps as f32);
+                            // From the TOP, clockwise, which is where every
+                            // pie in the world starts.
+                            let a = (turn - 0.25) * std::f32::consts::TAU;
+                            pb.line_to(gpui::point(px(cx0 + r * a.cos()), px(cy0 + r * a.sin())));
+                        }
+                        pb.close();
+                        if let Ok(path) = pb.build() {
+                            window.paint_path(path, colour);
+                        }
+                    }
+                    return;
+                }
+
+                let n = vals.len();
+                let gap = if n > 1 { w / (n - 1) as f32 } else { 0.0 };
+                let x_of = |i: usize| if n > 1 { x0 + gap * i as f32 } else { x0 + w / 2.0 };
+
+                if kind == crate::chart::Kind::Area {
+                    // The area is drawn first and the line over it, so the
+                    // line stays crisp where the fill is pale.
+                    let mut pb = gpui::PathBuilder::fill();
+                    let base = y_of(axis_lo.max(0.0).min(axis_hi));
+                    let mut open = false;
+                    for (i, v) in vals.iter().enumerate() {
+                        match v {
+                            Some(n) => {
+                                let p = gpui::point(px(x_of(i)), px(y_of(*n)));
+                                if open {
+                                    pb.line_to(p);
+                                } else {
+                                    pb.move_to(gpui::point(px(x_of(i)), px(base)));
+                                    pb.line_to(p);
+                                    open = true;
+                                }
+                            }
+                            // A GAP closes the shape rather than drawing
+                            // across it: an area that spans a missing value
+                            // claims a measurement nobody took.
+                            None => {
+                                if open {
+                                    pb.line_to(gpui::point(px(x_of(i.saturating_sub(1))), px(base)));
+                                    pb.close();
+                                    open = false;
+                                }
+                            }
+                        }
+                    }
+                    if open {
+                        pb.line_to(gpui::point(px(x_of(n - 1)), px(base)));
+                        pb.close();
+                    }
+                    if let Ok(path) = pb.build() {
+                        window.paint_path(path, fillc);
+                    }
+                }
+
+                if matches!(kind, crate::chart::Kind::Line | crate::chart::Kind::Area) {
+                    // TWO pixels, not a derived length: this is the data's
+                    // own line, and a line that thickened with the text size
+                    // would bury a dense series at a large one.
+                    let mut pb = gpui::PathBuilder::stroke(px(2.0));
+                    let mut open = false;
+                    for (i, v) in vals.iter().enumerate() {
+                        match v {
+                            Some(n) => {
+                                let p = gpui::point(px(x_of(i)), px(y_of(*n)));
+                                if open {
+                                    pb.line_to(p);
+                                } else {
+                                    pb.move_to(p);
+                                    open = true;
+                                }
+                            }
+                            None => open = false,
+                        }
+                    }
+                    if let Ok(path) = pb.build() {
+                        window.paint_path(path, linec);
+                    }
+                }
+
+                if kind == crate::chart::Kind::Scatter {
+                    // Little squares rather than circles: at three pixels a
+                    // circle is a square anyway, and a quad is one draw call.
+                    let d = 3.0;
+                    for (i, v) in vals.iter().enumerate() {
+                        let Some(n) = v else { continue };
+                        window.paint_quad(gpui::fill(
+                            gpui::Bounds {
+                                origin: gpui::point(px(x_of(i) - d), px(y_of(*n) - d)),
+                                size: gpui::size(px(d * 2.0), px(d * 2.0)),
+                            },
+                            dotc,
+                        ));
+                    }
+                }
+
+                // WHERE the pointer is, as a full-height rule: a tooltip with
+                // no mark on the picture leaves it guessing which point it is
+                // talking about.
+                if let Some(i) = at.filter(|i| *i < n) {
+                    window.paint_quad(gpui::fill(
+                        gpui::Bounds {
+                            origin: gpui::point(px(x_of(i)), px(y0)),
+                            size: gpui::size(px(1.0), px(h)),
+                        },
+                        linec,
+                    ));
+                }
+            },
+        );
+
+        // The ticks as TEXT, in a column down the left — painted text inside
+        // the canvas would need the text system and a shaped line per tick,
+        // and these are four labels in a fixed place.
+        let mut axis = div().flex().flex_col().justify_between().w(px(ms.base() * 4.0)).flex_none();
+        for tv in ticks.iter().rev() {
+            axis = axis.child(
+                div()
+                    .text_size(ms.tiny())
+                    .text_color(t.muted())
+                    .text_right()
+                    .child(SharedString::from(crate::chart::tick_label(*tv))),
+            );
+        }
+
+        let hovered = at.and_then(|i| {
+            let v = values.get(i)?;
+            let l = labels.get(i)?;
+            Some(match v {
+                Some(n) => format!("{l}: {n}"),
+                None => format!("{l}: NULL"),
+            })
+        });
+
+        let count = values.len();
+        let plot = div()
+            .id(SharedString::from(format!("chart-plot-{tab_id}")))
+            .flex_1()
+            .h_full()
+            .relative()
+            .child(canvas.size_full())
+            // The nearest point to the pointer, by x. See `chart::nearest`.
+            .on_mouse_move(cx.listener(move |this, ev: &gpui::MouseMoveEvent, _, cx| {
+                let Some(b) = this.chart_bounds else { return };
+                let rel = f32::from(ev.position.x) - b.0;
+                if let Some(i) = crate::chart::nearest(rel, count, b.1) {
+                    if this.chart_hover != Some((tab_id, i)) {
+                        this.chart_hover = Some((tab_id, i));
+                        cx.notify();
+                    }
+                }
+            }))
+            .child(
+                // The plot's own position, measured while it is laid out: the
+                // mouse event carries a WINDOW coordinate and the nearest
+                // point needs one relative to the plot.
+                gpui::canvas(
+                    move |bounds, _w, _cx| bounds,
+                    {
+                        let me = cx.entity().downgrade();
+                        move |_b, bounds: gpui::Bounds<gpui::Pixels>, _w, cx| {
+                            let _ = me.update(cx, |this: &mut Workspace, _| {
+                                this.chart_bounds =
+                                    Some((f32::from(bounds.origin.x), f32::from(bounds.size.width)));
+                            });
+                        }
+                    },
+                )
+                .absolute()
+                .size_full(),
+            );
+
+        div()
+            .flex()
+            .flex_col()
+            .flex_1()
+            .min_h_0()
+            .px_3()
+            .py_1()
+            .child(div().flex().flex_1().min_h_0().gap_1().child(axis).child(plot))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .child(self.small(
+                        match &hovered {
+                            Some(h) => h.clone(),
+                            None => format!(
+                                "{count} point(s) of {} loaded \u{2014} axis from {} to {}",
+                                tab.rows.len(),
+                                crate::chart::tick_label(axis_lo),
+                                crate::chart::tick_label(axis_hi)
+                            ),
+                        },
+                        if hovered.is_some() { t.fg() } else { t.muted() },
+                    ))
+                    .children((tab.rows.len() > count).then(|| {
+                        // SAID, when not every row is drawn. A chart that
+                        // quietly shows every tenth row is a chart that lies
+                        // about the shape of the data.
+                        self.small(
+                            format!("every {}th row", tab.rows.len().div_ceil(count.max(1))),
+                            t.warning(),
+                        )
+                    })),
+            )
             .into_any_element()
     }
 

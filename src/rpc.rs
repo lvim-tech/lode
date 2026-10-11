@@ -172,7 +172,13 @@ use serde_json::json;
 ///     answer rather than eighteen; a driver that declares no type says
 ///     `unknown` rather than guessing. Additive — a client that ignores it
 ///     behaves exactly as before.
-pub const PROTO: u32 = 18;
+/// 19. `store.charts.save` takes `kind` and every chart row carries it: how
+///     the chart is DRAWN — bars, line, area, scatter, pie. The words are the
+///     client's and the engine neither draws nor interprets them, so a newer
+///     client can save a kind this engine never heard of. Additive: a client
+///     that sends none keeps the empty string, which means "the client's
+///     default".
+pub const PROTO: u32 = 19;
 
 /// One decoded incoming request.
 #[derive(Debug, Deserialize)]

@@ -408,7 +408,7 @@ check "size is readable" \
 check "metrics are grouped" \
     "$(printf '%s' "$M" | jq '[.result.metrics[].group] | unique | length >= 2')" "true"
 
-send '{"jsonrpc":"2.0","id":901,"method":"store.charts.save","params":{"conn":"smoke","name":"by balance","sql":"SELECT name, balance FROM t","measure":"balance"}}'
+send '{"jsonrpc":"2.0","id":901,"method":"store.charts.save","params":{"conn":"smoke","name":"by balance","sql":"SELECT name, balance FROM t","measure":"balance","kind":"line"}}'
 check "chart saved" "$(await '.id == 901' | jq '.result.saved')" "true"
 send '{"jsonrpc":"2.0","id":902,"method":"store.charts.list","params":{"conn":"smoke"}}'
 C=$(await '.id == 902')
@@ -416,6 +416,19 @@ check "chart listed" "$(printf '%s' "$C" | jq '.result.charts | length')" "1"
 # The measure is kept BY NAME. An index would move the moment the statement
 # changed a column, and the chart would silently measure something else.
 check "measure kept by name" "$(printf '%s' "$C" | jq -r '.result.charts[0].measure')" "balance"
+# HOW it is drawn comes back with it. A chart saved as a line that reopened as
+# bars is a chart somebody has to fix every time they open it. The engine does
+# not interpret the word — it is the client's, so a newer client can save a
+# kind this engine never heard of.
+check "kind kept" "$(printf '%s' "$C" | jq -r '.result.charts[0].kind')" "line"
+send '{"jsonrpc":"2.0","id":903,"method":"store.charts.save","params":{"conn":"smoke","name":"from the future","sql":"SELECT 1","measure":"x","kind":"sunburst"}}'
+await '.id == 903' >/dev/null
+send '{"jsonrpc":"2.0","id":904,"method":"store.charts.list","params":{"conn":"smoke"}}'
+check "a kind the engine never heard of is stored anyway" \
+    "$(await '.id == 904' | jq -r '[.result.charts[] | select(.name == "from the future")][0].kind')" \
+    "sunburst"
+send '{"jsonrpc":"2.0","id":905,"method":"store.charts.remove","params":{"conn":"smoke","name":"from the future"}}'
+await '.id == 905' >/dev/null
 send '{"jsonrpc":"2.0","id":903,"method":"store.charts.remove","params":{"conn":"smoke","name":"by balance"}}'
 check "chart removed" "$(await '.id == 903' | jq '.result.removed')" "true"
 

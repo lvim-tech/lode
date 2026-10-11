@@ -299,6 +299,10 @@ pub struct Tab {
     /// once the result arrives: a name survives a statement that reordered its
     /// columns, and an index does not.
     pub chart_measure: Option<String>,
+    /// How the chart is drawn. Part of the TAB rather than of the chart view,
+    /// because it is a property of what is being looked at and it has to
+    /// survive switching to the grid and back.
+    pub chart_kind: crate::chart::Kind,
     /// A write waiting to be confirmed: the statement the ENGINE said it would
     /// run, why it is dangerous, and the plan to repeat with `confirm`.
     pub pending_write: Option<PendingWrite>,
@@ -840,6 +844,7 @@ impl Tab {
             builder: Builder::default(),
             chart_col: None,
             chart_measure: None,
+            chart_kind: crate::chart::Kind::default(),
             pending_write: None,
             rendered: String::new(),
             board: None,

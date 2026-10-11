@@ -438,6 +438,11 @@ pub struct SavedChart {
     /// statement changed a column, and silently measure something else.
     #[serde(default)]
     pub measure: String,
+    /// How it is drawn: `bars`, `line`, `area`, `scatter`, `pie`
+    /// (`proto >= 19`). Empty from an older engine, or from a chart saved
+    /// before the field existed, and that means the client's default.
+    #[serde(default)]
+    pub kind: String,
 }
 
 /// One thing an engine says about itself.

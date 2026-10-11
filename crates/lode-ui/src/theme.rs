@@ -411,6 +411,75 @@ impl Theme {
     /// The colour a type badge is drawn in. Mapped from the badge word rather
     /// than from a driver name, so a type this client has never heard of lands
     /// on the neutral ink instead of nothing.
+    /// The colour of the nth thing in a chart.
+    ///
+    /// Themes have no palette for series, so the roles are used in an order
+    /// that keeps neighbours apart: accent, success, warning, error, then two
+    /// mixes of accent towards the foreground and the panel. Six is enough for
+    /// a pie of six slices, and past that they repeat — a chart of twelve
+    /// categories is unreadable whatever the colours, and the honest fix is
+    /// fewer categories, not more hues nobody can tell apart.
+    ///
+    /// They are ROLES rather than fixed hues so a chart in a light theme and a
+    /// chart in a dark one are both legible: a palette picked for one would be
+    /// invisible in the other.
+    pub fn series(&self, n: usize) -> Rgba {
+        let all = self.series_all();
+        all[n % all.len()]
+    }
+
+    /// The six, built so that no two of them are the same colour.
+    ///
+    /// Picking four roles and two mixes was not enough: in `LvimBase_darker`
+    /// the accent and the success colour are within a hundredth of each other,
+    /// and two adjacent slices of a pie in one colour is one slice. So a
+    /// candidate too close to one already taken is SKIPPED, and the list is
+    /// filled out with mixes of what was taken against the foreground and the
+    /// panel — which are the two directions guaranteed to move a colour away
+    /// from the others while staying visible on this theme's background.
+    fn series_all(&self) -> Vec<Rgba> {
+        // A rough "same colour to the eye" test. Not contrast: two colours can
+        // have equal luminance and be plainly different (blue and red), and
+        // contrast would call those a clash.
+        let near = |a: Rgba, b: Rgba| {
+            (a.r - b.r).abs() + (a.g - b.g).abs() + (a.b - b.b).abs() < 0.12
+        };
+        let mut out: Vec<Rgba> = Vec::with_capacity(6);
+        let candidates = [
+            self.accent(),
+            self.success(),
+            self.warning(),
+            self.error(),
+            Self::mix(self.fg(), self.accent(), 0.5),
+            Self::mix(self.accent(), self.panel(), 0.4),
+            Self::mix(self.warning(), self.fg(), 0.35),
+            Self::mix(self.error(), self.panel(), 0.35),
+            Self::mix(self.success(), self.fg(), 0.4),
+            self.title(),
+            self.fg(),
+            self.muted(),
+        ];
+        for c in candidates {
+            if out.len() == 6 {
+                break;
+            }
+            // Invisible against the canvas is not a colour either.
+            if Self::contrast(c, self.base()) < 1.3 {
+                continue;
+            }
+            if out.iter().any(|&o| near(o, c)) {
+                continue;
+            }
+            out.push(c);
+        }
+        // A theme so flat that twelve candidates gave fewer than two: the
+        // foreground, which every theme has to be able to show.
+        if out.is_empty() {
+            out.push(self.fg());
+        }
+        out
+    }
+
     pub fn badge(&self, kind: &str) -> Rgba {
         match kind {
             "string" => hex(&self.syntax.string, self.fg()),
@@ -508,6 +577,59 @@ mod tests {
         assert_eq!(hex("20272b", rgb(0xff0000)).g, rgb(0x20272b).g);
         assert_eq!(hex("nope", rgb(0xff0000)).r, rgb(0xff0000).r);
         assert_eq!(hex("#12345", rgb(0xff0000)).r, rgb(0xff0000).r);
+    }
+
+    /// Six series, all visible against the background, and no two the same.
+    ///
+    /// On every theme installed: a palette that works on the dark one and
+    /// disappears on the light one is a chart that is blank for whoever picked
+    /// the light one.
+    #[test]
+    fn every_series_can_be_seen_and_told_apart() {
+        let mut themes = vec![("builtin".to_string(), Theme::builtin())];
+        for (name, path) in discover() {
+            if let Ok(t) = load(&path) {
+                themes.push((name, t));
+            }
+        }
+        for (name, t) in &themes {
+            let cols: Vec<Rgba> = (0..6).map(|i| t.series(i)).collect();
+            for (i, c) in cols.iter().enumerate() {
+                // Against the CANVAS, which is the base.
+                let on_base = Theme::contrast(*c, t.base());
+                assert!(on_base >= 1.3, "{name}: series {i} is {on_base:.2} against the base");
+            }
+            // Neighbours differ: two adjacent slices of a pie in the same
+            // colour is one slice.
+            for i in 0..5 {
+                let d = Theme::contrast(cols[i], cols[i + 1]);
+                let same = (cols[i].r - cols[i + 1].r).abs() < 0.02
+                    && (cols[i].g - cols[i + 1].g).abs() < 0.02
+                    && (cols[i].b - cols[i + 1].b).abs() < 0.02;
+                assert!(!same, "{name}: series {i} and {} are one colour ({d:.2})", i + 1);
+            }
+        }
+        // And past the end they repeat rather than running out.
+        let t = Theme::builtin();
+        let n = (0..24).map(|i| t.series(i)).collect::<Vec<_>>();
+        assert_eq!(n[0].r, n[6].r, "the seventh is the first again");
+        // Every theme gives at least four distinguishable series: a pie of
+        // four is the common case, and fewer would mean repeating inside one
+        // chart.
+        for (name, t) in &themes {
+            let got: Vec<Rgba> = (0..6).map(|i| t.series(i)).collect();
+            let mut uniq = 0;
+            for i in 0..got.len() {
+                if !got[..i].iter().any(|o| {
+                    (o.r - got[i].r).abs() < 0.02
+                        && (o.g - got[i].g).abs() < 0.02
+                        && (o.b - got[i].b).abs() < 0.02
+                }) {
+                    uniq += 1;
+                }
+            }
+            assert!(uniq >= 4, "{name}: only {uniq} distinguishable series");
+        }
     }
 
     /// The DERIVED roles carry their own thresholds, on every theme installed.

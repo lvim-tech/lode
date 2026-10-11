@@ -161,6 +161,11 @@ impl Store {
                 -- moment the statement changed a column, and silently measure
                 -- something else.
                 measure    TEXT NOT NULL DEFAULT '',
+                -- HOW it is drawn: bars, line, area, scatter, pie. A word
+                -- rather than a number, so the store stays readable and a
+                -- client that reorders its own enum cannot change what was
+                -- saved. Empty means the client's default.
+                kind       TEXT NOT NULL DEFAULT '',
                 updated_at INTEGER
             );
             CREATE UNIQUE INDEX IF NOT EXISTS charts_conn_name ON charts (conn, name);
@@ -298,6 +303,7 @@ impl Store {
         // Columns added after the table first shipped. A database written by an
         // older build has the table without them.
         Self::add_column(conn, "connections", "grp", "TEXT");
+        Self::add_column(conn, "charts", "kind", "TEXT NOT NULL DEFAULT ''");
         conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
         Ok(())
     }
@@ -627,7 +633,8 @@ impl Store {
     pub async fn list_charts(&self, conn_name: String) -> anyhow::Result<Vec<Json>> {
         self.with(move |c| {
             let mut st = c.prepare(
-                "SELECT name, sql, measure, updated_at FROM charts WHERE conn = ?1 ORDER BY name",
+                "SELECT name, sql, measure, kind, updated_at FROM charts WHERE conn = ?1 \
+                 ORDER BY name",
             )?;
             let rows = st
                 .query_map(params![conn_name], |r| {
@@ -635,7 +642,8 @@ impl Store {
                         "name": r.get::<_, String>(0)?,
                         "sql": r.get::<_, String>(1)?,
                         "measure": r.get::<_, String>(2)?,
-                        "updated_at": r.get::<_, Option<i64>>(3)?,
+                        "kind": r.get::<_, String>(3)?,
+                        "updated_at": r.get::<_, Option<i64>>(4)?,
                     }))
                 })?
                 .collect::<Result<Vec<_>, _>>()?;
@@ -650,13 +658,16 @@ impl Store {
         name: String,
         sql: String,
         measure: String,
+        kind: String,
     ) -> anyhow::Result<()> {
         self.with(move |c| {
             c.execute(
-                "INSERT INTO charts (conn, name, sql, measure, updated_at) VALUES (?1, ?2, ?3, ?4, ?5) \
+                "INSERT INTO charts (conn, name, sql, measure, kind, updated_at) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6) \
                  ON CONFLICT(conn, name) DO UPDATE SET sql = excluded.sql, \
-                 measure = excluded.measure, updated_at = excluded.updated_at",
-                params![conn_name, name, sql, measure, now()],
+                 measure = excluded.measure, kind = excluded.kind, \
+                 updated_at = excluded.updated_at",
+                params![conn_name, name, sql, measure, kind, now()],
             )?;
             Ok(())
         })
@@ -1395,7 +1406,9 @@ mod tests {
         s.save_connection("stays".into(), "postgres".into(), json!({}), None).await.unwrap();
         s.save_query("gone".into(), "q".into(), "SELECT 1".into()).await.unwrap();
         s.save_query("stays".into(), "q".into(), "SELECT 1".into()).await.unwrap();
-        s.save_chart("gone".into(), "c".into(), "SELECT 1".into(), "n".into()).await.unwrap();
+        s.save_chart("gone".into(), "c".into(), "SELECT 1".into(), "n".into(), "bars".into())
+            .await
+            .unwrap();
         s.save_script("gone".into(), "s".into(), "lua".into(), "print(1)".into())
             .await
             .unwrap();

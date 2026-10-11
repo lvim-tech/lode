@@ -82,7 +82,7 @@ notification   {"method":"…","params":{…}}
 
 `proto` grows **additively**: a client accepts any engine reporting
 `proto >= its minimum`, so a newer engine keeps working with an older client.
-The current protocol is **18**. What each version added is listed in
+The current protocol is **19**. What each version added is listed in
 `src/rpc.rs` beside the constant.
 
 ### Handshake
@@ -197,7 +197,7 @@ own SQLite database — so two clients share them.
 | `store.history.record` | `{ conn, driver, statement, state, ms, rows }` | `{ recorded }` |
 | `store.history.list` | `{ limit }` | `{ history }` |
 | `store.charts.list` | `{ conn }` | `{ charts }` |
-| `store.charts.save` | `{ conn, name, sql, measure }` | `{ saved }` |
+| `store.charts.save` | `{ conn, name, sql, measure, kind? }` | `{ saved }` |
 | `store.charts.remove` | `{ conn, name }` | `{ removed }` |
 | `store.audit.list` | `{ limit, conn? }` | `{ audit, mode }` |
 | `store.profiles.users` | `{ kind, name }` | `{ users }` (`proto >= 14`) |

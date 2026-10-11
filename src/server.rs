@@ -1812,12 +1812,18 @@ impl Server {
             sql: String,
             #[serde(default)]
             measure: String,
+            /// How it is drawn: `bars`, `line`, `area`, `scatter`, `pie`. Not
+            /// checked against a list here — the words are the CLIENT's, the
+            /// engine neither draws nor interprets them, and a newer client
+            /// should be able to save a kind an older engine never heard of.
+            #[serde(default)]
+            kind: String,
         }
         let p: P = serde_json::from_value(params)?;
         if p.name.trim().is_empty() {
             return Err(anyhow::anyhow!("a saved chart needs a name"));
         }
-        self.store()?.save_chart(p.conn, p.name, p.sql, p.measure).await?;
+        self.store()?.save_chart(p.conn, p.name, p.sql, p.measure, p.kind).await?;
         Ok(json!({ "saved": true }))
     }
 
