@@ -82,7 +82,7 @@ notification   {"method":"…","params":{…}}
 
 `proto` grows **additively**: a client accepts any engine reporting
 `proto >= its minimum`, so a newer engine keeps working with an older client.
-The current protocol is **16**. What each version added is listed in
+The current protocol is **17**. What each version added is listed in
 `src/rpc.rs` beside the constant.
 
 ### Handshake
@@ -191,10 +191,20 @@ own SQLite database — so two clients share them.
 | `store.audit.list` | `{ limit, conn? }` | `{ audit, mode }` |
 | `store.profiles.users` | `{ kind, name }` | `{ users }` (`proto >= 14`) |
 | `store.import` | `{ path }` | `{ connections, queries, history }` |
+| `vault.put` | `{ name, value }` | `{ stored, name }` (`proto >= 17`) |
 
 A saved connection keeps only the **template**: `spec` is the
 `{ params, auth, tls, tunnel }` JSON with secrets still as templates. Nothing
 resolved is ever stored.
+
+`vault.put` is the one verb that carries a secret INTO the engine rather than a
+name for one. It exists so a password typed into a client can be moved into the
+lvim-keyring wallet and the client can then keep only a `{{ vault "db/prod" }}`
+template. The value arrives on the engine's stdin — the same path a literal
+credential already takes on `conn.connect` — goes straight to the wallet's
+socket, and is never written to the store, the audit log or an error message. A
+locked wallet is an error with an instruction in it: the gate stays in front of
+the person, so the engine never unlocks it in the background.
 
 `group` is which FOLDER a client files a connection in, and it is in the shared
 store rather than a client's own file: two clients filing one connection in two

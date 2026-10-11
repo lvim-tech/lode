@@ -1,4 +1,4 @@
-// lode/vault: resolve a `{{ vault "name" }}` secret from the lvim-keyring agent.
+// lode/vault: resolve a `{{ vault "name" }}` secret from the lvim-keyring agent, and store one.
 //
 // The wallet (lvim-keyring) runs its OWN per-user daemon behind a unix socket. This module is a
 // one-shot CLIENT of it: connect, send a single `secret.get`, read the value. lode never spawns
@@ -25,6 +25,31 @@ fn socket_path() -> Option<String> {
 
 /// Fetch the secret named `name` from the keyring agent.
 pub async fn fetch(name: &str) -> Result<String> {
+    let msg = talk("secret.get", serde_json::json!({ "name": name })).await?;
+    msg.pointer("/result/value")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .ok_or_else(|| anyhow!("secret: lvim-keyring returned no value"))
+}
+
+/// Store `value` under `name`, so a client can stop keeping it itself.
+///
+/// This is the one verb here that WRITES, and it exists so a password typed
+/// into a connection form can be moved into the wallet instead of being
+/// written into the store. The value travels the engine's stdin pipe and this
+/// socket and is never stored, logged or echoed back — the reply says only
+/// whether it landed.
+///
+/// `wait` is not passed, exactly as in `fetch`: a locked wallet is an error
+/// with an instruction in it, not something to unlock from the background. The
+/// gate belongs in front of the person.
+pub async fn put(name: &str, value: &str) -> Result<()> {
+    talk("secret.set", serde_json::json!({ "name": name, "value": value, "wait": false })).await?;
+    Ok(())
+}
+
+/// One request, one reply. Connect, send, read until OUR id comes back.
+async fn talk(method: &str, params: Value) -> Result<Value> {
     let path = socket_path().ok_or_else(|| {
         anyhow!("secret: lvim-keyring socket path is unknown (set $XDG_RUNTIME_DIR or $LVIM_KEYRING_SOCK)")
     })?;
@@ -33,7 +58,7 @@ pub async fn fetch(name: &str) -> Result<String> {
         anyhow!("secret: lvim-keyring is not running — open Neovim's :LvimKeyring (or install lvim-keyring)")
     })?;
 
-    let req = serde_json::json!({ "id": 1, "method": "secret.get", "params": { "name": name } }).to_string();
+    let req = serde_json::json!({ "id": 1, "method": method, "params": params }).to_string();
     let mut reader = BufReader::new(stream);
     reader.get_mut().write_all(req.as_bytes()).await?;
     reader.get_mut().write_all(b"\n").await?;
@@ -55,11 +80,7 @@ pub async fn fetch(name: &str) -> Result<String> {
             continue; // a notification — skip
         }
         if msg.get("ok").and_then(Value::as_bool) == Some(true) {
-            return msg
-                .pointer("/result/value")
-                .and_then(Value::as_str)
-                .map(str::to_string)
-                .ok_or_else(|| anyhow!("secret: lvim-keyring returned no value"));
+            return Ok(msg);
         }
         let err = msg.get("error").and_then(Value::as_str).unwrap_or("unknown error");
         return Err(if err == "locked" {

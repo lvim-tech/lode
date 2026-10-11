@@ -81,6 +81,22 @@ impl Source {
     }
 }
 
+/// What a secret is called in the wallet.
+///
+/// `db/<connection>` for the password, which is the name lvim-db uses — so the
+/// Neovim client finds the same secret rather than a second copy of it. Every
+/// other secret a connection can have hangs below that, because one name for
+/// four secrets is one secret overwritten three times.
+pub fn vault_name(conn: &str, field: &str) -> String {
+    let conn = conn.trim();
+    match field {
+        "auth-password" | "password" => format!("db/{conn}"),
+        // `auth-` says only where the field lives in this window; it is noise
+        // in a name somebody has to read in the wallet.
+        other => format!("db/{conn}/{}", other.trim_start_matches("auth-")),
+    }
+}
+
 /// One value, kept per source.
 ///
 /// Switching `Literal → Env → Literal` used to show the variable name where the
@@ -191,6 +207,8 @@ pub struct Field {
 
 pub struct ConnectionForm {
     workspace: WeakEntity<Workspace>,
+    /// What the engine speaks, for the one button that needs a new engine.
+    proto: u32,
     theme: Theme,
     /// The same type scale as the workspace, handed over when the window opens:
     /// a dialog in its own OS window is still the same application, and a form
@@ -299,6 +317,10 @@ pub struct ConnectionForm {
     /// The last answer from each `conn.test` stage.
     tests: HashMap<&'static str, Result<String, String>>,
     error: Option<String>,
+    /// What just happened that is not a failure — the wallet taking a secret,
+    /// so far. Separate from `error` because a success printed in the error
+    /// line reads as a failure whatever it says.
+    note: Option<String>,
 }
 
 /// The spec to save: `edited` laid over `existing`, key by key.
@@ -344,6 +366,9 @@ impl ConnectionForm {
     pub fn new(
         workspace: WeakEntity<Workspace>,
         look: crate::widgets::Look,
+        // What the engine speaks. Only `>= 17` can be asked to put a secret in
+        // the wallet, and a button that would fail is a button not to draw.
+        proto: u32,
         drivers: Vec<DriverMeta>,
         tunnel_profiles: Vec<String>,
         tunnel_profile_specs: std::collections::BTreeMap<String, Value>,
@@ -395,6 +420,7 @@ impl ConnectionForm {
         let tls_v = spec.get("tls").cloned().unwrap_or(json!({}));
         let mut form = ConnectionForm {
             workspace,
+            proto,
             existing_spec: spec.clone(),
             tab: FormTab::Main,
             editing: existing.as_ref().map(|(n, _, _)| n.clone()),
@@ -490,6 +516,7 @@ impl ConnectionForm {
             },
             tests: HashMap::new(),
             error: None,
+            note: None,
             theme,
             scale,
             font_family: text_font,
@@ -1146,6 +1173,53 @@ impl ConnectionForm {
             }
             row = row.child(picker);
         }
+        // INTO THE WALLET. Only for a literal — the other three sources are
+        // already a pointer at a secret kept somewhere else, and there would be
+        // nothing to move.
+        //
+        // Named after the connection, as lvim-db names them, so the Neovim
+        // client looks the secret up in the same place. The password gets the
+        // bare `db/<name>`, which is that convention; the other secrets a
+        // connection can have hang below it, because one name for four secrets
+        // would be one secret overwritten three times.
+        if secret && source == Source::Literal && self.proto >= 17 {
+            let typed = input.read(cx).text().to_string();
+            let conn = self.name.read(cx).text().trim().to_string();
+            let can = !typed.is_empty() && !conn.is_empty();
+            let (k, field) = (key.clone(), key.clone());
+            row = row.child(
+                div()
+                    .id(SharedString::from(format!("vault-{key}")))
+                    .flex_none()
+                    .cursor_pointer()
+                    .tooltip(crate::tip::Tip::build(
+                        if can {
+                            format!(
+                                "{} \u{2192} {}",
+                                self.tr("tip.to_keyring"),
+                                vault_name(&conn, &k)
+                            )
+                        } else if conn.is_empty() {
+                            self.tr("tip.to_keyring_needs_name").to_string()
+                        } else {
+                            self.tr("tip.to_keyring_needs_value").to_string()
+                        },
+                        None,
+                        self.theme.clone(),
+                        ms,
+                    ))
+                    .hover(|d| d.bg(t.hover_mark()))
+                    .child(self.icon_inline(
+                        "\u{f084}",
+                        if can { t.accent() } else { t.disabled() },
+                    ))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        if can {
+                            this.to_keyring(&field, cx);
+                        }
+                    })),
+            );
+        }
         // Dots, and an eye to look.
         //
         // Only when the value IS the credential. Under `Env`, `Command` and
@@ -1207,6 +1281,73 @@ impl ConnectionForm {
             // Only a literal is the secret itself.
             i.set_mask(f.secret && to == Source::Literal, cx);
         });
+    }
+
+    /// Hand the typed secret to the engine, to be put in the wallet.
+    ///
+    /// The field is NOT switched here. It is switched when the engine says the
+    /// secret landed — see `stored_in_keyring`. Switching first would mean a
+    /// form pointing at a wallet entry that does not exist, with the password
+    /// that was typed already gone.
+    fn to_keyring(&mut self, key: &str, cx: &mut Context<Self>) {
+        let conn = self.name.read(cx).text().trim().to_string();
+        let Some(f) = self.field(key) else { return };
+        let value = f.input.read(cx).text().to_string();
+        if conn.is_empty() || value.is_empty() {
+            return;
+        }
+        let name = vault_name(&conn, key);
+        let (k, me) = (key.to_string(), cx.entity().downgrade());
+        self.error = None;
+        self.note = Some(format!("storing {name}\u{2026}"));
+        let _ = self.workspace.update(cx, |w, _| w.vault_put(k, name, value, me));
+        cx.notify();
+    }
+
+    /// The engine stored it. NOW the field becomes a pointer at the wallet.
+    pub fn stored_in_keyring(&mut self, key: &str, name: &str, cx: &mut Context<Self>) {
+        if self.field(key).is_none() {
+            return;
+        }
+        let f = self.field_mut(key).expect("just checked");
+        Self::swap_source(f, Source::Keyring, cx);
+        if let Some(f) = self.field_mut(key) {
+            f.input.update(cx, |i, cx| i.set_text(name.to_string(), cx));
+        }
+        self.error = None;
+        self.note = Some(format!("{name} is in the keyring"));
+        cx.notify();
+    }
+
+    /// The wallet refused it — locked, or not running. The field keeps the
+    /// value, because it is the only copy.
+    pub fn keyring_refused(&mut self, _key: &str, why: &str, cx: &mut Context<Self>) {
+        self.note = None;
+        self.error = Some(why.to_string());
+        cx.notify();
+    }
+
+    /// One field, by the key its row was drawn with.
+    fn field(&self, key: &str) -> Option<&Field> {
+        match key {
+            "auth-password" => Some(&self.auth_password),
+            "auth-key-password" => Some(&self.auth_key_password),
+            "auth-token" => Some(&self.auth_token),
+            "tunnel-passphrase" => Some(&self.tunnel_passphrase),
+            "tunnel-password" => Some(&self.tunnel_password),
+            other => self.params.get(other),
+        }
+    }
+
+    fn field_mut(&mut self, key: &str) -> Option<&mut Field> {
+        match key {
+            "auth-password" => Some(&mut self.auth_password),
+            "auth-key-password" => Some(&mut self.auth_key_password),
+            "auth-token" => Some(&mut self.auth_token),
+            "tunnel-passphrase" => Some(&mut self.tunnel_passphrase),
+            "tunnel-password" => Some(&mut self.tunnel_password),
+            other => self.params.get_mut(other),
+        }
     }
 
     fn set_source(&mut self, key: &str, s: Source, cx: &mut gpui::App) {
@@ -2057,6 +2198,9 @@ impl Render for ConnectionForm {
         if let Some(e) = &self.error {
             body = body.child(self.small(e.clone(), t.error()));
         }
+        if let Some(n) = &self.note {
+            body = body.child(self.small(n.clone(), t.success()));
+        }
 
         // Test on the left, Cancel and Save on the right — the arrangement a
         // dialog has everywhere, and the one dbflux uses.
@@ -2476,6 +2620,36 @@ mod tests {
             assert_eq!(s.wrap(""), "", "{} must not wrap nothing", s.label());
             assert_eq!(s.wrap("   "), "");
         }
+    }
+
+    /// The wallet name follows lvim-db for the password and hangs the rest
+    /// below it.
+    ///
+    /// The point of the first half is that the Neovim client finds the SAME
+    /// secret rather than a second copy of it; the point of the second is that
+    /// a connection with a password, a key passphrase and a token would
+    /// otherwise store three secrets under one name and keep the last.
+    #[test]
+    fn a_secret_is_named_after_its_connection() {
+        assert_eq!(super::vault_name("prod", "auth-password"), "db/prod");
+        assert_eq!(super::vault_name("prod", "password"), "db/prod");
+        assert_eq!(super::vault_name("prod", "auth-token"), "db/prod/token");
+        assert_eq!(super::vault_name("prod", "auth-key-password"), "db/prod/key-password");
+        assert_eq!(super::vault_name("prod", "tunnel-passphrase"), "db/prod/tunnel-passphrase");
+        // Spaces around the name are the typist's, not the name's.
+        assert_eq!(super::vault_name("  prod  ", "auth-password"), "db/prod");
+        // Four secrets, four names.
+        let names: std::collections::BTreeSet<String> = [
+            "auth-password",
+            "auth-key-password",
+            "auth-token",
+            "tunnel-passphrase",
+            "tunnel-password",
+        ]
+        .iter()
+        .map(|f| super::vault_name("one", f))
+        .collect();
+        assert_eq!(names.len(), 5, "{names:?}");
     }
 
     /// Something that merely looks like a template is not one.

@@ -157,7 +157,12 @@ use serde_json::json;
 ///      folder as a side effect of saving a password. Additive: a client that
 ///      never sends it behaves exactly as before, and one that never reads the
 ///      field sees a flat list.
-pub const PROTO: u32 = 16;
+/// 17. `vault.put {name, value}` stores a secret in the lvim-keyring wallet,
+///     so a password typed into a form can be moved out of the store instead
+///     of being kept in it. The value travels the engine's stdin pipe, which
+///     is the same path a literal credential already takes on `conn.connect`;
+///     it is never written to the store, the audit log or an error message.
+pub const PROTO: u32 = 17;
 
 /// One decoded incoming request.
 #[derive(Debug, Deserialize)]

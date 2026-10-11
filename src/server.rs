@@ -758,6 +758,7 @@ impl Server {
             "store.history.record" => self.store_history_record(params).await,
             "store.history.list" => self.store_history_list(params).await,
             "store.import" => self.store_import(params).await,
+            "vault.put" => Self::vault_put(params).await,
             other => Err(anyhow::anyhow!("unknown method '{other}'")),
         }
     }
@@ -2635,6 +2636,37 @@ impl Server {
         }
         let p: P = serde_json::from_value(params).unwrap_or_default();
         Ok(json!({ "history": self.store()?.list_history(p.limit).await? }))
+    }
+
+    /// Put a secret in the wallet, so the store does not have to hold it.
+    ///
+    /// The VALUE is the one thing here that must not be kept: it arrives on the
+    /// engine's stdin, goes straight to the keyring socket, and is never
+    /// written to the store, the audit log or an error message. That is why the
+    /// failure below names the SECRET and not what was being stored under it —
+    /// an error carrying the value would be the leak this method exists to
+    /// prevent.
+    ///
+    /// Not a method on `self`: it touches neither the store nor a connection.
+    async fn vault_put(params: Json) -> anyhow::Result<Json> {
+        #[derive(Deserialize)]
+        struct P {
+            name: String,
+            value: String,
+        }
+        let p: P = serde_json::from_value(params)?;
+        if p.name.trim().is_empty() {
+            anyhow::bail!("a secret needs a name");
+        }
+        if p.value.is_empty() {
+            // An empty value would overwrite a real secret with nothing, and
+            // "it saved" would be the only sign.
+            anyhow::bail!("a secret needs a value");
+        }
+        crate::vault::put(p.name.trim(), &p.value)
+            .await
+            .map_err(|e| anyhow::anyhow!("could not store {:?}: {e}", p.name.trim()))?;
+        Ok(json!({ "stored": true, "name": p.name.trim() }))
     }
 
     async fn store_import(&self, params: Json) -> anyhow::Result<Json> {

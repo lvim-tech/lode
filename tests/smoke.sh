@@ -65,7 +65,12 @@ mkfifo "$IN"
 : >"$OUT"
 # The store MUST land in the throwaway directory: this test writes connections
 # and history, and it has no business touching the real ones.
-LODE_DATA_DIR=$WORK/data "$BIN" <"$IN" >"$OUT" 2>"$WORK/err" &
+# The keyring socket is pointed at NOTHING on purpose. `vault.put` writes to the
+# real per-user wallet, and a test that stores secrets in the person's wallet is
+# a test with a side effect nobody asked for — so the engine must find no agent
+# there, which is exactly the refusal the checks below want to see.
+LODE_DATA_DIR=$WORK/data LVIM_KEYRING_SOCK=$WORK/no-such-agent.sock \
+    "$BIN" <"$IN" >"$OUT" 2>"$WORK/err" &
 PID=$!
 # Hold the fifo open for the whole run: a plain `echo > fifo` would close it and
 # the engine would see EOF on stdin and exit after the first request.
@@ -333,6 +338,35 @@ send '{"id":48,"method":"store.connections.save","params":{"name":"smoke","drive
 await '.id == 48' >/dev/null
 send '{"id":49,"method":"store.connections.get","params":{"name":"smoke"}}'
 check "and null takes it out" "$(await '.id == 49' | jq -r '.result.connection.group')" "null"
+
+# `vault.put` CARRIES a secret, and the one thing it must never do is keep it
+# anywhere: not in the store, not in the audit log, not in the error it fails
+# with. There is no agent on that socket, so this is the refusal path — the one
+# that has an error message to inspect.
+send '{"id":60,"method":"vault.put","params":{"name":"db/smoke","value":"s3cret-canary"}}'
+VP=$(await '.id == 60')
+check "no wallet is a refusal" "$(printf '%s' "$VP" | jq -r '.ok')" "false"
+check "and it says what to do" \
+    "$(printf '%s' "$VP" | jq -r 'if (.error | test("lvim-keyring")) then "yes" else .error end')" \
+    "yes"
+check "and the secret is not in the error" \
+    "$(printf '%s' "$VP" | jq -r 'if (.error | test("s3cret-canary")) then "LEAKED" else "no" end')" \
+    "no"
+# Nor anywhere else the engine writes. Everything it has said on stdout and
+# stderr is searched, because a value echoed back in a reply or logged on the
+# way past is the same leak by another route. Zero files, not zero lines: a
+# count of lines would pass just as well if the search itself were broken.
+check "and not in anything the engine wrote" \
+    "$(grep -l s3cret-canary "$OUT" "$WORK/err" 2>/dev/null | wc -l | tr -d ' ')" \
+    "0"
+send '{"id":61,"method":"vault.put","params":{"name":"  ","value":"x"}}'
+check "a secret needs a name" \
+    "$(await '.id == 61' | jq -r 'if (.error | test("needs a name")) then "yes" else .error end')" \
+    "yes"
+send '{"id":62,"method":"vault.put","params":{"name":"db/smoke","value":""}}'
+check "and a value" \
+    "$(await '.id == 62' | jq -r 'if (.error | test("needs a value")) then "yes" else .error end')" \
+    "yes"
 
 # A REMOVE takes everything scoped to the name too. It used to take only the
 # saved queries, so a chart or a dashboard was left pointing at a name nothing

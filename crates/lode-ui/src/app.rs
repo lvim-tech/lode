@@ -946,6 +946,10 @@ enum Pending {
     Classify { conn: String, statement: String },
     /// One `conn.test` stage asked from the connection window.
     FormTest { stage: &'static str, form: WeakEntity<ConnectionForm> },
+    /// A secret the connection window asked to be moved into the wallet. The
+    /// field is only switched over once the engine says it LANDED: switching
+    /// first and failing after would lose the password that was typed.
+    VaultPut { field: String, name: String, form: WeakEntity<ConnectionForm> },
     /// The saved tunnel or proxy profiles, by kind.
     Profiles { kind: &'static str },
     /// The AWS profile names the engine found in `~/.aws/config`.
@@ -2044,6 +2048,10 @@ impl Workspace {
                     f.test_answer(stage, Ok(format!("{detail} ({ms} ms)")), cx)
                 });
             }
+            Pending::VaultPut { field, name, form } => {
+                let _ = form.update(cx, |f, cx| f.stored_in_keyring(&field, &name, cx));
+                self.toast(format!("stored as {name}"), false);
+            }
             Pending::Metrics { conn } => {
                 self.metrics =
                     serde_json::from_value(v.get("metrics").cloned().unwrap_or(json!([])))
@@ -2605,6 +2613,12 @@ impl Workspace {
             }
             Pending::FormTest { stage, form } => {
                 let _ = form.update(cx, |f, cx| f.test_answer(stage, Err(e), cx));
+            }
+            Pending::VaultPut { field, form, .. } => {
+                // The field is LEFT as it was, holding the value: a form that
+                // had switched to the wallet while the wallet refused it would
+                // be a form pointing at a secret that is not there.
+                let _ = form.update(cx, |f, cx| f.keyring_refused(&field, &e, cx));
             }
             // A classification that failed is NOT permission to run: the answer
             // was "I do not know", and the whole point is to ask first.
@@ -3471,6 +3485,9 @@ impl Workspace {
             None => "lode — New connection".to_string(),
         };
         let look = self.look();
+        // PUSHED, like everything else this window is given: it cannot read the
+        // workspace while the workspace is drawing it. See the guardrail test.
+        let proto = self.hello.as_ref().map_or(0, |h| h.proto);
         let (w, h) = self.scale.window(crate::metrics::Window::Connection);
         let bounds = Bounds::centered(None, size(px(w), px(h)), cx);
         let opened = cx.open_window(
@@ -3487,6 +3504,7 @@ impl Workspace {
                     ConnectionForm::new(
                         me,
                         look,
+                        proto,
                         drivers,
                         tunnel_profiles,
                         tunnel_profile_specs,
@@ -3663,6 +3681,25 @@ impl Workspace {
             Pending::FormTest { stage, form },
             "conn.test",
             json!({ "stage": stage, "spec": spec }),
+        );
+    }
+
+    /// Move a secret the connection window is holding into the wallet.
+    ///
+    /// The value goes out on the engine's stdin, which is the same path a
+    /// literal credential already takes on `conn.connect` — it does not touch
+    /// the store on the way, and the engine does not keep it.
+    pub fn vault_put(
+        &mut self,
+        field: String,
+        name: String,
+        value: String,
+        form: WeakEntity<ConnectionForm>,
+    ) {
+        self.ask(
+            Pending::VaultPut { field, name: name.clone(), form },
+            "vault.put",
+            json!({ "name": name, "value": value }),
         );
     }
 
