@@ -53,6 +53,14 @@ pub struct Session {
     /// otherwise silently open somebody else's groups.
     #[serde(default)]
     pub settings_open: Option<Vec<String>>,
+    /// Keys somebody has changed: the action's name, and the keystroke it
+    /// should answer to.
+    ///
+    /// By ACTION NAME, as `gpui::actions!` spells it (`lode::NextRow`), because
+    /// that is the only stable handle on one — an index into a table would move
+    /// the first time an action is added in the middle.
+    #[serde(default)]
+    pub keys: Option<std::collections::BTreeMap<String, String>>,
     /// Which connection FOLDERS are folded shut, by key.
     ///
     /// The folders themselves are the store's — shared, so two clients agree
@@ -246,6 +254,7 @@ mod tests {
             settings_open: Some(vec!["theme".into()]),
             panel_hidden: None,
             shut_groups: None,
+            keys: None,
             panel_w: Some(320.0),
         };
         let text = serde_json::to_string(&s).unwrap();
@@ -289,6 +298,7 @@ mod tests {
             settings_open: None,
             panel_hidden: None,
             shut_groups: None,
+            keys: None,
             panel_w: None,
         };
         let round: Session = serde_json::from_str(&serde_json::to_string(&typed).unwrap()).unwrap();

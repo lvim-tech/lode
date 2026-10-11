@@ -38,6 +38,9 @@ use crate::widgets::{btn, Btn};
 /// forgets leaves a stale number beside the stepper that moves it.
 #[derive(Clone)]
 pub struct Appearance {
+    /// Keys somebody has changed, so the page can mark them and say what the
+    /// default was.
+    pub keys: std::collections::BTreeMap<String, String>,
     pub theme_name: String,
     pub themes: Vec<String>,
     pub theme_dirs: Vec<String>,
@@ -48,82 +51,6 @@ pub struct Appearance {
     pub font_family: String,
     pub icon_family: String,
 }
-
-/// What the keyboard does, grouped as somebody would look for it.
-///
-/// A LIST, written here rather than read from the bindings: `gpui` does not
-/// offer its key map back, and a table generated from nothing is a table that
-/// can only be wrong. It is checked by a test against the bindings' own file,
-/// so a key added there and not here fails the build rather than quietly
-/// disagreeing.
-const KEYS: &[(&str, &[(&str, &str)])] = &[
-    (
-        "THE WINDOW",
-        &[
-            ("Everything, by name", "ctrl-p"),
-            ("Leave what is in front", "escape"),
-            ("Settings", "ctrl-,"),
-            ("Hide the panel", "ctrl-shift-b"),
-            ("New connection", "ctrl-shift-n"),
-            ("Audit", "ctrl-shift-a"),
-            ("Tasks", "ctrl-shift-t"),
-        ],
-    ),
-    (
-        "TABS",
-        &[
-            ("A tab of its own", "ctrl-t"),
-            ("Close it", "ctrl-w"),
-            ("The one before this", "ctrl-tab"),
-            ("By position", "ctrl-1 \u{2026} ctrl-9"),
-            ("Left / right", "h / l"),
-        ],
-    ),
-    (
-        "THE RESULT",
-        &[
-            ("Run this tab", "r / f5"),
-            ("Run what is in the editor", "ctrl-enter"),
-            ("Run it in a new tab", "ctrl-shift-enter"),
-            ("A row down / up", "j / k"),
-            ("First / last row", "g / shift-g"),
-            ("A page down / up", "ctrl-f / ctrl-b"),
-            ("The grid sideways", "shift-h / shift-l"),
-            ("A page of rows", "[ / ]"),
-            ("Show the row", "enter"),
-            ("A cell left / right", ", / ."),
-            ("Copy the cell", "ctrl-c"),
-            ("Copy the row", "ctrl-shift-c"),
-            ("Copy the loaded rows", "y"),
-            ("Export", "ctrl-e"),
-        ],
-    ),
-    (
-        "THE EDITOR",
-        &[
-            ("A new line", "enter"),
-            ("Indent / unindent", "tab / shift-tab"),
-            ("Comment the block", "ctrl-/"),
-            ("Duplicate the line", "ctrl-d"),
-            ("Undo / redo", "ctrl-z / ctrl-shift-z"),
-            ("A word left / right", "ctrl-left / ctrl-right"),
-            ("Take the suggestion", "tab / enter"),
-            ("Dismiss it", "escape"),
-        ],
-    ),
-    (
-        "THE COMMAND LINE",
-        &[("The line before / after", "up / down"), ("Run it", "enter")],
-    ),
-    (
-        "A WINDOW OF ITS OWN",
-        &[
-            ("The next / previous field", "tab / shift-tab"),
-            ("Save", "enter"),
-            ("Close", "escape"),
-        ],
-    ),
-];
 
 /// What the ENGINE has said, for the pages that report rather than set.
 ///
@@ -256,6 +183,10 @@ pub struct SettingsWindow {
     /// Which profile a remove has been ASKED about. The question stands on the
     /// row, before anything happens — not in a toast afterwards.
     confirm_rm: Option<(&'static str, String)>,
+    /// Which key is being changed, by action name.
+    editing_key: Option<String>,
+    /// The field the new keystroke is typed into.
+    key_input: Entity<TextInput>,
     /// The theme filter.
     ///
     /// In the HEADER, never in the page. A `TextInput` shapes and measures its
@@ -294,6 +225,14 @@ impl SettingsWindow {
         let colors = crate::form::colors_of(&theme);
         let search = cx.new(|cx| TextInput::new(cx, "Search settings…", colors));
         let theme_filter = cx.new(|cx| TextInput::new(cx, lang.tr("settings.filter_themes"), colors));
+        let key_input = cx.new(|cx| TextInput::new(cx, "ctrl-shift-k", colors));
+        cx.subscribe(&key_input, |this, input, ev: &crate::input::InputEvent, cx| {
+            if matches!(ev, crate::input::InputEvent::Submit) {
+                let typed = input.read(cx).text().trim().to_string();
+                this.commit_key(typed, cx);
+            }
+        })
+        .detach();
         let driver_shown = drivers.first().map(|d| d.kind.clone());
         SettingsWindow {
             workspace,
@@ -305,6 +244,8 @@ impl SettingsWindow {
             tunnels,
             proxies,
             confirm_rm: None,
+            editing_key: None,
+            key_input,
             theme_filter,
             font_family: text_font,
             icon_family: icon_font,
@@ -339,7 +280,7 @@ impl SettingsWindow {
     }
 
     pub fn all_inputs(&self) -> Vec<Entity<TextInput>> {
-        vec![self.search.clone(), self.theme_filter.clone()]
+        vec![self.search.clone(), self.theme_filter.clone(), self.key_input.clone()]
     }
 
     /// The sizes changed under us — see `Workspace::poke_settings`.
@@ -625,6 +566,16 @@ impl SettingsWindow {
         let (t, ms) = (&self.theme, self.scale);
         crate::widgets::chip(t, ms, id, label, on)
             .on_click(cx.listener(move |this, _, window, cx| on_press(this, window, cx)))
+    }
+
+    /// The new keystroke was typed. Hand it to the workspace, which owns the
+    /// bindings — an empty answer puts the default back.
+    fn commit_key(&mut self, typed: String, cx: &mut Context<Self>) {
+        let Some(name) = self.editing_key.take() else { return };
+        let _ = self
+            .workspace
+            .update(cx, |w, cx| w.set_key_override(&name, &typed, cx));
+        cx.notify();
     }
 
     /// Tab and shift-tab between the two fields — see
@@ -1129,17 +1080,90 @@ impl SettingsWindow {
                 ));
             }
             Category::Keys => {
-                // SHOWN, not editable. Editing them means a keymap stored
-                // somewhere and read at startup, which is its own step; a list
-                // nobody can find is the bigger gap, and this closes it.
                 out = out.child(self.note(
-                    "What the keyboard does. Changing them is not built yet.",
+                    "Press a row to change its key, then type the new one and press Enter. \
+                     `escape` leaves it alone; an empty answer puts the default back.",
                 ));
-                for (group, rows) in KEYS {
-                    out = out.child(self.head(*group));
-                    for (action, key) in *rows {
-                        out = out.child(self.row(*action, *key));
+                // From the SAME table the bindings come from — it was written
+                // out twice, with a test to stop the two disagreeing, and one
+                // table cannot disagree with itself.
+                let mut group = "";
+                for (g, label, name, default) in crate::app::KEYMAP {
+                    if *g != group {
+                        group = g;
+                        out = out.child(self.head(*g));
                     }
+                    let now = self
+                        .look
+                        .keys
+                        .get(*name)
+                        .map(String::as_str)
+                        .unwrap_or(default);
+                    let changed = now != *default;
+                    let editing = self.editing_key.as_deref() == Some(*name);
+                    if editing {
+                        out = out.child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap_2()
+                                .py(px(1.0))
+                                .child(
+                                    div()
+                                        .w(px(ms.base() * 13.0))
+                                        .flex_none()
+                                        .text_size(ms.small())
+                                        .text_color(t.accent())
+                                        .child(SharedString::from(*label)),
+                                )
+                                .child(
+                                    div()
+                                        .w(px(ms.base() * 12.0))
+                                        .text_size(ms.small())
+                                        .child(self.key_input.clone()),
+                                ),
+                        );
+                        continue;
+                    }
+                    let whose = name.to_string();
+                    out = out.child(
+                        div()
+                            .id(SharedString::from(format!("key-{name}")))
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .py(px(1.0))
+                            .cursor_pointer()
+                            .hover(|d| d.bg(t.hover_mark()))
+                            .child(
+                                div()
+                                    .w(px(ms.base() * 13.0))
+                                    .flex_none()
+                                    .text_size(ms.small())
+                                    .text_color(t.muted())
+                                    .child(SharedString::from(*label)),
+                            )
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .text_size(ms.small())
+                                    // A changed key is marked, and its default
+                                    // is said: "why does this not match the
+                                    // documentation" needs an answer in the
+                                    // place somebody is looking.
+                                    .text_color(if changed { t.accent() } else { t.fg() })
+                                    .child(SharedString::from(if changed {
+                                        format!("{now}   (was {default})")
+                                    } else {
+                                        now.to_string()
+                                    })),
+                            )
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.editing_key = Some(whose.clone());
+                                this.key_input.update(cx, |i, cx| i.set_text("", cx));
+                                cx.notify();
+                            })),
+                    );
                 }
             }
             Category::Audit => {
@@ -1296,45 +1320,32 @@ mod tests {
         }
     }
 
-    /// The key table says what the bindings actually say.
+    /// Every default in the table is a keystroke gpui can parse.
     ///
-    /// Written by hand, because gpui does not offer its key map back — so the
-    /// only thing that can keep it honest is reading the file the bindings are
-    /// in. A key bound there and missing here is a page that teaches something
-    /// untrue, which is worse than a page that teaches nothing.
+    /// The test that used to live here compared a hand-written table against
+    /// the bindings' own file, because the two were written out twice. They are
+    /// one table now, so that test has nothing to compare — and what is left
+    /// worth checking is that a default cannot take the window down:
+    /// `KeyBinding::new` PANICS on a keystroke it cannot parse, so a typo in
+    /// the table would be a window that does not open.
     #[test]
-    fn the_key_table_agrees_with_the_bindings() {
-        let src = |name: &str| {
-            std::fs::read_to_string(
-                std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src").join(name),
-            )
-            .unwrap_or_default()
-        };
-        let bound = format!("{}{}{}", src("app.rs"), src("input.rs"), src("editor_el.rs"));
-        let mut missing = Vec::new();
-        for (_, rows) in KEYS {
-            for (action, keys) in *rows {
-                // A row may list two ways to do one thing ("r / f5"); each
-                // has to be bound somewhere. The separator is a SLASH, not a
-                // comma: `ctrl-,` and `,` are both keys whose own name is a
-                // comma, and a comma separator cannot tell them apart.
-                for key in keys.split(" / ").map(str::trim) {
-                    // The ranges and the words are not literal bindings.
-                    if key.contains('\u{2026}') {
-                        continue;
-                    }
-                    if !bound.contains(&format!("KeyBinding::new(\"{key}\"")) {
-                        missing.push(format!("{action}: {key}"));
-                    }
-                }
+    fn every_default_key_parses() {
+        let mut seen: Vec<(&str, &str)> = Vec::new();
+        for (group, label, name, key) in crate::app::KEYMAP {
+            assert!(
+                crate::app::valid_keystroke(key),
+                "{name} ({label}) has {key:?}, which gpui cannot parse"
+            );
+            assert!(!group.is_empty() && !label.is_empty(), "{name} has no label");
+            assert!(name.starts_with("lode::"), "{name} is not an action name");
+            // And no two rows CLASH by default: two actions on one key is a key
+            // that does whichever gpui resolves first.
+            if let Some((other, _)) = seen.iter().find(|(_, k)| k == key) {
+                panic!("{name} and {other} both default to {key:?}");
             }
+            seen.push((name, key));
         }
-        assert!(
-            missing.is_empty(),
-            "{} key(s) on the Keybindings page that nothing binds:\n  {}",
-            missing.len(),
-            missing.join("\n  ")
-        );
+        assert!(seen.len() > 20, "only {} changeable keys?", seen.len());
     }
 
     /// A proxy is not a tunnel, and its line must not invent a port 22 or a

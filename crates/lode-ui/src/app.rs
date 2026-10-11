@@ -132,72 +132,136 @@ gpui::actions!(
 /// `j` typed into a filter box has to be a `j`. The field's own bindings — the
 /// arrows, home, end — stay as they are; these are what is left over when
 /// nothing is being typed into.
+/// Every key somebody may CHANGE: what it does, its default, and where it
+/// works.
+///
+/// One table, and two things come out of it — the bindings themselves and the
+/// Keybindings page. Written by hand before, in two places, with a test to
+/// stop them disagreeing; one table cannot disagree with itself.
+///
+/// The ACTION NAME is the handle an override is stored under, because it is the
+/// only stable one: an index into this table would move the first time a row
+/// was added in the middle, and a keystroke cannot be its own key when the
+/// keystroke is the thing being changed.
+macro_rules! keymap {
+    ( $( $group:literal, $label:literal, $name:literal, $action:ident, $key:literal, $ctx:expr );* $(;)? ) => {
+        /// The table, for the page that shows it.
+        pub const KEYMAP: &[(&str, &str, &str, &str)] =
+            &[ $( ($group, $label, $name, $key) ),* ];
+
+        /// Bind them, letting an override replace a default.
+        fn bind_changeable(
+            cx: &mut gpui::App,
+            over: &std::collections::BTreeMap<String, String>,
+        ) {
+            use gpui::KeyBinding;
+            let mut out = Vec::new();
+            $(
+                let want = over.get($name).map(String::as_str).unwrap_or($key);
+                // VALIDATED first. `KeyBinding::new` panics on a keystroke it
+                // cannot parse, so a session file with one bad line would take
+                // the window down on startup — and the window would never get
+                // far enough to let anybody fix it.
+                let key = if valid_keystroke(want) {
+                    want
+                } else {
+                    eprintln!("lode: {:?} is not a keystroke; {} keeps {:?}", want, $name, $key);
+                    $key
+                };
+                out.push(KeyBinding::new(key, $action, $ctx));
+            )*
+            cx.bind_keys(out);
+        }
+    };
+}
+
+/// Does gpui's parser accept this keystroke?
+///
+/// Asked BEFORE binding, because binding an invalid one is a panic. A sequence
+/// (`g g`) is several keystrokes, so each part is checked.
+pub fn valid_keystroke(s: &str) -> bool {
+    let s = s.trim();
+    !s.is_empty() && s.split_whitespace().all(|part| gpui::Keystroke::parse(part).is_ok())
+}
+
+// Not in a field, and not in the EDITOR: `j`, `k`, `r` and `g` are letters
+// somebody types into a statement, and a grid binding that reaches the editor
+// makes it impossible to write one.
+const OUTSIDE: Option<&str> = Some("Workspace && !TextInput && !Editor");
+// These hold a modifier, so they are safe INSIDE a field as well — and have to
+// be: ctrl-w while the cursor is in a statement still means close the tab.
+const ANYWHERE: Option<&str> = None;
+
+keymap! {
+    "THE RESULT", "A row down", "lode::NextRow", NextRow, "j", OUTSIDE;
+    "THE RESULT", "A row up", "lode::PrevRow", PrevRow, "k", OUTSIDE;
+    "THE RESULT", "First row", "lode::FirstRow", FirstRow, "g", OUTSIDE;
+    "THE RESULT", "Last row", "lode::LastRow", LastRow, "shift-g", OUTSIDE;
+    "THE RESULT", "A page down", "lode::PageDown", PageDown, "ctrl-f", OUTSIDE;
+    "THE RESULT", "A page up", "lode::PageUp", PageUp, "ctrl-b", OUTSIDE;
+    "THE RESULT", "The grid left", "lode::ScrollLeft", ScrollLeft, "shift-h", OUTSIDE;
+    "THE RESULT", "The grid right", "lode::ScrollRight", ScrollRight, "shift-l", OUTSIDE;
+    "THE RESULT", "Show the row", "lode::ToggleDetail", ToggleDetail, "enter", OUTSIDE;
+    "THE RESULT", "Run this tab", "lode::RunActive", RunActive, "r", OUTSIDE;
+    "THE RESULT", "Run it again", "lode::Refresh", Refresh, "f5", ANYWHERE;
+    "THE RESULT", "A cell left", "lode::PrevCol", PrevCol, ",", OUTSIDE;
+    "THE RESULT", "A cell right", "lode::NextCol", NextCol, ".", OUTSIDE;
+    "THE RESULT", "Copy the cell", "lode::CopyCell", CopyCell, "ctrl-c", OUTSIDE;
+    "THE RESULT", "Copy the row", "lode::CopyRowTsv", CopyRowTsv, "ctrl-shift-c", OUTSIDE;
+    "THE RESULT", "Copy the loaded rows", "lode::CopyPageTsv", CopyPageTsv, "y", OUTSIDE;
+    "THE RESULT", "The next page of rows", "lode::NextPage", NextPage, "]", OUTSIDE;
+    "THE RESULT", "The previous page", "lode::PrevPage", PrevPage, "[", OUTSIDE;
+    "THE RESULT", "Export", "lode::ToggleExport", ToggleExport, "ctrl-e", ANYWHERE;
+    "TABS", "The tab left", "lode::PrevTab", PrevTab, "h", OUTSIDE;
+    "TABS", "The tab right", "lode::NextTab", NextTab, "l", OUTSIDE;
+    "TABS", "A tab of its own", "lode::NewTab", NewTab, "ctrl-t", ANYWHERE;
+    "TABS", "Close it", "lode::CloseTab", CloseTab, "ctrl-w", ANYWHERE;
+    "TABS", "The tab before this", "lode::LastTab", LastTab, "ctrl-tab", ANYWHERE;
+    "THE WINDOW", "Everything, by name", "lode::TogglePalette", TogglePalette, "ctrl-p", ANYWHERE;
+    "THE WINDOW", "Leave what is in front", "lode::Escape", Escape, "escape", ANYWHERE;
+    "THE WINDOW", "Settings", "lode::OpenSettings", OpenSettings, "ctrl-,", ANYWHERE;
+    "THE WINDOW", "Hide the panel", "lode::TogglePanel", TogglePanel, "ctrl-shift-b", ANYWHERE;
+    "THE WINDOW", "New connection", "lode::NewConnection", NewConnection, "ctrl-shift-n", ANYWHERE;
+    "THE WINDOW", "Audit", "lode::ShowAudit", ShowAudit, "ctrl-shift-a", ANYWHERE;
+    "THE WINDOW", "Tasks", "lode::ShowTasks", ShowTasks, "ctrl-shift-t", ANYWHERE;
+}
+
+/// Bind the window's keys.
+///
+/// Every one of the changeable ones is in `keymap!` above. What is left here is
+/// what must NOT be changed: the aliases (the arrows beside `j` and `k`), the
+/// keys that only exist inside the palette or the console, and the nine tab
+/// positions — nine rows in a table of changeable keys would be nine rows
+/// nobody reads to learn one thing.
 pub fn bind_workspace_keys(cx: &mut gpui::App) {
     use gpui::KeyBinding;
-    // Not in a field, and not in the EDITOR: `j`, `k`, `r` and `g` are letters
-    // somebody types into a statement, and a grid binding that reaches the
-    // editor makes it impossible to write one.
-    const OUTSIDE: Option<&str> = Some("Workspace && !TextInput && !Editor");
+    // What somebody has changed, read from the session. The same file the
+    // window reads a moment later; this is cheap and happens once.
+    let over = session::load().keys.unwrap_or_default();
+    bind_changeable(cx, &over);
     cx.bind_keys([
-        KeyBinding::new("j", NextRow, OUTSIDE),
+        // ALIASES. The arrows do what the letters do, always: a window where
+        // the arrow keys do nothing is a window half the people cannot drive,
+        // and that is not something to leave to a setting.
         KeyBinding::new("down", NextRow, OUTSIDE),
-        KeyBinding::new("k", PrevRow, OUTSIDE),
         KeyBinding::new("up", PrevRow, OUTSIDE),
-        KeyBinding::new("h", PrevTab, OUTSIDE),
-        KeyBinding::new("l", NextTab, OUTSIDE),
-        KeyBinding::new("shift-h", ScrollLeft, OUTSIDE),
-        KeyBinding::new("shift-l", ScrollRight, OUTSIDE),
-        KeyBinding::new("ctrl-f", PageDown, OUTSIDE),
-        KeyBinding::new("ctrl-b", PageUp, OUTSIDE),
-        KeyBinding::new("g", FirstRow, OUTSIDE),
-        KeyBinding::new("shift-g", LastRow, OUTSIDE),
-        KeyBinding::new("enter", ToggleDetail, OUTSIDE),
-        KeyBinding::new("r", RunActive, OUTSIDE),
-        // The palette and escape work WHEREVER you are, including mid-word in a
-        // filter box — being unable to leave is the one thing a modal must not do.
-        KeyBinding::new("ctrl-p", TogglePalette, None),
-        KeyBinding::new("escape", Escape, None),
+        // Inside the palette only, where they cannot clash with anything.
         KeyBinding::new("ctrl-n", PaletteDown, Some("Palette")),
         KeyBinding::new("ctrl-j", PaletteDown, Some("Palette")),
         KeyBinding::new("ctrl-k", PaletteUp, Some("Palette")),
         KeyBinding::new("ctrl-y", PaletteAccept, Some("Palette")),
-        // These hold a modifier, so they are safe INSIDE a field as well — and
-        // have to be: ctrl-w while the cursor is in a statement still means
-        // close the tab. Only the bare letters above are barred.
-        KeyBinding::new("ctrl-t", NewTab, None),
-        KeyBinding::new("ctrl-w", CloseTab, None),
-        KeyBinding::new("ctrl-tab", LastTab, None),
-        KeyBinding::new("ctrl-shift-b", TogglePanel, None),
-        KeyBinding::new("ctrl-,", OpenSettings, None),
-        KeyBinding::new("ctrl-shift-n", NewConnection, None),
-        KeyBinding::new("ctrl-e", ToggleExport, None),
-        KeyBinding::new("ctrl-shift-a", ShowAudit, None),
-        KeyBinding::new("ctrl-shift-t", ShowTasks, None),
-        KeyBinding::new("f5", Refresh, None),
+        // And inside the console only.
         KeyBinding::new("up", ConsolePrev, Some("Console")),
         KeyBinding::new("down", ConsoleNext, Some("Console")),
-        // The CELL cursor. `,` and `.` because shift-h and shift-l are already
-        // the grid's horizontal scroll, and a cursor that also scrolled would
-        // be two things on one key.
-        KeyBinding::new(",", PrevCol, OUTSIDE),
-        KeyBinding::new(".", NextCol, OUTSIDE),
-        // `y` for the page, as lvim-db has it; ctrl-c for the cell and
-        // ctrl-shift-c for the row, as everything else has them.
-        KeyBinding::new("y", CopyPageTsv, OUTSIDE),
-        KeyBinding::new("ctrl-c", CopyCell, OUTSIDE),
-        KeyBinding::new("ctrl-shift-c", CopyRowTsv, OUTSIDE),
-        // Paging is `[` and `]`, which ARE bare — so they stay outside a field.
-        KeyBinding::new("[", PrevPage, OUTSIDE),
-        KeyBinding::new("]", NextPage, OUTSIDE),
-        KeyBinding::new("ctrl-1", GoTab1, None),
-        KeyBinding::new("ctrl-2", GoTab2, None),
-        KeyBinding::new("ctrl-3", GoTab3, None),
-        KeyBinding::new("ctrl-4", GoTab4, None),
-        KeyBinding::new("ctrl-5", GoTab5, None),
-        KeyBinding::new("ctrl-6", GoTab6, None),
-        KeyBinding::new("ctrl-7", GoTab7, None),
-        KeyBinding::new("ctrl-8", GoTab8, None),
-        KeyBinding::new("ctrl-9", GoTab9, None),
+        KeyBinding::new("ctrl-1", GoTab1, ANYWHERE),
+        KeyBinding::new("ctrl-2", GoTab2, ANYWHERE),
+        KeyBinding::new("ctrl-3", GoTab3, ANYWHERE),
+        KeyBinding::new("ctrl-4", GoTab4, ANYWHERE),
+        KeyBinding::new("ctrl-5", GoTab5, ANYWHERE),
+        KeyBinding::new("ctrl-6", GoTab6, ANYWHERE),
+        KeyBinding::new("ctrl-7", GoTab7, ANYWHERE),
+        KeyBinding::new("ctrl-8", GoTab8, ANYWHERE),
+        KeyBinding::new("ctrl-9", GoTab9, ANYWHERE),
     ]);
 }
 
@@ -941,6 +1005,9 @@ pub struct Workspace {
     fatal: Option<String>,
     /// How many times the engine has been started again after it exited, and
     /// when the next attempt is due. See [`respawn_delay`].
+    /// Keys somebody has changed: action name → keystroke. Applied at startup
+    /// by `bind_workspace_keys`; changing one here rebinds it at once.
+    key_over: std::collections::BTreeMap<String, String>,
     /// Folders folded away, by key. Remembered, like the panel itself.
     shut_groups: std::collections::BTreeSet<String>,
     /// Something asked for the keyboard back, from a place that had no
@@ -1285,6 +1352,7 @@ impl Workspace {
             exporting: None,
             confirm_disconnect: None,
             console_hist: None,
+            key_over: restore.keys.clone().unwrap_or_default(),
             shut_groups: restore
                 .shut_groups
                 .clone()
@@ -3191,6 +3259,7 @@ impl Workspace {
             panel_hidden: Some(self.panel_hidden).filter(|x| *x),
             shut_groups: Some(self.shut_groups.iter().cloned().collect())
                 .filter(|v: &Vec<String>| !v.is_empty()),
+            keys: Some(self.key_over.clone()).filter(|m| !m.is_empty()),
             // Nothing opens or closes a settings group any more — the panel
             // became a window with categories. The field stays in the file's
             // shape so a session written by an older build still parses.
@@ -5322,6 +5391,7 @@ impl Workspace {
     /// number beside a stepper that moves the new one.
     pub fn appearance(&self) -> crate::settings::Appearance {
         crate::settings::Appearance {
+            keys: self.key_over.clone(),
             theme_name: self.theme_name.clone(),
             themes: self.themes.keys().cloned().collect(),
             theme_dirs: theme::theme_dirs().iter().map(|d| d.display().to_string()).collect(),
@@ -5332,6 +5402,47 @@ impl Workspace {
             font_family: self.font_family.clone(),
             icon_family: self.icon_family.clone(),
         }
+    }
+
+    /// Change what a key does, or put its default back.
+    ///
+    /// REBOUND at once, not on the next start: a setting that needs a restart
+    /// is a setting nobody believes they have changed. gpui's bindings are
+    /// replaced wholesale, which is why everything is bound again rather than
+    /// one line being patched.
+    pub fn set_key_override(&mut self, action: &str, keystroke: &str, cx: &mut Context<Self>) {
+        let want = keystroke.trim().to_string();
+        if want.is_empty() {
+            self.key_over.remove(action);
+        } else if !crate::app::valid_keystroke(&want) {
+            self.toast(format!("{want:?} is not a keystroke"), true);
+            return;
+        } else {
+            // WHO ELSE has it. Two actions on one key is a key that does
+            // whichever gpui resolves first, which is not something to find out
+            // by pressing it.
+            let clash = KEYMAP
+                .iter()
+                .find(|(_, _, name, default)| {
+                    *name != action
+                        && self.key_over.get(*name).map(String::as_str).unwrap_or(default) == want
+                })
+                .map(|(_, label, _, _)| *label);
+            if let Some(other) = clash {
+                self.toast(format!("{want} is already {other}"), true);
+                return;
+            }
+            self.key_over.insert(action.to_string(), want);
+        }
+        self.remember();
+        // The session is written on a debounce and the binding is read from the
+        // session at startup; this one is written NOW, because a key changed
+        // and then lost in a crash is a key somebody changed twice.
+        self.write_session();
+        let over = self.key_over.clone();
+        bind_changeable(cx, &over);
+        self.poke_settings(cx);
+        cx.notify();
     }
 
     /// Look for theme files again, and say what changed. Folders are read at
