@@ -972,6 +972,8 @@ enum Pending {
     ScriptNames,
     /// How many statements the box holds, asked before running it.
     Split { tab: u64 },
+    /// One table's columns, for the diagram that is being drawn.
+    DiagramColumns { tab: u64, table: String, schema: Option<String> },
     /// One of the driver's live views.
     Inspect { name: String },
     /// A row of one, asked about and then acted on.
@@ -2423,6 +2425,37 @@ impl Workspace {
                 // again rather than left to be refreshed by hand.
                 self.ask_profiles();
             }
+            Pending::DiagramColumns { tab, table, schema } => {
+                let cols: Vec<TableColumn> =
+                    serde_json::from_value(v.get("columns").cloned().unwrap_or(json!([])))
+                        .unwrap_or_default();
+                if let Some(d) = self
+                    .tabs
+                    .iter_mut()
+                    .find(|t| t.id == tab)
+                    .and_then(|t| t.diagram.as_mut())
+                {
+                    d.waiting = d.waiting.saturating_sub(1);
+                    d.tables.push(crate::diagram::Table {
+                        name: table,
+                        schema,
+                        columns: cols
+                            .into_iter()
+                            .map(|c| crate::diagram::Col {
+                                name: c.name,
+                                primary: c.primary,
+                                points_at: c.references.map(|r| r.table),
+                            })
+                            .collect(),
+                        at: (0.0, 0.0),
+                    });
+                    // IN NAME ORDER as they arrive, because they arrive in
+                    // whatever order the engine answers and a picture that
+                    // depends on that is a picture that is different every
+                    // time.
+                    d.tables.sort_by(|a, b| a.name.cmp(&b.name));
+                }
+            }
             Pending::Split { tab } => {
                 let stmts: Vec<String> =
                     serde_json::from_value(v.get("statements").cloned().unwrap_or(json!([])))
@@ -2901,6 +2934,19 @@ impl Workspace {
             }
             Pending::FormTest { stage, form } => {
                 let _ = form.update(cx, |f, cx| f.test_answer(stage, Err(e), cx));
+            }
+            Pending::DiagramColumns { tab, table, .. } => {
+                // One table that cannot be read is one box missing, not a
+                // diagram that never finishes loading.
+                if let Some(d) = self
+                    .tabs
+                    .iter_mut()
+                    .find(|t| t.id == tab)
+                    .and_then(|t| t.diagram.as_mut())
+                {
+                    d.waiting = d.waiting.saturating_sub(1);
+                }
+                self.log_push("warn", format!("{table}: {e}"));
             }
             Pending::VaultPut { field, form, .. } => {
                 // The field is LEFT as it was, holding the value: a form that
@@ -3585,6 +3631,10 @@ impl Workspace {
                 self.open_board(&t.conn, &t.name, cx);
                 continue;
             }
+            if t.kind == "diagram" {
+                self.open_diagram(&t.conn, cx);
+                continue;
+            }
             if t.name.is_empty() {
                 // A typed tab. It comes back with its words in the box and
                 // NOTHING run: a statement someone was halfway through writing
@@ -3678,6 +3728,26 @@ impl Workspace {
                             name: b.name.clone(),
                             schema: None,
                             kind: "dashboard".into(),
+                            view: String::new(),
+                            title: t.title.clone(),
+                            draft: String::new(),
+                            sub: String::new(),
+                            lang: String::new(),
+                            detail: None,
+                        };
+                    }
+                    // A DIAGRAM is remembered by nothing but its kind: the
+                    // picture is read from the engine's schema every time, so
+                    // writing a copy of it here would be a second place for it
+                    // to be out of date. Without this it came back as an empty
+                    // draft tab titled after a connection, which looks like a
+                    // tab somebody forgot to close.
+                    if t.diagram.is_some() {
+                        return SessionTab {
+                            conn: t.conn_name.clone(),
+                            name: String::new(),
+                            schema: None,
+                            kind: "diagram".into(),
                             view: String::new(),
                             title: t.title.clone(),
                             draft: String::new(),
@@ -4569,6 +4639,66 @@ impl Workspace {
         self.active = self.tabs.len() - 1;
         let hint = meta.as_ref().map(|m| m.hint.clone()).unwrap_or_default();
         self.make_editor(id, Some(&hint), "", cx);
+        crate::workspace::mru_touch(&mut self.mru, id);
+        self.remember();
+        cx.notify();
+    }
+
+    /// Open the schema as a picture.
+    ///
+    /// The tables come from the tree, which the engine has already answered;
+    /// the columns and the references of each are asked for one at a time and
+    /// the picture is drawn as they arrive. A blank panel for the length of
+    /// twenty round trips looks broken, and the first few boxes are already
+    /// worth looking at.
+    fn open_diagram(&mut self, conn: &str, cx: &mut Context<Self>) {
+        let Some(live) = self.live(conn) else {
+            self.toast(format!("{conn} is not connected"), true);
+            return;
+        };
+        // Every TABLE in the tree, at any depth: a schema's tables are under
+        // the schema and a database's are under the database, and a diagram of
+        // "whatever happens to be at the top level" would be empty on
+        // PostgreSQL.
+        let mut names: Vec<(String, Option<String>)> = Vec::new();
+        let mut stack: Vec<&Node> = live.nodes.iter().collect();
+        while let Some(n) = stack.pop() {
+            if matches!(n.kind.as_str(), "table" | "collection") {
+                names.push((n.name.clone(), n.schema.clone()));
+            }
+            stack.extend(n.children.iter());
+        }
+        names.sort();
+        names.dedup();
+        if names.is_empty() {
+            self.toast("nothing to draw \u{2014} this connection has no tables".to_string(), true);
+            return;
+        }
+        let total = names.len();
+        names.truncate(crate::workspace::DIAGRAM_MAX);
+        let driver = live.driver.clone();
+        let conn_id = live.conn_id;
+        let meta = self.meta(&driver).cloned();
+        let id = self.next_tab;
+        self.next_tab += 1;
+        let mut tab =
+            Tab::new(id, conn.to_string(), driver, format!("{conn} \u{2014} schema"), meta.as_ref());
+        tab.diagram = Some(crate::workspace::Diagram {
+            tables: Vec::new(),
+            waiting: names.len(),
+            total,
+            zoom: 1.0,
+            drag: None,
+        });
+        self.tabs.push(tab);
+        self.active = self.tabs.len() - 1;
+        for (name, schema) in names {
+            self.ask(
+                Pending::DiagramColumns { tab: id, table: name.clone(), schema: schema.clone() },
+                "schema.columns",
+                json!({ "conn_id": conn_id, "object": { "name": name, "schema": schema } }),
+            );
+        }
         crate::workspace::mru_touch(&mut self.mru, id);
         self.remember();
         cx.notify();
@@ -8109,6 +8239,27 @@ impl Workspace {
                     );
                 }
             }
+            // THE SCHEMA AS A PICTURE. One row, under the tree it is a
+            // picture of: it answers "how does this fit together", which is
+            // the question somebody has while looking at the tree and failing
+            // to answer it from a list of names.
+            list = list.child(
+                div()
+                    .id(SharedString::from(format!("diag-{}", live.name)))
+                    .flex()
+                    .items_center()
+                    .gap_1()
+                    .px_2()
+                    .py(px(1.0))
+                    .cursor_pointer()
+                    .hover(|d| d.bg(t.hover_mark()))
+                    .child(self.icon_inline("\u{f0e8}", t.muted()))
+                    .child(self.small(self.lang.tr("panel.diagram"), t.fg()))
+                    .on_click(cx.listener({
+                        let cn = live.name.clone();
+                        move |this, _, _, cx| this.open_diagram(&cn, cx)
+                    })),
+            );
             // Dashboards come before the saved charts, because a board is what
             // somebody opens and a chart is what a board is made of.
             list = list.child(self.section(self.lang.tr("panel.dashboards")));
@@ -8770,6 +8921,10 @@ impl Workspace {
         if tab.script.is_some() {
             return self.script_el(tab, cx);
         }
+        // Nor is a DIAGRAM: boxes and the lines between them.
+        if tab.diagram.is_some() {
+            return self.diagram_el(tab, cx);
+        }
 
         let mut body = div().flex().flex_col().size_full();
 
@@ -9168,6 +9323,381 @@ impl Workspace {
     /// two tiles side by side meet on a pixel rather than nearly. The gutter is
     /// the tile's own padding, not a gap in the layout, which keeps the
     /// arithmetic to one division.
+    /// The schema as a picture.
+    ///
+    /// The BOXES are elements and only the LINES are painted. A table's name
+    /// and columns are text, and text wants the text system, a tooltip and a
+    /// click — none of which a painted rectangle has.
+    fn diagram_el(&self, tab: &Tab, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let t = self.t();
+        let ms = self.scale;
+        let Some(d) = tab.diagram.as_ref() else {
+            return div().into_any_element();
+        };
+        let tab_id = tab.id;
+        let conn = tab.conn_name.clone();
+
+        // ── the head: how far it has got, and the zoom ──────────────────
+        let mut head = div().flex().items_center().gap_2().px_2().py_1();
+        head = head.child(self.small(
+            if d.waiting > 0 {
+                format!("{} of {} tables\u{2026}", d.tables.len(), d.tables.len() + d.waiting)
+            } else if d.total > d.tables.len() {
+                // SAID, not hidden: a diagram that quietly shows forty of four
+                // hundred tables is a diagram that lies about the schema.
+                format!(
+                    "{} tables \u{2014} the first {} of {}",
+                    d.tables.len(),
+                    crate::workspace::DIAGRAM_MAX,
+                    d.total
+                )
+            } else {
+                format!("{} tables", d.tables.len())
+            },
+            if d.total > d.tables.len() && d.waiting == 0 { t.warning() } else { t.muted() },
+        ));
+        head = head.child(div().flex_1());
+        for z in crate::diagram::ZOOMS {
+            let on = (d.zoom - *z).abs() < 0.01;
+            head = head.child(
+                chip(t, ms, format!("dz-{tab_id}-{z}"), format!("{}%", (z * 100.0) as i32), on)
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        if let Some(dd) = this
+                            .tabs
+                            .iter_mut()
+                            .find(|x| x.id == tab_id)
+                            .and_then(|x| x.diagram.as_mut())
+                        {
+                            dd.zoom = *z;
+                        }
+                        cx.notify();
+                    })),
+            );
+        }
+        head = head.child(
+            btn(t, ms, format!("d-copy-{tab_id}"), "copy the references", Btn::Link).on_click(
+                cx.listener(move |this, _, _, cx| this.copy_references(tab_id, cx)),
+            ),
+        );
+        head = head.child(
+            btn(t, ms, format!("d-tidy-{tab_id}"), "lay it out again", Btn::Secondary).on_click(
+                cx.listener(move |this, _, _, cx| {
+                    if let Some(dd) = this
+                        .tabs
+                        .iter_mut()
+                        .find(|x| x.id == tab_id)
+                        .and_then(|x| x.diagram.as_mut())
+                    {
+                        // Back to the computed places: a picture dragged into
+                        // a mess needs a way back that is not closing the tab.
+                        for tb in dd.tables.iter_mut() {
+                            tb.at = (0.0, 0.0);
+                        }
+                    }
+                    cx.notify();
+                }),
+            ),
+        );
+
+        if d.tables.is_empty() {
+            return div()
+                .flex()
+                .flex_col()
+                .size_full()
+                .child(head)
+                .child(
+                    div()
+                        .flex_1()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .child(self.small("reading the schema\u{2026}", t.muted())),
+                )
+                .into_any_element();
+        }
+
+        // ── where everything goes ───────────────────────────────────────
+        let edges = crate::diagram::edges(&d.tables);
+        let layers = crate::diagram::layers(&d.tables, &edges);
+        let line_h = f32::from(ms.line_h());
+        let head_h = ms.base() * 2.2;
+        // How many columns a box shows. A table with forty columns would be a
+        // box taller than the window and a picture of one table; the KEYS and
+        // the REFERENCES are what a diagram is read for, so those come first
+        // and the rest are counted.
+        fn shown_of(tb: &crate::diagram::Table) -> Vec<&crate::diagram::Col> {
+            let out: Vec<&crate::diagram::Col> = tb
+                .columns
+                .iter()
+                .filter(|c| c.primary || c.points_at.is_some())
+                .collect();
+            if out.is_empty() {
+                // A table with no key and no reference: its first few
+                // columns, so the box says something rather than only its
+                // name.
+                return tb.columns.iter().take(6).collect();
+            }
+            out
+        }
+        let heights: std::collections::BTreeMap<String, f32> = d
+            .tables
+            .iter()
+            .map(|tb| {
+                (tb.name.clone(), crate::diagram::box_h(shown_of(tb).len(), line_h, head_h))
+            })
+            .collect();
+        let computed = crate::diagram::place(&d.tables, &layers, |tb| {
+            heights.get(&tb.name).copied().unwrap_or(head_h)
+        });
+        // A box that has been DRAGGED keeps where it was put; everything else
+        // sits where the layout says.
+        let places: std::collections::BTreeMap<String, (f32, f32)> = d
+            .tables
+            .iter()
+            .map(|tb| {
+                let at = if tb.at == (0.0, 0.0) {
+                    computed.get(&tb.name).copied().unwrap_or((0.0, 0.0))
+                } else {
+                    tb.at
+                };
+                (tb.name.clone(), at)
+            })
+            .collect();
+        let (w, h) = crate::diagram::extent(&places, &heights);
+        let z = d.zoom;
+
+        // ── the lines ───────────────────────────────────────────────────
+        let linec = t.divider();
+        let lines: Vec<((f32, f32), (f32, f32))> = edges
+            .iter()
+            .filter_map(|e| {
+                let from = places.get(&e.from)?;
+                let to = places.get(&e.to)?;
+                // A SELF-reference has no line: it would be a stub from a box
+                // to itself, which says less than the arrow already in the
+                // row does.
+                if e.from == e.to {
+                    return None;
+                }
+                Some(crate::diagram::line_ends(
+                    *from,
+                    heights.get(&e.from).copied().unwrap_or(0.0),
+                    *to,
+                    heights.get(&e.to).copied().unwrap_or(0.0),
+                ))
+            })
+            .collect();
+        let canvas = gpui::canvas(
+            move |_b, _w, _cx| {},
+            move |bounds, _p, window, _cx| {
+                let (x0, y0) = (f32::from(bounds.origin.x), f32::from(bounds.origin.y));
+                for (a, b) in &lines {
+                    let mut pb = gpui::PathBuilder::stroke(px(1.0));
+                    pb.move_to(gpui::point(px(x0 + a.0 * z), px(y0 + a.1 * z)));
+                    // A BEND rather than a straight line between the two
+                    // middles: a straight line crosses whatever boxes are
+                    // between them, and a line that leaves sideways and
+                    // arrives sideways reads as a connection rather than as a
+                    // scratch across the picture.
+                    let mid = (a.0 + b.0) / 2.0;
+                    pb.line_to(gpui::point(px(x0 + mid * z), px(y0 + a.1 * z)));
+                    pb.line_to(gpui::point(px(x0 + mid * z), px(y0 + b.1 * z)));
+                    pb.line_to(gpui::point(px(x0 + b.0 * z), px(y0 + b.1 * z)));
+                    if let Ok(path) = pb.build() {
+                        window.paint_path(path, linec);
+                    }
+                }
+            },
+        );
+
+        // ── the boxes ───────────────────────────────────────────────────
+        let mut canvas_el = div()
+            .relative()
+            .w(px(w * z + crate::diagram::BOX_W))
+            .h(px(h * z + crate::diagram::GAP_Y))
+            .child(canvas.absolute().size_full());
+        for tb in &d.tables {
+            let (x, y) = places.get(&tb.name).copied().unwrap_or((0.0, 0.0));
+            let cols = shown_of(tb);
+            let hidden = tb.columns.len() - cols.len();
+            let mut card = div()
+                .flex()
+                .flex_col()
+                .w(px(crate::diagram::BOX_W * z))
+                .bg(t.panel())
+                .border_1()
+                .border_color(t.border())
+                .child(
+                    div()
+                        .px_1()
+                        .bg(t.header_bg())
+                        .text_size(ms.small() * z)
+                        .text_color(t.header_fg())
+                        .child(SharedString::from(tb.name.clone())),
+                );
+            for c in &cols {
+                card = card.child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap_1()
+                        .px_1()
+                        .text_size(ms.tiny() * z)
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .truncate()
+                                .text_color(if c.primary { t.accent() } else { t.fg() })
+                                .child(SharedString::from(c.name.clone())),
+                        )
+                        .children(c.points_at.as_ref().map(|target| {
+                            div()
+                                .flex_none()
+                                .text_color(t.accent())
+                                .child(SharedString::from(format!("\u{2192} {target}")))
+                        })),
+                );
+            }
+            if hidden > 0 {
+                card = card.child(
+                    div()
+                        .px_1()
+                        .text_size(ms.tiny() * z)
+                        .text_color(t.muted())
+                        .child(SharedString::from(format!("+{hidden} more"))),
+                );
+            }
+            let (name, cn) = (tb.name.clone(), conn.clone());
+            let (dname, dschema) = (tb.name.clone(), tb.schema.clone());
+            canvas_el = canvas_el.child(
+                div()
+                    .id(SharedString::from(format!("dbox-{tab_id}-{}", tb.name)))
+                    .absolute()
+                    .left(px(x * z))
+                    .top(px(y * z))
+                    .cursor_pointer()
+                    // DRAG moves it: a generated layout is a starting point,
+                    // and the one thing somebody always wants is to move two
+                    // boxes apart.
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, ev: &gpui::MouseDownEvent, _, cx| {
+                            if let Some(dd) = this
+                                .tabs
+                                .iter_mut()
+                                .find(|x| x.id == tab_id)
+                                .and_then(|x| x.diagram.as_mut())
+                            {
+                                dd.drag = Some((
+                                    name.clone(),
+                                    f32::from(ev.position.x),
+                                    f32::from(ev.position.y),
+                                ));
+                            }
+                            cx.notify();
+                        }),
+                    )
+                    // And a DOUBLE click opens the table, which is what a
+                    // diagram is usually a way of finding.
+                    .on_click(cx.listener(move |this, ev: &gpui::ClickEvent, _, cx| {
+                        if ev.click_count() >= 2 {
+                            this.open_object(&cn, &dname, dschema.as_deref(), "table", cx);
+                        }
+                    }))
+                    .child(card),
+            );
+        }
+
+        div()
+            .flex()
+            .flex_col()
+            .size_full()
+            .child(head)
+            .child(
+                div()
+                    .id(SharedString::from(format!("dcanvas-{tab_id}")))
+                    .flex_1()
+                    .min_h_0()
+                    .overflow_scroll()
+                    .p_2()
+                    // The drag is followed HERE rather than on the box, so a
+                    // pointer that outran the box still moves it — which at a
+                    // fast drag is most of the time.
+                    .on_mouse_move(cx.listener(move |this, ev: &gpui::MouseMoveEvent, _, cx| {
+                        let Some(dd) = this
+                            .tabs
+                            .iter_mut()
+                            .find(|x| x.id == tab_id)
+                            .and_then(|x| x.diagram.as_mut())
+                        else {
+                            return;
+                        };
+                        let Some((name, px0, py0)) = dd.drag.clone() else { return };
+                        let (nx, ny) = (f32::from(ev.position.x), f32::from(ev.position.y));
+                        let zoom = dd.zoom.max(0.01);
+                        let at = places.get(&name).copied().unwrap_or((0.0, 0.0));
+                        if let Some(tb) = dd.tables.iter_mut().find(|x| x.name == name) {
+                            // In DIAGRAM coordinates, which is what `at`
+                            // holds: dividing by the zoom is what makes a drag
+                            // at 50% move the box by what the pointer did
+                            // rather than by twice it.
+                            tb.at = (
+                                (at.0 + (nx - px0) / zoom).max(0.0),
+                                (at.1 + (ny - py0) / zoom).max(0.0),
+                            );
+                        }
+                        dd.drag = Some((name, nx, ny));
+                        cx.notify();
+                    }))
+                    .on_mouse_up(
+                        MouseButton::Left,
+                        cx.listener(move |this, _, _, cx| {
+                            if let Some(dd) = this
+                                .tabs
+                                .iter_mut()
+                                .find(|x| x.id == tab_id)
+                                .and_then(|x| x.diagram.as_mut())
+                            {
+                                dd.drag = None;
+                            }
+                            cx.notify();
+                        }),
+                    )
+                    .child(canvas_el),
+            )
+            .into_any_element()
+    }
+
+    /// Put the diagram's references on the clipboard.
+    ///
+    /// As `table.column \u{2192} table.column` lines rather than as SQL: the
+    /// constraints already exist, so `ALTER TABLE … ADD FOREIGN KEY` would be
+    /// a set of statements that fail on the database they were read from. What
+    /// is useful is the list — for a note, a message, a review.
+    fn copy_references(&mut self, tab_id: u64, cx: &mut Context<Self>) {
+        let Some(d) = self
+            .tabs
+            .iter()
+            .find(|t| t.id == tab_id)
+            .and_then(|t| t.diagram.as_ref())
+        else {
+            return;
+        };
+        let edges = crate::diagram::edges(&d.tables);
+        if edges.is_empty() {
+            self.toast("there are no references to copy".to_string(), true);
+            return;
+        }
+        let text = edges
+            .iter()
+            .map(|e| format!("{}.{} \u{2192} {}", e.from, e.from_col, e.to))
+            .collect::<Vec<_>>()
+            .join("\n");
+        cx.write_to_clipboard(ClipboardItem::new_string(text));
+        self.toast(format!("{} reference(s) copied", edges.len()), false);
+    }
+
     /// A script tab: the body above, what it printed below.
     ///
     /// The output is UNDER the body rather than beside it, because a script's

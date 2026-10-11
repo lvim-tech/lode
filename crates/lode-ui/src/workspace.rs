@@ -326,7 +326,33 @@ pub struct Tab {
     /// already true of a tab. What differs is that it has a body in a language
     /// instead of a statement, and output instead of rows.
     pub script: Option<Script>,
+    /// When this tab is a SCHEMA DIAGRAM, what it holds.
+    pub diagram: Option<Diagram>,
 }
+
+/// The schema as a picture: boxes for the tables, lines for the references.
+pub struct Diagram {
+    /// The tables, once their columns have arrived.
+    pub tables: Vec<crate::diagram::Table>,
+    /// Which tables were asked for but have not answered yet. The picture is
+    /// drawn as they arrive rather than all at once: twenty tables is twenty
+    /// round trips, and a blank panel for the length of all of them looks
+    /// broken.
+    pub waiting: usize,
+    /// How many tables the connection has, said when not all of them are
+    /// drawn.
+    pub total: usize,
+    pub zoom: f32,
+    /// The box being dragged, and where the pointer took hold of it.
+    pub drag: Option<(String, f32, f32)>,
+}
+
+/// How many tables a diagram asks for.
+///
+/// Each one costs a `schema.columns` round trip, and a schema with four
+/// hundred tables would be four hundred of them and a picture nobody can read.
+/// The limit is said out loud rather than applied quietly.
+pub const DIAGRAM_MAX: usize = 40;
 
 /// A script as a tab holds it.
 ///
@@ -849,6 +875,7 @@ impl Tab {
             rendered: String::new(),
             board: None,
             script: None,
+            diagram: None,
         }
     }
 

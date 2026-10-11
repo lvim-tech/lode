@@ -19,6 +19,7 @@ mod app;
 mod board;
 mod editor;
 mod chart;
+mod diagram;
 mod editor_el;
 mod export;
 mod form;
