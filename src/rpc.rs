@@ -193,7 +193,16 @@ use serde_json::json;
 ///     or a SQL Server batch is not a boundary — and two clients would learn
 ///     that twice and get it differently wrong. A driver whose statements are
 ///     not SQL gets its text back as one statement rather than cut up.
-pub const PROTO: u32 = 21;
+/// 22. `schema.columns` rows carry `references` where a column is a FOREIGN
+///     KEY: `{ table, schema?, column }`. The one thing a client cannot work
+///     out for itself — `customer_id` looks like a reference and `parent` does
+///     not, and both guesses are wrong about half the schemas in the world.
+///     Read from the server's own catalogue (PostgreSQL `pg_constraint`,
+///     MySQL `key_column_usage`, SQLite `foreign_key_list`, SQL Server
+///     `sys.foreign_key_columns`); absent where a driver has no way to ask,
+///     because saying nothing is the honest answer rather than saying no. A
+///     failure to read them is not a failure of the column list.
+pub const PROTO: u32 = 22;
 
 /// One decoded incoming request.
 #[derive(Debug, Deserialize)]

@@ -664,6 +664,7 @@ impl Connection for MongoConnection {
                 .into_iter()
                 .map(|c| TableColumn {
                     primary: c.name == "_id",
+                    references: None,
                     name: c.name,
                     type_name: c.type_name,
                 })

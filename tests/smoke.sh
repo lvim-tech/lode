@@ -37,7 +37,10 @@ trap 'kill $PID 2>/dev/null || true' EXIT
 SEEDED=no
 if command -v sqlite3 >/dev/null; then
     sqlite3 "$DB" "CREATE TABLE t(id INTEGER PRIMARY KEY, name TEXT);
-                   INSERT INTO t(name) VALUES ('alpha'),('beta'),('gamma'),('delta'),('epsilon');"
+                   INSERT INTO t(name) VALUES ('alpha'),('beta'),('gamma'),('delta'),('epsilon');
+                   -- A real foreign key, so what points where can be checked
+                   -- against a server rather than only against a unit test.
+                   CREATE TABLE child(id INTEGER PRIMARY KEY, t_id INTEGER REFERENCES t(id), note TEXT);"
     SEEDED=yes
 fi
 
@@ -214,6 +217,24 @@ check "columns say their kind" \
     "$(printf '%s' "$PAGE" | jq -r '[.result.columns[].kind] | join(",")')" "integer,text"
 check "and the driver's own word is still there" \
     "$(printf '%s' "$PAGE" | jq -r '.result.columns[0].type')" "INTEGER"
+
+# WHAT POINTS WHERE. `customer_id` looks like a reference and `parent` does
+# not, and both guesses are wrong about half the schemas in the world — so the
+# server is asked. This is the one driver here whose foreign keys can be checked
+# against a live database rather than only in a unit test.
+send "{\"id\":75,\"method\":\"schema.columns\",\"params\":{\"conn_id\":$CID,\"object\":{\"name\":\"child\"}}}"
+FKC=$(await '.id == 75')
+check "a foreign key is reported" \
+    "$(printf '%s' "$FKC" | jq -r '[.result.columns[] | select(.name == "t_id") | .references.table] | join(",")')" \
+    "t"
+check "and the column it points at" \
+    "$(printf '%s' "$FKC" | jq -r '[.result.columns[] | select(.name == "t_id") | .references.column] | join(",")')" \
+    "id"
+# A column that is NOT a key says nothing rather than saying no: the field is
+# absent, which is what `skip_serializing_if` is for.
+check "a plain column carries no reference" \
+    "$(printf '%s' "$FKC" | jq -r '[.result.columns[] | select(.name == "note") | has("references")] | join(",")')" \
+    "false"
 
 # ONE BUFFER, several statements. The boundary is not just `;` — this checks
 # the three that cost the most to get wrong: a semicolon in a string, one in a

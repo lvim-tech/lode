@@ -147,6 +147,18 @@ warning and returns `encrypted: false`.
 key/value store has neither, and several SQL engines expose indexes but no
 server-side `CREATE` statement.
 
+A column of `schema.columns` carries `references` (`proto >= 22`) when it is a
+**foreign key**: `{ table, schema?, column }`. It is the one thing about a
+column that a client cannot work out for itself — `customer_id` looks like a
+reference and `parent` does not, and both guesses are wrong about half the
+schemas in the world — so the server's own catalogue is asked: `pg_constraint`,
+`information_schema.key_column_usage`, `PRAGMA foreign_key_list`,
+`sys.foreign_key_columns`. The field is ABSENT where there is no reference and
+also where the driver cannot be asked, and the two are deliberately not
+distinguished: both mean "nothing is known", and a client that drew "no
+references" over a driver that was never asked would be stating a fact nobody
+established. Failing to read them is never a failure of the column list.
+
 ### The server itself
 
 | method | params | result |

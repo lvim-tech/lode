@@ -8422,6 +8422,35 @@ impl Workspace {
                                     .child("key"),
                             )
                         })
+                        // A REFERENCE, as a mark rather than as a name: the
+                        // tree is a narrow column and `\u{2192} customers.id`
+                        // beside every foreign key would push the names out of
+                        // it. The arrow says there is one and the tooltip says
+                        // where; the Schema tab spells it out and can be
+                        // clicked.
+                        .when_some(c.references.as_ref(), |d, r| {
+                            d.child(
+                                div()
+                                    .id(SharedString::from(format!("fk-{key}-{}", c.name)))
+                                    .flex_none()
+                                    .text_size(ms.tiny())
+                                    .text_color(t.accent())
+                                    .tooltip(crate::tip::Tip::build(
+                                        match &r.schema {
+                                            Some(sc) => {
+                                                format!("{} \u{2192} {sc}.{}.{}", c.name, r.table, r.column)
+                                            }
+                                            None => {
+                                                format!("{} \u{2192} {}.{}", c.name, r.table, r.column)
+                                            }
+                                        },
+                                        None,
+                                        self.theme.clone(),
+                                        self.scale,
+                                    ))
+                                    .child("\u{2192}"),
+                            )
+                        })
                         .on_click(cx.listener(move |this, _, _, cx| {
                             this.insert_into_editor(&name, cx);
                         })),
@@ -8960,7 +8989,7 @@ impl Workspace {
         // paging do not apply to it: it is not a different rendering of the
         // rows, it is a different subject.
         if tab.sub == SubTab::Schema {
-            return body.child(self.schema_el(tab)).into_any_element();
+            return body.child(self.schema_el(tab, cx)).into_any_element();
         }
         if tab.sub == SubTab::Builder {
             return body.child(self.builder_el(tab, cx)).into_any_element();
@@ -10476,7 +10505,7 @@ impl Workspace {
     /// here. A CREATE assembled from column metadata reads as authoritative and
     /// quietly drops constraints, defaults and storage clauses — so a driver
     /// that cannot ask its server for one says so instead.
-    fn schema_el(&self, tab: &Tab) -> gpui::AnyElement {
+    fn schema_el(&self, tab: &Tab, cx: &mut Context<Self>) -> gpui::AnyElement {
         let t = self.t();
         let ms = self.scale;
         let mut body = div().flex().flex_col().flex_1().overflow_hidden().p_3().gap_2();
@@ -10494,18 +10523,43 @@ impl Workspace {
         if tab.meta_columns.is_empty() {
             body = body.child(self.small("the engine has not answered yet", t.muted()));
         }
+        let conn = tab.conn_name.clone();
         for c in &tab.meta_columns {
-            body = body.child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap_2()
-                    .child(div().w(px(ms.base() * 15.5)).text_size(ms.body()).text_color(t.fg()).child(
-                        SharedString::from(c.name.clone()),
-                    ))
-                    .child(div().w(px(ms.base() * 11.5)).child(self.small(c.type_name.clone(), t.muted())))
-                    .when(c.primary, |d| d.child(self.small("key", t.accent()))),
-            );
+            let mut row = div()
+                .flex()
+                .items_center()
+                .gap_2()
+                .child(div().w(px(ms.base() * 15.5)).text_size(ms.body()).text_color(t.fg()).child(
+                    SharedString::from(c.name.clone()),
+                ))
+                .child(div().w(px(ms.base() * 11.5)).child(self.small(c.type_name.clone(), t.muted())))
+                .when(c.primary, |d| d.child(self.small("key", t.accent())));
+            // WHAT IT POINTS AT, and a way to go there.
+            //
+            // The thing a schema reader is usually after: `t_id` says nothing
+            // and `\u{2192} t.id` says everything. Pressing it BROWSES the other
+            // table rather than generating a join — a join needs a direction,
+            // an alias and a decision about which columns, and none of those
+            // is implied by clicking a reference.
+            if let Some(r) = &c.references {
+                let label = match &r.schema {
+                    Some(sc) => format!("\u{2192} {sc}.{}.{}", r.table, r.column),
+                    None => format!("\u{2192} {}.{}", r.table, r.column),
+                };
+                let (cn, table, schema) = (conn.clone(), r.table.clone(), r.schema.clone());
+                row = row.child(
+                    div()
+                        .id(SharedString::from(format!("fk-{}-{}", tab.id, c.name)))
+                        .px_1()
+                        .cursor_pointer()
+                        .hover(|d| d.bg(t.hover_mark()))
+                        .child(self.small(label, t.accent()))
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.open_object(&cn, &table, schema.as_deref(), "table", cx);
+                        })),
+                );
+            }
+            body = body.child(row);
         }
 
         let keyed = tab.meta_columns.iter().any(|c| c.primary);

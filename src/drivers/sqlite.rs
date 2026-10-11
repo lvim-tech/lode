@@ -328,7 +328,27 @@ impl Connection for SqliteConnection {
     }
 
     async fn columns(&mut self, obj: &ObjRef) -> anyhow::Result<Vec<TableColumn>> {
-        let sql = format!("PRAGMA table_info('{}')", obj.name.replace('\'', "''"));
+        let esc = obj.name.replace('\'', "''");
+        // WHAT POINTS WHERE, first. `foreign_key_list` → (id, seq, table,
+        // from, to, on_update, on_delete, match); `from` is the column here
+        // and `to` the column there — and `to` is NULL when the reference is
+        // written without one, which means "the other table's primary key".
+        // Left as None in that case rather than filled in with a guess: the
+        // key would have to be read from the other table, and a reference
+        // naming the wrong column is worse than one naming none.
+        let mut refs: std::collections::HashMap<String, crate::spec::Ref> = Default::default();
+        if let Ok((_c, fks, _a)) = self.run(format!("PRAGMA foreign_key_list('{esc}')")).await {
+            for r in fks {
+                let text = |i: usize| match r.get(i) {
+                    Some(Value::Text(s)) => Some(s.clone()),
+                    _ => None,
+                };
+                if let (Some(table), Some(from), Some(to)) = (text(2), text(3), text(4)) {
+                    refs.insert(from, crate::spec::Ref { table, schema: None, column: to });
+                }
+            }
+        }
+        let sql = format!("PRAGMA table_info('{esc}')");
         let (_c, rows, _a) = self.run(sql).await?;
         // table_info → (cid, name, type, notnull, dflt, pk); name=1, type=2, pk=5.
         // `pk` is the 1-based position within the primary key (0 = not in it), which is ALSO how an
@@ -346,6 +366,10 @@ impl Connection for SqliteConnection {
                     _ => String::new(),
                 },
                 primary: matches!(r.get(5), Some(Value::Int(i)) if *i > 0),
+                references: match r.get(1) {
+                    Some(Value::Text(s)) => refs.get(s).cloned(),
+                    _ => None,
+                },
             })
             .collect())
     }

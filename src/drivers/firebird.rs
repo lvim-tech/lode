@@ -267,6 +267,7 @@ impl Connection for FirebirdConnection {
                     Some(Value::Text(s)) => s.trim() == "1",
                     _ => false,
                 },
+                references: None,
             })
             .collect())
     }

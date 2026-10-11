@@ -327,6 +327,7 @@ impl Connection for ClickhouseConnection {
                     Some(Value::Bool(b)) => *b,
                     _ => false,
                 },
+                references: None,
             })
             .collect())
     }

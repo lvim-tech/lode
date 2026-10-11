@@ -613,6 +613,56 @@ impl Connection for PgConnection {
             schema_pred
         );
         let (_c, rows, _a) = self.simple(&sql).await?;
+        // WHAT POINTS WHERE. A separate query rather than another join: the
+        // columns query already carries a subquery for the primary key, and a
+        // second join against four more catalogue views for a column that is
+        // usually NULL would make every column list pay for the few that are
+        // keys.
+        //
+        // `pg_constraint` rather than `information_schema.referential_
+        // constraints`: the catalogue carries the column arrays directly,
+        // where the standard view needs a join through `key_column_usage` to
+        // get from a constraint's name to its columns.
+        let fk_sql = format!(
+            "SELECT a.attname AS col, nf.nspname AS fschema, cf.relname AS ftable, \
+               af.attname AS fcol \
+             FROM pg_constraint k \
+             JOIN pg_class c ON c.oid = k.conrelid \
+             JOIN pg_namespace n ON n.oid = c.relnamespace \
+             JOIN pg_class cf ON cf.oid = k.confrelid \
+             JOIN pg_namespace nf ON nf.oid = cf.relnamespace \
+             JOIN unnest(k.conkey, k.confkey) AS u(att, fatt) ON true \
+             JOIN pg_attribute a ON a.attrelid = k.conrelid AND a.attnum = u.att \
+             JOIN pg_attribute af ON af.attrelid = k.confrelid AND af.attnum = u.fatt \
+             WHERE k.contype = 'f' AND c.relname = '{}' {}",
+            obj.name.replace('\'', "''"),
+            schema_pred.replace("c.table_schema", "n.nspname")
+        );
+        let mut refs: std::collections::HashMap<String, crate::spec::Ref> = Default::default();
+        // A FAILURE here is not a failure of the column list: an older server,
+        // a restricted role, a catalogue that is not readable — the columns are
+        // still the columns, and they are worth more than the references.
+        if let Ok((_c, fks, _a)) = self.simple(&fk_sql).await {
+            for r in fks {
+                let text = |i: usize| match r.get(i) {
+                    Some(Value::Text(s)) => Some(s.clone()),
+                    _ => None,
+                };
+                if let (Some(col), Some(table), Some(fcol)) = (text(0), text(2), text(3)) {
+                    refs.insert(
+                        col,
+                        crate::spec::Ref {
+                            table,
+                            // The schema only when the reference LEAVES this
+                            // one: `public.orders → public.customers` reads
+                            // worse than `orders → customers`.
+                            schema: text(1).filter(|f| Some(f.as_str()) != obj.schema.as_deref()),
+                            column: fcol,
+                        },
+                    );
+                }
+            }
+        }
         Ok(rows
             .into_iter()
             .map(|r| TableColumn {
@@ -628,6 +678,10 @@ impl Connection for PgConnection {
                     Some(Value::Bool(b)) => *b,
                     Some(Value::Text(s)) => s == "t" || s == "true",
                     _ => false,
+                },
+                references: match r.first() {
+                    Some(Value::Text(s)) => refs.get(s).cloned(),
+                    _ => None,
                 },
             })
             .collect())

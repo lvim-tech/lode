@@ -345,6 +345,45 @@ impl Connection for MssqlConnection {
             schema_pred
         );
         let (_c, rows) = self.run(&sql).await?;
+        // WHAT POINTS WHERE. `sys.foreign_key_columns` carries the two object
+        // ids and the two column ids, so both ends need a join back to
+        // `sys.columns` — SQL Server keeps names in one place and references
+        // in another.
+        let fk_sql = format!(
+            "SELECT pc.name AS col, rs.name AS fschema, rt.name AS ftable, rc.name AS fcol \
+             FROM sys.foreign_key_columns k \
+             JOIN sys.tables t ON t.object_id = k.parent_object_id \
+             JOIN sys.schemas s ON s.schema_id = t.schema_id \
+             JOIN sys.columns pc ON pc.object_id = k.parent_object_id \
+               AND pc.column_id = k.parent_column_id \
+             JOIN sys.tables rt ON rt.object_id = k.referenced_object_id \
+             JOIN sys.schemas rs ON rs.schema_id = rt.schema_id \
+             JOIN sys.columns rc ON rc.object_id = k.referenced_object_id \
+               AND rc.column_id = k.referenced_column_id \
+             WHERE t.name = '{}' {}",
+            obj.name.replace('\'', "''"),
+            schema_pred
+        );
+        let mut refs: std::collections::HashMap<String, crate::spec::Ref> = Default::default();
+        // A failure here is not a failure of the column list.
+        if let Ok((_c, fks)) = self.run(&fk_sql).await {
+            for r in fks {
+                let text = |i: usize| match r.get(i) {
+                    Some(Value::Text(s)) => Some(s.clone()),
+                    _ => None,
+                };
+                if let (Some(col), Some(table), Some(fcol)) = (text(0), text(2), text(3)) {
+                    refs.insert(
+                        col,
+                        crate::spec::Ref {
+                            schema: text(1).filter(|f| Some(f.as_str()) != obj.schema.as_deref()),
+                            table,
+                            column: fcol,
+                        },
+                    );
+                }
+            }
+        }
         Ok(rows
             .into_iter()
             .map(|r| TableColumn {
@@ -357,6 +396,10 @@ impl Connection for MssqlConnection {
                     _ => String::new(),
                 },
                 primary: matches!(r.get(2), Some(Value::Int(i)) if *i != 0),
+                references: match r.first() {
+                    Some(Value::Text(s)) => refs.get(s).cloned(),
+                    _ => None,
+                },
             })
             .collect())
     }

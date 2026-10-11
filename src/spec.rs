@@ -914,6 +914,33 @@ pub struct TableColumn {
     pub type_name: String,
     /// Part of the object's identifying key (a PK column; mongo's `_id`; a CQL partition/clustering key).
     pub primary: bool,
+    /// What this column POINTS AT, when it is a foreign key.
+    ///
+    /// The single most useful thing a client can say about a column and the
+    /// one thing it cannot work out for itself: `customer_id` looks like a
+    /// reference and `parent` does not, and both guesses are wrong about half
+    /// the schemas in the world. Only the server knows, and it is asked here
+    /// rather than guessed at from the name.
+    ///
+    /// `None` where there is no reference, and also where the driver has no
+    /// way to ask — a key/value store has no constraints, and saying nothing
+    /// is the honest answer rather than saying no.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub references: Option<Ref>,
+}
+
+/// Where a foreign key points.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Ref {
+    /// The object referred to.
+    pub table: String,
+    /// Its schema, where the engine has them and the reference crosses one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub schema: Option<String>,
+    /// The column referred to. A composite key points at several, and this
+    /// carries ONE: the client's use for it is "open that row", and a
+    /// composite reference is drawn as the several rows it is.
+    pub column: String,
 }
 
 /// Read a value that came in over the wire, back into the enum the drivers bind.

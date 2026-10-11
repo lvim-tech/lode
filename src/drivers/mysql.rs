@@ -417,6 +417,43 @@ impl Connection for MysqlConnection {
             schema_pred
         );
         let (_c, rows, _a) = self.run(&sql).await?;
+        // WHAT POINTS WHERE. `key_column_usage` carries the referenced table
+        // and column on the row itself, so no join is needed; the rows where
+        // `referenced_table_name` is NULL are the primary and unique keys,
+        // which is why it is tested rather than assumed.
+        let fk_sql = format!(
+            "SELECT column_name, referenced_table_schema, referenced_table_name, \
+               referenced_column_name \
+             FROM information_schema.key_column_usage \
+             WHERE table_name = '{}' AND referenced_table_name IS NOT NULL {}",
+            obj.name.replace('\'', "''"),
+            schema_pred
+        );
+        let mut refs: std::collections::HashMap<String, crate::spec::Ref> = Default::default();
+        // A failure here is not a failure of the column list: the columns are
+        // still the columns, and they are worth more than the references.
+        if let Ok((_c, fks, _a)) = self.run(&fk_sql).await {
+            for r in fks {
+                let text = |i: usize| match r.get(i) {
+                    Some(Value::Text(s)) => Some(s.clone()),
+                    _ => None,
+                };
+                if let (Some(col), Some(table), Some(fcol)) = (text(0), text(2), text(3)) {
+                    refs.insert(
+                        col,
+                        crate::spec::Ref {
+                            // The schema only when the reference LEAVES this
+                            // one: in MySQL a schema IS a database, so a
+                            // reference that crosses one matters and one that
+                            // does not is noise.
+                            schema: text(1).filter(|f| Some(f.as_str()) != obj.schema.as_deref()),
+                            table,
+                            column: fcol,
+                        },
+                    );
+                }
+            }
+        }
         Ok(rows
             .into_iter()
             .map(|r| TableColumn {
@@ -432,6 +469,10 @@ impl Connection for MysqlConnection {
                     Some(Value::Int(i)) => *i != 0,
                     Some(Value::Text(s)) => s == "1",
                     _ => false,
+                },
+                references: match r.first() {
+                    Some(Value::Text(s)) => refs.get(s).cloned(),
+                    _ => None,
                 },
             })
             .collect())

@@ -2632,7 +2632,7 @@ mod tests {
     /// Numbers compare as numbers and NULL goes last, both ways — a NULL is not
     /// a small value and sorting it to the top would say it was.
     fn tabcol(name: &str, primary: bool) -> TableColumn {
-        TableColumn { name: name.into(), type_name: String::new(), primary }
+        TableColumn { name: name.into(), type_name: String::new(), primary, references: None }
     }
 
     fn table_tab() -> Tab {

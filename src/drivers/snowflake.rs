@@ -354,6 +354,7 @@ impl Connection for SnowflakeConnection {
                 };
                 TableColumn {
                     primary: pk.iter().any(|k| k.eq_ignore_ascii_case(&name)),
+                    references: None,
                     name,
                     type_name: match r.get(1) {
                         Some(Value::Text(s)) => s.clone(),

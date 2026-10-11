@@ -420,6 +420,15 @@ pub struct Node {
     pub children: Vec<Node>,
 }
 
+/// Where a foreign key points.
+#[derive(Debug, Clone, Deserialize)]
+pub struct Ref {
+    pub table: String,
+    #[serde(default)]
+    pub schema: Option<String>,
+    pub column: String,
+}
+
 /// One column of a result.
 #[derive(Debug, Clone, Deserialize)]
 pub struct Column {
@@ -447,6 +456,15 @@ pub struct TableColumn {
     /// these, and only when there is at least one.
     #[serde(default)]
     pub primary: bool,
+    /// What this column points at, when it is a foreign key (`proto >= 22`).
+    ///
+    /// Absent where there is no reference AND where the driver cannot be
+    /// asked, which are different things the engine deliberately does not
+    /// distinguish: both mean "nothing is known", and a client that drew "no
+    /// references" over a driver that was never asked would be stating a fact
+    /// nobody established.
+    #[serde(default)]
+    pub references: Option<Ref>,
 }
 
 /// A chart somebody saved: a statement and how to read it.

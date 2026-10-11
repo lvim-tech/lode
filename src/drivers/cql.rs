@@ -318,6 +318,7 @@ impl Connection for CqlConnection {
                     _ => String::new(),
                 },
                 primary: matches!(r.get(2), Some(Value::Text(k)) if k == "partition_key" || k == "clustering"),
+                references: None,
             })
             .collect())
     }

@@ -365,6 +365,7 @@ impl Connection for DuckdbConnection {
                     Some(Value::Int(i)) => *i > 0,
                     _ => false,
                 },
+                references: None,
             })
             .collect())
     }
