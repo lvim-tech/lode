@@ -181,6 +181,17 @@ person's work, which is what read-only is for.
 | `query.cancel` | `{ call_id }` | `{}` |
 | `query.release` | `{ call_id }` | `{}` |
 | `query.cell` | `{ call_id, row, col }` | `{ value }` — one full cell |
+| `query.split` | `{ driver, text }` | `{ statements }` (`proto >= 21`) |
+
+`query.split` turns one buffer into the statements it holds, and it is in the
+engine because splitting SQL is a fact about a **dialect**: a semicolon inside a
+string, a line or block comment, a PostgreSQL `$$` body or a SQL Server `GO`
+batch is not a boundary. A client that split on `;` would send half a statement
+— which is either a syntax error or, worse, half a statement that parses — and
+two clients would learn `$func$` and `GO` separately and get them differently
+wrong. A driver whose statements are not SQL at all gets its text back as ONE
+statement, because a command document full of semicolons is one command and
+cutting it up would destroy it.
 
 `query.execute` answers with its `call_id` **before** the statement starts, so
 the response provably precedes the `query.state` notification for that call.

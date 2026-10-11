@@ -215,6 +215,22 @@ check "columns say their kind" \
 check "and the driver's own word is still there" \
     "$(printf '%s' "$PAGE" | jq -r '.result.columns[0].type')" "INTEGER"
 
+# ONE BUFFER, several statements. The boundary is not just `;` — this checks
+# the three that cost the most to get wrong: a semicolon in a string, one in a
+# comment, and a dollar-quoted function body.
+send '{"id":70,"method":"query.split","params":{"driver":"postgres","text":"SELECT 1; INSERT INTO t VALUES (\u0027a;b\u0027); -- x; y\nSELECT 2"}}'
+SP=$(await '.id == 70')
+check "a buffer comes apart" "$(printf '%s' "$SP" | jq -r '.result.statements | length')" "3"
+check "a string keeps its semicolon" \
+    "$(printf '%s' "$SP" | jq -r '.result.statements[1]')" \
+    "INSERT INTO t VALUES ('a;b')"
+send '{"id":71,"method":"query.split","params":{"driver":"postgres","text":"CREATE FUNCTION f() AS $$ BEGIN RETURN 1; END; $$ LANGUAGE plpgsql; SELECT f()"}}'
+check "a function body stays whole" \
+    "$(await '.id == 71' | jq -r '.result.statements | length')" "2"
+send '{"id":72,"method":"query.split","params":{"driver":"mongodb","text":"{ \"find\": \"t\", \"filter\": { \"a\": \"x;y\" } }"}}'
+check "a document is one statement" \
+    "$(await '.id == 72' | jq -r '.result.statements | length')" "1"
+
 # A live VIEW is declared per driver, and asking for one that was not declared
 # is refused rather than reaching the driver. SQLite declares none — it is a
 # file, and there is nobody connected to it to list — so the refusal is the

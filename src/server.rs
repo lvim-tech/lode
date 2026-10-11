@@ -721,6 +721,7 @@ impl Server {
             "query.classify" => self.classify(params),
             "row.write" => self.row_write(params).await,
             "instance.metrics" => self.metrics(params).await,
+            "query.split" => Self::query_split(params),
             "instance.inspect" => self.inspect(params).await,
             "instance.action" => self.instance_action(params).await,
             // ── saved state (proto 2) ───────────────────────────────────────
@@ -1649,6 +1650,26 @@ impl Server {
         let conn = self.conn(p.conn_id)?;
         let metrics = conn.lock().await.metrics().await?;
         Ok(json!({ "metrics": metrics }))
+    }
+
+    /// One buffer of text into the statements it holds.
+    ///
+    /// Here rather than in a client because splitting SQL is a fact about a
+    /// DIALECT: a semicolon inside a string, a comment, a `$$` body or a SQL
+    /// Server batch is not a boundary. Two clients would learn that twice and
+    /// get it differently wrong.
+    ///
+    /// Not a method on `self`: it touches no connection and no store, and a
+    /// client may ask about a driver it has not connected to.
+    fn query_split(params: Json) -> anyhow::Result<Json> {
+        #[derive(Deserialize)]
+        struct P {
+            #[serde(default)]
+            driver: String,
+            text: String,
+        }
+        let p: P = serde_json::from_value(params)?;
+        Ok(json!({ "statements": crate::split::split(&p.driver, &p.text) }))
     }
 
     /// One of the live views a driver declared.

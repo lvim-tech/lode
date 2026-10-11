@@ -29,6 +29,7 @@ mod secret;
 mod sigv4;
 mod server;
 mod spec;
+mod split;
 mod store;
 mod vault;
 #[cfg(feature = "tls")]

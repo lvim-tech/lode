@@ -187,7 +187,13 @@ use serde_json::json;
 ///     to show. The action is two-step like `row.write` and audited either
 ///     way: ending somebody's session rolls back what they were doing, and
 ///     "who ended that session" is the question asked straight afterwards.
-pub const PROTO: u32 = 20;
+/// 21. `query.split {driver, text}` → `{statements}`: one buffer into the
+///     statements it holds. In the ENGINE because splitting SQL is a fact
+///     about a dialect — a semicolon inside a string, a comment, a `$$` body
+///     or a SQL Server batch is not a boundary — and two clients would learn
+///     that twice and get it differently wrong. A driver whose statements are
+///     not SQL gets its text back as one statement rather than cut up.
+pub const PROTO: u32 = 21;
 
 /// One decoded incoming request.
 #[derive(Debug, Deserialize)]

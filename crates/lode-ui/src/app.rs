@@ -930,6 +930,26 @@ impl Rail {
     }
 }
 
+/// A run of several statements out of one editor.
+///
+/// Kept whole rather than as a queue of asks, because the run has to be able to
+/// STOP: statement three usually depends on statement two, and a queue already
+/// handed to the engine cannot be called back.
+pub struct Multi {
+    /// The tab the text came from — where the card is drawn.
+    pub tab: u64,
+    pub conn: String,
+    /// What the tab is called, which each step's title is built from.
+    pub title: String,
+    pub stmts: Vec<String>,
+    /// How many have been started.
+    pub at: usize,
+    /// Which tab the step in flight is in, so its ending can be recognised.
+    pub waiting: Option<u64>,
+    /// Whether a person has said yes.
+    pub asked: bool,
+}
+
 /// What an outstanding request was for.
 enum Pending {
     /// `schema.ddl` asked for by the context menu: the answer goes on the
@@ -950,6 +970,8 @@ enum Pending {
     StoreImport,
     /// The saved scripts, for the names a hook can point at.
     ScriptNames,
+    /// How many statements the box holds, asked before running it.
+    Split { tab: u64 },
     /// One of the driver's live views.
     Inspect { name: String },
     /// A row of one, asked about and then acted on.
@@ -1102,6 +1124,10 @@ pub struct Workspace {
     /// The saved scripts themselves, for the panel that lists them: the
     /// connection's and the global ones, as the engine returned them.
     scripts: Vec<Value>,
+    /// A multi-statement run: what is in the box, and how far it has got.
+    multi: Option<Multi>,
+    /// A step that finished, noticed in a notification and acted on in `pump`.
+    multi_advance: Option<(u64, bool)>,
     /// Which live view is open, by the name the driver gave it.
     inspecting: Option<String>,
     /// What that view answered: its columns and its rows.
@@ -1452,6 +1478,8 @@ impl Workspace {
             scripts_reopened: false,
             chart_hover: None,
             chart_bounds: None,
+            multi: None,
+            multi_advance: None,
             inspecting: None,
             inspected: None,
             inspect_error: None,
@@ -1797,6 +1825,14 @@ impl Workspace {
         }
         // A running task's clock moves even when nothing arrived, so the
         // duration beside it is not frozen at the moment it started.
+        // A step of a multi-statement run that has just finished. Noted while
+        // the notification was read and acted on HERE, because starting the
+        // next statement opens a tab and an editor — which needs the window,
+        // and `on_notification` does not have it.
+        if let Some((tab, ok)) = self.multi_advance.take() {
+            self.multi_done(tab, ok, cx);
+            changed = true;
+        }
         if changed || self.tasks.iter().any(|t| t.running()) {
             cx.notify();
         }
@@ -1953,6 +1989,16 @@ impl Workspace {
                         self.record_run(tab_id, "done", st.ms, st.affected)
                     }
                     _ => {}
+                }
+                // And if a multi-statement run was waiting on this tab, say so.
+                // `pump` acts on it: the next statement needs a tab and an
+                // editor, which need the window.
+                if self.multi.as_ref().and_then(|m| m.waiting) == Some(tab_id) {
+                    if let crate::workspace::Settle::Finished(_) =
+                        crate::workspace::task_settled(&st.state, st.error.as_deref())
+                    {
+                        self.multi_advance = Some((tab_id, st.state == "done"));
+                    }
                 }
             }
             "daemon.log" => {
@@ -2376,6 +2422,39 @@ impl Workspace {
                 // It became a profile; the lists that show profiles are asked
                 // again rather than left to be refreshed by hand.
                 self.ask_profiles();
+            }
+            Pending::Split { tab } => {
+                let stmts: Vec<String> =
+                    serde_json::from_value(v.get("statements").cloned().unwrap_or(json!([])))
+                        .unwrap_or_default();
+                match stmts.len() {
+                    // Nothing to run. Not an error: an editor holding only a
+                    // comment is somebody mid-thought.
+                    0 => {}
+                    1 => self.run_one(tab, stmts[0].clone()),
+                    n => {
+                        // ASKED FIRST. Running five statements because
+                        // somebody pressed what they thought was "run this
+                        // query" is the kind of surprise that ends in a
+                        // restored backup.
+                        let (conn, title) = self
+                            .tabs
+                            .iter()
+                            .find(|t| t.id == tab)
+                            .map(|t| (t.conn_name.clone(), t.title.clone()))
+                            .unwrap_or_default();
+                        self.multi = Some(Multi {
+                            tab,
+                            conn,
+                            title,
+                            stmts,
+                            at: 0,
+                            waiting: None,
+                            asked: false,
+                        });
+                        self.status = format!("{n} statements");
+                    }
+                }
             }
             Pending::Inspect { name } => {
                 // Only when it is still the view being looked at: an answer
@@ -3348,11 +3427,90 @@ impl Workspace {
             return;
         }
         let driver = self.tabs[idx].driver.clone();
+        // MORE THAN ONE statement in the box?
+        //
+        // Asked of the ENGINE, which knows the dialect: a semicolon inside a
+        // string, a comment or a `$$` body is not a boundary, and a client
+        // that split on `;` would send half a statement. An engine too old to
+        // answer is not asked, and the whole text goes as one statement —
+        // which is what this client did before, and what the server will
+        // either accept or complain about in its own words.
+        if self.hello.as_ref().is_some_and(|h| h.proto >= 21) && self.multi.is_none() {
+            self.ask(
+                Pending::Split { tab: tab_id },
+                "query.split",
+                json!({ "driver": driver, "text": statement }),
+            );
+            return;
+        }
         self.ask(
             Pending::ClassifyTab { tab: tab_id, statement: statement.clone() },
             "query.classify",
             json!({ "driver": driver, "statement": statement }),
         );
+    }
+
+    /// Classify and run ONE statement in this tab, with no splitting.
+    ///
+    /// The door `run_tab` goes through once it knows there is one statement,
+    /// and the door each step of a multi-statement run goes through. Separate
+    /// from `run_tab` so that a split cannot ask for a split.
+    fn run_one(&mut self, tab_id: u64, statement: String) {
+        let Some(idx) = self.tabs.iter().position(|t| t.id == tab_id) else { return };
+        let driver = self.tabs[idx].driver.clone();
+        self.ask(
+            Pending::ClassifyTab { tab: tab_id, statement: statement.clone() },
+            "query.classify",
+            json!({ "driver": driver, "statement": statement }),
+        );
+    }
+
+    /// Run the next statement of a multi-statement run.
+    ///
+    /// Each in a TAB OF ITS OWN, titled `(k/N)`. One tab showing each result
+    /// in turn would mean five statements and one result, which is the shape
+    /// that makes somebody run the file twice to see what the third one did.
+    fn multi_step(&mut self, cx: &mut Context<Self>) {
+        let Some(m) = self.multi.as_mut() else { return };
+        if m.at >= m.stmts.len() {
+            let n = m.stmts.len();
+            self.multi = None;
+            self.status = format!("ran {n} statement(s)");
+            cx.notify();
+            return;
+        }
+        let (conn, title, at, n) =
+            (m.conn.clone(), m.title.clone(), m.at, m.stmts.len());
+        let stmt = m.stmts[at].clone();
+        m.at += 1;
+        let id = self.next_tab;
+        self.run_statement_titled(&conn, &format!("{title} ({}/{n})", at + 1), &stmt, false, cx);
+        // WHICH tab to wait for. `run_statement_titled` takes the next id, so
+        // this is it — and waiting on the right one is what makes the next
+        // statement start after this one rather than beside it.
+        if let Some(m) = self.multi.as_mut() {
+            m.waiting = Some(id);
+        }
+    }
+
+    /// One statement of a multi-statement run has finished.
+    ///
+    /// On FAILURE the run stops. Statement three usually depends on statement
+    /// two, and carrying on after a failure is how a file half-applies — the
+    /// worst of the three possible outcomes, and the hardest to see.
+    fn multi_done(&mut self, tab: u64, ok: bool, cx: &mut Context<Self>) {
+        let Some(m) = self.multi.as_ref() else { return };
+        if m.waiting != Some(tab) {
+            return;
+        }
+        if !ok {
+            let (at, n) = (m.at, m.stmts.len());
+            self.multi = None;
+            self.toast(format!("stopped at statement {at} of {n}"), true);
+            cx.notify();
+            return;
+        }
+        self.multi_step(cx);
     }
 
     /// Run a tab, saying whether the person has already been asked.
@@ -8642,6 +8800,85 @@ impl Workspace {
         body = body.child(self.query_bar(tab, cx));
         if self.export_open {
             body = body.child(self.export_row(tab, cx));
+        }
+
+        // SEVERAL statements in the box, waiting for a person to say so.
+        //
+        // Before the first one runs, not after: "run five statements?" asked
+        // once is a decision, and five results appearing one after another
+        // without being asked is a surprise.
+        if let Some(m) = self.multi.as_ref().filter(|m| m.tab == tab.id && !m.asked) {
+            let n = m.stmts.len();
+            let preview: Vec<String> = m
+                .stmts
+                .iter()
+                .take(6)
+                .enumerate()
+                .map(|(i, s)| format!("{}. {}", i + 1, crate::workspace::draft_title(s)))
+                .collect();
+            let more = n.saturating_sub(preview.len());
+            let mut card = div()
+                .flex()
+                .flex_col()
+                .gap_1()
+                .m_3()
+                .p_2()
+                .border_1()
+                .border_color(t.warning())
+                .child(self.small(format!("{n} statements in this editor"), t.warning()));
+            for line in preview {
+                card = card.child(self.small(line, t.fg()));
+            }
+            if more > 0 {
+                card = card.child(self.small(format!("\u{2026} and {more} more"), t.muted()));
+            }
+            card = card
+                .child(self.small(
+                    "They run in order, each in a tab of its own, and the run STOPS at the \
+                     first failure.",
+                    t.muted(),
+                ))
+                .child(
+                    div()
+                        .flex()
+                        .gap_2()
+                        .child(
+                            btn(t, ms, "multi-run", format!("run all {n}"), Btn::Danger).on_click(
+                                cx.listener(|this, _, _, cx| {
+                                    if let Some(m) = this.multi.as_mut() {
+                                        m.asked = true;
+                                    }
+                                    this.multi_step(cx);
+                                }),
+                            ),
+                        )
+                        .child(
+                            // The FIRST one only, which is what somebody who
+                            // pasted a file and wanted to try the top of it
+                            // means.
+                            btn(t, ms, "multi-first", "just the first", Btn::Secondary).on_click(
+                                cx.listener(|this, _, _, cx| {
+                                    let first =
+                                        this.multi.as_ref().and_then(|m| m.stmts.first().cloned());
+                                    let tab = this.multi.as_ref().map(|m| m.tab);
+                                    this.multi = None;
+                                    if let (Some(t), Some(s)) = (tab, first) {
+                                        this.run_one(t, s);
+                                    }
+                                    cx.notify();
+                                }),
+                            ),
+                        )
+                        .child(
+                            btn(t, ms, "multi-leave", self.tr("write.leave_it"), Btn::Quiet)
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.multi = None;
+                                    cx.notify();
+                                })),
+                        ),
+                );
+            body = body.child(card);
+            return body.into_any_element();
         }
 
         // A statement the engine called destructive: the reason, the statement,
