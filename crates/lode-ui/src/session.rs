@@ -53,6 +53,24 @@ pub struct Session {
     /// otherwise silently open somebody else's groups.
     #[serde(default)]
     pub settings_open: Option<Vec<String>>,
+    /// The font to draw in, and the font to draw the ICONS in.
+    ///
+    /// A NAME, not a file. What happens when it is not installed is the
+    /// question worth answering: the window falls back through its own list
+    /// and the settings page says that it did — a font silently replaced by
+    /// another is a window that looks wrong for a reason nobody can find.
+    #[serde(default)]
+    pub font: Option<String>,
+    #[serde(default)]
+    pub icon_font: Option<String>,
+    /// Whether the connection window refuses a password typed as itself.
+    ///
+    /// This window's own policy, not the engine's: the engine will store
+    /// whatever it is handed, and this is a decision about what this client
+    /// is willing to hand it. Absent means off, which is what a machine with
+    /// no wallet needs.
+    #[serde(default)]
+    pub secrets_from_a_source: Option<bool>,
     /// Keys somebody has changed: the action's name, and the keystroke it
     /// should answer to.
     ///
@@ -264,6 +282,9 @@ mod tests {
             panel_hidden: None,
             shut_groups: None,
             keys: None,
+            secrets_from_a_source: None,
+            font: None,
+            icon_font: None,
             panel_w: Some(320.0),
         };
         let text = serde_json::to_string(&s).unwrap();
@@ -309,6 +330,9 @@ mod tests {
             panel_hidden: None,
             shut_groups: None,
             keys: None,
+            secrets_from_a_source: None,
+            font: None,
+            icon_font: None,
             panel_w: None,
         };
         let round: Session = serde_json::from_str(&serde_json::to_string(&typed).unwrap()).unwrap();

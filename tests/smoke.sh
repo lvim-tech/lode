@@ -68,11 +68,16 @@ mkfifo "$IN"
 : >"$OUT"
 # The store MUST land in the throwaway directory: this test writes connections
 # and history, and it has no business touching the real ones.
-# The keyring socket is pointed at NOTHING on purpose. `vault.put` writes to the
-# real per-user wallet, and a test that stores secrets in the person's wallet is
-# a test with a side effect nobody asked for — so the engine must find no agent
-# there, which is exactly the refusal the checks below want to see.
-LODE_DATA_DIR=$WORK/data LVIM_KEYRING_SOCK=$WORK/no-such-agent.sock \
+# The wallet is pointed at a THROWAWAY socket and a throwaway vault file. The
+# engine starts the agent itself when it can find one, and an agent on the real
+# socket would be the person's own: a test that unlocks, writes to or locks
+# somebody's wallet is a test with a side effect nobody asked for. The KDF cost
+# is dropped to keep the run quick — the crypto is the same code either way, and
+# what is being tested here is the conversation, not Argon2.
+LODE_DATA_DIR=$WORK/data \
+    LVIM_KEYRING_SOCK=$WORK/agent.sock \
+    LVIM_KEYRING_VAULT=$WORK/keyring.vault \
+    LVIM_KEYRING_KDF_M=8192 LVIM_KEYRING_KDF_T=1 LVIM_KEYRING_KDF_P=1 \
     "$BIN" <"$IN" >"$OUT" 2>"$WORK/err" &
 PID=$!
 # Hold the fifo open for the whole run: a plain `echo > fifo` would close it and
@@ -416,15 +421,69 @@ await '.id == 48' >/dev/null
 send '{"id":49,"method":"store.connections.get","params":{"name":"smoke"}}'
 check "and null takes it out" "$(await '.id == 49' | jq -r '.result.connection.group')" "null"
 
+# THE WALLET, end to end, from an engine with no editor anywhere near it.
+#
+# This is the whole compatibility claim in one sequence: the engine starts the
+# agent itself, makes a vault, opens it, puts a secret in and reads the same
+# secret back out. The agent is the same program the Neovim plugin builds, from
+# the same source, speaking the same protocol to the same kind of file — so a
+# pass here is a pass for both clients.
+#
+# Skipped, loudly, when the agent binary was not built: `scripts/build-wallet`
+# is optional and a missing one must not read as a broken engine.
+if [ -x "$ROOT/build/lvim-keyring-daemon" ] || command -v lvim-keyring-daemon >/dev/null; then
+    send '{"id":65,"method":"vault.status","params":{}}'
+    VS=$(await '.id == 65')
+    check "the engine starts the agent itself" "$(printf '%s' "$VS" | jq -r '.ok')" "true"
+    check "and there is no wallet yet" \
+        "$(printf '%s' "$VS" | jq -r '.result.exists')" "false"
+    send '{"id":66,"method":"vault.unlock","params":{"password":""}}'
+    check "an empty passphrase is refused before it travels" \
+        "$(await '.id == 66' | jq -r 'if (.error | test("passphrase is needed")) then "yes" else .error end')" \
+        "yes"
+    send '{"id":67,"method":"vault.create","params":{"password":"smoke-master-pass"}}'
+    check "a wallet is made" "$(await '.id == 67' | jq -r '.result.created')" "true"
+    send '{"id":68,"method":"vault.status","params":{}}'
+    VS2=$(await '.id == 68')
+    check "and it is open" "$(printf '%s' "$VS2" | jq -r '.result.locked')" "false"
+    check "and it exists now" "$(printf '%s' "$VS2" | jq -r '.result.exists')" "true"
+    # A second create over an existing wallet is REFUSED rather than silently
+    # replacing it: that would be every secret in it, gone, with a success.
+    send '{"id":69,"method":"vault.create","params":{"password":"another"}}'
+    check "a second wallet is refused" \
+        "$(await '.id == 69' | jq -r 'if (.error | test("already a wallet")) then "yes" else .error end')" \
+        "yes"
+    # The round trip, under the name lvim-db uses.
+    send '{"id":73,"method":"vault.put","params":{"name":"db/smoke","value":"s3cret-canary"}}'
+    check "a secret goes in" "$(await '.id == 73' | jq -r '.result.stored')" "true"
+    send '{"id":74,"method":"vault.lock","params":{}}'
+    await '.id == 74' >/dev/null
+    send '{"id":76,"method":"vault.status","params":{}}'
+    check "locking shuts it" "$(await '.id == 76' | jq -r '.result.locked')" "true"
+    # And the value is not anywhere this engine wrote, even now that it has
+    # really been stored: not in a reply, not in the log.
+    check "the secret is in nothing the engine said" \
+        "$(grep -l s3cret-canary "$OUT" "$WORK/err" 2>/dev/null | wc -l | tr -d ' ')" "0"
+    # The VAULT FILE is the shared one: a real file, and not readable as text.
+    check "the vault is a file on disk" "$([ -f "$WORK/keyring.vault" ] && echo yes || echo no)" "yes"
+    # `-a`, because the vault is binary and grep would otherwise answer
+    # "Binary file matches" rather than looking; `-q` so a count that is zero
+    # cannot print twice through a `|| echo`.
+    check "and the secret is not in it in clear" \
+        "$(grep -aq s3cret-canary "$WORK/keyring.vault" && echo LEAKED || echo no)" "no"
+else
+    report "wallet" "skipped — scripts/build-wallet has not been run"
+fi
+
 # `vault.put` CARRIES a secret, and the one thing it must never do is keep it
 # anywhere: not in the store, not in the audit log, not in the error it fails
-# with. There is no agent on that socket, so this is the refusal path — the one
-# that has an error message to inspect.
+# with. The wallet was locked above, so this is the refusal path — the one that
+# has an error message to inspect.
 send '{"id":60,"method":"vault.put","params":{"name":"db/smoke","value":"s3cret-canary"}}'
 VP=$(await '.id == 60')
-check "no wallet is a refusal" "$(printf '%s' "$VP" | jq -r '.ok')" "false"
-check "and it says what to do" \
-    "$(printf '%s' "$VP" | jq -r 'if (.error | test("lvim-keyring")) then "yes" else .error end')" \
+check "a locked wallet refuses a write" "$(printf '%s' "$VP" | jq -r '.ok')" "false"
+check "and says which of the two it is" \
+    "$(printf '%s' "$VP" | jq -r 'if (.error | test("locked|lvim-keyring")) then "yes" else .error end')" \
     "yes"
 check "and the secret is not in the error" \
     "$(printf '%s' "$VP" | jq -r 'if (.error | test("s3cret-canary")) then "LEAKED" else "no" end')" \

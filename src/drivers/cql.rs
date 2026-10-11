@@ -77,6 +77,25 @@ const CAPS: Caps = Caps {
     metrics: false,
 };
 
+/// Cassandra's own.
+///
+/// NO `alter_type`: Cassandra removed changing a column's type — the stored
+/// bytes are the old type's and nothing rewrites them. Its index statement
+/// has no UNIQUE either, because a secondary index there does not enforce
+/// one.
+const CQL_DDL_OPS: &[crate::spec::DdlOp] = &[
+    crate::spec::SQL_DDL_COMMON[0],
+    crate::spec::SQL_DDL_COMMON[1],
+    crate::spec::SQL_DDL_COMMON[2],
+    crate::spec::DdlOp {
+        op: "create_index",
+        label: "Index this column\u{2026}",
+        template: "CREATE INDEX {index} ON {qualified} ({columns});",
+        asks: crate::spec::ASK_INDEX,
+    },
+    crate::spec::SQL_DDL_COMMON[4],
+];
+
 const CASSANDRA_META: DriverMeta = DriverMeta {
     kind: "cassandra",
     display: "Cassandra",
@@ -92,7 +111,8 @@ const CASSANDRA_META: DriverMeta = DriverMeta {
     browse_form: crate::spec::SQL_BROWSE_FORM,
     time_filter: crate::spec::SQL_TIME_FILTER,
     builder_ops: CQL_BUILDER_OPS,
-    ddl_ops: crate::spec::SQL_DDL_OPS,
+    ddl_ops: CQL_DDL_OPS,
+    types: crate::spec::CQL_TYPES,
     inspectors: &[],
 };
 
@@ -111,7 +131,8 @@ const SCYLLA_META: DriverMeta = DriverMeta {
     browse_form: crate::spec::SQL_BROWSE_FORM,
     time_filter: crate::spec::SQL_TIME_FILTER,
     builder_ops: CQL_BUILDER_OPS,
-    ddl_ops: crate::spec::SQL_DDL_OPS,
+    ddl_ops: CQL_DDL_OPS,
+    types: crate::spec::CQL_TYPES,
     inspectors: &[],
 };
 

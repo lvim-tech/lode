@@ -147,6 +147,17 @@ pub struct Editor {
     font: SharedString,
     /// The first visible line.
     scroll_top: usize,
+    /// How far the text is scrolled SIDEWAYS, in pixels.
+    ///
+    /// Lines are not wrapped — a statement is read as the lines it was written
+    /// in — so a long one has to be reachable some other way, and the way is
+    /// the caret dragging the view after it. Without this the caret walked off
+    /// the right edge and the text stayed where it was, which is a line nobody
+    /// can edit past the width of the box.
+    ///
+    /// In PIXELS rather than columns because the font may be proportional and
+    /// a column is then not a width.
+    scroll_x: f32,
     /// Set during paint, for hit-testing a click.
     last_lines: Vec<ShapedLine>,
     last_bounds: Option<Bounds<Pixels>>,
@@ -214,6 +225,7 @@ impl Editor {
             flavour,
             font: font.into(),
             scroll_top: 0,
+            scroll_x: 0.0,
             last_lines: Vec::new(),
             last_bounds: None,
             last_rows: MIN_ROWS,
@@ -262,6 +274,18 @@ impl Editor {
     pub fn set_text(&mut self, text: &str, cx: &mut Context<Self>) {
         self.doc.set_text(text);
         self.scroll_top = 0;
+        self.scroll_x = 0.0;
+        cx.notify();
+    }
+
+    /// Take the keyboard, with the caret AT THE END of what is there.
+    ///
+    /// For a box that opens on an existing value: somebody who opened it
+    /// means to carry on from where the text stops, and a caret parked at
+    /// character zero means typing lands at the front of the value instead.
+    pub fn focus_at_end(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.doc.move_doc_end(false);
+        window.focus(&self.focus_handle);
         cx.notify();
     }
 
@@ -517,7 +541,9 @@ impl Editor {
         let dy = (f32::from(p.y) - f32::from(bounds.top())).max(0.0);
         let row = (dy / line_h) as usize;
         let line = (self.scroll_top + row).min(self.doc.line_count() - 1);
-        let x = p.x - bounds.left() - px(self.gutter_w());
+        // The pointer is over the SCROLLED text, so where it lands in the
+        // line is further along by however far the view has moved.
+        let x = p.x - bounds.left() - px(self.gutter_w()) + px(self.scroll_x);
         let byte = match self.last_lines.get(row) {
             // `closest_index_for_x` rather than `index_for_x`: a click past the
             // end of a line has no index, and the answer somebody means by it
@@ -609,6 +635,28 @@ impl Render for Editor {
             .key_context("Editor")
             .track_focus(&self.focus_handle(cx))
             .cursor(gpui::CursorStyle::IBeam)
+            // THE WHEEL MOVES IT. Until now the view followed the CARET and
+            // nothing else, so a document longer than sixteen rows could be
+            // read only by walking the cursor down it — and in a card the
+            // text below the fold looked simply unreachable.
+            .on_scroll_wheel(cx.listener(|this, ev: &gpui::ScrollWheelEvent, window, cx| {
+                let line_h = f32::from(this.scale.line_h()).max(1.0);
+                let dy = match ev.delta {
+                    gpui::ScrollDelta::Lines(p) => f32::from(p.y),
+                    gpui::ScrollDelta::Pixels(p) => f32::from(p.y) / line_h,
+                };
+                if dy == 0.0 {
+                    return;
+                }
+                // Three lines a notch, the step every other list here moves
+                // by. Down the page is a NEGATIVE delta.
+                let step = (dy * 3.0).round() as isize;
+                let last = this.doc.line_count().saturating_sub(1);
+                let now = this.scroll_top as isize - step;
+                this.scroll_top = now.clamp(0, last as isize) as usize;
+                let _ = window;
+                cx.notify();
+            }))
             .on_action(cx.listener(|this, _: &crate::app::Escape, window, cx| {
                 // The LIST first: escape is how a popup is dismissed, and the
                 // window's own escape still works once there is none.
@@ -736,6 +784,9 @@ struct Prepaint {
     gutter: f32,
     quads: Vec<PaintQuad>,
     cursor: Option<PaintQuad>,
+    /// How far sideways this frame was drawn, so the editor remembers it for
+    /// the next one and for hit-testing.
+    scroll_x: f32,
 }
 
 impl IntoElement for EditorElement {
@@ -799,6 +850,46 @@ impl Element for EditorElement {
             style: Default::default(),
         };
 
+        // HOW FAR SIDEWAYS. Worked out from the caret before anything is
+        // drawn, so the view has already followed it by the time this frame
+        // is painted rather than a frame later.
+        //
+        // The cursor's line is shaped twice on the frames where it is
+        // visible — once here and once in the loop — which is one line of
+        // text shaping and buys the caret never leaving the box.
+        let view_w = (f32::from(bounds.size.width) - gutter).max(1.0);
+        // Two characters of room, so the caret is never hard against an edge
+        // with the next keystroke already off it.
+        let pad = f32::from(font_size) * 1.2;
+        let mut scroll_x = ed.scroll_x.max(0.0);
+        if let Some(text) = ed.doc.lines().get(cursor.line) {
+            let runs = ed.runs_for(text);
+            let shaped = window.text_system().shape_line(
+                SharedString::from(text.clone()),
+                font_size,
+                &runs,
+                None,
+            );
+            let caret_x = f32::from(shaped.x_for_index(cursor.byte));
+            if caret_x - scroll_x > view_w - pad {
+                scroll_x = caret_x - view_w + pad;
+            }
+            if caret_x < scroll_x + pad {
+                scroll_x = (caret_x - pad).max(0.0);
+            }
+        }
+        // Back to the left edge when nothing needs the room: a short line
+        // drawn at an offset looks like text that has gone missing.
+        let widest = (0..rows)
+            .filter_map(|r| ed.doc.lines().get(top + r))
+            .map(|l| l.len())
+            .max()
+            .unwrap_or(0);
+        if widest == 0 {
+            scroll_x = 0.0;
+        }
+        let shift = px(-scroll_x);
+
         let mut lines = Vec::new();
         let mut numbers = Vec::new();
         let mut quads = Vec::new();
@@ -821,8 +912,8 @@ impl Element for EditorElement {
                 if n >= from.line && n <= to.line {
                     let start = if n == from.line { from.byte } else { 0 };
                     let end = if n == to.line { to.byte } else { text.len() };
-                    let x0 = bounds.left() + px(gutter) + shaped.x_for_index(start);
-                    let x1 = bounds.left() + px(gutter) + shaped.x_for_index(end);
+                    let x0 = bounds.left() + px(gutter) + shift + shaped.x_for_index(start);
+                    let x1 = bounds.left() + px(gutter) + shift + shaped.x_for_index(end);
                     // A line selected whole but EMPTY still shows: a zero-width
                     // mark says nothing, and the line break is part of what was
                     // selected.
@@ -835,7 +926,7 @@ impl Element for EditorElement {
             }
 
             if n == cursor.line {
-                let x = bounds.left() + px(gutter) + shaped.x_for_index(cursor.byte);
+                let x = bounds.left() + px(gutter) + shift + shaped.x_for_index(cursor.byte);
                 caret = Some(fill(
                     Bounds::new(point(x, y), size(px(1.5), line_h)),
                     ed.colors.cursor,
@@ -862,7 +953,7 @@ impl Element for EditorElement {
             lines.push(shaped);
         }
 
-        Prepaint { lines, numbers, gutter, quads, cursor: caret }
+        Prepaint { lines, numbers, gutter, quads, cursor: caret, scroll_x }
     }
 
     fn paint(
@@ -883,9 +974,10 @@ impl Element for EditorElement {
             window.paint_quad(quad);
         }
         let gutter = px(prepaint.gutter);
+        let shift = px(-prepaint.scroll_x);
         for (row, line) in prepaint.lines.iter().enumerate() {
             let y = bounds.top() + line_h * row as f32;
-            let _ = line.paint(point(bounds.left() + gutter, y), line_h, window, cx);
+            let _ = line.paint(point(bounds.left() + gutter + shift, y), line_h, window, cx);
         }
         for (row, num) in prepaint.numbers.iter().enumerate() {
             let y = bounds.top() + line_h * row as f32;
@@ -904,10 +996,12 @@ impl Element for EditorElement {
 
         let lines = std::mem::take(&mut prepaint.lines);
         let rows = lines.len();
+        let scroll_x = prepaint.scroll_x;
         self.editor.update(cx, |ed, _| {
             ed.last_lines = lines;
             ed.last_bounds = Some(bounds);
             ed.last_rows = rows;
+            ed.scroll_x = scroll_x;
         });
     }
 }
@@ -1037,7 +1131,8 @@ impl EntityInputHandler for Editor {
         let line = self.doc.lines().get(self.doc.cursor().line)?;
         let start = utf16_to_byte(line, range_utf16.start);
         let line_h = px(f32::from(self.scale.line_h()));
-        let x = bounds.left() + px(self.gutter_w()) + shaped.x_for_index(start);
+        let x =
+            bounds.left() + px(self.gutter_w()) - px(self.scroll_x) + shaped.x_for_index(start);
         let y = bounds.top() + line_h * row as f32;
         Some(Bounds::new(point(x, y), size(px(1.0), line_h)))
     }

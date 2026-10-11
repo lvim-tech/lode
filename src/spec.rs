@@ -186,6 +186,12 @@ pub struct DriverMeta {
     /// templates. Empty where the idea does not apply — a key/value store has
     /// no columns to add.
     pub ddl_ops: &'static [DdlOp],
+    /// THE TYPES THIS DIALECT'S COLUMNS CAN HAVE, for the client to offer
+    /// where an operation asks for one. Empty where the store has no column
+    /// types at all — a document or a key-value store says so by saying
+    /// nothing, and the client then never offers a type where there is none
+    /// to give.
+    pub types: &'static [TypeSpec],
     /// The live views this engine can be ASKED about: who is connected, what
     /// is locked, what is running.
     ///
@@ -247,41 +253,339 @@ pub struct QueryFieldSpec {
 #[derive(Debug, Clone, Copy, Serialize)]
 pub struct DdlOp {
     /// What it does, as a stable word: `add_column`, `rename_column`,
-    /// `drop_column`, `create_index`, `drop_index`.
+    /// `drop_column`, `alter_type`, `create_index`, `drop_index`.
     pub op: &'static str,
     /// What a person reads in the menu.
     pub label: &'static str,
-    /// The statement, with `{qualified}`, `{table}`, `{column}`, `{type}`,
-    /// `{to}`, `{index}` and `{columns}` filled in by the client.
+    /// The statement, with `{qualified}`, `{table}`, `{schema}` and each of
+    /// `asks`'s keys filled in by the client.
     pub template: &'static str,
+    /// WHAT THE TEMPLATE NEEDS, in the order to ask for it.
+    ///
+    /// Without this the client had to know that `add_column` wants a name and
+    /// a type while `create_index` wants a name and a list of columns — which
+    /// is the dialect's business leaking into the client, and the reason a
+    /// driver could not add an operation without the client being taught
+    /// about it first. Now a driver that declares a new op gets a form for it
+    /// and nothing in the client changes.
+    pub asks: &'static [DdlAsk],
 }
 
-/// What nearly every SQL dialect spells the same way.
+/// One hole in a `DdlOp`'s template, and what belongs in it.
+#[derive(Debug, Clone, Copy, Serialize)]
+pub struct DdlAsk {
+    /// The `{key}` it fills.
+    pub key: &'static str,
+    /// What a person reads beside the box.
+    pub label: &'static str,
+    pub kind: AskKind,
+    /// What to put there before anybody types: `{table}` and `{column}` are
+    /// substituted, so an index can be suggested a name made out of what it
+    /// is being created on.
+    pub suggest: &'static str,
+}
+
+/// What KIND of thing a hole wants, so the client can offer the right way to
+/// pick one rather than a text box for everything.
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AskKind {
+    /// Free text — a name, mostly.
+    Text,
+    /// One of the dialect's types: see `DriverMeta.types`.
+    Type,
+    /// One column of the table.
+    Column,
+    /// Several columns, in order, comma separated.
+    Columns,
+    /// The name of an index that already exists.
+    Index,
+    /// On or off. The template gets the word for on, or nothing.
+    Flag,
+}
+
+/// One type a dialect's columns can be declared with.
 ///
-/// A driver with a different spelling starts from this and replaces the one
-/// line that differs, rather than writing out five.
-pub const SQL_DDL_OPS: &[DdlOp] = &[
+/// The client cannot be the one that knows these: "the types postgres has"
+/// is a fact about postgres, it changes with the version, and a list baked
+/// into a GUI is a list that is wrong for somebody. So the driver says, and
+/// the client offers exactly what it was told — the same arrangement as
+/// `params`, `browse` and `ddl_ops`.
+#[derive(Debug, Clone, Copy, Serialize)]
+pub struct TypeSpec {
+    /// As it is written in a statement: `text`, `varchar`, `numeric`.
+    pub name: &'static str,
+    /// How many arguments it takes in parentheses: `varchar(n)` is one,
+    /// `numeric(p, s)` is two, `text` is none. The client uses it to decide
+    /// whether to ask for a size, not to validate — the statement is read
+    /// and run by a person either way.
+    pub args: u8,
+    /// A few words about when it is the right one. Empty where the name says
+    /// it all.
+    pub note: &'static str,
+}
+
+/// PostgreSQL's everyday types. Not all of them — the list is what somebody
+/// reaches for, and a hundred entries is a list nobody reads. The box takes
+/// typing, so anything missing can still be written.
+pub const PG_TYPES: &[TypeSpec] = &[
+    TypeSpec { name: "text", args: 0, note: "" },
+    TypeSpec { name: "varchar", args: 1, note: "text with a limit" },
+    TypeSpec { name: "char", args: 1, note: "padded to the length" },
+    TypeSpec { name: "integer", args: 0, note: "" },
+    TypeSpec { name: "bigint", args: 0, note: "" },
+    TypeSpec { name: "smallint", args: 0, note: "" },
+    TypeSpec { name: "serial", args: 0, note: "integer that counts itself up" },
+    TypeSpec { name: "bigserial", args: 0, note: "" },
+    TypeSpec { name: "numeric", args: 2, note: "exact, for money" },
+    TypeSpec { name: "real", args: 0, note: "" },
+    TypeSpec { name: "double precision", args: 0, note: "" },
+    TypeSpec { name: "boolean", args: 0, note: "" },
+    TypeSpec { name: "date", args: 0, note: "" },
+    TypeSpec { name: "time", args: 0, note: "" },
+    TypeSpec { name: "timestamp", args: 0, note: "no zone" },
+    TypeSpec { name: "timestamptz", args: 0, note: "with a zone" },
+    TypeSpec { name: "interval", args: 0, note: "" },
+    TypeSpec { name: "uuid", args: 0, note: "" },
+    TypeSpec { name: "json", args: 0, note: "kept as text" },
+    TypeSpec { name: "jsonb", args: 0, note: "parsed, indexable" },
+    TypeSpec { name: "bytea", args: 0, note: "bytes" },
+    TypeSpec { name: "inet", args: 0, note: "an address" },
+];
+
+/// MySQL and MariaDB.
+pub const MYSQL_TYPES: &[TypeSpec] = &[
+    TypeSpec { name: "int", args: 0, note: "" },
+    TypeSpec { name: "bigint", args: 0, note: "" },
+    TypeSpec { name: "smallint", args: 0, note: "" },
+    TypeSpec { name: "tinyint", args: 0, note: "1 is the boolean" },
+    TypeSpec { name: "decimal", args: 2, note: "exact, for money" },
+    TypeSpec { name: "float", args: 0, note: "" },
+    TypeSpec { name: "double", args: 0, note: "" },
+    TypeSpec { name: "varchar", args: 1, note: "" },
+    TypeSpec { name: "char", args: 1, note: "" },
+    TypeSpec { name: "text", args: 0, note: "" },
+    TypeSpec { name: "mediumtext", args: 0, note: "" },
+    TypeSpec { name: "longtext", args: 0, note: "" },
+    TypeSpec { name: "blob", args: 0, note: "bytes" },
+    TypeSpec { name: "date", args: 0, note: "" },
+    TypeSpec { name: "datetime", args: 0, note: "" },
+    TypeSpec { name: "timestamp", args: 0, note: "moves with the zone" },
+    TypeSpec { name: "time", args: 0, note: "" },
+    TypeSpec { name: "year", args: 0, note: "" },
+    TypeSpec { name: "json", args: 0, note: "" },
+];
+
+/// SQLite's five affinities.
+/// 
+/// It stores what it is given and these are preferences, not rules \u{2014} which
+/// is why the list is short and honest rather than borrowed from another
+/// dialect.
+pub const SQLITE_TYPES: &[TypeSpec] = &[
+    TypeSpec { name: "integer", args: 0, note: "" },
+    TypeSpec { name: "real", args: 0, note: "" },
+    TypeSpec { name: "text", args: 0, note: "" },
+    TypeSpec { name: "blob", args: 0, note: "bytes" },
+    TypeSpec { name: "numeric", args: 0, note: "" },
+];
+
+/// SQL Server.
+pub const MSSQL_TYPES: &[TypeSpec] = &[
+    TypeSpec { name: "int", args: 0, note: "" },
+    TypeSpec { name: "bigint", args: 0, note: "" },
+    TypeSpec { name: "smallint", args: 0, note: "" },
+    TypeSpec { name: "tinyint", args: 0, note: "" },
+    TypeSpec { name: "bit", args: 0, note: "the boolean" },
+    TypeSpec { name: "decimal", args: 2, note: "exact, for money" },
+    TypeSpec { name: "float", args: 0, note: "" },
+    TypeSpec { name: "real", args: 0, note: "" },
+    TypeSpec { name: "varchar", args: 1, note: "" },
+    TypeSpec { name: "nvarchar", args: 1, note: "unicode" },
+    TypeSpec { name: "char", args: 1, note: "" },
+    TypeSpec { name: "nchar", args: 1, note: "" },
+    TypeSpec { name: "date", args: 0, note: "" },
+    TypeSpec { name: "datetime2", args: 0, note: "" },
+    TypeSpec { name: "datetimeoffset", args: 0, note: "with a zone" },
+    TypeSpec { name: "time", args: 0, note: "" },
+    TypeSpec { name: "uniqueidentifier", args: 0, note: "a uuid" },
+    TypeSpec { name: "varbinary", args: 1, note: "bytes" },
+];
+
+/// ClickHouse. Capitalised, because it is case sensitive about these.
+pub const CLICKHOUSE_TYPES: &[TypeSpec] = &[
+    TypeSpec { name: "String", args: 0, note: "" },
+    TypeSpec { name: "FixedString", args: 1, note: "" },
+    TypeSpec { name: "Int32", args: 0, note: "" },
+    TypeSpec { name: "Int64", args: 0, note: "" },
+    TypeSpec { name: "UInt32", args: 0, note: "" },
+    TypeSpec { name: "UInt64", args: 0, note: "" },
+    TypeSpec { name: "Float32", args: 0, note: "" },
+    TypeSpec { name: "Float64", args: 0, note: "" },
+    TypeSpec { name: "Decimal", args: 2, note: "exact" },
+    TypeSpec { name: "Bool", args: 0, note: "" },
+    TypeSpec { name: "Date", args: 0, note: "" },
+    TypeSpec { name: "DateTime", args: 0, note: "" },
+    TypeSpec { name: "DateTime64", args: 1, note: "with sub-second places" },
+    TypeSpec { name: "UUID", args: 0, note: "" },
+    TypeSpec { name: "Nullable", args: 1, note: "wraps another type" },
+];
+
+/// Snowflake.
+pub const SNOWFLAKE_TYPES: &[TypeSpec] = &[
+    TypeSpec { name: "NUMBER", args: 2, note: "its one number type" },
+    TypeSpec { name: "FLOAT", args: 0, note: "" },
+    TypeSpec { name: "VARCHAR", args: 1, note: "" },
+    TypeSpec { name: "STRING", args: 0, note: "" },
+    TypeSpec { name: "BOOLEAN", args: 0, note: "" },
+    TypeSpec { name: "DATE", args: 0, note: "" },
+    TypeSpec { name: "TIME", args: 0, note: "" },
+    TypeSpec { name: "TIMESTAMP_NTZ", args: 0, note: "no zone" },
+    TypeSpec { name: "TIMESTAMP_TZ", args: 0, note: "with a zone" },
+    TypeSpec { name: "VARIANT", args: 0, note: "anything, semi-structured" },
+    TypeSpec { name: "OBJECT", args: 0, note: "" },
+    TypeSpec { name: "ARRAY", args: 0, note: "" },
+    TypeSpec { name: "BINARY", args: 0, note: "" },
+];
+
+/// Firebird.
+pub const FIREBIRD_TYPES: &[TypeSpec] = &[
+    TypeSpec { name: "SMALLINT", args: 0, note: "" },
+    TypeSpec { name: "INTEGER", args: 0, note: "" },
+    TypeSpec { name: "BIGINT", args: 0, note: "" },
+    TypeSpec { name: "NUMERIC", args: 2, note: "exact" },
+    TypeSpec { name: "DECIMAL", args: 2, note: "" },
+    TypeSpec { name: "FLOAT", args: 0, note: "" },
+    TypeSpec { name: "DOUBLE PRECISION", args: 0, note: "" },
+    TypeSpec { name: "VARCHAR", args: 1, note: "" },
+    TypeSpec { name: "CHAR", args: 1, note: "" },
+    TypeSpec { name: "BLOB", args: 0, note: "bytes or text" },
+    TypeSpec { name: "DATE", args: 0, note: "" },
+    TypeSpec { name: "TIME", args: 0, note: "" },
+    TypeSpec { name: "TIMESTAMP", args: 0, note: "" },
+    TypeSpec { name: "BOOLEAN", args: 0, note: "" },
+];
+
+/// Cassandra and Scylla.
+pub const CQL_TYPES: &[TypeSpec] = &[
+    TypeSpec { name: "text", args: 0, note: "" },
+    TypeSpec { name: "ascii", args: 0, note: "" },
+    TypeSpec { name: "int", args: 0, note: "" },
+    TypeSpec { name: "bigint", args: 0, note: "" },
+    TypeSpec { name: "smallint", args: 0, note: "" },
+    TypeSpec { name: "tinyint", args: 0, note: "" },
+    TypeSpec { name: "varint", args: 0, note: "any size" },
+    TypeSpec { name: "decimal", args: 0, note: "exact" },
+    TypeSpec { name: "float", args: 0, note: "" },
+    TypeSpec { name: "double", args: 0, note: "" },
+    TypeSpec { name: "boolean", args: 0, note: "" },
+    TypeSpec { name: "blob", args: 0, note: "bytes" },
+    TypeSpec { name: "date", args: 0, note: "" },
+    TypeSpec { name: "time", args: 0, note: "" },
+    TypeSpec { name: "timestamp", args: 0, note: "" },
+    TypeSpec { name: "uuid", args: 0, note: "" },
+    TypeSpec { name: "timeuuid", args: 0, note: "sorts by time" },
+    TypeSpec { name: "inet", args: 0, note: "an address" },
+    TypeSpec { name: "counter", args: 0, note: "only added to" },
+    TypeSpec { name: "list", args: 1, note: "of a type" },
+    TypeSpec { name: "set", args: 1, note: "of a type" },
+    TypeSpec { name: "map", args: 2, note: "key to value" },
+];
+
+/// The holes the common operations have, named once.
+pub const ASK_NEW_COLUMN: &[DdlAsk] = &[
+    DdlAsk { key: "column", label: "Name", kind: AskKind::Text, suggest: "" },
+    DdlAsk { key: "type", label: "Type", kind: AskKind::Type, suggest: "" },
+];
+pub const ASK_RENAME: &[DdlAsk] = &[
+    DdlAsk { key: "column", label: "Column", kind: AskKind::Column, suggest: "{column}" },
+    DdlAsk { key: "to", label: "New name", kind: AskKind::Text, suggest: "{column}" },
+];
+pub const ASK_COLUMN: &[DdlAsk] =
+    &[DdlAsk { key: "column", label: "Column", kind: AskKind::Column, suggest: "{column}" }];
+pub const ASK_RETYPE: &[DdlAsk] = &[
+    DdlAsk { key: "column", label: "Column", kind: AskKind::Column, suggest: "{column}" },
+    DdlAsk { key: "type", label: "New type", kind: AskKind::Type, suggest: "" },
+];
+pub const ASK_INDEX: &[DdlAsk] = &[
+    DdlAsk { key: "index", label: "Name", kind: AskKind::Text, suggest: "idx_{table}_{column}" },
+    DdlAsk { key: "columns", label: "Columns", kind: AskKind::Columns, suggest: "{column}" },
+];
+pub const ASK_UNIQUE_INDEX: &[DdlAsk] = &[
+    DdlAsk { key: "index", label: "Name", kind: AskKind::Text, suggest: "idx_{table}_{column}" },
+    DdlAsk { key: "columns", label: "Columns", kind: AskKind::Columns, suggest: "{column}" },
+    DdlAsk { key: "unique", label: "Unique", kind: AskKind::Flag, suggest: "" },
+];
+pub const ASK_DROP_INDEX: &[DdlAsk] =
+    &[DdlAsk { key: "index", label: "Index", kind: AskKind::Index, suggest: "{index}" }];
+
+/// The four every SQL dialect here spells the same way.
+///
+/// CHANGING A TYPE IS NOT AMONG THEM, because it is the one that is spelt
+/// differently everywhere — `ALTER COLUMN c TYPE t`, `MODIFY COLUMN c t`,
+/// `ALTER COLUMN c SET DATA TYPE t` — and sqlite cannot do it at all. Each
+/// dialect's list below starts from these and adds its own.
+pub const SQL_DDL_COMMON: &[DdlOp] = &[
     DdlOp {
         op: "add_column",
         label: "Add a column\u{2026}",
         template: "ALTER TABLE {qualified} ADD COLUMN {column} {type};",
+        asks: ASK_NEW_COLUMN,
     },
     DdlOp {
         op: "rename_column",
         label: "Rename this column\u{2026}",
         template: "ALTER TABLE {qualified} RENAME COLUMN {column} TO {to};",
+        asks: ASK_RENAME,
     },
     DdlOp {
         op: "drop_column",
         label: "Drop this column",
         template: "ALTER TABLE {qualified} DROP COLUMN {column};",
+        asks: ASK_COLUMN,
     },
     DdlOp {
         op: "create_index",
-        label: "Index this column\u{2026}",
-        template: "CREATE INDEX {index} ON {qualified} ({columns});",
+        label: "Index these columns\u{2026}",
+        template: "CREATE {unique} INDEX {index} ON {qualified} ({columns});",
+        asks: ASK_UNIQUE_INDEX,
     },
-    DdlOp { op: "drop_index", label: "Drop this index", template: "DROP INDEX {index};" },
+    DdlOp {
+        op: "drop_index",
+        label: "Drop this index",
+        template: "DROP INDEX {index};",
+        asks: ASK_DROP_INDEX,
+    },
+];
+
+/// The dialects that write `ALTER COLUMN c TYPE t`: postgres, duckdb,
+/// firebird, libsql.
+pub const SQL_DDL_OPS: &[DdlOp] = &[
+    SQL_DDL_COMMON[0],
+    SQL_DDL_COMMON[1],
+    SQL_DDL_COMMON[2],
+    DdlOp {
+        op: "alter_type",
+        label: "Change this column\u{2019}s type\u{2026}",
+        template: "ALTER TABLE {qualified} ALTER COLUMN {column} TYPE {type};",
+        asks: ASK_RETYPE,
+    },
+    SQL_DDL_COMMON[3],
+    SQL_DDL_COMMON[4],
+];
+
+/// The dialects that write `MODIFY COLUMN c t`: mysql, mariadb, clickhouse.
+pub const SQL_DDL_MODIFY: &[DdlOp] = &[
+    SQL_DDL_COMMON[0],
+    SQL_DDL_COMMON[1],
+    SQL_DDL_COMMON[2],
+    DdlOp {
+        op: "alter_type",
+        label: "Change this column\u{2019}s type\u{2026}",
+        template: "ALTER TABLE {qualified} MODIFY COLUMN {column} {type};",
+        asks: ASK_RETYPE,
+    },
+    SQL_DDL_COMMON[3],
+    SQL_DDL_COMMON[4],
 ];
 
 /// One live view of a server, offered by name.
@@ -1404,14 +1708,18 @@ mod tests {
     /// Every DDL template a driver declares can be filled in, and none of them
     /// is a statement with a hole left in it.
     ///
-    /// The placeholders are the contract: a client substitutes `{qualified}`,
-    /// `{table}`, `{column}`, `{type}`, `{to}`, `{index}` and `{columns}` and
-    /// nothing else. A template with a `{something}` nobody fills in would
-    /// reach the editor with braces in it, and a person would run it.
+    /// THE OP'S OWN `asks` ARE THE LIST. A client substitutes the three that
+    /// name the thing being changed — `{qualified}`, `{table}`, `{schema}` —
+    /// and then whatever the op said it needs. A template with a
+    /// `{something}` no ask names would reach the editor with braces in it,
+    /// and a person would run it.
+    ///
+    /// Checked against the declaration rather than against a fixed list,
+    /// because the declaration is what the client actually goes by: a list
+    /// here that agreed with neither would pass a template nothing can fill.
     #[test]
     fn a_ddl_template_has_no_placeholder_nobody_fills() {
-        const KNOWN: &[&str] =
-            &["{qualified}", "{table}", "{schema}", "{column}", "{type}", "{to}", "{index}", "{columns}"];
+        const STANDING: &[&str] = &["{qualified}", "{table}", "{schema}"];
         let mut seen = 0;
         for m in crate::registry::Registry::new().metas() {
             let mut ops = std::collections::BTreeSet::new();
@@ -1419,21 +1727,46 @@ mod tests {
                 assert!(!d.op.is_empty(), "{}: an op with no name", m.kind);
                 assert!(!d.label.is_empty(), "{}: {} has no label", m.kind, d.op);
                 assert!(ops.insert(d.op), "{}: {} twice", m.kind, d.op);
-                // A statement, not a fragment: it ends in a semicolon, so
-                // pasting two of them into an editor gives two statements.
+                // A WHOLE THING, not a fragment: a SQL statement ends in a
+                // semicolon, so pasting two of them into an editor gives two
+                // statements, and a command document is a document — which
+                // is what a store whose language is JSON runs instead.
+                let t = d.template.trim_end();
                 assert!(
-                    d.template.trim_end().ends_with(';'),
-                    "{}: {} does not end a statement: {:?}",
+                    t.ends_with(';') || (t.starts_with('{') && t.ends_with('}')),
+                    "{}: {} is neither a statement nor a command: {:?}",
                     m.kind,
                     d.op,
                     d.template
                 );
                 let mut rest = d.template.to_string();
-                for k in KNOWN {
+                for k in STANDING {
                     rest = rest.replace(k, "");
                 }
+                for a in d.asks {
+                    assert!(!a.key.is_empty(), "{}: {} has an ask with no key", m.kind, d.op);
+                    assert!(!a.label.is_empty(), "{}: {}.{} has no label", m.kind, d.op, a.key);
+                    // An ask nothing uses is a box somebody fills in for
+                    // nothing, which is as bad as a hole nobody fills.
+                    assert!(
+                        d.template.contains(&format!("{{{}}}", a.key)),
+                        "{}: {} asks for {} and its template has no place for it",
+                        m.kind,
+                        d.op,
+                        a.key
+                    );
+                    rest = rest.replace(&format!("{{{}}}", a.key), "");
+                }
+                // A LEFTOVER `{word}`, not a leftover `{`: a command
+                // document is made of braces and they are its syntax, while
+                // a hole is a brace with a name in it. Scanning for the name
+                // is what tells the two apart.
+                let leftover = rest.split('{').skip(1).any(|r| {
+                    r.split_once('}')
+                        .is_some_and(|(k, _)| !k.is_empty() && k.chars().all(|c| c.is_ascii_alphanumeric() || c == '_'))
+                });
                 assert!(
-                    !rest.contains('{'),
+                    !leftover,
                     "{}: {} has a placeholder nothing fills: {:?}",
                     m.kind,
                     d.op,

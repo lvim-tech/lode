@@ -75,6 +75,7 @@ const META: DriverMeta = DriverMeta {
     time_filter: crate::spec::SQL_TIME_FILTER,
     builder_ops: crate::spec::SQL_BUILDER_OPS,
     ddl_ops: MSSQL_DDL_OPS,
+    types: crate::spec::MSSQL_TYPES,
     inspectors: &[],
 };
 
@@ -90,26 +91,41 @@ const MSSQL_DDL_OPS: &[crate::spec::DdlOp] = &[
         op: "add_column",
         label: "Add a column\u{2026}",
         template: "ALTER TABLE {qualified} ADD {column} {type};",
+        asks: crate::spec::ASK_NEW_COLUMN,
     },
     crate::spec::DdlOp {
         op: "rename_column",
         label: "Rename this column\u{2026}",
         template: "EXEC sp_rename '{table}.{column}', '{to}', 'COLUMN';",
+        asks: crate::spec::ASK_RENAME,
     },
     crate::spec::DdlOp {
         op: "drop_column",
         label: "Drop this column",
         template: "ALTER TABLE {qualified} DROP COLUMN {column};",
+        asks: crate::spec::ASK_COLUMN,
+    },
+    // SQL Server's own spelling: no `TYPE` word, and the type goes where the
+    // whole definition would.
+    crate::spec::DdlOp {
+        op: "alter_type",
+        label: "Change this column\u{2019}s type\u{2026}",
+        template: "ALTER TABLE {qualified} ALTER COLUMN {column} {type};",
+        asks: crate::spec::ASK_RETYPE,
     },
     crate::spec::DdlOp {
         op: "create_index",
-        label: "Index this column\u{2026}",
-        template: "CREATE INDEX {index} ON {qualified} ({columns});",
+        label: "Index these columns\u{2026}",
+        template: "CREATE {unique} INDEX {index} ON {qualified} ({columns});",
+        asks: crate::spec::ASK_UNIQUE_INDEX,
     },
     crate::spec::DdlOp {
         op: "drop_index",
+        // SQL Server wants the table: an index name alone is ambiguous,
+        // because two tables may each have one of that name.
         label: "Drop this index",
         template: "DROP INDEX {index} ON {qualified};",
+        asks: crate::spec::ASK_DROP_INDEX,
     },
 ];
 

@@ -137,6 +137,7 @@ const META: DriverMeta = DriverMeta {
     time_filter: "",
     builder_ops: &[],
     ddl_ops: &[],
+    types: &[],
     inspectors: &[],
 };
 

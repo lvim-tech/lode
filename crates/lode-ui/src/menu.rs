@@ -94,6 +94,10 @@ pub enum Act {
     CopyRowInsert { tab: u64, row: usize },
     ShowRow { tab: u64, row: usize },
     EditRow { tab: u64, row: usize },
+    /// The whole row at once, as JSON — the same write, chosen a different
+    /// way. Offered beside the field-by-field one because which of the two
+    /// is less work depends entirely on how many fields are changing.
+    EditDoc { tab: u64, row: usize },
     DeleteRow { tab: u64, row: usize },
     CloseTab(u64),
     CloseOtherTabs(u64),
@@ -241,6 +245,11 @@ pub fn menu_for(target: &Target) -> Vec<Item> {
                     Item::on("menu.edit_row", Act::EditRow { tab, row })
                 } else {
                     Item::off("menu.edit_row", Act::EditRow { tab, row })
+                },
+                if *editable {
+                    Item::on("menu.edit_doc", Act::EditDoc { tab, row })
+                } else {
+                    Item::off("menu.edit_doc", Act::EditDoc { tab, row })
                 },
                 if *editable {
                     Item::on("menu.delete_row", Act::DeleteRow { tab, row })

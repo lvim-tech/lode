@@ -106,6 +106,57 @@ const QUERY_FORM: &[QueryFieldSpec] = &[
         rows: 1,
     },
 ];
+/// MongoDB's schema changes are COMMANDS, not statements — which changes
+/// nothing about how this works.
+///
+/// A template is a template: what goes in the editor here is the command
+/// document, read and run exactly like a `find`. Mongo has no column types
+/// to change (a field holds whatever it was given), so what it declares is
+/// the two index operations it really has, and no type operations at all.
+/// Saying so is the point: the client offers what the driver declares, and a
+/// store without types simply declares none.
+const MONGO_DDL_OPS: &[crate::spec::DdlOp] = &[
+    crate::spec::DdlOp {
+        op: "create_index",
+        label: "Index these fields\u{2026}",
+        template: concat!(
+            "{\"createIndexes\": \"{table}\", \"indexes\": ",
+            "[{\"key\": {{columns}}, \"name\": \"{index}\", \"unique\": {unique}}]}"
+        ),
+        asks: MONGO_ASK_INDEX,
+    },
+    crate::spec::DdlOp {
+        op: "drop_index",
+        label: "Drop this index",
+        template: "{\"dropIndexes\": \"{table}\", \"index\": \"{index}\"}",
+        asks: crate::spec::ASK_DROP_INDEX,
+    },
+];
+
+/// The same holes as SQL's, with one difference the client needs told: the
+/// key is a DOCUMENT, so the columns come as `"a": 1, "b": 1` rather than as
+/// a bare list, and `unique` is a JSON boolean rather than a word.
+const MONGO_ASK_INDEX: &[crate::spec::DdlAsk] = &[
+    crate::spec::DdlAsk {
+        key: "index",
+        label: "Name",
+        kind: crate::spec::AskKind::Text,
+        suggest: "idx_{table}_{column}",
+    },
+    crate::spec::DdlAsk {
+        key: "columns",
+        label: "Fields",
+        kind: crate::spec::AskKind::Columns,
+        suggest: "{column}",
+    },
+    crate::spec::DdlAsk {
+        key: "unique",
+        label: "Unique",
+        kind: crate::spec::AskKind::Flag,
+        suggest: "",
+    },
+];
+
 
 const MONGO_META: DriverMeta = DriverMeta {
     kind: "mongodb",
@@ -142,7 +193,8 @@ const MONGO_META: DriverMeta = DriverMeta {
     browse_form: &[],
     time_filter: "{\"{col}\": {\"$gte\": {\"$date\": \"{from}\"}, \"$lt\": {\"$date\": \"{to}\"}}}",
     builder_ops: &[],
-    ddl_ops: &[],
+    ddl_ops: MONGO_DDL_OPS,
+    types: &[],
     inspectors: MONGO_INSPECTORS,
 };
 
@@ -553,7 +605,7 @@ impl Connection for MongoConnection {
     async fn inspect(
         &mut self,
         name: &str,
-    ) -> anyhow::Result<(Vec<Column>, Vec<Vec<Value>>)> {
+    ) -> anyhow::Result<crate::driver::Inspected> {
         if name != "currentop" {
             anyhow::bail!("this driver has no live view called '{name}'");
         }
@@ -567,17 +619,50 @@ impl Connection for MongoConnection {
         // `opid` FIRST, because that is the key `act` is handed. The rest are
         // the fields worth reading at a glance; the whole document is one
         // `db.currentOp()` away for anybody who wants it.
-        let cols = ["opid", "op", "ns", "secs_running", "client", "appName", "desc"];
+        // `command` is DERIVED below — the first key of the operation's own
+        // command document, which is the difference between a wall of
+        // `admin.$cmd` and a list that says `hello`, `find`, `aggregate`.
+        //
+        // It answers the question this view otherwise provokes: "why are
+        // there twenty of these?" Because every client connection parks a
+        // `hello` on the server for up to ten seconds at a time — that is how
+        // a MongoDB driver watches for a change of primary, and it is the
+        // server doing nothing rather than the server being busy.
+        let cols = ["opid", "command", "op", "ns", "secs_running", "client", "appName", "desc"];
         let columns = cols
             .iter()
             .map(|c| Column { name: c.to_string(), type_name: String::new() })
             .collect();
-        let rows = ops
-            .iter()
-            .filter_map(|o| o.as_document())
-            .map(|d| {
-                cols.iter()
-                    .map(|c| match d.get(c) {
+        let mut rows: Vec<Vec<Value>> = Vec::new();
+        // WHOSE operations may be killed.
+        //
+        // On an idle server most of what `currentOp` reports is MongoDB's own
+        // housekeeping — the oplog applier, the journal flusher, the noop
+        // writer. They are running, so a view called "what is running" has to
+        // show them; what it must not do is offer to kill the journal
+        // flusher. An operation with a CLIENT is somebody's work and can be
+        // stopped; one without is the server's own and is shown, dimmed.
+        let mut acts: Vec<String> = Vec::new();
+        for d in ops.iter().filter_map(|o| o.as_document()) {
+            // WHAT IT IS: the first key of the command document, which is
+            // the command's name. Mongo puts the name first by protocol, so
+            // this is reading the shape rather than guessing at it.
+            let what = d
+                .get_document("command")
+                .ok()
+                .and_then(|c| c.keys().next().cloned())
+                .unwrap_or_default();
+            let row: Vec<Value> = cols
+                .iter()
+                .map(|c| {
+                    if *c == "command" {
+                        return if what.is_empty() {
+                            Value::Null
+                        } else {
+                            Value::Text(what.clone())
+                        };
+                    }
+                    match d.get(c) {
                         Some(Bson::Int32(i)) => Value::Int(*i as i64),
                         Some(Bson::Int64(i)) => Value::Int(*i),
                         Some(Bson::Double(f)) => Value::Float(*f),
@@ -585,11 +670,24 @@ impl Connection for MongoConnection {
                         Some(Bson::String(s)) => Value::Text(s.clone()),
                         Some(Bson::Null) | None => Value::Null,
                         Some(other) => Value::Text(other.to_string()),
-                    })
-                    .collect()
-            })
-            .collect();
-        Ok((columns, rows))
+                    }
+                })
+                .collect();
+            let has_client = d
+                .get("client")
+                .and_then(Bson::as_str)
+                .map(|c| !c.is_empty())
+                .unwrap_or(false);
+            if has_client {
+                if let Some(Value::Int(id)) = row.first() {
+                    acts.push(id.to_string());
+                } else if let Some(Value::Text(id)) = row.first() {
+                    acts.push(id.clone());
+                }
+            }
+            rows.push(row);
+        }
+        Ok(crate::driver::Inspected { columns, rows, acts })
     }
 
     /// Stop an operation, by its opid.

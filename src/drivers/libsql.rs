@@ -86,6 +86,7 @@ const META: DriverMeta = DriverMeta {
     time_filter: SQL_TIME_FILTER,
     builder_ops: SQL_BUILDER_OPS,
     ddl_ops: crate::spec::SQL_DDL_OPS,
+    types: crate::spec::SQLITE_TYPES,
     inspectors: &[],
 };
 

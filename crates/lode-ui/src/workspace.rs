@@ -43,6 +43,16 @@ impl ResultView {
         }
     }
 
+    /// The catalogue KEY for what a person reads — `label` is what is stored.
+    pub fn key(self) -> &'static str {
+        match self {
+            ResultView::Tree => "view.tree",
+            ResultView::Table => "view.table",
+            ResultView::Json => "view.json",
+            ResultView::Chart => "view.chart",
+        }
+    }
+
     /// What a driver should open with.
     ///
     /// A document store opens on Tree because a document is a tree and flattening
@@ -164,12 +174,28 @@ pub enum SubTab {
 }
 
 impl SubTab {
+    /// The word STORED — in the session, and in the label when nothing has
+    /// been translated. Lower case and stable, because it goes in a file.
     pub fn label(self) -> &'static str {
         match self {
             SubTab::Documents => "Documents",
             SubTab::Schema => "Schema",
             SubTab::Aggregate => "Aggregate",
             SubTab::Builder => "Builder",
+        }
+    }
+
+    /// The catalogue KEY for what a person reads.
+    ///
+    /// These are chrome like every other word in the window, and they were
+    /// the English ones in a Bulgarian window — which reads as a translation
+    /// somebody abandoned halfway.
+    pub fn key(self) -> &'static str {
+        match self {
+            SubTab::Documents => "sub.documents",
+            SubTab::Schema => "sub.schema",
+            SubTab::Aggregate => "sub.aggregate",
+            SubTab::Builder => "sub.builder",
         }
     }
 
@@ -1021,6 +1047,33 @@ pub fn fmt_duration(d: Duration) -> String {
         format!("{ms} ms")
     } else {
         format!("{:.1} s", d.as_secs_f64())
+    }
+}
+
+/// The glyph for a field of this KIND, as the tree draws it.
+///
+/// A field's type said twice — once as a word and once as a mark — is not a
+/// repetition: the word is read and the mark is SCANNED, and a column of
+/// thirteen fields is scanned. The marks are Font Awesome codepoints, which is
+/// what every other icon in this client is, so they come out of the same patched
+/// font at the same size.
+///
+/// A KEY gets the key, whatever its type: being part of the identity is the
+/// most important thing about a column and outranks being an ObjectId.
+pub fn field_glyph(kind: &str, primary: bool) -> &'static str {
+    if primary {
+        return "\u{f084}"; // a key
+    }
+    match kind {
+        "oid" => "\u{f084}",
+        "date" => "\u{f017}",       // a clock
+        "int" | "num" => "\u{f292}", // a hash
+        "bool" => "\u{f205}",        // a toggle
+        "array" => "\u{f03a}",       // a list
+        "object" => "\u{f1b2}",      // a cube
+        "null" => "\u{f05e}",        // struck through
+        // Text, and anything a driver named that this client does not know.
+        _ => "\u{f031}", // the letter mark
     }
 }
 
@@ -3049,6 +3102,33 @@ mod tests {
     }
 
     #[test]
+    /// Every kind a badge can be has a mark, and a key is a key first.
+    ///
+    /// The marks are SCANNED rather than read, so two kinds sharing one would
+    /// be two kinds nobody can tell apart in a column of thirteen.
+    #[test]
+    fn every_kind_of_field_has_its_own_mark() {
+        use super::field_glyph;
+        let kinds = ["oid", "date", "int", "num", "bool", "array", "object", "null", "str"];
+        for k in kinds {
+            assert!(!field_glyph(k, false).is_empty(), "{k} has no mark");
+        }
+        // Being part of the KEY outranks the type: that is the thing worth
+        // seeing first about a column.
+        assert_eq!(field_glyph("str", true), field_glyph("oid", false));
+        assert_ne!(field_glyph("str", false), field_glyph("str", true));
+        // A type this client has never met still gets a mark rather than a
+        // hole in the column.
+        assert_eq!(field_glyph("geometry", false), field_glyph("str", false));
+        // And the marks that must not collide, do not.
+        let distinct: std::collections::BTreeSet<&str> =
+            ["date", "int", "bool", "array", "object", "str"]
+                .iter()
+                .map(|k| field_glyph(k, false))
+                .collect();
+        assert_eq!(distinct.len(), 6, "{distinct:?}");
+    }
+
     fn type_badges_prefer_what_the_driver_said() {
         assert_eq!(type_badge(&json!("x"), Some("ObjectId")), "oid");
         assert_eq!(type_badge(&json!("x"), Some("timestamp")), "date");

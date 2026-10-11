@@ -38,6 +38,17 @@ use crate::widgets::{btn, Btn};
 /// forgets leaves a stale number beside the stepper that moves it.
 #[derive(Clone)]
 pub struct Appearance {
+    /// A font that was asked for and is not installed, so the page can say
+    /// what was used instead rather than showing a choice nobody made.
+    pub font_asked: Option<String>,
+    pub icon_asked: Option<String>,
+    /// Whether the connection window refuses to save a password as typed.
+    ///
+    /// Off by default, because turning it on without a wallet would leave
+    /// somebody unable to save a connection at all. On, the only ways to give
+    /// a password are the wallet, the environment and a command — and the
+    /// store cannot hold one even by accident.
+    pub secrets_only_from_a_source: bool,
     /// Keys somebody has changed, so the page can mark them and say what the
     /// default was.
     pub keys: std::collections::BTreeMap<String, String>,
@@ -58,6 +69,22 @@ pub struct Appearance {
 /// a different time: the look changes when somebody moves a stepper, and these
 /// change when the engine answers. Pushed the same way, for the same reason —
 /// see `Appearance`.
+/// What the WALLET said, pushed in like everything else this window knows.
+///
+/// `reachable` and `why` are separate from `exists` because they are different
+/// facts about different things: no agent is a machine with nothing installed,
+/// and no vault is an agent with nothing in it. A page that showed one as the
+/// other would tell somebody to install what they have.
+#[derive(Clone, Default)]
+pub struct Wallet {
+    pub reachable: bool,
+    pub exists: bool,
+    pub locked: bool,
+    pub proto: u32,
+    /// Why it is not reachable, in the engine's words.
+    pub why: Option<String>,
+}
+
 #[derive(Clone, Default)]
 pub struct Facts {
     pub proto: u32,
@@ -89,6 +116,8 @@ pub enum Category {
     Tunnels,
     Proxies,
     Access,
+    /// The wallet: whether this machine has one, and whether it is open.
+    Keyring,
     Hooks,
     Drivers,
     Rpc,
@@ -97,9 +126,12 @@ pub enum Category {
 }
 
 impl Category {
-    pub fn all() -> [Category; 11] {
+    pub fn all() -> [Category; 12] {
         use Category::*;
-        [General, Keys, Audit, Tunnels, Proxies, Access, Hooks, Drivers, Rpc, Mcp, About]
+        [
+            General, Keys, Audit, Tunnels, Proxies, Access, Keyring, Hooks, Drivers, Rpc, Mcp,
+            About,
+        ]
     }
 
     /// The heading above a run of categories, when this one starts a new run.
@@ -121,6 +153,7 @@ impl Category {
             Category::Tunnels => "SSH tunnels",
             Category::Proxies => "Proxies",
             Category::Access => "Auth profiles",
+            Category::Keyring => "Keyring",
             Category::Hooks => "Hooks",
             Category::Drivers => "Drivers",
             Category::Rpc => "RPC services",
@@ -140,6 +173,10 @@ impl Category {
             }
             Category::Proxies => "HTTP and SOCKS proxies. Connections pick one in their Access tab.",
             Category::Access => "Reusable sign-ins for secrets, parameters and SSO.",
+            Category::Keyring => {
+                "The wallet this machine keeps its secrets in \u{2014} the same one the Neovim \
+                 client uses."
+            }
             Category::Hooks => "Commands, scripts and Lua that run around connect and disconnect.",
             Category::Drivers => "What each driver can do, and the settings it declares.",
             Category::Rpc => {
@@ -160,6 +197,9 @@ impl Category {
             Category::Tunnels => "ssh bastion jump host key passphrase agent keyring port",
             Category::Proxies => "http socks5 connect bypass cidr",
             Category::Access => "aws sso provider credentials profile token",
+            Category::Keyring => {
+                "vault wallet passphrase unlock lock master secret lvim-keyring agent"
+            }
             Category::Hooks => "command script lua pre post connect disconnect environment timeout",
             Category::Drivers => "capabilities caps sql tls tunnel edit metrics overrides",
             Category::Rpc => "external driver socket command stdio",
@@ -183,10 +223,22 @@ pub struct SettingsWindow {
     /// Which profile a remove has been ASKED about. The question stands on the
     /// row, before anything happens — not in a toast afterwards.
     confirm_rm: Option<(&'static str, String)>,
+    /// Which font row is open: `"text"`, `"icon"`, or neither.
+    font_pick: Option<&'static str>,
+    /// The filter over the installed fonts. Its own box: a machine with six
+    /// hundred fonts is a list nobody scrolls.
+    font_filter: Entity<TextInput>,
     /// Which key is being changed, by action name.
     editing_key: Option<String>,
     /// The field the new keystroke is typed into.
     key_input: Entity<TextInput>,
+    /// What the wallet said when last asked.
+    wallet: Wallet,
+    /// What came back from the last unlock or create.
+    wallet_said: Option<String>,
+    /// The passphrase box. Masked from the moment it is built: this one is
+    /// never anything but a secret, so there is no source to pick and no eye.
+    pass_input: Entity<TextInput>,
     /// The theme filter.
     ///
     /// In the HEADER, never in the page. A `TextInput` shapes and measures its
@@ -223,9 +275,15 @@ impl SettingsWindow {
     ) -> Self {
         let crate::widgets::Look { theme, scale, text_font, icon_font, lang } = look;
         let colors = crate::form::colors_of(&theme);
-        let search = cx.new(|cx| TextInput::new(cx, "Search settings…", colors));
+        let search = cx.new(|cx| TextInput::new(cx, lang.tr("ph.search_settings"), colors));
         let theme_filter = cx.new(|cx| TextInput::new(cx, lang.tr("settings.filter_themes"), colors));
         let key_input = cx.new(|cx| TextInput::new(cx, "ctrl-shift-k", colors));
+        let font_filter = cx.new(|cx| TextInput::new(cx, lang.tr("ph.filter_fonts"), colors));
+        let pass_input = cx.new(|cx| {
+            let mut i = TextInput::new(cx, lang.tr("ph.passphrase"), colors);
+            i.set_mask(true, cx);
+            i
+        });
         cx.subscribe(&key_input, |this, input, ev: &crate::input::InputEvent, cx| {
             if matches!(ev, crate::input::InputEvent::Submit) {
                 let typed = input.read(cx).text().trim().to_string();
@@ -245,7 +303,12 @@ impl SettingsWindow {
             proxies,
             confirm_rm: None,
             editing_key: None,
+            font_pick: None,
+            font_filter,
             key_input,
+            pass_input,
+            wallet: Wallet::default(),
+            wallet_said: None,
             theme_filter,
             font_family: text_font,
             icon_family: icon_font,
@@ -280,7 +343,13 @@ impl SettingsWindow {
     }
 
     pub fn all_inputs(&self) -> Vec<Entity<TextInput>> {
-        vec![self.search.clone(), self.theme_filter.clone(), self.key_input.clone()]
+        vec![
+            self.search.clone(),
+            self.theme_filter.clone(),
+            self.key_input.clone(),
+            self.pass_input.clone(),
+            self.font_filter.clone(),
+        ]
     }
 
     /// The sizes changed under us — see `Workspace::poke_settings`.
@@ -385,7 +454,7 @@ impl Render for SettingsWindow {
                     .py_1()
                     .text_size(ms.small())
                     .text_color(t.muted())
-                    .child("nothing matches"),
+                    .child(self.tr("ui.nothing_matches")),
             );
         }
 
@@ -443,11 +512,9 @@ impl Render for SettingsWindow {
             .border_t_1()
             .border_color(t.border())
             .child(
-                btn(&t, ms, "settings-close", "Close", Btn::Secondary).on_click(cx.listener(
-                    |this, _, _, cx| {
-                        let _ = this.workspace.update(cx, |w, cx| w.close_settings(cx));
-                    },
-                )),
+                btn(&t, ms, "settings-close", self.tr("settings.close"), Btn::Secondary).on_click(
+                    cx.listener(|this, _, window: &mut Window, cx| this.leave(window, cx)),
+                ),
             );
 
         div()
@@ -469,8 +536,8 @@ impl Render for SettingsWindow {
             .on_action(cx.listener(|this, _: &crate::input::FocusPrev, window, cx| {
                 this.step_focus(true, window, cx)
             }))
-            .on_action(cx.listener(|this, _: &crate::app::Escape, _, cx| {
-                let _ = this.workspace.update(cx, |w, cx| w.close_settings(cx));
+            .on_action(cx.listener(|this, _: &crate::app::Escape, window, cx| {
+                this.leave(window, cx)
             }))
             .child(head)
             .child(
@@ -523,7 +590,10 @@ impl SettingsWindow {
         let ms = self.scale;
         div()
             .font_family(SharedString::from(self.icon_family.clone()))
-            .text_size(px(ms.icon_size()))
+            // The size of the text it sits beside, not the RAIL's number: this
+            // is in a settings row, and the rail's size is a separate thing a
+            // person sets for the rail.
+            .text_size(ms.icon_beside(ms.small()))
             .text_color(colour)
             .child(glyph)
     }
@@ -556,6 +626,228 @@ impl SettingsWindow {
         let (t, ms) = (&self.theme, self.scale);
         crate::widgets::chip(t, ms, id, label, on)
             .on_click(cx.listener(move |this, _, window, cx| on_press(this, window, cx)))
+    }
+
+    /// A font row: what is being used, and a way to change it.
+    ///
+    /// Says what was ASKED FOR when that is not what is being used. A name in
+    /// the session or in `$LODE_FONT` that is not installed falls back
+    /// through a list, and a window that showed the fallback as though it had
+    /// been chosen would leave somebody searching their config for a setting
+    /// that was already right.
+    fn font_row(
+        &self,
+        label: SharedString,
+        which: &'static str,
+        now: &str,
+        asked: Option<&str>,
+        cx: &mut Context<Self>,
+    ) -> gpui::Div {
+        let (t, ms) = (&self.theme, self.scale);
+        let open = self.font_pick == Some(which);
+        let mut row = div()
+            .flex()
+            .flex_col()
+            .child(
+                div()
+                    .id(SharedString::from(format!("font-{which}")))
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .py(px(1.0))
+                    .cursor_pointer()
+                    .hover(|d| d.bg(t.hover_mark()))
+                    .child(
+                        div()
+                            .w(px(ms.base() * 11.0))
+                            .flex_none()
+                            .text_size(ms.small())
+                            .text_color(t.muted())
+                            .child(label),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .text_size(ms.small())
+                            .text_color(t.fg())
+                            .child(SharedString::from(now.to_string())),
+                    )
+                    .child(self.icon(if open { "\u{f0d7}" } else { "\u{f0da}" }, t.muted()))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.font_pick = if open { None } else { Some(which) };
+                        cx.notify();
+                    })),
+            );
+        if let Some(wanted) = asked {
+            row = row.child(
+                div().text_size(ms.tiny()).text_color(t.warning()).child(SharedString::from(
+                    format!("{wanted} is not installed \u{2014} using {now}"),
+                )),
+            );
+        }
+        row
+    }
+
+    /// Every installed font, to choose from.
+    ///
+    /// The ICON list marks the ones that do not carry the marks this window
+    /// draws. Marked rather than hidden: a font that covers the four glyphs
+    /// somebody actually looks at is a reasonable choice, and refusing it
+    /// would be this window deciding for them. What it must not do is let
+    /// them pick one and then show boxes with no explanation.
+    fn font_list(&self, which: &'static str, cx: &mut Context<Self>) -> gpui::Div {
+        let (t, ms) = (&self.theme, self.scale);
+        let needle = self.font_filter.read(cx).text().trim().to_lowercase();
+        let all = cx.text_system().all_font_names();
+        let mut names: Vec<String> = all
+            .into_iter()
+            .filter(|n| needle.is_empty() || n.to_lowercase().contains(&needle))
+            .collect();
+        names.sort();
+        names.dedup();
+        let shown = names.len();
+        let now = if which == "icon" {
+            self.look.icon_family.clone()
+        } else {
+            self.look.font_family.clone()
+        };
+        let mut list = crate::widgets::scroll(SharedString::from(format!("fonts-{which}")))
+            .outer(|d| d.max_h(px(ms.base() * 18.0)).border_1().border_color(t.border()));
+        for n in names.into_iter().take(400) {
+            let on = n == now;
+            // Only for the ICON list, and only then: asking the text system
+            // about every installed font is a measurement per font, and the
+            // text list does not need the answer.
+            let bare = which == "icon" && !crate::app::covers_all_glyphs(cx, &n);
+            let name = n.clone();
+            list = list.child(
+                div()
+                    .id(SharedString::from(format!("f-{which}-{n}")))
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .px_2()
+                    .py(px(1.0))
+                    .cursor_pointer()
+                    .hover(|d| d.bg(t.hover_mark()))
+                    .when(on, |d| d.bg(t.selected_mark()))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .truncate()
+                            .text_size(ms.small())
+                            .text_color(if on { t.accent() } else { t.fg() })
+                            // DRAWN IN ITSELF: a list of font names in one
+                            // face is a list nobody can choose from.
+                            .font_family(SharedString::from(n.clone()))
+                            .child(SharedString::from(n.clone())),
+                    )
+                    .children(bare.then(|| {
+                        div()
+                            .flex_none()
+                            .text_size(ms.tiny())
+                            .text_color(t.warning())
+                            .child(self.tr("ui.no_icons"))
+                    }))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        let n = name.clone();
+                        let _ = this.workspace.update(cx, |w, cx| {
+                            if which == "icon" {
+                                w.set_icon_font(n, cx);
+                            } else {
+                                w.set_text_font(n, cx);
+                            }
+                        });
+                        this.font_pick = None;
+                        cx.notify();
+                    })),
+            );
+        }
+        div()
+            .flex()
+            .flex_col()
+            .gap_1()
+            .py_1()
+            .child(div().text_size(ms.body()).child(self.font_filter.clone()))
+            .child(self.note(format!("{shown} installed")))
+            .child(list)
+    }
+
+    /// Close this window, from INSIDE it.
+    ///
+    /// Its own `&mut Window`. Asking the workspace to close it is
+    /// `WindowHandle::update` on the window already being updated, which gpui
+    /// refuses and the `let _ =` hid — the third place in this client with
+    /// the same fault, after the connection window's Cancel and the profile
+    /// window's.
+    fn leave(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let _ = self.workspace.update(cx, |w, cx| w.forget_settings(cx));
+        window.remove_window();
+    }
+
+    /// The wallet answered. Pushed, like everything else here.
+    pub fn wallet_arrived(&mut self, w: Wallet, said: Option<String>, cx: &mut Context<Self>) {
+        self.wallet = w;
+        if said.is_some() {
+            self.wallet_said = said;
+            // The passphrase is not kept a moment longer than the request that
+            // carried it.
+            self.pass_input.update(cx, |i, cx| i.set_text(String::new(), cx));
+        }
+        cx.notify();
+    }
+
+    /// Unlock, create or lock — the passphrase comes out of the box and goes
+    /// straight to the engine.
+    fn wallet_do(&mut self, what: &'static str, cx: &mut Context<Self>) {
+        let pass = self.pass_input.read(cx).text().to_string();
+        if what != "lock" && pass.is_empty() {
+            self.wallet_said = Some("a passphrase is needed".into());
+            cx.notify();
+            return;
+        }
+        self.wallet_said = None;
+        let _ = self.workspace.update(cx, |w, _| w.wallet_do(what, pass));
+        cx.notify();
+    }
+
+    /// A SETTING that is on or off: a drawn box, its name, and a sentence
+    /// saying what turning it on does.
+    ///
+    /// A chip would do for one of several choices; this is a yes or a no, and
+    /// a yes/no drawn as a chip reads as "one of one".
+    fn tickbox(
+        &self,
+        label: impl Into<SharedString>,
+        why: impl Into<SharedString>,
+        on: bool,
+        press: impl Fn(&mut Self, &mut Window, &mut Context<Self>) + 'static,
+        cx: &mut Context<Self>,
+    ) -> gpui::Stateful<gpui::Div> {
+        let (t, ms) = (&self.theme, self.scale);
+        let label: SharedString = label.into();
+        div()
+            .id(SharedString::from(format!("tick-{label}")))
+            .flex()
+            .flex_col()
+            .py_1()
+            .cursor_pointer()
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .child(crate::widgets::tick(t, ms, on))
+                    .child(
+                        div()
+                            .text_size(ms.small())
+                            .text_color(if on { t.fg() } else { t.muted() })
+                            .child(label),
+                    ),
+            )
+            .child(self.note(why.into()))
+            .on_click(cx.listener(move |this, _, window, cx| press(this, window, cx)))
     }
 
     /// The new keystroke was typed. Hand it to the workspace, which owns the
@@ -631,14 +923,14 @@ impl SettingsWindow {
                     .as_ref()
                     .and_then(|k| self.drivers.iter().find(|d| &d.kind == k))
                 {
-                    out = out.child(self.row("Driver", d.kind.clone()));
+                    out = out.child(self.row(self.tr("ui.driver"), d.kind.clone()));
                     out = out.child(self.row(
                         "Default port",
                         d.default_port.map(|p| p.to_string()).unwrap_or_else(|| "—".into()),
                     ));
-                    out = out.child(self.row("Parameters", format!("{}", d.params.len())));
+                    out = out.child(self.row(self.tr("ui.parameters"), format!("{}", d.params.len())));
                     out = out.child(
-                        div().pt_2().text_size(ms.tiny()).text_color(t.title()).child("CAPABILITIES"),
+                        div().pt_2().text_size(ms.tiny()).text_color(t.title()).child(self.tr("ui.capabilities")),
                     );
                     let c = &d.caps;
                     let mut chips = div().flex().flex_wrap().gap_1().py_1();
@@ -659,8 +951,7 @@ impl SettingsWindow {
                     }
                     out = out.child(chips);
                     out = out.child(self.note(
-                        "Faded means the driver says it cannot. The engine refuses those rather \
-                         than letting the window offer them.",
+                        self.tr("settings.faded_means"),
                     ));
                 }
             }
@@ -691,7 +982,7 @@ impl SettingsWindow {
                             .text_color(t.warning())
                             .child(self.tr("settings.no_themes")),
                     );
-                    out = out.child(self.note("the built-in theme is the generated LvimBase_dark"));
+                    out = out.child(self.note(self.tr("ui.builtin_theme")));
                 }
                 let needle = self.theme_filter.read(cx).text().trim().to_lowercase();
                 let mut names: Vec<String> = a
@@ -701,11 +992,18 @@ impl SettingsWindow {
                     .cloned()
                     .collect();
                 names.sort();
-                // Every one of them, in the page's own scrolling. No cap and no
-                // inner scroller: a window is wide and tall enough that the
-                // thing the rail's panel kept fighting — thirty-six themes in a
-                // narrow column — is not a problem here.
-                let mut list = div().flex().flex_col().py_1();
+                // A SCROLLER OF ITS OWN. The note above said a window is tall
+                // enough for all of them; forty-nine installed says otherwise
+                // — they filled the page from the heading to the bottom and
+                // pushed the fonts, the sizes and the language off it, so the
+                // page about everything was a page about themes.
+                //
+                // Bounded by what the WINDOW gives: tall enough to pick from
+                // without hunting, short enough that what is under it is
+                // still on screen.
+                let mut list = crate::widgets::scroll("theme-list")
+                    .outer(|d| d.max_h(px(ms.base() * 20.0)).border_1().border_color(t.border()))
+                    .rows(|d| d.py_1());
                 for name in &names {
                     let on = *name == a.theme_name;
                     let pick = name.clone();
@@ -751,8 +1049,23 @@ impl SettingsWindow {
 
                 // ── the type ────────────────────────────────────────────────
                 out = out.child(self.head(self.tr("settings.text").to_uppercase()));
-                out = out.child(self.row(self.tr("settings.text_font"), a.font_family.clone()));
-                out = out.child(self.row(self.tr("settings.icon_font"), a.icon_family.clone()));
+                out = out.child(self.font_row(
+                    self.tr("settings.text_font"),
+                    "text",
+                    &a.font_family,
+                    a.font_asked.as_deref(),
+                    cx,
+                ));
+                out = out.child(self.font_row(
+                    self.tr("settings.icon_font"),
+                    "icon",
+                    &a.icon_family,
+                    a.icon_asked.as_deref(),
+                    cx,
+                ));
+                if let Some(open) = self.font_pick {
+                    out = out.child(self.font_list(open, cx));
+                }
                 out = out.child(self.note(self.tr("settings.font_env")));
 
                 // One number, and it moves everything: the steps, the grid row
@@ -889,8 +1202,7 @@ impl SettingsWindow {
                 }
                 out = out.child(langs);
                 out = out.child(self.note(
-                    "the engine's refusals and the audit log stay in English — they are the \
-                     record, not the interface",
+                    self.tr("settings.lang_record"),
                 ));
 
                 // ── what the window remembers ───────────────────────────────
@@ -969,7 +1281,7 @@ impl SettingsWindow {
                             )
                             .child({
                                 let (n, sp) = (name.clone(), spec.clone());
-                                btn(&t, ms, format!("prof-ed-{kind}-{n}"), "edit", Btn::Link)
+                                btn(&t, ms, format!("prof-ed-{kind}-{n}"), self.tr("ui.edit"), Btn::Link)
                                     .on_click(cx.listener(move |this, _, _, cx| {
                                         let (n, sp) = (n.clone(), sp.clone());
                                         let _ = this.workspace.update(cx, |w, cx| {
@@ -984,7 +1296,7 @@ impl SettingsWindow {
                                 // here, so the warning can stand where the row
                                 // is rather than arriving as a toast once it is
                                 // too late.
-                                btn(&t, ms, format!("prof-rm-{kind}-{n}"), "remove", Btn::Quiet)
+                                btn(&t, ms, format!("prof-rm-{kind}-{n}"), self.tr("ui.remove"), Btn::Quiet)
                                     .on_click(cx.listener(move |this, _, _, cx| {
                                         this.confirm_rm = Some((kind, n.clone()));
                                         cx.notify();
@@ -1020,7 +1332,7 @@ impl SettingsWindow {
                                 .gap_2()
                                 .py_1()
                                 .child(
-                                    btn(&t, ms, format!("prof-yes-{n}"), "remove it", Btn::Danger)
+                                    btn(&t, ms, format!("prof-yes-{n}"), self.tr("ui.remove_it"), Btn::Danger)
                                         .on_click(cx.listener({
                                             let n = n.clone();
                                             move |this, _, _, cx| {
@@ -1034,7 +1346,7 @@ impl SettingsWindow {
                                         })),
                                 )
                                 .child(
-                                    btn(&t, ms, format!("prof-no-{n}"), "keep it", Btn::Quiet)
+                                    btn(&t, ms, format!("prof-no-{n}"), self.tr("ui.keep_it"), Btn::Quiet)
                                         .on_click(cx.listener(|this, _, _, cx| {
                                             this.confirm_rm = None;
                                             cx.notify();
@@ -1044,8 +1356,7 @@ impl SettingsWindow {
                     }
                 }
                 out = out.child(self.note(
-                    "A connection picks one by name in its Access tab. A connection whose \
-                     profile is missing FAILS rather than falling back to a direct link.",
+                    self.tr("settings.profile_by_name"),
                 ));
             }
             Category::About => {
@@ -1055,25 +1366,23 @@ impl SettingsWindow {
                 // WHERE things are. "Where is my saved connection" and "which
                 // binary is this" had no answer anywhere in the window.
                 let f = &self.facts;
-                out = out.child(self.head("THE ENGINE"));
-                out = out.child(self.row("Version", f.version.clone()));
-                out = out.child(self.row("Protocol", f.proto.to_string()));
-                out = out.child(self.row("Binary", f.engine_binary.clone()));
-                out = out.child(self.head("THE STORE"));
+                out = out.child(self.head(self.tr("ui.the_engine")));
+                out = out.child(self.row(self.tr("ui.version"), f.version.clone()));
+                out = out.child(self.row(self.tr("ui.protocol"), f.proto.to_string()));
+                out = out.child(self.row(self.tr("ui.binary"), f.engine_binary.clone()));
+                out = out.child(self.head(self.tr("ui.the_store")));
                 out = out.child(self.row(
                     "State",
                     if f.store_ok { "open" } else { "NOT available" },
                 ));
-                out = out.child(self.row("Path", f.store_path.clone()));
+                out = out.child(self.row(self.tr("ui.path"), f.store_path.clone()));
                 out = out.child(self.note(
-                    "The saved connections, queries, charts, dashboards, scripts, history and \
-                     audit are all in that one file, and it is the engine's — two clients share it.",
+                    self.tr("settings.one_store"),
                 ));
             }
             Category::Keys => {
                 out = out.child(self.note(
-                    "Press a row to change its key, then type the new one and press Enter. \
-                     `escape` leaves it alone; an empty answer puts the default back.",
+                    self.tr("settings.keys_howto"),
                 ));
                 // From the SAME table the bindings come from — it was written
                 // out twice, with a test to stop the two disagreeing, and one
@@ -1159,7 +1468,7 @@ impl SettingsWindow {
             }
             Category::Audit => {
                 let f = &self.facts;
-                out = out.child(self.row("Keeping", match f.audit_mode.as_str() {
+                out = out.child(self.row(self.tr("ui.keeping"), match f.audit_mode.as_str() {
                     "shape" => "the SHAPE of each statement, not its text",
                     "off" => "no statement text at all",
                     _ => "the whole statement, with credentials redacted",
@@ -1170,21 +1479,17 @@ impl SettingsWindow {
                      window's — a client that could turn the record down would not be a record.",
                 ));
                 out = out.child(self.note(
-                    "What is written: every statement that changed anything, every refusal, and \
-                     every connect and disconnect. Reads are not in it. There is no method to \
-                     delete from it.",
+                    self.tr("settings.audit_what"),
                 ));
                 out = out.child(self.note(
-                    "The rail's Audit panel is the log itself — ctrl-shift-a.",
+                    self.tr("settings.audit_panel"),
                 ));
             }
             Category::Rpc => {
                 let f = &self.facts;
                 if f.external.is_empty() {
                     out = out.child(self.note(
-                        "No driver programs are registered. One is a `driver` profile holding a \
-                         command line; the engine asks it to describe itself at startup and it \
-                         then appears like any other driver.",
+                        self.tr("settings.no_drivers"),
                     ));
                 }
                 for (name, kind, ok, why) in &f.external {
@@ -1200,26 +1505,120 @@ impl SettingsWindow {
                         },
                     ));
                 }
-                out = out.child(self.note("Changes take effect when the engine restarts."));
-                out = out.child(self.head("AN OLDER STORE"));
+                out = out.child(self.note(self.tr("ui.engine_restart")));
+                out = out.child(self.head(self.tr("ui.older_store")));
                 out = out.child(self.note(
-                    "A database written by the Neovim client can be read in: the connections, \
-                     queries and history that are missing are copied, keyed by name, so running \
-                     it twice imports nothing the second time. The source file is only read.",
+                    self.tr("settings.import_store"),
                 ));
                 out = out.child(
-                    btn(&t, ms, "store-import", "Choose a file\u{2026}", Btn::Secondary).on_click(
+                    btn(&t, ms, "store-import", self.tr("ui.choose_file"), Btn::Secondary).on_click(
                         cx.listener(|this, _, _, cx| {
                             let _ = this.workspace.update(cx, |w, cx| w.import_store(cx));
                         }),
                     ),
                 );
             }
+            Category::Keyring => {
+                let w = &self.wallet;
+                // WHAT IS THERE, before what to do about it. "Unlock" over a
+                // machine with no wallet is a button for a thing that does not
+                // exist, and "set a passphrase" over one that has a wallet is
+                // an offer to lose it.
+                match (w.reachable, w.exists, w.locked) {
+                    (false, _, _) => {
+                        out = out.child(self.row(
+                            "The agent",
+                            w.why.clone().unwrap_or_else(|| "not reachable".into()),
+                        ));
+                        out = out.child(self.note(
+                            self.tr("settings.wallet_agent"),
+                        ));
+                    }
+                    (true, false, _) => {
+                        out = out.child(self.row(self.tr("ui.the_agent"), "running, with no wallet yet"));
+                        out = out.child(self.note(
+                            self.tr("settings.wallet_passphrase"),
+                        ));
+                        out = out.child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap_2()
+                                .py_1()
+                                .child(
+                                    div()
+                                        .w(px(ms.base() * 14.0))
+                                        .text_size(ms.body())
+                                        .child(self.pass_input.clone()),
+                                )
+                                .child(
+                                    btn(&t, ms, "vault-create", self.tr("ui.make_wallet"), Btn::Primary)
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            this.wallet_do("create", cx)
+                                        })),
+                                ),
+                        );
+                    }
+                    (true, true, true) => {
+                        out = out.child(self.row(self.tr("ui.the_wallet"), "locked"));
+                        out = out.child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap_2()
+                                .py_1()
+                                .child(
+                                    div()
+                                        .w(px(ms.base() * 14.0))
+                                        .text_size(ms.body())
+                                        .child(self.pass_input.clone()),
+                                )
+                                .child(
+                                    btn(&t, ms, "vault-unlock", self.tr("ui.unlock"), Btn::Primary).on_click(
+                                        cx.listener(|this, _, _, cx| this.wallet_do("unlock", cx)),
+                                    ),
+                                ),
+                        );
+                    }
+                    (true, true, false) => {
+                        out = out.child(self.row(self.tr("ui.the_wallet"), "open"));
+                        out = out.child(self.note(
+                            self.tr("settings.wallet_idle"),
+                        ));
+                        out = out.child(
+                            btn(&t, ms, "vault-lock", self.tr("ui.lock_now"), Btn::Secondary).on_click(
+                                cx.listener(|this, _, _, cx| this.wallet_do("lock", cx)),
+                            ),
+                        );
+                    }
+                }
+                if w.proto > 0 {
+                    out = out.child(self.row(self.tr("ui.agent_proto"), w.proto.to_string()));
+                }
+                if let Some(said) = &self.wallet_said {
+                    out = out.child(self.note(said.clone()));
+                }
+                out = out.child(self.head(self.tr("ui.where_secrets")));
+                out = out.child(self.note(
+                    self.tr("settings.secret_as_typed"),
+                ));
+                out = out.child(self.tickbox(
+                    "Refuse to save a secret as plain text",
+                    "The connection window will not save a literal password \u{2014} it has to \
+                     come from this wallet, the environment, or a command.",
+                    self.look.secrets_only_from_a_source,
+                    |this, _, cx| {
+                        let _ = this.workspace.update(cx, |w, cx| w.toggle_literal_secrets(cx));
+                        cx.notify();
+                    },
+                    cx,
+                ));
+            }
             Category::Access => {
                 let f = &self.facts;
                 if f.access.is_empty() {
                     out = out.child(self.note(
-                        "Nothing found. The engine reads ~/.aws/config and ~/.aws/credentials.",
+                        self.tr("settings.no_aws"),
                     ));
                 }
                 for (name, kind, usable, why) in f.access.clone() {
@@ -1253,7 +1652,7 @@ impl SettingsWindow {
                             // provider that reads as usable and fails when
                             // picked is the thing this page exists to prevent.
                             .children(usable.then(|| {
-                                btn(&t, ms, format!("acc-test-{name}"), "test", Btn::Secondary)
+                                btn(&t, ms, format!("acc-test-{name}"), self.tr("ui.test"), Btn::Secondary)
                                     .on_click(cx.listener(move |this, _, _, cx| {
                                         let n = test_n.clone();
                                         let _ = this
@@ -1263,7 +1662,7 @@ impl SettingsWindow {
                             }))
                             // IMPORT stores the profile's NAME, never its key.
                             .children(usable.then(|| {
-                                btn(&t, ms, format!("acc-imp-{name}"), "import", Btn::Link)
+                                btn(&t, ms, format!("acc-imp-{name}"), self.tr("ui.import"), Btn::Link)
                                     .on_click(cx.listener(move |this, _, _, cx| {
                                         let n = imp_n.clone();
                                         let _ = this
@@ -1274,42 +1673,31 @@ impl SettingsWindow {
                     );
                 }
                 out = out.child(self.note(
-                    "The whole list is shown and the ones that will not work are marked, rather \
-                     than offering eight of which three fail only when picked. An import stores \
-                     the profile's NAME, never its key: the credential stays where the AWS tools \
-                     rotate it.",
+                    self.tr("settings.aws_whole_list"),
                 ));
             }
             Category::Mcp => {
                 let f = &self.facts;
                 if f.approvals.is_empty() {
-                    out = out.child(self.note("Nothing is waiting for an answer."));
+                    out = out.child(self.note(self.tr("ui.nothing_waiting")));
                 }
                 for (id, statement, state) in &f.approvals {
                     out = out.child(self.row(format!("{id} \u{2014} {state}"), statement.clone()));
                 }
                 out = out.child(self.note(
-                    "An agent speaking MCP runs against the SAME engine: same drivers, same \
-                     store, same classify, same connection policy, same audit log. What differs \
-                     only ever restricts \u{2014} a role (`reader` by default, $LODE_MCP_ROLE), an \
-                     unrestricted policy read as `confirm`, and an agent that CANNOT confirm. A \
-                     statement classify names is not run: it is filed here for a person.",
+                    self.tr("settings.mcp_same_engine"),
                 ));
-                out = out.child(self.note("Deciding one from this window is not built yet."));
+                out = out.child(self.note(self.tr("ui.decide_not_built")));
             }
             Category::Hooks => {
                 out = out.child(self.note(
-                    "A hook is your own code run at one of four moments: before and after a \
-                     connect, before and after a disconnect. A PreConnect hook that fails stops \
-                     the connection, which is the only reason to have one before rather than \
-                     after.",
+                    self.tr("settings.hooks_what"),
                 ));
                 out = out.child(self.note(
-                    "The environment a child gets carries CONTEXT and never a credential \u{2014} a \
-                     child's environment is readable from `ps` and `/proc`.",
+                    self.tr("settings.hooks_env"),
                 ));
                 out = out.child(self.note(
-                    "They are set per connection, in its own window. Global hooks are not built.",
+                    self.tr("settings.hooks_per_conn"),
                 ));
             }
 
@@ -1327,7 +1715,10 @@ mod tests {
     #[test]
     fn a_search_finds_a_page_by_what_it_is_about() {
         let all = Category::all();
-        assert_eq!(all.len(), 11);
+        // Not a magic number: the point is that `all()` and the enum agree,
+        // and a page added without a line here would be a page the search
+        // never sees.
+        assert_eq!(all.len(), 12);
 
         let find = |needle: &str| -> Vec<&'static str> {
             let n = needle.trim().to_lowercase();
@@ -1354,7 +1745,7 @@ mod tests {
 
         // Empty shows everything; nonsense shows nothing — and nothing is a
         // real answer, as long as the window says so rather than looking broken.
-        assert_eq!(find("").len(), 11);
+        assert_eq!(find("").len(), all.len());
         assert!(find("zzzz-not-a-thing").is_empty());
 
         // Every category carries words to be found by. One that does not is one
@@ -1391,6 +1782,33 @@ mod tests {
             seen.push((name, key));
         }
         assert!(seen.len() > 20, "only {} changeable keys?", seen.len());
+    }
+
+    /// The wallet page is found by the words somebody would actually type.
+    ///
+    /// "passphrase" already finds the tunnels page, so the test is that it
+    /// finds BOTH — a search that stops at the first match sends somebody to
+    /// the page about an SSH key when they were looking for the wallet.
+    #[test]
+    fn the_wallet_page_is_findable() {
+        let hits = |needle: &str| -> Vec<&'static str> {
+            let n = needle.to_lowercase();
+            Category::all()
+                .iter()
+                .filter(|c| {
+                    c.title().to_lowercase().contains(&n)
+                        || c.keywords().contains(&n)
+                        || c.blurb().to_lowercase().contains(&n)
+                })
+                .map(|c| c.title())
+                .collect()
+        };
+        assert!(hits("wallet").contains(&"Keyring"), "{:?}", hits("wallet"));
+        assert!(hits("unlock").contains(&"Keyring"));
+        assert!(hits("vault").contains(&"Keyring"));
+        let pass = hits("passphrase");
+        assert!(pass.contains(&"Keyring"), "{pass:?}");
+        assert!(pass.contains(&"SSH tunnels"), "{pass:?}");
     }
 
     /// A proxy is not a tunnel, and its line must not invent a port 22 or a

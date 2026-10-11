@@ -59,6 +59,7 @@ const META: DriverMeta = DriverMeta {
     time_filter: crate::spec::SQL_TIME_FILTER,
     builder_ops: crate::spec::SQL_BUILDER_OPS,
     ddl_ops: SQLITE_DDL_OPS,
+    types: crate::spec::SQLITE_TYPES,
     inspectors: &[],
 };
 
@@ -79,26 +80,36 @@ const SQLITE_DDL_OPS: &[crate::spec::DdlOp] = &[
         op: "add_column",
         label: "Add a column\u{2026}",
         template: "ALTER TABLE {qualified} ADD COLUMN {column} {type};",
+        asks: crate::spec::ASK_NEW_COLUMN,
     },
     crate::spec::DdlOp {
         op: "rename_column",
         label: "Rename this column\u{2026}",
         template: "ALTER TABLE {qualified} RENAME COLUMN {column} TO {to};",
+        asks: crate::spec::ASK_RENAME,
     },
     crate::spec::DdlOp {
         op: "drop_column",
         label: "Drop this column",
         template: "ALTER TABLE {qualified} DROP COLUMN {column};",
+        asks: crate::spec::ASK_COLUMN,
     },
+    // NO `alter_type`. SQLite has no statement for it: changing a column's
+    // type means building a new table, copying the rows and swapping the
+    // names. An operation offered here that always fails would be worse than
+    // one that is missing, and a four-statement recipe is not something to
+    // generate behind a menu item.
     crate::spec::DdlOp {
         op: "create_index",
-        label: "Index this column\u{2026}",
-        template: "CREATE INDEX {index} ON {qualified} ({columns});",
+        label: "Index these columns\u{2026}",
+        template: "CREATE {unique} INDEX {index} ON {qualified} ({columns});",
+        asks: crate::spec::ASK_UNIQUE_INDEX,
     },
     crate::spec::DdlOp {
         op: "drop_index",
         label: "Drop this index",
         template: "DROP INDEX {index};",
+        asks: crate::spec::ASK_DROP_INDEX,
     },
 ];
 

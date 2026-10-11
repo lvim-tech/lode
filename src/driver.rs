@@ -194,6 +194,32 @@ fn object_of(lowered: &str, skip: usize) -> String {
 
 /// A live connection. Held server-side behind a mutex and addressed by a numeric
 /// `conn_id`; mutable so stateful drivers (a current database, a session) work.
+/// What a live view answered.
+///
+/// `acts` is the rows the view's ACTION applies to, by key. Empty means all of
+/// them, which is what a view whose every row is a session wants.
+///
+/// It exists because `currentOp` on an idle MongoDB is mostly the server's own
+/// housekeeping — `JournalFlusher`, `NoopWriter`, the oplog applier — and
+/// those are running, so a view called "what is running" must show them. What
+/// it must not do is offer to kill them. Which rows are somebody's work and
+/// which are the server's is DRIVER knowledge, so the driver says.
+pub struct Inspected {
+    pub columns: Vec<crate::spec::Column>,
+    pub rows: Vec<Vec<crate::spec::Value>>,
+    pub acts: Vec<String>,
+}
+
+impl Inspected {
+    /// A view where every row can be acted on.
+    pub fn all(
+        columns: Vec<crate::spec::Column>,
+        rows: Vec<Vec<crate::spec::Value>>,
+    ) -> Self {
+        Inspected { columns, rows, acts: Vec::new() }
+    }
+}
+
 #[async_trait]
 pub trait Connection: Send {
     /// Databases visible on this connection (for `MULTI_DB` drivers).
@@ -274,7 +300,7 @@ pub trait Connection: Send {
     async fn inspect(
         &mut self,
         name: &str,
-    ) -> anyhow::Result<(Vec<crate::spec::Column>, Vec<Vec<crate::spec::Value>>)> {
+    ) -> anyhow::Result<Inspected> {
         anyhow::bail!("this driver has no live view called '{name}'")
     }
 

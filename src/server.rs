@@ -762,6 +762,10 @@ impl Server {
             "store.history.list" => self.store_history_list(params).await,
             "store.import" => self.store_import(params).await,
             "vault.put" => Self::vault_put(params).await,
+            "vault.status" => Self::vault_status().await,
+            "vault.unlock" => Self::vault_unlock(params).await,
+            "vault.create" => Self::vault_create(params).await,
+            "vault.lock" => Self::vault_lock().await,
             other => Err(anyhow::anyhow!("unknown method '{other}'")),
         }
     }
@@ -1694,8 +1698,15 @@ impl Server {
             anyhow::bail!("the {kind} driver has no live view called '{}'", p.name);
         }
         let conn = self.conn(p.conn_id)?;
-        let (columns, rows) = conn.lock().await.inspect(&p.name).await?;
-        Ok(json!({ "columns": columns, "rows": rows }))
+        let got = conn.lock().await.inspect(&p.name).await?;
+        Ok(json!({
+            "columns": got.columns,
+            "rows": got.rows,
+            // Which rows the action applies to, by key. ABSENT means all of
+            // them — a view whose every row is a session has nothing to say
+            // here, and an empty array would mean the opposite.
+            "acts": (!got.acts.is_empty()).then_some(got.acts),
+        }))
     }
 
     /// Act on one row of a live view — terminate a session, so far.
@@ -2801,6 +2812,64 @@ impl Server {
             .await
             .map_err(|e| anyhow::anyhow!("could not store {:?}: {e}", p.name.trim()))?;
         Ok(json!({ "stored": true, "name": p.name.trim() }))
+    }
+
+    /// Is there a wallet on this machine, and is it open?
+    ///
+    /// The one call a client may make before anything else: it starts the
+    /// agent if nothing is running, so "there is no wallet" and "the wallet is
+    /// shut" are told apart before a connection fails for a reason that reads
+    /// like a broken password.
+    async fn vault_status() -> anyhow::Result<Json> {
+        let h = crate::vault::status().await?;
+        Ok(json!({ "proto": h.proto, "locked": h.locked, "exists": h.vault_exists }))
+    }
+
+    /// Open the wallet with a person's passphrase.
+    ///
+    /// The passphrase arrives on this engine's stdin and goes straight to the
+    /// agent's socket. It is not stored, not logged and not echoed back, which
+    /// is why the error below says only that it was refused — a message
+    /// carrying the attempt would be the leak this exists to prevent.
+    async fn vault_unlock(params: Json) -> anyhow::Result<Json> {
+        #[derive(Deserialize)]
+        struct P {
+            password: String,
+        }
+        let p: P = serde_json::from_value(params)?;
+        if p.password.is_empty() {
+            anyhow::bail!("a passphrase is needed");
+        }
+        crate::vault::unlock(&p.password).await?;
+        Ok(json!({ "unlocked": true }))
+    }
+
+    /// Make a wallet, for a machine that has never had one.
+    ///
+    /// Refused when one already exists — the agent refuses it too, and saying
+    /// so here means a client never asks somebody to "set a passphrase" over a
+    /// vault that has one.
+    async fn vault_create(params: Json) -> anyhow::Result<Json> {
+        #[derive(Deserialize)]
+        struct P {
+            password: String,
+        }
+        let p: P = serde_json::from_value(params)?;
+        if p.password.is_empty() {
+            anyhow::bail!("a passphrase is needed");
+        }
+        let h = crate::vault::status().await?;
+        if h.vault_exists {
+            anyhow::bail!("there is already a wallet on this machine \u{2014} unlock it instead");
+        }
+        crate::vault::create(&p.password).await?;
+        Ok(json!({ "created": true }))
+    }
+
+    /// Shut the wallet now, rather than waiting for its own timeout.
+    async fn vault_lock() -> anyhow::Result<Json> {
+        crate::vault::lock().await?;
+        Ok(json!({ "locked": true }))
     }
 
     async fn store_import(&self, params: Json) -> anyhow::Result<Json> {

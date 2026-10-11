@@ -186,6 +186,7 @@ impl MetaOwned {
             // trait method the child protocol has no verb for, so offering one
             // would be offering a button that cannot be pressed.
             ddl_ops: &[],
+            types: &[],
             inspectors: &[],
         };
         Box::leak(Box::new(meta))

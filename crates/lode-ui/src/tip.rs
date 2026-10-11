@@ -55,10 +55,21 @@ impl Render for Tip {
         let (t, ms) = (&self.theme, self.scale);
         let mut row = div()
             .flex()
-            .items_center()
+            .items_start()
             .gap_2()
             .px_2()
             .py_1()
+            // IT WRAPS, and it is held to a width that makes it wrap.
+            //
+            // A tip is one line by default, so a tip whose job is to show the
+            // whole of a value that was too long to fit was itself too long
+            // to fit: it ran off the window and the end — the part somebody
+            // hovered to read — was the part cut off. A box forty characters
+            // wide across as many lines as it needs shows all of it.
+            //
+            // In the type scale rather than pixels, so it is forty characters
+            // at every size.
+            .max_w(px(ms.base() * 40.0))
             // Raised, bordered and square: it has to read as sitting ON the
             // window on palettes whose surfaces are a hair apart, and the
             // corners are square everywhere else.
@@ -67,10 +78,13 @@ impl Render for Tip {
             .border_color(t.border())
             .text_size(ms.small())
             .text_color(t.fg())
-            .child(self.text.clone());
+            // The text takes the width and gives way, so the key beside it is
+            // never pushed off the edge.
+            .child(div().flex_1().min_w_0().child(self.text.clone()));
         if let Some(key) = &self.key {
             row = row.child(
                 div()
+                    .flex_none()
                     .px_1()
                     .bg(t.status())
                     .text_size(ms.tiny())

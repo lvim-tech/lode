@@ -90,6 +90,7 @@ const META: DriverMeta = DriverMeta {
     time_filter: "",
     builder_ops: &[],
     ddl_ops: &[],
+    types: &[],
     inspectors: REDIS_INSPECTORS,
 };
 
@@ -419,7 +420,7 @@ impl Connection for RedisConnection {
     async fn inspect(
         &mut self,
         name: &str,
-    ) -> anyhow::Result<(Vec<Column>, Vec<Vec<Value>>)> {
+    ) -> anyhow::Result<crate::driver::Inspected> {
         if name != "clients" {
             anyhow::bail!("this driver has no live view called '{name}'");
         }
@@ -459,7 +460,8 @@ impl Connection for RedisConnection {
                     .collect(),
             );
         }
-        Ok((columns, rows))
+        // Every row of CLIENT LIST is a client.
+        Ok(crate::driver::Inspected::all(columns, rows))
     }
 
     /// Disconnect a client, by its address.

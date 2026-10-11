@@ -202,6 +202,12 @@ use serde_json::json;
 ///     `sys.foreign_key_columns`); absent where a driver has no way to ask,
 ///     because saying nothing is the honest answer rather than saying no. A
 ///     failure to read them is not a failure of the column list.
+/// 25. `DdlOp.asks` and `DriverMeta.types`: an operation says WHAT IT NEEDS
+///     filled in and the driver says which types its columns can have, so a
+///     client builds the form from the declaration instead of knowing that
+///     `add_column` wants a name and a type. A driver can add an operation
+///     without a client being taught about it, and a store with no column
+///     types declares none and is offered none.
 /// 23. `DriverMeta.ddl_ops`: the schema changes a dialect can be asked to
 ///     WRITE OUT, as templates — `add_column`, `rename_column`,
 ///     `drop_column`, `create_index`, `drop_index`.
@@ -217,7 +223,21 @@ use serde_json::json;
 ///     GENERATED, never run. The statement goes into the editor to be read
 ///     and changed first: a schema change that happens because somebody
 ///     picked a menu item is a schema change nobody reviewed.
-pub const PROTO: u32 = 23;
+/// 24. The wallet, in full: `vault.status`, `vault.unlock`, `vault.create` and
+///     `vault.lock` beside the `vault.put` of 17.
+///
+///     It is the SAME wallet the Neovim client uses — one vault file, one
+///     socket, one daemon program, one set of secret names. What was missing
+///     was a way to open it from anything but an editor, which left a machine
+///     with no editor on it with no wallet at all.
+///
+///     The engine now holds ONE connection to the agent for its whole life,
+///     because the agent locks and exits when its last client disconnects: a
+///     socket opened per question meant unlocking, reading one secret, and
+///     watching the wallet shut behind you. It also starts the agent when
+///     none is running — which is not a way round the gate, since a fresh
+///     agent is locked and asks.
+pub const PROTO: u32 = 25;
 
 /// One decoded incoming request.
 #[derive(Debug, Deserialize)]

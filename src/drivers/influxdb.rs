@@ -72,6 +72,7 @@ const META: DriverMeta = DriverMeta {
     time_filter: "|> range(start: {from}, stop: {to})",
     builder_ops: &[],
     ddl_ops: &[],
+    types: &[],
     inspectors: &[],
 };
 

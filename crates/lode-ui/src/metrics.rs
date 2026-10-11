@@ -151,6 +151,22 @@ impl Metrics {
         px(self.base - 2.0)
     }
 
+    /// An icon that sits BESIDE text, at the size of that text.
+    ///
+    /// Not the text size itself, and the difference is the whole point. A
+    /// Font Awesome mark's ink fills less of its em box than a letter's does,
+    /// so a glyph set to the same point size as the words next to it comes out
+    /// visibly smaller — which is the complaint, and it was correct. The
+    /// factor makes the two OPTICALLY equal rather than numerically equal.
+    ///
+    /// The one place this does not apply is the icon RAIL down the left edge,
+    /// which has a number of its own that a person sets — see `icon_size`.
+    /// Those marks sit beside no text and are the thing being pointed at, so
+    /// tying them to a text step would take away the setting.
+    pub fn icon_beside(self, text: Pixels) -> Pixels {
+        px((f32::from(text) * 1.2).round())
+    }
+
     /// The icon rail's glyphs. Its OWN number — see `DEFAULT_ICON`.
     pub fn icon(self) -> Pixels {
         px(self.icon)
@@ -376,6 +392,17 @@ impl Metrics {
     /// One level of indent in a tree.
     pub fn indent(self) -> f32 {
         (self.base * 0.85).round()
+    }
+
+    /// One level of a tree, in SPACES.
+    ///
+    /// `indent` is a fixed step that has nothing to say about the setting
+    /// people actually set — the one that says the JSON view indents by four.
+    /// A tree beside that JSON stepping by a different amount is two answers
+    /// to one question, so the tree steps by the same number of spaces, in
+    /// the width a space actually has at this size.
+    pub fn indent_by(self, spaces: u8) -> f32 {
+        (self.base * 0.55 * f32::from(spaces.max(1))).round()
     }
 
     /// The standard inset from a panel's edge, where `px_2` and `pl(10.0)` were

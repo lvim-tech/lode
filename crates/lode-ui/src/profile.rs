@@ -256,7 +256,7 @@ impl ProfileForm {
                     .child(
                         div()
                             .font_family(SharedString::from(self.font_family.clone()))
-                            .text_size(ms.small())
+                            .text_size(ms.icon_beside(ms.small()))
                             .text_color(if shown { t.warning() } else { t.muted() })
                             .child(if shown { "\u{f06e}" } else { "\u{f070}" }),
                     )
@@ -535,7 +535,7 @@ impl Render for ProfileForm {
                     )
                     .child(div().flex_1().text_size(ms.body()).child(self.key_path.clone()))
                     .child(
-                        btn(&t, ms, "pick-profile-key", "browse\u{2026}", Btn::Secondary)
+                        btn(&t, ms, "pick-profile-key", self.tr("ui.browse"), Btn::Secondary)
                             .on_click(cx.listener(move |_this, _, _, cx| {
                                 let me = cx.entity().downgrade();
                                 pick_file(
@@ -627,12 +627,12 @@ impl ProfileForm {
             .border_t_1()
             .border_color(t.border())
             .child(
-                btn(&t, ms, "profile-cancel", "Cancel", Btn::Quiet).on_click(cx.listener(
+                btn(&t, ms, "profile-cancel", self.tr("ui.cancel_b"), Btn::Quiet).on_click(cx.listener(
                     |this, _, window: &mut Window, cx| this.leave(window, cx),
                 )),
             )
             .child(
-                btn(&t, ms, "profile-save", "Save", Btn::Primary)
+                btn(&t, ms, "profile-save", self.tr("ui.save"), Btn::Primary)
                     .on_click(cx.listener(|this, _, _, cx| this.save(cx))),
             );
 

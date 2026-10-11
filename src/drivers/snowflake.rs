@@ -67,6 +67,20 @@ const PARAMS: &[ParamSpec] = &[
     },
 ];
 
+/// Snowflake writes `SET DATA TYPE`, and it has no secondary indexes at all
+/// — so neither index operation is offered rather than offered and failing.
+const SNOWFLAKE_DDL_OPS: &[crate::spec::DdlOp] = &[
+    crate::spec::SQL_DDL_COMMON[0],
+    crate::spec::SQL_DDL_COMMON[1],
+    crate::spec::SQL_DDL_COMMON[2],
+    crate::spec::DdlOp {
+        op: "alter_type",
+        label: "Change this column\u{2019}s type\u{2026}",
+        template: "ALTER TABLE {qualified} ALTER COLUMN {column} SET DATA TYPE {type};",
+        asks: crate::spec::ASK_RETYPE,
+    },
+];
+
 const META: DriverMeta = DriverMeta {
     kind: "snowflake",
     display: "Snowflake",
@@ -95,7 +109,8 @@ const META: DriverMeta = DriverMeta {
     browse_form: crate::spec::SQL_BROWSE_FORM,
     time_filter: crate::spec::SQL_TIME_FILTER,
     builder_ops: crate::spec::SQL_BUILDER_OPS,
-    ddl_ops: crate::spec::SQL_DDL_OPS,
+    ddl_ops: SNOWFLAKE_DDL_OPS,
+    types: crate::spec::SNOWFLAKE_TYPES,
     inspectors: &[],
 };
 

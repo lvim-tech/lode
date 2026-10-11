@@ -45,6 +45,31 @@ const PARAMS: &[ParamSpec] = &[
     },
 ];
 
+/// ClickHouse's index is a DATA-SKIPPING index, and it is added and dropped
+/// with `ALTER TABLE` rather than with `CREATE INDEX`.
+///
+/// The generic SQL spelling would have been accepted here and then failed at
+/// the server, which is the thing the whole `ddl_ops` arrangement exists to
+/// prevent: what a dialect is offered is what that dialect can do.
+const CLICKHOUSE_DDL_OPS: &[crate::spec::DdlOp] = &[
+    crate::spec::SQL_DDL_MODIFY[0],
+    crate::spec::SQL_DDL_MODIFY[1],
+    crate::spec::SQL_DDL_MODIFY[2],
+    crate::spec::SQL_DDL_MODIFY[3],
+    crate::spec::DdlOp {
+        op: "create_index",
+        label: "Index these columns\u{2026}",
+        template: "ALTER TABLE {qualified} ADD INDEX {index} ({columns}) TYPE minmax GRANULARITY 1;",
+        asks: crate::spec::ASK_INDEX,
+    },
+    crate::spec::DdlOp {
+        op: "drop_index",
+        label: "Drop this index",
+        template: "ALTER TABLE {qualified} DROP INDEX {index};",
+        asks: crate::spec::ASK_DROP_INDEX,
+    },
+];
+
 const META: DriverMeta = DriverMeta {
     kind: "clickhouse",
     display: "ClickHouse",
@@ -72,7 +97,8 @@ const META: DriverMeta = DriverMeta {
     browse_form: crate::spec::SQL_BROWSE_FORM,
     time_filter: crate::spec::SQL_TIME_FILTER,
     builder_ops: crate::spec::SQL_BUILDER_OPS,
-    ddl_ops: crate::spec::SQL_DDL_OPS,
+    ddl_ops: CLICKHOUSE_DDL_OPS,
+    types: crate::spec::CLICKHOUSE_TYPES,
     inspectors: &[],
 };
 

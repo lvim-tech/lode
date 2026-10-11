@@ -20,3 +20,15 @@ cargo build --release --bin loded "$@"
 mkdir -p build
 cp -f target/release/loded build/loded
 echo "installed build/loded"
+
+# The WALLET, where its source can be found. Optional and never fatal: lode
+# runs without one, and what it cannot do without one is keep a password out of
+# its own database. It is the same program the Neovim plugin builds — see
+# scripts/build-wallet.
+if [ -z "$LODE_NO_WALLET" ]; then
+    if ! scripts/build-wallet >/dev/null 2>&1; then
+        echo "no wallet built (scripts/build-wallet says why) — secrets would be stored as typed"
+    else
+        echo "installed build/lvim-keyring-daemon"
+    fi
+fi

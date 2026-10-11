@@ -77,7 +77,8 @@ const MARIADB_META: DriverMeta = DriverMeta {
     browse_form: crate::spec::SQL_BROWSE_FORM,
     time_filter: crate::spec::SQL_TIME_FILTER,
     builder_ops: crate::spec::SQL_BUILDER_OPS,
-    ddl_ops: crate::spec::SQL_DDL_OPS,
+    ddl_ops: crate::spec::SQL_DDL_MODIFY,
+    types: crate::spec::MYSQL_TYPES,
     inspectors: MY_INSPECTORS,
 };
 
@@ -96,7 +97,8 @@ const MYSQL_META: DriverMeta = DriverMeta {
     browse_form: crate::spec::SQL_BROWSE_FORM,
     time_filter: crate::spec::SQL_TIME_FILTER,
     builder_ops: crate::spec::SQL_BUILDER_OPS,
-    ddl_ops: crate::spec::SQL_DDL_OPS,
+    ddl_ops: crate::spec::SQL_DDL_MODIFY,
+    types: crate::spec::MYSQL_TYPES,
     inspectors: MY_INSPECTORS,
 };
 
@@ -307,7 +309,7 @@ impl Connection for MysqlConnection {
     async fn inspect(
         &mut self,
         name: &str,
-    ) -> anyhow::Result<(Vec<Column>, Vec<Vec<Value>>)> {
+    ) -> anyhow::Result<crate::driver::Inspected> {
         if name != "processlist" {
             anyhow::bail!("this driver has no live view called '{name}'");
         }
@@ -319,7 +321,8 @@ impl Connection for MysqlConnection {
                  FROM information_schema.processlist ORDER BY TIME DESC",
             )
             .await?;
-        Ok((columns, rows))
+        // Every row of the processlist is a connection.
+        Ok(crate::driver::Inspected::all(columns, rows))
     }
 
     /// Terminate a connection, by its id.

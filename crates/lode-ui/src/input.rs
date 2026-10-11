@@ -113,6 +113,16 @@ pub struct TextInput {
     marked_range: Option<Range<usize>>,
     last_layout: Option<ShapedLine>,
     last_bounds: Option<Bounds<Pixels>>,
+    /// How far the text is scrolled SIDEWAYS, in pixels.
+    ///
+    /// A one-line field is as wide as it is, and a value longer than that was
+    /// simply cut: the caret walked past the right edge while the text stayed
+    /// where it was, so the end of a long value could be neither seen nor
+    /// corrected. The view follows the caret instead.
+    ///
+    /// Written by the element each frame, because only the element knows how
+    /// wide the field came out and where in the line the caret landed.
+    scroll_x: f32,
     is_selecting: bool,
     colors: InputColors,
     /// Draw this value as dots.
@@ -171,6 +181,7 @@ impl TextInput {
             marked_range: None,
             last_layout: None,
             last_bounds: None,
+            scroll_x: 0.0,
             is_selecting: false,
             colors,
             mask: false,
@@ -379,7 +390,9 @@ impl TextInput {
         if position.y > bounds.bottom() {
             return self.content.len();
         }
-        self.from_display(line.closest_index_for_x(position.x - bounds.left()))
+        self.from_display(
+            line.closest_index_for_x(position.x - bounds.left() + px(self.scroll_x)),
+        )
     }
 
     fn select_to(&mut self, offset: usize, cx: &mut Context<Self>) {
@@ -542,13 +555,16 @@ impl EntityInputHandler for TextInput {
     ) -> Option<Bounds<Pixels>> {
         let last_layout = self.last_layout.as_ref()?;
         let range = self.range_from_utf16(&range_utf16);
+        // Shifted with the text: the candidate window belongs under the
+        // characters being composed, wherever the field has scrolled them to.
+        let shift = px(-self.scroll_x);
         Some(Bounds::from_corners(
             point(
-                bounds.left() + last_layout.x_for_index(self.to_display(range.start)),
+                bounds.left() + shift + last_layout.x_for_index(self.to_display(range.start)),
                 bounds.top(),
             ),
             point(
-                bounds.left() + last_layout.x_for_index(self.to_display(range.end)),
+                bounds.left() + shift + last_layout.x_for_index(self.to_display(range.end)),
                 bounds.bottom(),
             ),
         ))
@@ -574,6 +590,9 @@ struct TextElement {
 }
 
 struct PrepaintState {
+    /// How far sideways this frame was drawn — kept so the next frame and the
+    /// hit test agree with what was painted.
+    scroll_x: f32,
     line: Option<ShapedLine>,
     cursor: Option<PaintQuad>,
     selection: Option<PaintQuad>,
@@ -675,7 +694,30 @@ impl Element for TextElement {
         let font_size = style.font_size.to_pixels(window.rem_size());
         let line = window.text_system().shape_line(display_text, font_size, &runs, None);
 
-        let cursor_pos = line.x_for_index(cursor);
+        let caret_x = f32::from(line.x_for_index(cursor));
+        // HOW FAR SIDEWAYS, worked out from the caret: enough that it is
+        // inside the field with a character of room, and no further. Back to
+        // zero whenever the whole line fits, or a short value would be drawn
+        // half off the left edge and look like text that had gone missing.
+        let view_w = f32::from(bounds.size.width).max(1.0);
+        let pad = f32::from(font_size) * 0.8;
+        let mut scroll_x = self.input.read(cx).scroll_x.max(0.0);
+        if f32::from(line.width) <= view_w {
+            scroll_x = 0.0;
+        } else {
+            if caret_x - scroll_x > view_w - pad {
+                scroll_x = caret_x - view_w + pad;
+            }
+            if caret_x < scroll_x + pad {
+                scroll_x = (caret_x - pad).max(0.0);
+            }
+            // Never past the end: the last character sits against the right
+            // edge and the field does not keep scrolling into blank space.
+            scroll_x = scroll_x.min((f32::from(line.width) - view_w + pad).max(0.0));
+        }
+        let shift = px(-scroll_x);
+
+        let cursor_pos = line.x_for_index(cursor) + shift;
         let (selection, cursor) = if selected_range.is_empty() {
             (
                 None,
@@ -691,15 +733,21 @@ impl Element for TextElement {
             (
                 Some(fill(
                     Bounds::from_corners(
-                        point(bounds.left() + line.x_for_index(selected_range.start), bounds.top()),
-                        point(bounds.left() + line.x_for_index(selected_range.end), bounds.bottom()),
+                        point(
+                            bounds.left() + shift + line.x_for_index(selected_range.start),
+                            bounds.top(),
+                        ),
+                        point(
+                            bounds.left() + shift + line.x_for_index(selected_range.end),
+                            bounds.bottom(),
+                        ),
                     ),
                     colors.selection,
                 )),
                 None,
             )
         };
-        PrepaintState { line: Some(line), cursor, selection }
+        PrepaintState { line: Some(line), cursor, selection, scroll_x }
     }
 
     fn paint(
@@ -718,7 +766,8 @@ impl Element for TextElement {
             window.paint_quad(selection)
         }
         let line = prepaint.line.take().unwrap();
-        let _ = line.paint(bounds.origin, window.line_height(), window, cx);
+        let origin = point(bounds.left() - px(prepaint.scroll_x), bounds.top());
+        let _ = line.paint(origin, window.line_height(), window, cx);
 
         // The cursor only where the focus is, or several fields would appear to
         // be taking input at once.
@@ -728,9 +777,11 @@ impl Element for TextElement {
             }
         }
 
+        let scroll_x = prepaint.scroll_x;
         self.input.update(cx, |input, _| {
             input.last_layout = Some(line);
             input.last_bounds = Some(bounds);
+            input.scroll_x = scroll_x;
         });
     }
 }

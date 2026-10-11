@@ -411,6 +411,29 @@ impl Theme {
     /// The colour a type badge is drawn in. Mapped from the badge word rather
     /// than from a driver name, so a type this client has never heard of lands
     /// on the neutral ink instead of nothing.
+    /// Readable INK for a given background.
+    ///
+    /// Picked, not assumed. The danger button filled itself with the error
+    /// colour on hover and wrote in `inverted` — and on a theme where those
+    /// two are close, the text vanished and left a red block. `inverted` is
+    /// the ink for the ACCENT, which is a different colour, and a button that
+    /// is right on one theme and blank on another is not a style, it is a
+    /// button nobody can read.
+    ///
+    /// Of the three inks a theme has, whichever stands out most against the
+    /// background it is going on. Three rather than a computed colour because
+    /// a theme's own inks are the ones that belong to it.
+    pub fn on(&self, bg: Rgba) -> Rgba {
+        [self.inverted(), self.base(), self.fg()]
+            .into_iter()
+            .max_by(|a, b| {
+                Self::contrast(*a, bg)
+                    .partial_cmp(&Self::contrast(*b, bg))
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .unwrap_or_else(|| self.fg())
+    }
+
     /// The colour of the nth thing in a chart.
     ///
     /// Themes have no palette for series, so the roles are used in an order
@@ -512,6 +535,20 @@ pub fn theme_dirs() -> Vec<PathBuf> {
     if let Some(h) = std::env::var_os("HOME") {
         out.push(PathBuf::from(h).join(".config/lode/themes"));
     }
+    // ONE ENTRY PER DIRECTORY. `$XDG_CONFIG_HOME` is `~/.config` on most
+    // machines, so the second and third rules name the same folder — and the
+    // settings page, which lists what is searched, printed that folder twice
+    // and read as a bug in the page rather than as two rules agreeing.
+    //
+    // By resolved path where the path exists, so two spellings of one folder
+    // (a symlink, a trailing slash) count as one; by the written path where
+    // it does not, since a folder that is not there has nothing to resolve
+    // and is still worth naming.
+    let mut seen = std::collections::BTreeSet::new();
+    out.retain(|p| {
+        let key = p.canonicalize().unwrap_or_else(|_| p.clone());
+        seen.insert(key)
+    });
     out
 }
 
@@ -577,6 +614,72 @@ mod tests {
         assert_eq!(hex("20272b", rgb(0xff0000)).g, rgb(0x20272b).g);
         assert_eq!(hex("nope", rgb(0xff0000)).r, rgb(0xff0000).r);
         assert_eq!(hex("#12345", rgb(0xff0000)).r, rgb(0xff0000).r);
+    }
+
+    /// The search path names each directory once.
+    ///
+    /// `$XDG_CONFIG_HOME` is `~/.config` on most machines, so two of the three
+    /// rules point at one folder — and the page that lists them showed it
+    /// twice.
+    #[test]
+    fn the_theme_path_names_each_folder_once() {
+        std::env::set_var("HOME", "/tmp/lode-theme-test-home");
+        std::env::set_var("XDG_CONFIG_HOME", "/tmp/lode-theme-test-home/.config");
+        std::env::remove_var("LODE_THEME_DIR");
+        let dirs = theme_dirs();
+        let mut uniq = dirs.clone();
+        uniq.sort();
+        uniq.dedup();
+        assert_eq!(dirs.len(), uniq.len(), "a folder is listed twice: {dirs:?}");
+        assert_eq!(dirs.len(), 1, "{dirs:?}");
+
+        // An explicit override is a SEPARATE folder and stays.
+        std::env::set_var("LODE_THEME_DIR", "/tmp/lode-theme-test-other");
+        let dirs = theme_dirs();
+        assert_eq!(dirs.len(), 2, "{dirs:?}");
+        std::env::remove_var("LODE_THEME_DIR");
+    }
+
+    /// Whatever a button fills itself with, its text can be read on it.
+    ///
+    /// On EVERY installed theme, because this failed on exactly one of them:
+    /// the danger button's hover wrote `inverted` over the error colour, and
+    /// where those two are close the text disappeared.
+    #[test]
+    fn a_filled_button_can_be_read() {
+        let mut themes = vec![("builtin".to_string(), Theme::builtin())];
+        for (name, path) in discover() {
+            if let Ok(t) = load(&path) {
+                themes.push((name, t));
+            }
+        }
+        for (name, t) in &themes {
+            // A PRIMARY is filled, so its ink is picked for the fill — and
+            // for the lighter fill the hover uses, since the ink does not
+            // change with it.
+            for (what, bg) in [
+                ("accent", t.accent()),
+                ("accent hovered", Theme::mix(t.fg(), t.accent(), 0.18)),
+            ] {
+                let ink = t.on(t.accent());
+                let c = Theme::contrast(ink, bg);
+                assert!(c >= 2.0, "{name}: text on the {what} button is {c:.2}");
+            }
+            // A DANGER keeps its red text through both states, so what has to
+            // hold is the red against the tints — the thing that was wrong
+            // when the text was expected to change colour and did not.
+            for (what, bg) in [
+                ("danger", t.base()),
+                ("danger hovered", Theme::mix(t.error(), t.base(), 0.16)),
+                ("danger pressed", Theme::mix(t.error(), t.base(), 0.26)),
+            ] {
+                let c = Theme::contrast(t.error(), bg);
+                assert!(
+                    c >= 1.6,
+                    "{name}: the {what} button's own red is {c:.2} against its background"
+                );
+            }
+        }
     }
 
     /// Six series, all visible against the background, and no two the same.

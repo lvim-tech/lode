@@ -95,6 +95,7 @@ const PG_META: DriverMeta = DriverMeta {
     time_filter: crate::spec::SQL_TIME_FILTER,
     builder_ops: PG_BUILDER_OPS,
     ddl_ops: crate::spec::SQL_DDL_OPS,
+    types: crate::spec::PG_TYPES,
     inspectors: PG_INSPECTORS,
 };
 
@@ -131,6 +132,7 @@ const CRDB_META: DriverMeta = DriverMeta {
     // The same wire, so the same statistics views: this IS the postgres driver
     // underneath, and a view that works through it works through the alias.
     ddl_ops: crate::spec::SQL_DDL_OPS,
+    types: crate::spec::PG_TYPES,
     inspectors: PG_INSPECTORS,
 };
 
@@ -170,6 +172,7 @@ const REDSHIFT_META: DriverMeta = DriverMeta {
     // The same wire, so the same statistics views: this IS the postgres driver
     // underneath, and a view that works through it works through the alias.
     ddl_ops: crate::spec::SQL_DDL_OPS,
+    types: crate::spec::PG_TYPES,
     inspectors: PG_INSPECTORS,
 };
 
@@ -473,7 +476,7 @@ impl Connection for PgConnection {
     async fn inspect(
         &mut self,
         name: &str,
-    ) -> anyhow::Result<(Vec<Column>, Vec<Vec<Value>>)> {
+    ) -> anyhow::Result<crate::driver::Inspected> {
         let sql = match name {
             // `pid` FIRST, because that is the key `act` is given — a view
             // whose key is not in it cannot be acted on from the row.
@@ -486,7 +489,9 @@ impl Connection for PgConnection {
             other => anyhow::bail!("this driver has no live view called '{other}'"),
         };
         let (columns, rows, _) = self.simple(sql).await?;
-        Ok((columns, rows))
+        // Every row of `pg_stat_activity` is a backend — somebody's session,
+        // or this one. All of them can be terminated.
+        Ok(crate::driver::Inspected::all(columns, rows))
     }
 
     /// Terminate a session, by its backend pid.

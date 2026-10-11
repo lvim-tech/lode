@@ -1,0 +1,48 @@
+#!/bin/sh
+# Build the lvim-keyring agent into build/lvim-keyring-daemon.
+#
+# THE SAME PROGRAM the Neovim plugin builds, from the same source. Not a copy
+# and not a second implementation: one vault file, one socket, one set of
+# secret names, so a connection saved in either client opens in the other. A
+# wallet reimplemented here would be a second format to keep in step, and the
+# first time the two disagreed somebody's passwords would be the thing that
+# noticed.
+#
+# Two copies of the binary on disk are harmless. The daemon takes an exclusive
+# lock on its socket and the second instance exits 0, so whichever starts first
+# serves both clients.
+#
+#   scripts/build-wallet                     # from a sibling checkout, else git
+#   LVIM_KEYRING_SRC=/path/to/lvim-keyring scripts/build-wallet
+#
+# Optional. lode works without a wallet; what it cannot do without one is keep
+# a password out of its own database.
+set -e
+cd "$(dirname "$0")/.."
+
+REPO=https://github.com/lvim-tech/lvim-keyring.git
+
+# A LOCAL checkout first, and it is told explicitly or found beside this one.
+# Guessing at a plugin manager's directory layout would be guessing.
+for src in "$LVIM_KEYRING_SRC" ../lvim-keyring ../../lua/lvim-keyring; do
+    [ -n "$src" ] || continue
+    if [ -f "$src/native/Cargo.toml" ]; then
+        echo "building the wallet from $src"
+        cargo build --release --manifest-path "$src/native/Cargo.toml" \
+            --bin lvim-keyring-daemon
+        mkdir -p build
+        cp -f "$src/native/target/release/lvim-keyring-daemon" build/
+        echo "installed build/lvim-keyring-daemon"
+        exit 0
+    fi
+done
+
+# Otherwise from the repository it lives in. `--root build` keeps it beside the
+# engine, which is one of the places both clients look.
+echo "no local lvim-keyring checkout — building from $REPO"
+cargo install --git "$REPO" lvim-keyring-native --bin lvim-keyring-daemon \
+    --root build --force
+echo "installed build/bin/lvim-keyring-daemon"
+mkdir -p build
+cp -f build/bin/lvim-keyring-daemon build/lvim-keyring-daemon
+echo "installed build/lvim-keyring-daemon"

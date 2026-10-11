@@ -131,6 +131,8 @@ pub struct DriverMeta {
     /// up.
     #[serde(default)]
     pub ddl_ops: Vec<DdlOp>,
+    #[serde(default)]
+    pub types: Vec<TypeSpec>,
     /// The live views this engine can be asked about (`proto >= 20`): who is
     /// connected, what is locked, what is running.
     ///
@@ -148,6 +150,43 @@ pub struct DdlOp {
     pub op: String,
     pub label: String,
     pub template: String,
+    /// What the template needs filled in. Absent from an older engine, which
+    /// is why it defaults: a client that gets nothing offers nothing to fill
+    /// in and the statement arrives with its holes still in it, exactly as
+    /// it used to.
+    #[serde(default)]
+    pub asks: Vec<DdlAsk>,
+}
+
+/// One hole in a `DdlOp`'s template — see the engine's `spec::DdlAsk`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct DdlAsk {
+    pub key: String,
+    pub label: String,
+    pub kind: AskKind,
+    #[serde(default)]
+    pub suggest: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AskKind {
+    Text,
+    Type,
+    Column,
+    Columns,
+    Index,
+    Flag,
+}
+
+/// One type this dialect's columns can be declared with.
+#[derive(Debug, Clone, Deserialize)]
+pub struct TypeSpec {
+    pub name: String,
+    #[serde(default)]
+    pub args: u8,
+    #[serde(default)]
+    pub note: String,
 }
 
 /// One live view a driver offers.
@@ -340,11 +379,7 @@ pub fn render_ddl(
     op: &str,
     name: &str,
     schema: Option<&str>,
-    column: &str,
-    type_name: &str,
-    to: &str,
-    index: &str,
-    columns: &str,
+    values: &[(String, String)],
 ) -> Option<String> {
     let t = meta.ddl_ops.iter().find(|d| d.op == op)?;
     let schema = schema.filter(|s| !s.is_empty());
@@ -352,20 +387,30 @@ pub fn render_ddl(
         Some(s) => format!("{s}.{name}"),
         None => name.to_string(),
     };
-    Some(
-        t.template
-            // `{qualified}` BEFORE `{table}`, or the substitution of the
-            // shorter name would eat the longer one's braces.
-            .replace("{qualified}", &qualified)
-            .replace("{table}", name)
-            .replace("{schema}", schema.unwrap_or(""))
-            .replace("{column}", column)
-            .replace("{type}", type_name)
-            .replace("{to}", to)
-            .replace("{index}", index)
-            .replace("{columns}", if columns.is_empty() { column } else { columns }),
-    )
+    // `{qualified}` BEFORE `{table}`, or the substitution of the shorter name
+    // would eat the longer one's braces.
+    let mut out = t
+        .template
+        .replace("{qualified}", &qualified)
+        .replace("{table}", name)
+        .replace("{schema}", schema.unwrap_or(""));
+    // Then whatever the op asked for, by the key it asked under. The client
+    // does not know what the keys mean and does not have to: it collected
+    // them because the driver said to.
+    for (key, value) in values {
+        out = out.replace(&format!("{{{key}}}"), value);
+    }
+    // Any hole nobody filled keeps its braces rather than becoming an empty
+    // space: a statement with `{type}` still in it cannot be run by mistake,
+    // which is the same reason the old one wrote `<type>`.
+    //
+    // A flag that is off was substituted as nothing and left a gap where its
+    // word would have been, so the same squeeze the browse templates get:
+    // between tokens, never inside a quoted string, which is the whole of a
+    // JSON command template.
+    Some(collapse_spaces(&out))
 }
+
 
 /// Assemble a structured query bar's values into a statement, using only what
 /// the engine declared.

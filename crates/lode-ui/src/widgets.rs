@@ -106,10 +106,16 @@ pub fn btn(
         .text_size(ms.small())
         .child(label.into());
     match kind {
+        // The INK IS PICKED for whatever the button is filled with — see
+        // `Theme::on`. Assuming `inverted` is right for every fill is what
+        // made the danger button a blank red block on hover.
+        // A PRIMARY is filled from the start, so its ink is chosen once and
+        // never changes either: hover only lightens the fill, and the ink is
+        // picked to read on both.
         Btn::Primary => base
             .bg(t.accent())
-            .text_color(t.inverted())
-            .hover(|d| d.bg(t.fg()))
+            .text_color(t.on(t.accent()))
+            .hover(|d| d.bg(Theme::mix(t.fg(), t.accent(), 0.18)))
             .active(|d| d.bg(t.accent())),
         Btn::Secondary => base
             .border_1()
@@ -121,12 +127,26 @@ pub fn btn(
             .text_color(t.muted())
             .hover(|d| d.bg(t.hover_mark()).text_color(t.fg()))
             .active(|d| d.bg(t.selected_mark())),
+        // THE TEXT DOES NOT CHANGE COLOUR, and that is the fix.
+        //
+        // It used to fill with the error colour on hover and switch the text
+        // to a contrasting ink. The ink was right — the arithmetic picks it
+        // and a test checks it on every theme — and the button still came out
+        // a blank red block, because the text is a CHILD and whether a hover
+        // refinement reaches it is a question about the toolkit rather than
+        // about this palette. A button that is legible only if a cascade
+        // behaves is a button that is sometimes blank.
+        //
+        // So the hover TINTS the background instead: the red text stays red
+        // and stays readable, the button still answers the pointer, and
+        // nothing depends on a style reaching a child. `a_filled_button_can_be_read`
+        // holds the tint to the same contrast rule.
         Btn::Danger => base
             .border_1()
             .border_color(t.error())
             .text_color(t.error())
-            .hover(|d| d.bg(t.error()).text_color(t.inverted()))
-            .active(|d| d.bg(t.error())),
+            .hover(|d| d.bg(Theme::mix(t.error(), t.base(), 0.16)).border_color(t.error()))
+            .active(|d| d.bg(Theme::mix(t.error(), t.base(), 0.26))),
         Btn::Link => base
             .text_color(t.accent())
             .hover(|d| d.bg(t.hover_mark()))

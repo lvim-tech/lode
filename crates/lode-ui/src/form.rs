@@ -269,6 +269,13 @@ pub struct ConnectionForm {
     workspace: WeakEntity<Workspace>,
     /// What the engine speaks, for the one button that needs a new engine.
     proto: u32,
+    /// Whether this window refuses to save a password typed as itself.
+    secrets_from_a_source: bool,
+    /// The field whose secret is waiting on a locked wallet, if any. The row
+    /// to unlock it appears while this is set.
+    unlocking: Option<String>,
+    /// The passphrase box, masked from the moment it is built.
+    pass_input: Entity<TextInput>,
     theme: Theme,
     /// The same type scale as the workspace, handed over when the window opens:
     /// a dialog in its own OS window is still the same application, and a form
@@ -445,6 +452,9 @@ impl ConnectionForm {
         // What the engine speaks. Only `>= 17` can be asked to put a secret in
         // the wallet, and a button that would fail is a button not to draw.
         proto: u32,
+        // Whether a password may be saved as typed. The window's own policy,
+        // pushed in like everything else it is told.
+        secrets_from_a_source: bool,
         drivers: Vec<DriverMeta>,
         tunnel_profiles: Vec<String>,
         tunnel_profile_specs: std::collections::BTreeMap<String, Value>,
@@ -499,9 +509,17 @@ impl ConnectionForm {
         let key_path = get(&tunnel_auth_v, "path");
 
         let tls_v = spec.get("tls").cloned().unwrap_or(json!({}));
+        let pass_input = cx.new(|cx| {
+            let mut i = TextInput::new(cx, lang.tr("ph.passphrase"), colors);
+            i.set_mask(true, cx);
+            i
+        });
         let mut form = ConnectionForm {
             workspace,
             proto,
+            secrets_from_a_source,
+            unlocking: None,
+            pass_input,
             existing_spec: spec.clone(),
             tab: FormTab::Main,
             editing: existing.as_ref().map(|(n, _, _)| n.clone()),
@@ -630,11 +648,19 @@ impl ConnectionForm {
         // "save as profile" row and saving the connection from it would be the
         // wrong one of two visible buttons.
         let name_field = form.profile_name.clone();
+        let pass_field = form.pass_input.clone();
         for field in form.all_inputs() {
             let is_profile_name = field == name_field;
+            // Enter in the PASSPHRASE box opens the wallet. It is the only
+            // thing that box is for, and saving the connection from it would
+            // be the wrong one of two visible buttons — the same rule the
+            // profile-name box already follows.
+            let is_pass = field == pass_field;
             cx.subscribe(&field, move |this, _f, ev: &InputEvent, cx| {
                 if matches!(ev, InputEvent::Submit) {
-                    if is_profile_name {
+                    if is_pass {
+                        this.unlock_then_store(cx);
+                    } else if is_profile_name {
                         this.save_tunnel_profile(cx);
                     } else {
                         this.save(cx);
@@ -770,6 +796,7 @@ impl ConnectionForm {
     /// Every live field in this window.
     pub fn all_inputs(&self) -> Vec<Entity<TextInput>> {
         let mut out = vec![
+            self.pass_input.clone(),
             self.name.clone(),
             self.auth_user.clone(),
             self.auth_password.input.clone(),
@@ -945,6 +972,38 @@ impl ConnectionForm {
             self.error = Some("a connection needs a name".into());
             cx.notify();
             return;
+        }
+        // A SECRET TYPED AS ITSELF, where that has been turned off.
+        //
+        // Refused at the save, because the save is what would put it in the
+        // store — and the store is a plain SQLite file that the other client
+        // reads too. The message names the field and the way out rather than
+        // just saying no.
+        if self.secrets_from_a_source {
+            let literal: Vec<&str> = [
+                ("password", &self.auth_password),
+                ("key passphrase", &self.auth_key_password),
+                ("token", &self.auth_token),
+                ("tunnel passphrase", &self.tunnel_passphrase),
+                ("tunnel password", &self.tunnel_password),
+            ]
+            .iter()
+            .filter(|(_, f)| {
+                f.source == Source::Literal && !f.input.read(cx).text().trim().is_empty()
+            })
+            .map(|(n, _)| *n)
+            .collect();
+            if !literal.is_empty() {
+                self.error = Some(format!(
+                    "{} would be stored as typed, and this window is set not to do that. \
+                     Press the key beside the field to put it in the wallet, or point it at \
+                     the environment or a command.",
+                    literal.join(", ")
+                ));
+                self.tab = FormTab::Main;
+                cx.notify();
+                return;
+            }
         }
         // Refused here rather than at dial time. The connection that broke was
         // broken by a save, and a save is the last moment anybody is looking at
@@ -1715,7 +1774,55 @@ impl ConnectionForm {
 
     /// The wallet refused it — locked, or not running. The field keeps the
     /// value, because it is the only copy.
-    pub fn keyring_refused(&mut self, _key: &str, why: &str, cx: &mut Context<Self>) {
+    ///
+    /// A LOCKED wallet is not a failure to report and walk away from: it is
+    /// one passphrase away from working, and sending somebody to Settings to
+    /// type it — then back here to press the key again — is three windows for
+    /// one thought. The row appears here instead.
+    pub fn keyring_refused(&mut self, key: &str, why: &str, cx: &mut Context<Self>) {
+        self.note = None;
+        if why.contains("locked") {
+            self.unlocking = Some(key.to_string());
+            self.error = None;
+            self.pass_input.update(cx, |i, cx| i.set_text(String::new(), cx));
+        } else {
+            self.unlocking = None;
+            self.error = Some(why.to_string());
+        }
+        cx.notify();
+    }
+
+    /// The passphrase was typed here. Open the wallet, and if it opens, put
+    /// the secret in — which is what was being asked for when it was locked.
+    fn unlock_then_store(&mut self, cx: &mut Context<Self>) {
+        let pass = self.pass_input.read(cx).text().to_string();
+        if pass.is_empty() {
+            self.error = Some(self.lang.tr("wallet.need_pass").to_string());
+            cx.notify();
+            return;
+        }
+        let field = self.unlocking.clone();
+        let me = cx.entity().downgrade();
+        self.note = Some(self.lang.tr("wallet.unlocking").to_string());
+        let _ = self.workspace.update(cx, |w, _| w.unlock_for_form(pass, field, me));
+        self.pass_input.update(cx, |i, cx| i.set_text(String::new(), cx));
+        cx.notify();
+    }
+
+    /// The wallet opened. The key that was pressed is pressed again, by the
+    /// window rather than by the person — they already said what they wanted.
+    pub fn wallet_opened(&mut self, field: Option<String>, cx: &mut Context<Self>) {
+        self.unlocking = None;
+        self.note = Some(self.lang.tr("wallet.open").to_string());
+        if let Some(k) = field {
+            self.to_keyring(&k, cx);
+        }
+        cx.notify();
+    }
+
+    /// It did not open. The passphrase is gone and the row stays, because the
+    /// next thing somebody does is type it again.
+    pub fn wallet_refused(&mut self, why: &str, cx: &mut Context<Self>) {
         self.note = None;
         self.error = Some(why.to_string());
         cx.notify();
@@ -1870,7 +1977,9 @@ impl ConnectionForm {
     /// inherited the root's family.
     fn icon_inline(&self, glyph: &'static str, colour: gpui::Rgba) -> gpui::Div {
         let ms = self.scale;
-        let box_w = (ms.base() * 1.25).round();
+        // The size of the text beside it, optically — see `icon_beside`.
+        let size = ms.icon_beside(ms.small());
+        let box_w = (f32::from(size) * 1.25).round();
         div()
             .flex()
             .items_center()
@@ -1880,7 +1989,7 @@ impl ConnectionForm {
             .h(px(box_w))
             .line_height(px(box_w))
             .font_family(SharedString::from(self.icon_family.clone()))
-            .text_size(ms.small())
+            .text_size(size)
             .text_color(colour)
             .child(glyph)
     }
@@ -2567,7 +2676,7 @@ impl Render for ConnectionForm {
                     if self.tunnel_auth == "password" {
                         let (i, src) =
                             (self.tunnel_password.input.clone(), self.tunnel_password.source);
-                        body = body.child(self.row("Password", &i, src, true, "tunnel-password".into(), cx));
+                        body = body.child(self.row(&self.tr("ui.password"), &i, src, true, "tunnel-password".into(), cx));
                     }
                     body = body.child(self.stage_row("tunnel", cx));
                     // This is how a profile is CREATED: out of the fields
@@ -2675,6 +2784,47 @@ impl Render for ConnectionForm {
             }
         }
 
+        // THE WALLET IS SHUT, and one passphrase opens it. Here rather than
+        // in Settings: the key was pressed on this field, in this window, and
+        // the answer to "it is locked" is a box to type in, not an errand.
+        if self.unlocking.is_some() {
+            body = body.child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .my_1()
+                    .p_2()
+                    .border_1()
+                    .border_color(t.warning())
+                    .child(self.small(self.tr("wallet.locked"), t.warning()))
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .w(px(ms.base() * 14.0))
+                                    .text_size(ms.body())
+                                    .child(self.pass_input.clone()),
+                            )
+                            .child(
+                                btn(&t, ms, "form-unlock", self.tr("ui.unlock"), Btn::Primary)
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.unlock_then_store(cx)
+                                    })),
+                            )
+                            .child(
+                                btn(&t, ms, "form-unlock-no", self.tr("ui.cancel"), Btn::Quiet)
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.unlocking = None;
+                                        cx.notify();
+                                    })),
+                            ),
+                    ),
+            );
+        }
         if let Some(e) = &self.error {
             body = body.child(self.small(e.clone(), t.error()));
         }
@@ -2707,7 +2857,7 @@ impl Render for ConnectionForm {
                 div()
                     .flex()
                     .gap_2()
-                    .child(btn(&t, ms, "form-cancel", self.tr("tip.cancel_edit"), Btn::Quiet).on_click(
+                    .child(btn(&t, ms, "form-cancel", self.tr("ui.cancel"), Btn::Quiet).on_click(
                         cx.listener(|this, _, window: &mut Window, cx| this.leave(window, cx)),
                     ))
                     .child(btn(&t, ms, "form-save", self.tr("form.save"), Btn::Primary).on_click(cx.listener(

@@ -332,7 +332,7 @@ const GLYPH_PROBE: f32 = 20.0;
 const GLYPHS: &[(&str, &str)] = &[
     // The rail.
     ("\u{f1c0}", "DB"),
-    ("\u{f080}", "||"),
+    ("\u{f233}", "S"),
     ("\u{f1da}", "H"),
     ("\u{f132}", "A"),
     ("\u{f0ae}", "T"),
@@ -344,6 +344,8 @@ const GLYPHS: &[(&str, &str)] = &[
     ("\u{f067}", "+"),
     ("\u{f10c}", "o"),
     ("\u{f111}", "*"),
+    // A saved chart's row, where a bar chart is the right mark.
+    ("\u{f080}", "||"),
     // A collection in the schema tree.
     ("\u{f0c5}", "C"),
     ("\u{f044}", "e"),
@@ -362,6 +364,19 @@ const GLYPHS: &[(&str, &str)] = &[
     (crate::workspace::LINK_OPEN, "U"),
     // The mark a cancelled tab carries — see `workspace::tab_mark`.
     ("\u{f05e}", "/"),
+    // The rail's scripts, and the schema-as-a-picture row.
+    ("\u{f120}", ">"),
+    ("\u{f0e8}", "#"),
+    // What a FIELD is, in the tree — see `workspace::field_glyph`. Every one
+    // of these is drawn beside a column name, so every one is probed: a mark
+    // this font lacks is an empty box in a list of thirteen.
+    ("\u{f084}", "K"),
+    ("\u{f017}", "t"),
+    ("\u{f292}", "#"),
+    ("\u{f205}", "b"),
+    ("\u{f03a}", "="),
+    ("\u{f1b2}", "{"),
+    ("\u{f031}", "A"),
 ];
 
 /// The advance of one character per pixel of text size, in this font.
@@ -410,7 +425,7 @@ const NODE_SAMPLE: usize = 20;
 /// on this machine not ONE of the six families the picker used to ask for was
 /// installed under that name, so it had been falling through to whatever was
 /// left, and six of the rail's glyphs were drawing as empty rectangles.
-fn covers_all_glyphs(cx: &gpui::App, family: &str) -> bool {
+pub(crate) fn covers_all_glyphs(cx: &gpui::App, family: &str) -> bool {
     missing_in(cx, family).is_empty()
 }
 
@@ -896,7 +911,10 @@ impl Rail {
         match self {
             // Font Awesome codepoints, carried by every Nerd Font patch.
             Rail::Connections => "\u{f1c0}",
-            Rail::Instance => "\u{f080}",
+            // A SERVER, not a bar chart. The panel is about the machine on
+            // the other end — who is connected to it, what it is running —
+            // and a chart is what one of its pages happens to show.
+            Rail::Instance => "\u{f233}",
             Rail::History => "\u{f1da}",
             Rail::Audit => "\u{f132}",
             Rail::Tasks => "\u{f0ae}",
@@ -950,6 +968,43 @@ pub struct Multi {
     pub asked: bool,
 }
 
+/// A schema change being filled in — see `Workspace.ddl`.
+#[derive(Clone)]
+struct DdlForm {
+    conn: String,
+    table: String,
+    schema: Option<String>,
+    /// The column the menu was opened on, for the title.
+    column: String,
+    op: String,
+    label: String,
+    asks: Vec<lode_proto::DdlAsk>,
+    /// One per ask; meaningful only where the ask is a flag.
+    flags: Vec<bool>,
+}
+
+/// What a flag contributes to its template when it is ON.
+///
+/// SQL wants the word and JSON wants a boolean, and which of the two this is
+/// can be read off the template rather than configured: a hole that sits
+/// inside quotes or beside a colon is in a command document. The one word
+/// per key is kept here rather than in the driver because it is a property
+/// of the template, and the template is right next to it.
+fn flag_word(meta: &lode_proto::DriverMeta, key: &str, on: bool) -> String {
+    let json = meta
+        .ddl_ops
+        .iter()
+        .any(|d| {
+            d.template.trim_start().starts_with('{')
+                && d.template.contains(&format!("{{{key}}}"))
+        });
+    match (json, on) {
+        (true, on) => on.to_string(),
+        (false, true) => key.to_uppercase(),
+        (false, false) => String::new(),
+    }
+}
+
 /// What an outstanding request was for.
 enum Pending {
     /// `schema.ddl` asked for by the context menu: the answer goes on the
@@ -999,6 +1054,20 @@ enum Pending {
     /// field is only switched over once the engine says it LANDED: switching
     /// first and failing after would lose the password that was typed.
     VaultPut { field: String, name: String, form: WeakEntity<ConnectionForm> },
+    /// THE WALLET. Three things are asked of it and each answer goes
+    /// somewhere different, which is why they are three variants rather than
+    /// one with a tag.
+    ///
+    /// An unlock asked FOR A FORM carries the form that asked, because the
+    /// point of it is the secret that form is about to read — and `field`
+    /// says which one, when the unlock was for a particular box rather than
+    /// for the window as a whole.
+    WalletForForm { field: Option<String>, form: WeakEntity<ConnectionForm> },
+    /// What `vault.status` answered: reachable, exists, locked.
+    WalletStatus,
+    /// Something was DONE to it — unlocked, made, locked — and the word is
+    /// carried so the page can say which.
+    WalletDid { what: &'static str },
     /// The saved tunnel or proxy profiles, by kind.
     Profiles { kind: &'static str },
     /// The AWS profile names the engine found in `~/.aws/config`.
@@ -1092,6 +1161,46 @@ pub struct Workspace {
     /// A connection somebody asked to close while it was still working, and
     /// what it is working on.
     confirm_disconnect: Option<(String, Vec<String>)>,
+    /// Whether a secret may be stored ONLY as a reference to somewhere else
+    /// — the wallet, the environment, a file — and never as the thing
+    /// itself. Off by default, because a client that refuses to hold a
+    /// password before anybody has a wallet is a client nobody can connect
+    /// with; on, it is the stronger rule and the connection window stops
+    /// offering to keep one.
+    secrets_from_a_source: bool,
+    /// What the wallet last said, for the Keyring page.
+    wallet: crate::settings::Wallet,
+    /// The last thing that happened to the wallet, in words, for the page
+    /// that shows it. `None` once it has been read: it is news, not state.
+    wallet_said: Option<String>,
+    /// Which WAY the open document is being edited: field by field, or the
+    /// whole of it as JSON. One flag rather than one per document, because
+    /// `editing_doc` already says only one is open at a time.
+    doc_whole: bool,
+    /// Set when the whole-row card has just opened and has not been handed
+    /// the keyboard yet — see `cell_focus`.
+    doc_focus: bool,
+    /// The whole-document editor, when that is the way being used.
+    doc_editor: Option<(u64, Entity<crate::editor_el::Editor>)>,
+    /// Set when a cell card has just opened and the keyboard has not been
+    /// handed to it yet.
+    ///
+    /// The focusing itself happens in `render`, because that is where there
+    /// is a `Window` — `begin_edit` is reached from a menu action and from
+    /// two click handlers that have dropped theirs, and threading one down
+    /// three paths to call a single method is more moving parts than a flag
+    /// the next frame clears.
+    cell_focus: bool,
+    /// The cell being edited, and the editor holding its value. One at a
+    /// time, because `Tab.editing` is one at a time.
+    cell_editor: Option<(u64, Entity<crate::editor_el::Editor>)>,
+    /// A schema change being filled in.
+    ///
+    /// What it asks for is not decided here: the driver's `DdlOp` says which
+    /// holes its template has and what kind of thing goes in each, and this
+    /// holds one answer per hole. A driver that gains an operation gains a
+    /// form for it without a line changing in this file.
+    ddl: Option<DdlForm>,
     /// How far back in the console's history the prompt is showing, if at all.
     console_hist: Option<usize>,
     /// A connection somebody has asked to remove, and what would go with it:
@@ -1130,10 +1239,23 @@ pub struct Workspace {
     multi: Option<Multi>,
     /// A step that finished, noticed in a notification and acted on in `pump`.
     multi_advance: Option<(u64, bool)>,
+    /// Whether the icon font was picked by hand rather than derived from the
+    /// text font. A derived one follows the text font; a chosen one does not.
+    icon_font_chosen: bool,
+    /// A font that was asked for and is NOT installed, so the page can say
+    /// what was used instead. `None` when what was asked for is what was got.
+    font_asked: Option<String>,
+    icon_asked: Option<String>,
+    /// Something changed that the settings window shows. Pushed from `pump`:
+    /// see `poke_settings`.
+    settings_dirty: bool,
     /// Which live view is open, by the name the driver gave it.
     inspecting: Option<String>,
     /// What that view answered: its columns and its rows.
     inspected: Option<(Vec<lode_proto::Column>, Vec<Vec<Value>>)>,
+    /// Which of those rows the action applies to, by key, where the driver
+    /// narrowed it. `None` means every row.
+    inspect_acts: Option<Vec<String>>,
     inspect_error: Option<String>,
     /// A row the engine has described and a person has not yet agreed to:
     /// `(view, key, what the engine said it would do)`.
@@ -1398,13 +1520,45 @@ impl Workspace {
         // Read ONCE, and FIRST: the theme, the type scale and the window's
         // fields all come out of it.
         let restore = session::load();
-        let font_family = pick_font(cx);
-        let icon_family = pick_icon_font(cx, &font_family);
+        // WHAT WAS ASKED FOR, and what was available. A name from the session
+        // or `$LODE_FONT` that is not installed falls back — and the fallback
+        // is recorded so the settings page can SAY it fell back, rather than
+        // showing a font nobody chose as though they had.
+        let installed = cx.text_system().all_font_names();
+        let asked = restore
+            .font
+            .clone()
+            .or_else(|| std::env::var("LODE_FONT").ok())
+            .filter(|n| !n.is_empty());
+        let font_family = match asked.as_ref().filter(|n| installed.contains(n)) {
+            Some(n) => n.clone(),
+            None => pick_font(cx),
+        };
+        let font_asked = asked.filter(|n| *n != font_family);
+        let icon_asked = restore
+            .icon_font
+            .clone()
+            .or_else(|| std::env::var("LODE_ICON_FONT").ok())
+            .filter(|n| !n.is_empty());
+        let icon_family = match icon_asked.as_ref().filter(|n| installed.contains(n)) {
+            Some(n) => n.clone(),
+            None => pick_icon_font(cx, &font_family),
+        };
+        let icon_asked = icon_asked.filter(|n| *n != icon_family);
         // The session's theme before anything else. It was being saved and
         // never read, so the choice survived to the file and no further.
         let (theme_name, theme) = theme::pick_named(restore.theme.as_deref());
         let colors = input_colors(&theme);
-        let filter = cx.new(|cx| TextInput::new(cx, "Filter connections and schema…", colors));
+        // The LANGUAGE before the fields: a placeholder is a word somebody
+        // reads, so it comes out of the catalogue like every other one.
+        let lang = restore
+            .lang
+            .as_deref()
+            .and_then(Lang::from_tag)
+            .or_else(Lang::from_env)
+            .unwrap_or_default();
+        let filter =
+            cx.new(|cx| TextInput::new(cx, lang.tr("ph.filter_conns"), colors));
         cx.subscribe(&filter, |_this, _input, _ev: &InputEvent, cx| {
             // Typed into the filter: the panel is rebuilt from it each frame,
             // so there is nothing to do but ask for that frame.
@@ -1412,15 +1566,15 @@ impl Workspace {
         })
         .detach();
         let export_path = cx.new(|cx| TextInput::new(cx, "result.csv", colors));
-        let history_filter = cx.new(|cx| TextInput::new(cx, "Search history…", colors));
-        let audit_filter = cx.new(|cx| TextInput::new(cx, "Search the audit log…", colors));
-        let board_name = cx.new(|cx| TextInput::new(cx, "name this dashboard", colors));
-        let tile_text = cx.new(|cx| TextInput::new(cx, "heading for this tile", colors));
-        let board_time_col = cx.new(|cx| TextInput::new(cx, "column", colors));
+        let history_filter = cx.new(|cx| TextInput::new(cx, lang.tr("ph.search_history"), colors));
+        let audit_filter = cx.new(|cx| TextInput::new(cx, lang.tr("ph.search_audit"), colors));
+        let board_name = cx.new(|cx| TextInput::new(cx, lang.tr("ph.name_dashboard"), colors));
+        let tile_text = cx.new(|cx| TextInput::new(cx, lang.tr("ph.tile_heading"), colors));
+        let board_time_col = cx.new(|cx| TextInput::new(cx, lang.tr("ph.column"), colors));
         let board_time_from = cx.new(|cx| TextInput::new(cx, "2026-01-01", colors));
         let board_time_to = cx.new(|cx| TextInput::new(cx, "2026-02-01", colors));
-        let palette_input = cx.new(|cx| TextInput::new(cx, "Type to find a command…", colors));
-        let save_name = cx.new(|cx| TextInput::new(cx, "name it, then press Enter", colors));
+        let palette_input = cx.new(|cx| TextInput::new(cx, lang.tr("ph.find_command"), colors));
+        let save_name = cx.new(|cx| TextInput::new(cx, lang.tr("ph.name_enter"), colors));
         cx.subscribe(&save_name, |this, input, ev: &InputEvent, cx| {
             if matches!(ev, InputEvent::Submit) {
                 let name = input.read(cx).text().trim().to_string();
@@ -1430,7 +1584,7 @@ impl Workspace {
         })
         .detach();
         let console = cx.new(|cx| {
-            TextInput::new(cx, "Type a command and press Enter — it runs against the open connection", colors)
+            TextInput::new(cx, lang.tr("ph.console"), colors)
         });
         cx.subscribe(&console, |this, input, ev: &InputEvent, cx| {
             if matches!(ev, InputEvent::Submit) {
@@ -1451,8 +1605,17 @@ impl Workspace {
             fatal: None,
             exporting: None,
             confirm_disconnect: None,
+            ddl: None,
             console_hist: None,
             key_over: restore.keys.clone().unwrap_or_default(),
+            secrets_from_a_source: restore.secrets_from_a_source.unwrap_or(false),
+            doc_whole: false,
+            doc_focus: false,
+            doc_editor: None,
+            cell_focus: false,
+            cell_editor: None,
+            wallet: crate::settings::Wallet::default(),
+            wallet_said: None,
             shut_groups: restore
                 .shut_groups
                 .clone()
@@ -1482,8 +1645,13 @@ impl Workspace {
             chart_bounds: None,
             multi: None,
             multi_advance: None,
+            settings_dirty: false,
+            icon_font_chosen: restore.icon_font.is_some(),
+            font_asked,
+            icon_asked,
             inspecting: None,
             inspected: None,
+            inspect_acts: None,
             inspect_error: None,
             act_confirm: None,
             approvals: Vec::new(),
@@ -1562,12 +1730,7 @@ impl Workspace {
             grid_rows: gpui::UniformListScrollHandle::new(),
             grid_overflow: std::cell::Cell::new(0.0),
             hbar_drag: std::cell::Cell::new(false),
-            lang: restore
-                .lang
-                .as_deref()
-                .and_then(Lang::from_tag)
-                .or_else(Lang::from_env)
-                .unwrap_or_default(),
+            lang,
             json_indent: restore.json_indent.unwrap_or(4).clamp(2, 4),
             themes: theme::discover(),
             profiles: std::collections::BTreeMap::new(),
@@ -1694,7 +1857,7 @@ impl Workspace {
                 self.engine = Some(engine);
                 self.respawn_attempts = 0;
                 self.fatal = None;
-                self.toast("the engine is back".to_string(), false);
+                self.toast(self.tr("engine.back").to_string(), false);
                 // The saved list comes first: reconnecting what was open is
                 // done from `restore.connections` once it arrives (see
                 // `Pending::Connections`), which is the same path a cold start
@@ -1712,10 +1875,9 @@ impl Workspace {
                     // Out of tries: this is the one case that is fatal, and it
                     // says what went wrong rather than "restart".
                     None => {
-                        self.fatal = Some(format!(
-                            "the engine exited and would not start again: {e}. Its drivers run in \
-                             a separate process, so this window survived it."
-                        ));
+                        self.fatal = Some(
+                            self.tr("engine.gone").replace("{why}", &e.to_string()),
+                        );
                     }
                 }
             }
@@ -1786,6 +1948,9 @@ impl Workspace {
         self.poll_board();
         self.poll_approvals();
         self.reopen_scripts(cx);
+        // What the settings window shows, pushed from HERE rather than from
+        // whoever changed it — see `poke_settings`.
+        self.flush_settings(cx);
         loop {
             let Some(engine) = &self.engine else { break };
             let Some(msg) = engine.try_recv() else { break };
@@ -1809,8 +1974,8 @@ impl Workspace {
                     for task in self.tasks.iter_mut().filter(|t| t.running()) {
                         task.finish(Duration::from_millis(0), Some("the engine exited".into()));
                     }
-                    self.status = "the engine exited — starting it again…".into();
-                    self.toast("the engine exited — starting it again".to_string(), true);
+                    self.status = self.tr("engine.restarting").to_string();
+                    self.toast(self.tr("engine.restarting").to_string(), true);
                     self.respawn_at =
                         respawn_delay(self.respawn_attempts).map(|d| std::time::Instant::now() + d);
                     break;
@@ -2355,7 +2520,7 @@ impl Workspace {
                         json!({ "conn": conn }),
                     );
                 }
-                self.toast("dashboard saved", false);
+                self.toast(self.tr("toast.board_saved"), false);
             }
             Pending::SavedQueries { conn } => {
                 let qs: Vec<SavedQuery> =
@@ -2489,6 +2654,28 @@ impl Workspace {
                     }
                 }
             }
+            Pending::WalletForForm { field, form } => {
+                let _ = form.update(cx, |f, cx| f.wallet_opened(field, cx));
+                self.ask_wallet();
+            }
+            Pending::WalletStatus => {
+                self.wallet = crate::settings::Wallet {
+                    reachable: true,
+                    exists: v.get("exists").and_then(Value::as_bool).unwrap_or(false),
+                    locked: v.get("locked").and_then(Value::as_bool).unwrap_or(true),
+                    proto: v.get("proto").and_then(Value::as_u64).unwrap_or(0) as u32,
+                    why: None,
+                };
+                self.poke_settings(cx);
+            }
+            Pending::WalletDid { what } => {
+                self.wallet_said = Some(format!("the wallet was {what}"));
+                // ASKED AGAIN rather than assumed: the agent decides what it
+                // is, and an unlock that went through is still an unlock that
+                // can have timed out by the time this is drawn.
+                self.ask_wallet();
+                self.poke_settings(cx);
+            }
             Pending::Inspect { name } => {
                 // Only when it is still the view being looked at: an answer
                 // that arrives after somebody pressed another chip would
@@ -2500,6 +2687,15 @@ impl Workspace {
                     let rows: Vec<Vec<Value>> =
                         serde_json::from_value(v.get("rows").cloned().unwrap_or(json!([])))
                             .unwrap_or_default();
+                    // WHICH rows may be acted on, where the driver said. An
+                    // absent list means all of them — an empty one would mean
+                    // the opposite, which is why it is absent and not empty.
+                    self.inspect_acts = v
+                        .get("acts")
+                        .and_then(Value::as_array)
+                        .map(|a| {
+                            a.iter().filter_map(Value::as_str).map(str::to_string).collect()
+                        });
                     self.inspected = Some((columns, rows));
                     self.inspect_error = None;
                 }
@@ -2584,9 +2780,9 @@ impl Workspace {
                 match v.get("ddl").and_then(Value::as_str) {
                     Some(ddl) if !ddl.trim().is_empty() => {
                         cx.write_to_clipboard(gpui::ClipboardItem::new_string(ddl.to_string()));
-                        self.toast("DDL copied".to_string(), false);
+                        self.toast(self.tr("toast.ddl_copied").to_string(), false);
                     }
-                    _ => self.toast("this driver answered no DDL".to_string(), true),
+                    _ => self.toast(self.tr("toast.no_ddl").to_string(), true),
                 }
             }
             Pending::Ddl { tab } => {
@@ -2821,7 +3017,7 @@ impl Workspace {
                 // sure happened.
                 self.close_form(cx);
                 self.ask(Pending::Connections, "store.connections.list", json!({}));
-                self.toast("connection saved".to_string(), false);
+                self.toast(self.tr("toast.conn_saved").to_string(), false);
             }
             Pending::Classify { conn, statement } => {
                 match v.get("reason").and_then(Value::as_str) {
@@ -2947,6 +3143,24 @@ impl Workspace {
                     d.waiting = d.waiting.saturating_sub(1);
                 }
                 self.log_push("warn", format!("{table}: {e}"));
+            }
+            Pending::WalletForForm { form, .. } => {
+                let _ = form.update(cx, |f, cx| f.wallet_refused(&e, cx));
+            }
+            Pending::WalletStatus => {
+                // NOT REACHABLE is a fact about this machine, not a failure to
+                // report as an error: a machine with no wallet is a normal
+                // machine, and the page says what to do about it.
+                self.wallet = crate::settings::Wallet {
+                    reachable: false,
+                    why: Some(e.clone()),
+                    ..Default::default()
+                };
+                self.poke_settings(cx);
+            }
+            Pending::WalletDid { .. } => {
+                self.wallet_said = Some(e.clone());
+                self.poke_settings(cx);
             }
             Pending::VaultPut { field, form, .. } => {
                 // The field is LEFT as it was, holding the value: a form that
@@ -3585,7 +3799,7 @@ impl Workspace {
         // from under the export.
         if self.exporting.as_ref().map(|e| e.tab) == Some(tab_id) {
             self.toast(
-                "an export of this result is running — it has to finish first".to_string(),
+                self.tr("toast.export_busy_result").to_string(),
                 true,
             );
             return;
@@ -3794,6 +4008,13 @@ impl Workspace {
             shut_groups: Some(self.shut_groups.iter().cloned().collect())
                 .filter(|v: &Vec<String>| !v.is_empty()),
             keys: Some(self.key_over.clone()).filter(|m| !m.is_empty()),
+            secrets_from_a_source: Some(self.secrets_from_a_source).filter(|x| *x),
+            font: Some(self.font_family.clone()),
+            // Only when it was CHOSEN. A derived one is written out by the
+            // next start from whatever the text font is, and writing it here
+            // would freeze it — change the text font and the icons would stay
+            // behind in the font that went with the old one.
+            icon_font: Some(self.icon_family.clone()).filter(|_| self.icon_font_chosen),
             // Nothing opens or closes a settings group any more — the panel
             // became a window with categories. The field stays in the file's
             // shape so a session written by an older build still parses.
@@ -3963,6 +4184,7 @@ impl Workspace {
         // PUSHED, like everything else this window is given: it cannot read the
         // workspace while the workspace is drawing it. See the guardrail test.
         let proto = self.hello.as_ref().map_or(0, |h| h.proto);
+        let secrets_from_a_source = self.secrets_from_a_source;
         let (w, h) = self.scale.window(crate::metrics::Window::Connection);
         let bounds = Bounds::centered(None, size(px(w), px(h)), cx);
         let opened = cx.open_window(
@@ -3980,6 +4202,7 @@ impl Workspace {
                         me,
                         look,
                         proto,
+                        secrets_from_a_source,
                         drivers,
                         tunnel_profiles,
                         tunnel_profile_specs,
@@ -4061,6 +4284,10 @@ impl Workspace {
             return;
         }
         self.ask_profiles();
+        // What the wallet is, asked when the window that shows it opens —
+        // and it STARTS the agent if none is running, which is the one call
+        // that turns "no wallet" into "a locked wallet" on a fresh machine.
+        self.ask_wallet();
         let drivers = self.hello.as_ref().map(|h| h.drivers.clone()).unwrap_or_default();
         let prof = |kind: &str| -> Vec<ProfileRow> {
             self.profiles.get(kind).cloned().unwrap_or_default()
@@ -4127,6 +4354,13 @@ impl Workspace {
             Ok(h) => self.settings_window = Some(h),
             Err(e) => self.log_push("error", format!("could not open the window: {e}")),
         }
+    }
+
+    /// Drop the settings handle without touching the window: the window is
+    /// closing itself and is mid-update.
+    pub fn forget_settings(&mut self, cx: &mut Context<Self>) {
+        self.settings_window = None;
+        cx.notify();
     }
 
     pub fn close_settings(&mut self, cx: &mut Context<Self>) {
@@ -4297,7 +4531,7 @@ impl Workspace {
     fn ask_for_name(&mut self, what: NameFor, cx: &mut Context<Self>) {
         let Some(tab) = self.tabs.get(self.active) else { return };
         if tab.sql.trim().is_empty() && tab.fields.is_empty() {
-            self.toast("there is nothing to save yet".to_string(), true);
+            self.toast(self.tr("toast.nothing_to_save").to_string(), true);
             return;
         }
         let suggestion = tab.title.clone();
@@ -4503,16 +4737,16 @@ impl Workspace {
     fn start_export_all(&mut self, cx: &mut Context<Self>) {
         let path = self.export_path.read(cx).text().trim().to_string();
         if path.is_empty() {
-            self.toast("name a file first".to_string(), true);
+            self.toast(self.tr("toast.name_file").to_string(), true);
             return;
         }
         if self.exporting.is_some() {
-            self.toast("an export is already running".to_string(), true);
+            self.toast(self.tr("toast.export_busy").to_string(), true);
             return;
         }
         let Some(tab) = self.tabs.get(self.active) else { return };
         let Some(call_id) = tab.call_id else {
-            self.toast("run something first".to_string(), true);
+            self.toast(self.tr("toast.run_first").to_string(), true);
             return;
         };
         let (tab_id, columns, total) = (tab.id, tab.columns.clone(), tab.total);
@@ -4647,7 +4881,7 @@ impl Workspace {
     /// then clear the box, which is a strange way to start.
     fn new_draft_tab(&mut self, cx: &mut Context<Self>) {
         let Some(conn) = self.target_conn() else {
-            self.toast("nothing connected".to_string(), true);
+            self.toast(self.tr("toast.nothing_connected").to_string(), true);
             return;
         };
         let Some(live) = self.live(&conn) else { return };
@@ -4692,7 +4926,7 @@ impl Workspace {
         names.sort();
         names.dedup();
         if names.is_empty() {
-            self.toast("nothing to draw \u{2014} this connection has no tables".to_string(), true);
+            self.toast(self.tr("toast.nothing_to_draw").to_string(), true);
             return;
         }
         let total = names.len();
@@ -4962,7 +5196,7 @@ impl Workspace {
         }
         for v in [ResultView::Tree, ResultView::Table, ResultView::Json, ResultView::Chart] {
             out.push(PaletteItem {
-                label: format!("View as {}", v.label()),
+                label: format!("{} {}", self.lang.tr("palette.view_as"), self.lang.tr(v.key())),
                 hint: "result".into(),
                 act: PaletteAct::View(v),
             });
@@ -5150,7 +5384,7 @@ impl Workspace {
                     .and_then(|t| t.selected.or(t.detail).map(|r| (t.id, r)));
                 match what {
                     Some((id, row)) => self.copy_row_tsv(id, row, cx),
-                    None => self.toast("pick a row first".to_string(), true),
+                    None => self.toast(self.tr("toast.pick_row").to_string(), true),
                 }
             }
             PaletteAct::CopyPage => self.copy_page_tsv(cx),
@@ -5192,7 +5426,7 @@ impl Workspace {
     fn copy_row(&mut self, as_insert: bool, cx: &mut Context<Self>) {
         let Some(tab) = self.tabs.get(self.active) else { return };
         let Some(i) = tab.selected.or(tab.detail) else {
-            self.toast("pick a row first", true);
+            self.toast(self.tr("toast.pick_row"), true);
             return;
         };
         let Some(row) = tab.rows.get(i) else { return };
@@ -5211,7 +5445,7 @@ impl Workspace {
         };
         cx.write_to_clipboard(ClipboardItem::new_string(sql));
         self.toast(
-            if as_insert { "row copied as INSERT" } else { "row copied as SELECT" },
+            if as_insert { self.tr("toast.row_copied") } else { self.tr("toast.row_select") },
             false,
         );
     }
@@ -5269,7 +5503,7 @@ impl Workspace {
     fn copy_cell(&mut self, cx: &mut Context<Self>) {
         let Some(tab) = self.tabs.get(self.active) else { return };
         let Some(row) = tab.selected.or(tab.detail) else {
-            self.toast("pick a row first".to_string(), true);
+            self.toast(self.tr("toast.pick_row").to_string(), true);
             return;
         };
         let cols = tab.grid_columns();
@@ -5277,14 +5511,14 @@ impl Workspace {
         let Some(value) = tab.rows.get(row).and_then(|r| r.get(ci)).cloned() else { return };
         let text = cell_text(&value).unwrap_or_default();
         cx.write_to_clipboard(ClipboardItem::new_string(text));
-        self.toast("cell copied".to_string(), false);
+        self.toast(self.tr("toast.cell_copied").to_string(), false);
     }
 
     /// Every loaded row as tab-separated values, with the column names above.
     fn copy_page_tsv(&mut self, cx: &mut Context<Self>) {
         let Some(tab) = self.tabs.get(self.active) else { return };
         if tab.rows.is_empty() {
-            self.toast("nothing to copy".to_string(), true);
+            self.toast(self.tr("toast.nothing_to_copy").to_string(), true);
             return;
         }
         let cols: Vec<String> = tab.columns.iter().map(|c| c.name.clone()).collect();
@@ -5307,7 +5541,7 @@ impl Workspace {
         let cols: Vec<String> = tab.columns.iter().map(|c| c.name.clone()).collect();
         let text = crate::menu::row_tsv(&cols, values);
         cx.write_to_clipboard(ClipboardItem::new_string(text));
-        self.toast("row copied".to_string(), false);
+        self.toast(self.tr("toast.row_copied").to_string(), false);
     }
 
     // ── saved charts ────────────────────────────────────────────────────────
@@ -5380,7 +5614,7 @@ impl Workspace {
                         // Nothing to put on it, said plainly rather than by
                         // adding an empty square.
                         self.toast(
-                            "there are no saved charts on this connection yet — save a chart first",
+                            self.tr("toast.no_charts"),
                             true,
                         );
                         return;
@@ -5456,7 +5690,7 @@ impl Workspace {
         let from = self.board_time_from.read(cx).text().trim().to_string();
         let to = self.board_time_to.read(cx).text().trim().to_string();
         if col.is_empty() || from.is_empty() || to.is_empty() {
-            self.toast("a time range needs a column, a start and an end", true);
+            self.toast(self.tr("toast.time_range"), true);
             return;
         }
         if let Some(b) = self.board_mut(tab) {
@@ -5564,7 +5798,7 @@ impl Workspace {
     fn board_preset_time(&mut self, tab: u64, seconds: u64, cx: &mut Context<Self>) {
         let col = self.board_time_col.read(cx).text().trim().to_string();
         if col.is_empty() {
-            self.toast("name the time column first".to_string(), true);
+            self.toast(self.tr("toast.name_time_column").to_string(), true);
             return;
         }
         let (from, to) =
@@ -5689,7 +5923,7 @@ impl Workspace {
         let Some(b) = tab.board.as_ref() else { return };
         let (conn, name, dash) = (tab.conn_name.clone(), b.name.clone(), b.dash.clone());
         if name.trim().is_empty() {
-            self.toast("the dashboard needs a name before it can be saved", true);
+            self.toast(self.tr("toast.board_needs_name"), true);
             return;
         }
         self.ask(
@@ -5747,7 +5981,7 @@ impl Workspace {
     /// Ask for one of the driver's live views.
     pub fn inspect(&mut self, name: &str) {
         let Some(conn) = self.metrics_conn.clone().or_else(|| self.target_conn()) else {
-            self.toast("nothing connected".to_string(), true);
+            self.toast(self.tr("toast.nothing_connected").to_string(), true);
             return;
         };
         let Some(conn_id) = self.live(&conn).map(|l| l.conn_id) else { return };
@@ -5786,11 +6020,11 @@ impl Workspace {
             return panel.child(div().px_2().child(self.small(e.clone(), t.error())));
         }
         let Some((columns, rows)) = self.inspected.as_ref() else {
-            return panel.child(div().px_2().child(self.small("asking\u{2026}", t.muted())));
+            return panel.child(div().px_2().child(self.small(self.tr("ui.asking"), t.muted())));
         };
         if rows.is_empty() {
             return panel.child(div().px_2().child(self.small(
-                "the server reports nothing here just now",
+                self.tr("server.quiet"),
                 t.muted(),
             )));
         }
@@ -5850,7 +6084,15 @@ impl Workspace {
                         ),
                 );
             }
-            if !act.is_empty() && !key.is_empty() {
+            // The driver's word on THIS row. MongoDB's `currentOp` lists its
+            // own housekeeping — the journal flusher, the checkpointer — and
+            // those are running, so they are shown; offering to kill the
+            // journal flusher is what must not happen.
+            let may = self
+                .inspect_acts
+                .as_ref()
+                .map_or(true, |a| a.iter().any(|k| *k == key));
+            if !act.is_empty() && !key.is_empty() && may {
                 let waiting = self.act_confirm.as_ref().filter(|(nm, k, _)| nm == name && *k == key);
                 match waiting {
                     // The engine has said what it would do; now a person says
@@ -5879,7 +6121,7 @@ impl Workspace {
                                         })),
                                     )
                                     .child(
-                                        btn(t, ms, format!("act-no-{n}"), "leave it", Btn::Quiet)
+                                        btn(t, ms, format!("act-no-{n}"), self.tr("ui.cancel"), Btn::Quiet)
                                             .on_click(cx.listener(|this, _, _, cx| {
                                                 this.act_confirm = None;
                                                 cx.notify();
@@ -5911,11 +6153,17 @@ impl Workspace {
         let Some(target) = self.target_conn() else { return };
         let Some(live) = self.live(&target) else { return };
         let (name, conn_id, driver) = (live.name.clone(), live.conn_id, live.driver.clone());
+        // A driver that declares no metrics is NOT a failure.
+        //
+        // It was put in `metrics_error` and drawn in red, which says something
+        // went wrong and might be fixable. Nothing went wrong: `caps.metrics`
+        // is false for this driver and always will be, and that is a fact
+        // about the driver in the same way "no indexes" is. The panel says it
+        // quietly — see `reports_metrics`.
         if !self.meta(&driver).map_or(false, |m| m.caps.metrics) {
             self.metrics.clear();
             self.metrics_conn = Some(name);
-            self.metrics_error =
-                Some(format!("the {driver} driver has nothing to report about its server"));
+            self.metrics_error = None;
             return;
         }
         self.metrics_inflight = true;
@@ -5998,7 +6246,7 @@ impl Workspace {
         let i = self.tabs[idx].builder.conds.len();
         self.tabs[idx].builder.conds.push(Cond { col: first, op: 0, value: String::new() });
         let colors = input_colors(&self.theme);
-        let input = cx.new(|cx| TextInput::new(cx, "value", colors));
+        let input = cx.new(|cx| TextInput::new(cx, self.lang.tr("ph.value"), colors));
         self.inputs.insert((tab_id, format!("b:{i}")), input);
         self.sync_builder(tab_id, cx);
     }
@@ -6180,23 +6428,64 @@ impl Workspace {
             .and_then(|r| r.get(col))
             .map(|v| cell_text(v).unwrap_or_default())
             .unwrap_or_default();
+        // EDITED IN A CARD, not in the cell.
+        //
+        // The cell is as wide as its column and one line tall, so a one-line
+        // box in it showed a sentence twenty characters at a time with no way
+        // to scroll and no way to see what was being changed. A note or a URL
+        // — the values most worth correcting — were the ones it could not
+        // show at all.
+        //
+        // The card uses the SAME editor the statement box does, so the value
+        // wraps onto as many lines as it needs, scrolls past sixteen, and
+        // brings undo, selection and the keys with it rather than a second
+        // implementation of all three.
         let colors = input_colors(&self.theme);
-        let input = cx.new(|cx| {
-            let mut i = TextInput::new(cx, "", colors);
-            i.set_text(now, cx);
-            i
+        let (theme, scale, font) = (self.theme.clone(), self.scale, self.font_family.clone());
+        let ed = cx.new(|cx| {
+            crate::editor_el::Editor::new(
+                &now,
+                crate::editor_el::Flavour::Plain,
+                colors,
+                theme,
+                scale,
+                font,
+                cx,
+            )
         });
-        // Enter commits. The grid's editor has no room for a tick beside it —
-        // a row there is one line tall — so the keyboard has to be a complete
-        // way through, and it is the one people reach for anyway.
-        cx.subscribe(&input, move |this, _, ev: &InputEvent, cx| {
-            if matches!(ev, InputEvent::Submit) {
-                this.commit_edit(tab_id, cx);
-                cx.notify();
+        // Ctrl-Enter commits and escape leaves — the editor's own Run and
+        // Escaped, which is what those keys already mean in the statement box.
+        // A plain Enter inserts a newline, because this box holds a value that
+        // may have one.
+        cx.subscribe(&ed, move |this, _, ev: &crate::editor_el::EditorEvent, cx| {
+            match ev {
+                crate::editor_el::EditorEvent::Run
+                | crate::editor_el::EditorEvent::RunNewTab => {
+                    this.commit_edit(tab_id, cx);
+                    cx.notify();
+                }
+                crate::editor_el::EditorEvent::Escaped => {
+                    if let Some(tb) = this.tabs.iter_mut().find(|x| x.id == tab_id) {
+                        tb.editing = None;
+                    }
+                    this.cell_editor = None;
+                    cx.notify();
+                }
+                _ => {}
             }
         })
         .detach();
-        self.inputs.insert((tab_id, "edit".into()), input);
+        // ONE EDITOR AT A TIME. A cell card and a whole-row card open
+        // together are two boxes offering to write the same row, and which
+        // of them the Save button belongs to is a question nobody should
+        // have to answer.
+        self.doc_editor = None;
+        self.doc_whole = false;
+        if let Some(tb) = self.tabs.get_mut(idx) {
+            tb.editing_doc = None;
+        }
+        self.cell_editor = Some((tab_id, ed));
+        self.cell_focus = true;
         self.tabs[idx].editing = Some((row, col));
         // Focus is taken on the next frame, once the field exists in the tree.
         cx.defer(move |cx| {
@@ -6210,15 +6499,19 @@ impl Workspace {
     fn commit_edit(&mut self, tab_id: u64, cx: &mut Context<Self>) {
         let Some(idx) = self.tabs.iter().position(|t| t.id == tab_id) else { return };
         let Some((row, col)) = self.tabs[idx].editing else { return };
-        let Some(input) = self.inputs.get(&(tab_id, "edit".into())) else { return };
-        let typed = input.read(cx).text().to_string();
+        let Some((_, ed)) = self.cell_editor.as_ref().filter(|(id, _)| *id == tab_id) else {
+            return;
+        };
+        let typed = ed.read(cx).text();
         let Some(name) = self.tabs[idx].columns.get(col).map(|c| c.name.clone()) else { return };
         let was = self.tabs[idx].rows.get(row).and_then(|r| r.get(col)).cloned();
         let value = parse_cell(&typed, was.as_ref());
         if Some(&value) == was.as_ref() {
             self.tabs[idx].editing = None;
+            self.cell_editor = None;
             return;
         }
+        self.cell_editor = None;
         self.propose_write(tab_id, row, vec![(name, value)], false, cx);
     }
 
@@ -6229,7 +6522,7 @@ impl Workspace {
     /// the same component that masks passwords, and a parse error would become
     /// a new way to lose an edit. A document is a set of fields; this edits the
     /// set, and sends it as one write.
-    fn begin_doc_edit(&mut self, tab_id: u64, row: usize, cx: &mut Context<Self>) {
+    fn begin_doc_edit(&mut self, tab_id: u64, row: usize, whole: bool, cx: &mut Context<Self>) {
         let Some(idx) = self.tabs.iter().position(|t| t.id == tab_id) else { return };
         if !self.meta(&self.tabs[idx].driver).map_or(false, |m| m.caps.edit) {
             let d = self.tabs[idx].driver.clone();
@@ -6264,8 +6557,127 @@ impl Workspace {
             });
             self.inputs.insert((tab_id, format!("doc-{name}")), input);
         }
+        // AND the whole of it, as JSON, for the other way of editing the
+        // same document. Built here rather than when the switch is thrown,
+        // so throwing the switch cannot lose what was typed on the other
+        // side of it — the two are filled from the same row at the same
+        // moment and diverge only as somebody edits one.
+        let doc = self.tabs[idx].document(row);
+        let pad = " ".repeat(self.json_indent as usize);
+        let text = {
+            let mut buf = Vec::new();
+            let fmt = serde_json::ser::PrettyFormatter::with_indent(pad.as_bytes());
+            let mut ser = serde_json::Serializer::with_formatter(&mut buf, fmt);
+            match serde::Serialize::serialize(&doc, &mut ser) {
+                Ok(()) => String::from_utf8(buf).unwrap_or_else(|_| "{}".into()),
+                Err(_) => "{}".into(),
+            }
+        };
+        let colors = input_colors(&self.theme);
+        let (theme, scale, font) = (self.theme.clone(), self.scale, self.font_family.clone());
+        let ed = cx.new(|cx| {
+            crate::editor_el::Editor::new(
+                &text,
+                crate::editor_el::Flavour::Json,
+                colors,
+                theme,
+                scale,
+                font,
+                cx,
+            )
+        });
+        cx.subscribe(&ed, move |this, _, ev: &crate::editor_el::EditorEvent, cx| {
+            match ev {
+                crate::editor_el::EditorEvent::Run
+                | crate::editor_el::EditorEvent::RunNewTab => {
+                    this.commit_doc_json(tab_id, cx);
+                    cx.notify();
+                }
+                crate::editor_el::EditorEvent::Escaped => {
+                    this.leave_doc_edit(tab_id, cx);
+                    cx.notify();
+                }
+                _ => {}
+            }
+        })
+        .detach();
+        // And the other way round — see `begin_edit`.
+        self.cell_editor = None;
+        if let Some(tb) = self.tabs.get_mut(idx) {
+            tb.editing = None;
+        }
+        self.doc_editor = Some((tab_id, ed));
+        self.doc_whole = whole;
+        self.doc_focus = whole;
         self.tabs[idx].editing_doc = Some(row);
         cx.notify();
+    }
+
+    /// Close the open document editor, whichever way it was being edited.
+    fn leave_doc_edit(&mut self, tab_id: u64, cx: &mut Context<Self>) {
+        if let Some(tb) = self.tabs.iter_mut().find(|x| x.id == tab_id) {
+            tb.editing_doc = None;
+        }
+        self.doc_editor = None;
+        cx.notify();
+    }
+
+    /// Save a document EDITED AS JSON: parse it, and send what changed.
+    ///
+    /// The same write as the field-by-field way — the same diff, the same
+    /// `row.write`, the same confirmation — because they are two ways of
+    /// saying one thing and a second write path would be a second set of
+    /// rules about what a save does.
+    ///
+    /// JSON THAT DOES NOT PARSE IS NOT SENT. The message says so and the text
+    /// stays exactly as it was typed: throwing away somebody's edit because
+    /// of a missing brace is the worst thing this could do.
+    fn commit_doc_json(&mut self, tab_id: u64, cx: &mut Context<Self>) {
+        let Some(idx) = self.tabs.iter().position(|t| t.id == tab_id) else { return };
+        let Some(row) = self.tabs[idx].editing_doc else { return };
+        let Some((_, ed)) = self.doc_editor.as_ref().filter(|(id, _)| *id == tab_id) else {
+            return;
+        };
+        let typed = ed.read(cx).text();
+        let parsed: Value = match serde_json::from_str(&typed) {
+            Ok(v) => v,
+            Err(why) => {
+                self.toast(format!("{}: {why}", self.tr("json.bad")), true);
+                cx.notify();
+                return;
+            }
+        };
+        let Value::Object(fields) = parsed else {
+            self.toast(self.tr("json.not_object").to_string(), true);
+            cx.notify();
+            return;
+        };
+        // Only the columns this client knows how to address, and only the
+        // ones that CHANGED. A field invented in the text is not written: it
+        // is not a column of the row, so there is nothing to write it to.
+        let cols: Vec<(usize, String)> = self.tabs[idx]
+            .columns
+            .iter()
+            .enumerate()
+            .map(|(i, c)| (i, c.name.clone()))
+            .collect();
+        let mut set: Vec<(String, Value)> = Vec::new();
+        for (ci, name) in cols {
+            if !crate::workspace::column_editable(&self.tabs[idx], ci) {
+                continue;
+            }
+            let Some(now) = fields.get(&name) else { continue };
+            let was = self.tabs[idx].rows.get(row).and_then(|r| r.get(ci));
+            if Some(now) != was {
+                set.push((name, now.clone()));
+            }
+        }
+        if set.is_empty() {
+            self.leave_doc_edit(tab_id, cx);
+            self.toast(self.tr("result.unchanged").to_string(), false);
+            return;
+        }
+        self.propose_write(tab_id, row, set, false, cx);
     }
 
     /// Send every field that CHANGED, as one write.
@@ -6294,7 +6706,7 @@ impl Workspace {
         }
         if set.is_empty() {
             self.tabs[idx].editing_doc = None;
-            self.toast("nothing changed".to_string(), false);
+            self.toast(self.tr("result.unchanged").to_string(), false);
             cx.notify();
             return;
         }
@@ -6391,9 +6803,15 @@ impl Workspace {
                 if let Some(h) = self.profile_window.clone() {
                     let _ = h.update(cx, |f, _, cx| f.set_theme(th.clone(), cx));
                 }
-                if let Some(h) = self.settings_window.clone() {
-                    let _ = h.update(cx, |f, _, cx| f.set_theme(th.clone(), cx));
-                }
+                // The SETTINGS window is pushed from `pump`, not from here.
+                //
+                // The theme is almost always changed from inside that window,
+                // so reaching into it here is the re-entrant update gpui
+                // refuses — the theme applied to the main window, to the
+                // connection window and to every editor, and not to the one
+                // place somebody was looking at. The tick stayed on the old
+                // theme for the same reason.
+                self.poke_settings(cx);
                 // And every open statement editor: it draws the statement in
                 // the theme's own syntax colours, so a theme change that missed
                 // it would leave the one place with the most colour in it
@@ -6424,6 +6842,9 @@ impl Workspace {
     /// number beside a stepper that moves the new one.
     pub fn appearance(&self) -> crate::settings::Appearance {
         crate::settings::Appearance {
+            font_asked: self.font_asked.clone(),
+            icon_asked: self.icon_asked.clone(),
+            secrets_only_from_a_source: self.secrets_from_a_source,
             keys: self.key_over.clone(),
             theme_name: self.theme_name.clone(),
             themes: self.themes.keys().cloned().collect(),
@@ -6508,7 +6929,16 @@ impl Workspace {
     /// brackets rather than prompted for: `<name> <type>` in a statement says
     /// what is missing better than two dialogs, and it is already in the place
     /// where it has to be typed.
-    fn write_ddl(
+    /// OPEN THE FORM for a schema change, filled in as far as it can be.
+    ///
+    /// Nothing is written and nothing is run: this collects what the driver
+    /// said it needs, and `write_ddl` then renders the statement into the
+    /// editor where a person reads it before running it. That is the same
+    /// arrangement as before — a schema change that happens because somebody
+    /// picked a menu item is a schema change nobody reviewed — with the
+    /// difference that the holes are filled in by somebody who can see them
+    /// rather than left as `<type>` for them to find.
+    fn open_ddl(
         &mut self,
         conn: &str,
         table: &str,
@@ -6520,32 +6950,83 @@ impl Workspace {
     ) {
         let Some(driver) = self.live(conn).map(|l| l.driver.clone()) else { return };
         let Some(meta) = self.meta(&driver).cloned() else { return };
-        let (column, idx) = if index { ("<column>", field) } else { (field, "") };
-        // A new column and a new index have no name yet; a rename has no
-        // target yet. Angle brackets, which no dialect uses, so the statement
-        // cannot be run by accident while it still has a hole in it.
-        let (column, type_name) = match op {
-            "add_column" => ("<name>", "<type>"),
-            _ => (column, ""),
-        };
-        let index_name = match op {
-            "create_index" => format!("idx_{table}_{field}"),
-            _ => idx.to_string(),
-        };
-        let Some(stmt) = lode_proto::render_ddl(
-            &meta,
-            op,
-            table,
-            schema,
-            column,
-            type_name,
-            "<new name>",
-            &index_name,
-            if index { "" } else { field },
-        ) else {
-            self.toast(format!("the {driver} driver has no {op}"), true);
+        let Some(spec) = meta.ddl_ops.iter().find(|d| d.op == op).cloned() else {
+            self.toast(
+                self.tr("ddl.unknown").replace("{driver}", &driver).replace("{op}", op),
+                true,
+            );
             return;
         };
+        let (column, index_name) = if index { (String::new(), field.to_string()) } else { (field.to_string(), String::new()) };
+        // The suggestion each hole starts with, with `{table}` and `{column}`
+        // put in — an index gets offered a name made out of what it is being
+        // created on, which is the name somebody would have typed.
+        let values: Vec<String> = spec
+            .asks
+            .iter()
+            .map(|a| {
+                a.suggest
+                    .replace("{table}", table)
+                    .replace("{column}", &column)
+                    .replace("{index}", &index_name)
+            })
+            .collect();
+        for (i, _) in spec.asks.iter().enumerate() {
+            let input = cx.new(|cx| {
+                let mut x = TextInput::new(cx, "", input_colors(&self.theme));
+                x.set_text(values[i].clone(), cx);
+                x
+            });
+            self.inputs.insert((0, format!("ddl-{i}")), input);
+        }
+        self.ddl = Some(DdlForm {
+            conn: conn.to_string(),
+            table: table.to_string(),
+            schema: schema.map(str::to_string),
+            column,
+            op: op.to_string(),
+            label: spec.label.clone(),
+            asks: spec.asks.clone(),
+            flags: spec.asks.iter().map(|_| false).collect(),
+        });
+        cx.notify();
+    }
+
+    /// Render the filled-in statement into the editor.
+    fn write_ddl(&mut self, cx: &mut Context<Self>) {
+        let Some(form) = self.ddl.clone() else { return };
+        let (conn, table, op) = (form.conn.clone(), form.table.clone(), form.op.clone());
+        let schema = form.schema.clone();
+        let Some(driver) = self.live(&conn).map(|l| l.driver.clone()) else { return };
+        let Some(meta) = self.meta(&driver).cloned() else { return };
+        // One value per hole, under the key the driver named it with. A flag
+        // contributes the word a template expects when it is on — `UNIQUE`
+        // for SQL, `true` for a JSON command — and nothing when it is off.
+        let mut values: Vec<(String, String)> = Vec::new();
+        for (i, a) in form.asks.iter().enumerate() {
+            let text = match a.kind {
+                lode_proto::AskKind::Flag => {
+                    let on = form.flags.get(i).copied().unwrap_or(false);
+                    flag_word(&meta, a.key.as_str(), on)
+                }
+                _ => self
+                    .inputs
+                    .get(&(0, format!("ddl-{i}")))
+                    .map(|x| x.read(cx).text().to_string())
+                    .unwrap_or_default(),
+            };
+            values.push((a.key.clone(), text));
+        }
+        let Some(stmt) = lode_proto::render_ddl(&meta, &op, &table, schema.as_deref(), &values)
+        else {
+            self.toast(
+                self.tr("ddl.unknown").replace("{driver}", &driver).replace("{op}", &op),
+                true,
+            );
+            return;
+        };
+        self.ddl = None;
+        let conn = conn.as_str();
         // INTO THE ACTIVE TAB, or a new one when there is nothing to put it
         // in: a statement written into a tab that is showing a result replaces
         // what was being read, which is somebody's place in a page of rows.
@@ -6626,6 +7107,64 @@ impl Workspace {
         cx.notify();
     }
 
+    /// Ask the wallet what it is, and do a thing to it.
+    ///
+    /// The passphrase goes out on the engine's stdin, as every other secret
+    /// does, and this window keeps no copy: the string handed in here is the
+    /// last of it.
+    pub fn wallet_do(&mut self, what: &'static str, pass: String) {
+        match what {
+            "unlock" => self.ask(
+                Pending::WalletDid { what: "unlocked" },
+                "vault.unlock",
+                json!({ "password": pass }),
+            ),
+            "create" => self.ask(
+                Pending::WalletDid { what: "made" },
+                "vault.create",
+                json!({ "password": pass }),
+            ),
+            "lock" => {
+                self.ask(Pending::WalletDid { what: "locked" }, "vault.lock", json!({}))
+            }
+            _ => {}
+        }
+    }
+
+    /// Open the wallet for the CONNECTION window, and tell it what happened.
+    ///
+    /// The same `vault.unlock` the settings page sends. It is here because
+    /// the answer has to come back to the window that asked — a window that
+    /// is mid-save on a field whose secret is waiting.
+    pub fn unlock_for_form(
+        &mut self,
+        pass: String,
+        field: Option<String>,
+        form: WeakEntity<ConnectionForm>,
+    ) {
+        self.ask(
+            Pending::WalletForForm { field, form },
+            "vault.unlock",
+            json!({ "password": pass }),
+        );
+    }
+
+    /// What the wallet is, asked when the settings window opens and after
+    /// anything that could have changed it.
+    pub fn ask_wallet(&mut self) {
+        if self.hello.as_ref().is_some_and(|h| h.proto >= 24) {
+            self.ask(Pending::WalletStatus, "vault.status", json!({}));
+        }
+    }
+
+    /// Whether a password may be saved as typed.
+    pub fn toggle_literal_secrets(&mut self, cx: &mut Context<Self>) {
+        self.secrets_from_a_source = !self.secrets_from_a_source;
+        self.remember();
+        self.poke_settings(cx);
+        cx.notify();
+    }
+
     /// Look for theme files again, and say what changed. Folders are read at
     /// startup, and a theme dropped in afterwards is the ordinary case.
     pub fn rescan_themes(&mut self, cx: &mut Context<Self>) {
@@ -6633,6 +7172,47 @@ impl Workspace {
         self.themes = theme::discover();
         let now = self.themes.len();
         self.toast(format!("{now} theme(s) found, was {before}"), false);
+        self.poke_settings(cx);
+        cx.notify();
+    }
+
+    /// Draw in a different font, from now on.
+    ///
+    /// Both windows and the editors are told: a font chosen in Settings that
+    /// only took effect in Settings would be a font nobody chose.
+    ///
+    /// The ICON font follows the text font when it was never picked by hand,
+    /// because that is how it was chosen in the first place — see
+    /// `pick_icon_font`. A font picked for the icons on purpose is left alone.
+    pub fn set_text_font(&mut self, name: String, cx: &mut Context<Self>) {
+        if name.is_empty() || name == self.font_family {
+            return;
+        }
+        self.font_family = name.clone();
+        if !self.icon_font_chosen {
+            self.icon_family = pick_icon_font(cx, &name);
+            self.missing_glyphs = missing_in(cx, &self.icon_family);
+        }
+        self.remember();
+        self.poke_settings(cx);
+        self.poke_editors(cx);
+        cx.notify();
+    }
+
+    /// Draw the ICONS in a different font.
+    ///
+    /// Allowed even when it does not have the glyphs: the page says which are
+    /// missing, and refusing a choice somebody made deliberately — a font that
+    /// covers the four marks they actually look at — would be this window
+    /// deciding for them. What it must not do is hide the fact.
+    pub fn set_icon_font(&mut self, name: String, cx: &mut Context<Self>) {
+        if name.is_empty() {
+            return;
+        }
+        self.icon_family = name;
+        self.icon_font_chosen = true;
+        self.missing_glyphs = missing_in(cx, &self.icon_family);
+        self.remember();
         self.poke_settings(cx);
         cx.notify();
     }
@@ -6779,7 +7359,27 @@ impl Workspace {
     /// It keeps its own `Metrics` so it can draw without reaching back on every
     /// row; the cost of that is this call, and a setter that forgets it leaves
     /// a window whose own text does not change when it changes everything else.
-    fn poke_settings(&mut self, cx: &mut Context<Self>) {
+    /// Push what the settings window shows — NEXT TICK, not now.
+    ///
+    /// **A window may not be updated while it is being updated.** Most callers
+    /// of this are settings callbacks: a language chip, a theme, a key. They
+    /// run inside the settings window's own update, so reaching back into it
+    /// with `WindowHandle::update` is the re-entrant update gpui refuses —
+    /// and the `let _ =` on the result made it silent. The language changed
+    /// everywhere except in the window that changed it, and the chip stayed on
+    /// the old one.
+    ///
+    /// So the push is MARKED here and done from `pump`, which runs on the
+    /// workspace and is inside nobody's update. Every caller then works, and
+    /// no caller has to know which window it is standing in.
+    fn poke_settings(&mut self, _cx: &mut Context<Self>) {
+        self.settings_dirty = true;
+    }
+
+    fn flush_settings(&mut self, cx: &mut Context<Self>) {
+        if !std::mem::take(&mut self.settings_dirty) {
+            return;
+        }
         let ms = self.scale;
         let look = self.appearance();
         let users: std::collections::BTreeMap<String, Vec<String>> = self
@@ -6788,12 +7388,16 @@ impl Workspace {
             .map(|(k, v)| (k.clone(), v.clone()))
             .collect();
         let facts = self.facts();
+        let (wallet, said) = (self.wallet.clone(), self.wallet_said.take());
+        let theme = self.theme.clone();
         if let Some(h) = self.settings_window.clone() {
             let _ = h.update(cx, |w, _, cx| {
+                w.set_theme(theme, cx);
                 w.set_scale(ms, cx);
                 w.look_changed(look, cx);
                 w.users_arrived(users, cx);
                 w.facts_arrived(facts, cx);
+                w.wallet_arrived(wallet, said, cx);
             });
         }
     }
@@ -6875,8 +7479,30 @@ impl Workspace {
     /// the point is not the size, it is that every glyph gets the same square,
     /// so a tree of tables and views does not look like a tree of two sizes.
     fn icon_inline(&self, glyph: &'static str, colour: Rgba) -> gpui::Div {
-        let ms = self.scale;
-        let box_w = (ms.base() * 1.25).round();
+        self.icon_at(glyph, colour, self.scale.small())
+    }
+
+    /// The mark that says whether a thing is open.
+    ///
+    /// Down when it is, right when it is not — which is the one convention
+    /// every tree in the world shares, so it needs no label.
+    fn caret(&self, open: bool) -> gpui::Div {
+        self.icon_at(
+            if open { "\u{f0d7}" } else { "\u{f0da}" },
+            self.t().muted(),
+            self.scale.small(),
+        )
+    }
+
+    /// An icon beside text of a GIVEN size, drawn to match it.
+    ///
+    /// The size is passed rather than assumed because these sit in rows drawn
+    /// at `small` and in rows drawn at `body`, and an icon that is right in
+    /// one is wrong in the other. `icon_beside` does the optical correction —
+    /// see `metrics.rs`.
+    fn icon_at(&self, glyph: &'static str, colour: Rgba, text: gpui::Pixels) -> gpui::Div {
+        let size = self.scale.icon_beside(text);
+        let box_w = (f32::from(size) * 1.25).round();
         div()
             .flex()
             .items_center()
@@ -6886,7 +7512,7 @@ impl Workspace {
             .h(px(box_w))
             .line_height(px(box_w))
             .font_family(self.icon_family.clone())
-            .text_size(ms.small())
+            .text_size(size)
             .text_color(colour)
             .child(self.ic(glyph))
     }
@@ -6916,7 +7542,7 @@ impl Workspace {
             .child(label)
             .on_click(cx.listener(move |this, _, _, cx| {
                 cx.write_to_clipboard(gpui::ClipboardItem::new_string(what.clone()));
-                this.toast("copied".to_string(), false);
+                this.toast(this.tr("toast.copied").to_string(), false);
                 cx.notify();
             }))
     }
@@ -6943,7 +7569,7 @@ impl Workspace {
             .h(px(ms.action_box()))
             .line_height(px(ms.action_box()))
             .font_family(self.icon_family.clone())
-            .text_size(ms.action())
+            .text_size(ms.icon_beside(ms.action()))
             .text_color(colour)
             .child(self.ic(glyph))
     }
@@ -7143,6 +7769,27 @@ impl Workspace {
             .py_1()
             .text_size(self.scale.tiny())
             .text_color(self.t().title())
+            .child(SharedString::from(text.to_uppercase()))
+    }
+
+    /// A heading that also DIVIDES: a rule above it and a shaded strip.
+    ///
+    /// For the second half of a panel that holds two. Tasks above and the log
+    /// below were two lists of rows in one column with nothing between them —
+    /// so where one ended and the other began was a question answered by
+    /// reading, and a reader who did not read it saw one list that changed
+    /// subject halfway down.
+    fn divider_section(&self, text: &str) -> impl IntoElement {
+        let t = self.t();
+        div()
+            .w_full()
+            .px_2()
+            .py_1()
+            .bg(t.header_bg())
+            .border_t_1()
+            .border_color(t.border())
+            .text_size(self.scale.tiny())
+            .text_color(t.header_fg())
             .child(SharedString::from(text.to_uppercase()))
     }
 
@@ -7369,13 +8016,13 @@ impl Workspace {
             }
             Rail::Instance => {
                 let who = self.metrics_conn.clone().unwrap_or_else(|| "nothing connected".into());
-                panel = panel.child(self.section(&format!("Instance \u{2014} {who}")));
+                panel = panel.child(self.section(&format!("{} \u{2014} {who}", self.tr("ui.instance"))));
 
                 // How often, said plainly and chosen explicitly. "off" is the
                 // default because repeating a statistics query against
                 // somebody else\u{2019}s production database is their decision.
                 let mut rate = div().flex().items_center().gap_1().px_2().py_1();
-                rate = rate.child(self.small("read every", t.muted()));
+                rate = rate.child(self.small(self.tr("ui.read_every"), t.muted()));
                 for (label, every) in [
                     ("off", None),
                     ("2s", Some(Duration::from_secs(2))),
@@ -7403,6 +8050,24 @@ impl Workspace {
                 if let Some(at) = self.metrics_at {
                     panel = panel.child(div().px_2().child(self.small(
                         format!("read {} ago", fmt_duration(at.elapsed())),
+                        t.muted(),
+                    )));
+                }
+                // WHAT THIS DRIVER CAN SAY, before anything it did say. A
+                // driver with no metrics says so once, in the voice of a
+                // fact.
+                let reports = self
+                    .metrics_conn
+                    .as_deref()
+                    .and_then(|c| self.live(c))
+                    .and_then(|l| self.meta(&l.driver).map(|m| (l.driver.clone(), m.caps.metrics)));
+                if let Some((driver, false)) = &reports {
+                    panel = panel.child(div().px_2().child(self.small(
+                        format!(
+                            "{} {}",
+                            driver,
+                            self.lang.tr("instance.no_metrics")
+                        ),
                         t.muted(),
                     )));
                 }
@@ -7451,8 +8116,16 @@ impl Workspace {
                     }
                     panel = panel.child(row);
                 }
+                // AN OPEN VIEW OWNS THE REST OF THE PANEL.
+                //
+                // It did not: the metrics drew their own list under it, and
+                // two `flex_1` children share the height — so a table of
+                // thirty sessions got half the panel and the empty state for
+                // metrics got the other half, which is the blank space below
+                // the list. The numbers are below the view only when there is
+                // no view.
                 if let Some(name) = self.inspecting.clone() {
-                    panel = self.inspect_el(panel, &name, &views, cx);
+                    return self.inspect_el(panel, &name, &views, cx);
                 }
                 if self.metrics.is_empty() && self.metrics_error.is_none() {
                     return panel.child(self.empty_state("empty.instance", "empty.instance_hint"));
@@ -7812,7 +8485,8 @@ impl Workspace {
                 return panel.child(list);
             }
             Rail::Tasks => {
-                panel = panel.child(self.section(&format!("Tasks ({})", self.tasks.len())));
+                panel = panel
+                    .child(self.section(&format!("{} ({})", self.tr("rail.tasks"), self.tasks.len())));
                 // It lived on the tasks strip, which the bottom drawer replaced.
                 // The panel is where the whole list is, so it is where emptying
                 // it belongs.
@@ -7905,7 +8579,9 @@ impl Workspace {
                 // run, a panel that failed to load.
                 if !self.log.is_empty() {
                     panel = panel.child(list);
-                    panel = panel.child(self.section(&format!("Log ({})", self.log.len())));
+                    panel = panel.child(
+                        self.divider_section(&format!("{} ({})", self.tr("panel.log"), self.log.len())),
+                    );
                     let mut lines = self.panel_list("log-list");
                     for (level, text) in self.log.iter().rev().take(200) {
                         let colour = match level.as_str() {
@@ -8599,7 +9275,24 @@ impl Workspace {
         let (t, ms) = (self.t(), self.scale);
         let pad = 16.0 + depth as f32 * 12.0;
         let w = (ms.line_w() - pad - ms.base() * 3.0).max(ms.base() * 4.0);
-        let mut out = div().flex().flex_col();
+        // A GUIDE down the level, so a long list of fields still says which
+        // object it belongs to. A tree indented by whitespace alone is read by
+        // counting pixels; a line is read by following it.
+        // The rail stands one gutter in from where the rows would have been,
+        // and the rows start one gutter after it — so the text lines up
+        // exactly where it did before the rail existed, and the gap follows
+        // the type scale like every other length here.
+        let gap = ms.gutter();
+        let mut out = div()
+            .flex()
+            .flex_col()
+            .ml(px(pad - gap))
+            .pl(px(gap))
+            .border_l_1()
+            .border_color(t.divider());
+        // Everything inside is already shifted by the rail, so the rows below
+        // are drawn from its edge rather than from the panel's.
+        let pad = 0.0f32;
 
         let fields = self.node_fields.get(key);
         let indexes = self.node_indexes.get(key);
@@ -8609,7 +9302,7 @@ impl Workspace {
                     div()
                         .pl(px(pad))
                         .py(px(1.0))
-                        .child(self.small("reading…", t.muted())),
+                        .child(self.small(self.tr("ui.reading"), t.muted())),
                 )
                 .into_any_element();
         }
@@ -8626,10 +9319,32 @@ impl Workspace {
                 }
                 _ => format!("Fields ({})", cols.len()),
             };
+            // A SECTION THAT FOLDS. Thirteen fields above two indexes means
+            // the indexes are off the bottom of the panel, and a heading that
+            // cannot be shut is a heading that costs whatever is under it.
+            let fkey = format!("{key}/fields");
+            let fopen = !self.shut_groups.contains(&fkey);
             out = out.child(
-                div().pl(px(pad)).py(px(1.0)).child(self.small(basis, t.title())),
+                div()
+                    .id(SharedString::from(fkey.clone()))
+                    .flex()
+                    .items_center()
+                    .gap_1()
+                    .pl(px(pad))
+                    .py(px(1.0))
+                    .cursor_pointer()
+                    .hover(|d| d.bg(t.hover_mark()))
+                    .child(self.caret(fopen))
+                    .child(self.small(basis, t.title()))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        if !this.shut_groups.remove(&fkey) {
+                            this.shut_groups.insert(fkey.clone());
+                        }
+                        this.remember();
+                        cx.notify();
+                    })),
             );
-            for c in cols {
+            for c in cols.iter().filter(|_| fopen) {
                 // The declared type, when the driver declares one. A document
                 // store does NOT — `schema.columns` comes back with an empty
                 // type for every field of a collection — and there are no
@@ -8686,6 +9401,14 @@ impl Workspace {
                             self.theme.clone(),
                             self.scale,
                         ))
+                        // WHAT IT IS, as a mark. The word is still there to
+                        // the right; this is the one that can be scanned down
+                        // a column of thirteen without reading any of them.
+                        .child(self.icon_at(
+                            crate::workspace::field_glyph(shown.unwrap_or("str"), c.primary),
+                            if c.primary { t.accent() } else { t.muted() },
+                            ms.small(),
+                        ))
                         .child(self.line_in(c.name.clone(), ms.small(), t.fg(), w))
                         .when_some(shown, |d, ty| {
                             d.child(
@@ -8702,7 +9425,7 @@ impl Workspace {
                                     .flex_none()
                                     .text_size(ms.tiny())
                                     .text_color(t.accent())
-                                    .child("key"),
+                                    .child(self.tr("ui.key")),
                             )
                         })
                         // A REFERENCE, as a mark rather than as a name: the
@@ -8774,13 +9497,29 @@ impl Workspace {
         }
 
         if let Some(idx) = indexes {
+            let ikey = format!("{key}/indexes");
+            let iopen = !self.shut_groups.contains(&ikey);
             out = out.child(
                 div()
+                    .id(SharedString::from(ikey.clone()))
+                    .flex()
+                    .items_center()
+                    .gap_1()
                     .pl(px(pad))
                     .py(px(1.0))
-                    .child(self.small(format!("Indexes ({})", idx.len()), t.title())),
+                    .cursor_pointer()
+                    .hover(|d| d.bg(t.hover_mark()))
+                    .child(self.caret(iopen))
+                    .child(self.small(format!("Indexes ({})", idx.len()), t.title()))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        if !this.shut_groups.remove(&ikey) {
+                            this.shut_groups.insert(ikey.clone());
+                        }
+                        this.remember();
+                        cx.notify();
+                    })),
             );
-            for i in idx {
+            for i in idx.iter().filter(|_| iopen) {
                 out = out.child(
                     div()
                         .flex()
@@ -8801,7 +9540,7 @@ impl Workspace {
                                     .flex_none()
                                     .text_size(ms.tiny())
                                     .text_color(t.accent())
-                                    .child("unique"),
+                                    .child(self.tr("ui.unique")),
                             )
                         }),
                 );
@@ -8926,6 +9665,136 @@ impl Workspace {
         strip
     }
 
+    /// THE WRITE THE ENGINE HAS DESCRIBED BUT NOT DONE, as a card.
+    ///
+    /// It used to be drawn inside the row's DETAIL PANEL, which is open only
+    /// when somebody has opened a row in the grid. Saving from the tree or
+    /// from the JSON therefore did nothing anybody could see: the engine
+    /// answered with the statement and the question about it was drawn in a
+    /// panel that was not on screen, so the change simply never happened.
+    ///
+    /// Where a write was started from has nothing to do with where the
+    /// question about it belongs, which is in front of the person who asked.
+    fn write_card(&self, tab: &Tab, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
+        let (t, ms) = (self.t(), self.scale);
+        let p = tab.pending_write.as_ref()?;
+        let tab_id = tab.id;
+let mut ask = div()
+                .flex()
+                .flex_col()
+                .gap_1()
+                .px_3()
+                .py_1()
+                .bg(t.panel())
+                .border_t_1()
+                .border_color(t.error())
+                .child(self.small(
+                    p.reason.clone().unwrap_or_else(|| {
+                        "this changes stored data".to_string()
+                    }),
+                    t.error(),
+                ))
+                // The statement is the ENGINE's, shown verbatim. A client that
+                // displayed its own version and sent another would be asking
+                // about one thing and doing a different one.
+                .child(
+                    div()
+                        .text_size(ms.small())
+                        .text_color(t.fg())
+                        .child(SharedString::from(p.statement.clone())),
+                );
+            ask = ask.child(
+                div()
+                    .flex()
+                    .gap_2()
+                    .child(
+                        btn(
+                            t,
+                            ms,
+                            "write-yes",
+                            // The two words of the answer, in the language
+                            // the window is in: they were written out in
+                            // English here, and an `if` is not a literal so
+                            // the catalogue guardrail never saw them.
+                            if p.delete { self.tr("write.delete_it") } else { self.tr("ui.save") },
+                            Btn::Danger,
+                        )
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                                this.apply_write(tab_id, cx);
+                                cx.notify();
+                            })),
+                    )
+                    .child(
+                        btn(t, ms, "write-no", self.tr("ui.cancel"), Btn::Quiet)
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                if let Some(tb) = this.tabs.iter_mut().find(|x| x.id == tab_id) {
+                                    tb.pending_write = None;
+                                }
+                                cx.notify();
+                            })),
+                    ),
+            );
+        Some(ask.w_full().flex_none().into_any_element())
+    }
+
+    /// THE ROW THAT ASKS WHAT TO CALL SOMETHING.
+    ///
+    /// Above the view, only while a save is waiting for a name. Not a modal
+    /// over the result: the thing being named is the result, and covering it
+    /// up to ask what to call it is exactly backwards.
+    ///
+    /// It used to be drawn inside the RESULT view alone, and a SCRIPT tab
+    /// draws its own body — so pressing Save on a script set `naming`, the
+    /// row never appeared anywhere, the name never arrived, and the save
+    /// waiting for it waited forever. A script could not be saved at all.
+    /// Anything that can be named draws this.
+    fn naming_el(&self, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
+        let (t, ms) = (self.t(), self.scale);
+        let what = self.naming.clone()?;
+        Some(
+
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .w_full()
+                    .px_3()
+                    .py_1()
+                    .flex_none()
+                    .bg(t.raised())
+                    .border_b_1()
+                    .border_color(t.accent())
+                    .child(self.small(
+                        match &what {
+                            NameFor::Folder(conn) => {
+                                format!("{} {conn}", self.lang.tr("name.folder"))
+                            }
+                            other => {
+                                format!("{} {}", self.lang.tr("result.name_it"), other.what())
+                            }
+                        },
+                        t.muted(),
+                    ))
+                    .child(div().flex_1().text_size(ms.body()).child(self.save_name.clone()))
+                    .child(
+                        btn(t, ms, "name-ok", self.tr("ui.save"), Btn::Link)
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                let name = this.save_name.read(cx).text().trim().to_string();
+                                this.named(name, cx);
+                                cx.notify();
+                            })),
+                    )
+                    .child(
+                        btn(t, ms, "name-no", self.tr("ui.cancel"), Btn::Quiet)
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.naming = None;
+                                cx.notify();
+                            })),
+                    )
+            .into_any_element(),
+        )
+    }
+
     fn result_el(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
         let t = self.t();
         let ms = self.scale;
@@ -8939,18 +9808,33 @@ impl Workspace {
                 .into_any_element();
         };
 
-        // A dashboard tab is not a result tab: no statement box, no grid, no
-        // row. It draws saved charts on a grid of twelve columns.
-        if tab.board.is_some() {
-            return self.board_el(tab, cx);
-        }
-        // Nor is a SCRIPT tab: a body in a language, and what it printed.
-        if tab.script.is_some() {
-            return self.script_el(tab, cx);
-        }
-        // Nor is a DIAGRAM: boxes and the lines between them.
-        if tab.diagram.is_some() {
-            return self.diagram_el(tab, cx);
+        // THE OTHER KINDS OF TAB, each with the naming row above it.
+        //
+        // Each of these draws its own body and returns, which is why the row
+        // goes on here rather than inside any one of them: a script, a
+        // dashboard and a diagram can all be saved under a name, and the one
+        // that could not was the one whose view had no row.
+        let other = if tab.board.is_some() {
+            // A dashboard tab is not a result tab: no statement box, no grid,
+            // no row. It draws saved charts on a grid of twelve columns.
+            Some(self.board_el(tab, cx))
+        } else if tab.script.is_some() {
+            // Nor is a SCRIPT tab: a body in a language, and what it printed.
+            Some(self.script_el(tab, cx))
+        } else if tab.diagram.is_some() {
+            // Nor is a DIAGRAM: boxes and the lines between them.
+            Some(self.diagram_el(tab, cx))
+        } else {
+            None
+        };
+        if let Some(view) = other {
+            return div()
+                .flex()
+                .flex_col()
+                .size_full()
+                .children(self.naming_el(cx))
+                .child(div().flex_1().min_h_0().child(view))
+                .into_any_element();
         }
 
         let mut body = div().flex().flex_col().size_full();
@@ -8985,7 +9869,9 @@ impl Workspace {
                         // rearrange when they arrive.
                         t.disabled()
                     })
-                    .child(SharedString::from(s.label()))
+                    // The catalogue's word, not the stored one: `label` is
+                    // what goes in the session file and must not move.
+                    .child(self.tr(s.key()))
                     .on_click(cx.listener(move |this, _, _, cx| {
                         if !usable {
                             return;
@@ -9033,51 +9919,7 @@ impl Workspace {
         );
 
         // ── the naming row ──────────────────────────────────────────────────
-        // Above the views, only while a save is waiting for a name. Not a modal
-        // over the result: the thing being named is the result, and covering it
-        // up to ask what to call it is exactly backwards.
-        if let Some(what) = self.naming.clone() {
-            body = body.child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap_2()
-                    .w_full()
-                    .px_3()
-                    .py_1()
-                    .flex_none()
-                    .bg(t.raised())
-                    .border_b_1()
-                    .border_color(t.accent())
-                    .child(self.small(
-                        match &what {
-                            NameFor::Folder(conn) => {
-                                format!("{} {conn}", self.lang.tr("name.folder"))
-                            }
-                            other => {
-                                format!("{} {}", self.lang.tr("result.name_it"), other.what())
-                            }
-                        },
-                        t.muted(),
-                    ))
-                    .child(div().flex_1().text_size(ms.body()).child(self.save_name.clone()))
-                    .child(
-                        btn(t, ms, "name-ok", self.tr("result.save"), Btn::Link)
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                let name = this.save_name.read(cx).text().trim().to_string();
-                                this.named(name, cx);
-                                cx.notify();
-                            })),
-                    )
-                    .child(
-                        btn(t, ms, "name-no", self.tr("tip.cancel_edit"), Btn::Quiet)
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.naming = None;
-                                cx.notify();
-                            })),
-                    ),
-            );
-        }
+        body = body.children(self.naming_el(cx));
 
         // ── view switch ─────────────────────────────────────────────────────
         // The sub-tabs belong HERE, next to the views, not pinned to the far
@@ -9088,7 +9930,7 @@ impl Workspace {
             let on = tab.view == v;
             let tab_id = tab.id;
             views = views.child(
-                chip(t, ms, format!("view-{}-{}", tab_id, v.label()), v.label(), on)
+                chip(t, ms, format!("view-{}-{}", tab_id, v.label()), self.tr(v.key()), on)
                     .on_click(cx.listener(move |this, _, _, cx| {
                         if let Some(tb) = this.tabs.iter_mut().find(|t| t.id == tab_id) {
                             tb.view = v;
@@ -9182,8 +10024,7 @@ impl Workspace {
             }
             card = card
                 .child(self.small(
-                    "They run in order, each in a tab of its own, and the run STOPS at the \
-                     first failure.",
+                    self.tr("multi.order"),
                     t.muted(),
                 ))
                 .child(
@@ -9204,7 +10045,7 @@ impl Workspace {
                             // The FIRST one only, which is what somebody who
                             // pasted a file and wanted to try the top of it
                             // means.
-                            btn(t, ms, "multi-first", "just the first", Btn::Secondary).on_click(
+                            btn(t, ms, "multi-first", self.tr("ui.just_first"), Btn::Secondary).on_click(
                                 cx.listener(|this, _, _, cx| {
                                     let first =
                                         this.multi.as_ref().and_then(|m| m.stmts.first().cloned());
@@ -9218,7 +10059,7 @@ impl Workspace {
                             ),
                         )
                         .child(
-                            btn(t, ms, "multi-leave", self.tr("write.leave_it"), Btn::Quiet)
+                            btn(t, ms, "multi-leave", self.tr("ui.cancel"), Btn::Quiet)
                                 .on_click(cx.listener(|this, _, _, cx| {
                                     this.multi = None;
                                     cx.notify();
@@ -9269,7 +10110,7 @@ impl Workspace {
                                     })),
                             )
                             .child(
-                                btn(t, ms, "tab-confirm-leave", self.tr("write.leave_it"), Btn::Quiet)
+                                btn(t, ms, "tab-confirm-leave", self.tr("ui.cancel"), Btn::Quiet)
                                     .on_click(cx.listener(move |this, _, _, cx| {
                                         if let Some(tab) =
                                             this.tabs.iter_mut().find(|t| t.id == id)
@@ -9300,7 +10141,7 @@ impl Workspace {
         if running {
             // No percentage: no driver reports one, and a bar that moved would
             // be inventing progress.
-            body = body.child(div().p_3().child(self.small("running…", t.muted())));
+            body = body.child(div().p_3().child(self.small(self.tr("ui.running"), t.muted())));
             return body.into_any_element();
         }
 
@@ -9332,6 +10173,17 @@ impl Workspace {
                 .into_any_element(),
             None => view,
         });
+        // THE EDITING CARDS GO UNDER WHICHEVER VIEW IS SHOWING.
+        //
+        // They were attached inside the grid, so editing started from the
+        // tree or from the JSON set everything up correctly and then drew
+        // the card in a view nobody was looking at — the record opened and
+        // closed and nothing else appeared to happen. Where the editing can
+        // be started from is not the view's business, so neither is where
+        // the card is drawn.
+        body = body.children(self.write_card(tab, cx));
+        body = body.children(self.cell_card(tab, cx));
+        body = body.children(self.doc_card(tab, cx));
         body.into_any_element()
     }
 
@@ -9402,12 +10254,12 @@ impl Workspace {
             );
         }
         head = head.child(
-            btn(t, ms, format!("d-copy-{tab_id}"), "copy the references", Btn::Link).on_click(
+            btn(t, ms, format!("d-copy-{tab_id}"), self.tr("ui.copy_refs"), Btn::Link).on_click(
                 cx.listener(move |this, _, _, cx| this.copy_references(tab_id, cx)),
             ),
         );
         head = head.child(
-            btn(t, ms, format!("d-tidy-{tab_id}"), "lay it out again", Btn::Secondary).on_click(
+            btn(t, ms, format!("d-tidy-{tab_id}"), self.tr("ui.lay_out"), Btn::Secondary).on_click(
                 cx.listener(move |this, _, _, cx| {
                     if let Some(dd) = this
                         .tabs
@@ -9438,7 +10290,7 @@ impl Workspace {
                         .flex()
                         .items_center()
                         .justify_center()
-                        .child(self.small("reading the schema\u{2026}", t.muted())),
+                        .child(self.small(self.tr("ui.reading_schema"), t.muted())),
                 )
                 .into_any_element();
         }
@@ -9713,7 +10565,7 @@ impl Workspace {
         };
         let edges = crate::diagram::edges(&d.tables);
         if edges.is_empty() {
-            self.toast("there are no references to copy".to_string(), true);
+            self.toast(self.tr("toast.no_refs").to_string(), true);
             return;
         }
         let text = edges
@@ -10039,7 +10891,7 @@ impl Workspace {
                         row = row
                             .child(div().w(px(ms.base() * 16.0)).child(self.field(ms.small(), self.tile_text.clone())))
                             .child(
-                                btn(t, ms, "tile-set-text", "Set", Btn::Link)
+                                btn(t, ms, "tile-set-text", self.tr("ui.save"), Btn::Link)
                                     .on_click(cx.listener(move |this, _, _, cx| {
                                         let txt = this.tile_text.read(cx).text().to_string();
                                         if let Some(bd) = this.board_mut(tab_id) {
@@ -10302,7 +11154,7 @@ impl Workspace {
             return div()
                 .flex_1()
                 .p_2()
-                .child(self.small("not loaded", t.muted()))
+                .child(self.small(self.tr("ui.not_loaded"), t.muted()))
                 .into_any_element();
         };
         if let Some(e) = &pane.error {
@@ -10318,7 +11170,7 @@ impl Workspace {
             return div()
                 .flex_1()
                 .p_2()
-                .child(self.small("running\u{2026}", t.muted()))
+                .child(self.small(self.tr("ui.running"), t.muted()))
                 .into_any_element();
         }
         let shape = match ChartShape::of(&pane.columns, &pane.rows) {
@@ -10391,7 +11243,7 @@ impl Workspace {
                     .gap_1()
                     .child(div().text_color(t.muted()).child(SharedString::from(why)))
                     .child(self.small(
-                        "a chart needs one column of numbers and one to name the bars",
+                        self.tr("chart.needs"),
                         t.muted(),
                     ))
                     .into_any_element();
@@ -10433,7 +11285,7 @@ impl Workspace {
         }
         picker = picker.child(div().w(px(ms.base())));
         if shape.values.len() > 1 {
-            picker = picker.child(self.small("measure", t.muted()));
+            picker = picker.child(self.small(self.tr("ui.measure"), t.muted()));
             for &i in &shape.values {
                 let on = i == chosen;
                 let name = tab.columns.get(i).map(|c| c.name.clone()).unwrap_or_default();
@@ -11021,17 +11873,17 @@ impl Workspace {
         if tab.object.is_none() {
             return body
                 .child(self.small(
-                    "the builder works on an object — open a table from the tree",
+                    self.tr("builder.needs_object"),
                     t.muted(),
                 ))
                 .into_any_element();
         }
 
         // ── columns ─────────────────────────────────────────────────────────
-        body = body.child(self.section("Show"));
+        body = body.child(self.section(&self.tr("ui.show")));
         let all = tab.builder.columns.is_empty();
         let mut cols_row = div().flex().flex_wrap().gap_2().child(
-            chip(t, ms, "b-all", "every column", all)
+            chip(t, ms, "b-all", self.tr("ui.every_column"), all)
                 .on_click(cx.listener(move |this, _, _, cx| {
                     if let Some(tb) = this.tabs.iter_mut().find(|x| x.id == tab_id) {
                         tb.builder.columns.clear();
@@ -11062,7 +11914,7 @@ impl Workspace {
         body = body.child(cols_row);
 
         // ── conditions ──────────────────────────────────────────────────────
-        body = body.child(self.section("Where"));
+        body = body.child(self.section(&self.tr("ui.where")));
         for (i, cond) in tab.builder.conds.iter().enumerate() {
             let mut row = div().flex().items_center().gap_2();
             // column
@@ -11122,7 +11974,7 @@ impl Workspace {
                     row = row.child(div().w(px(ms.base() * 17.0)).child(self.field(ms.small(), input.clone())));
                 }
             } else {
-                row = row.child(div().w(px(ms.base() * 17.0)).child(self.small("takes no value", t.muted())));
+                row = row.child(div().w(px(ms.base() * 17.0)).child(self.small(self.tr("ui.takes_no_value"), t.muted())));
             }
             row = row.child(
                 div()
@@ -11145,7 +11997,7 @@ impl Workspace {
             body = body.child(row);
         }
         body = body.child(
-            btn(t, ms, "b-add", "+ condition", Btn::Link)
+            btn(t, ms, "b-add", self.tr("ui.condition"), Btn::Link)
                 .on_click(cx.listener(move |this, _, _, cx| {
                     this.add_condition(tab_id, cx);
                     cx.notify();
@@ -11153,7 +12005,7 @@ impl Workspace {
         );
 
         // ── order ───────────────────────────────────────────────────────────
-        body = body.child(self.section("Order"));
+        body = body.child(self.section(&self.tr("ui.order")));
         let order_label = match &tab.builder.order {
             Some((c, asc)) => format!("{c} {}", if *asc { "ascending" } else { "descending" }),
             None => "none".to_string(),
@@ -11177,8 +12029,7 @@ impl Workspace {
         );
 
         body.child(self.small(
-            "the statement above is what runs \u{2014} it goes through the connection\u{2019}s policy \
-             like anything else",
+            self.tr("console.policy"),
             t.muted(),
         ))
         .into_any_element()
@@ -11199,15 +12050,15 @@ impl Workspace {
         if tab.object.is_none() {
             return body
                 .child(self.small(
-                    "this tab is a statement, not an object — there is nothing to describe",
+                    self.tr("schema.not_object"),
                     t.muted(),
                 ))
                 .into_any_element();
         }
 
-        body = body.child(self.section(&format!("Columns ({})", tab.meta_columns.len())));
+        body = body.child(self.section(&format!("{} ({})", self.tr("ui.columns"), tab.meta_columns.len())));
         if tab.meta_columns.is_empty() {
-            body = body.child(self.small("the engine has not answered yet", t.muted()));
+            body = body.child(self.small(self.tr("ui.not_answered"), t.muted()));
         }
         let conn = tab.conn_name.clone();
         for c in &tab.meta_columns {
@@ -11219,7 +12070,7 @@ impl Workspace {
                     SharedString::from(c.name.clone()),
                 ))
                 .child(div().w(px(ms.base() * 11.5)).child(self.small(c.type_name.clone(), t.muted())))
-                .when(c.primary, |d| d.child(self.small("key", t.accent())));
+                .when(c.primary, |d| d.child(self.small(self.tr("ui.key"), t.accent())));
             // WHAT IT POINTS AT, and a way to go there.
             //
             // The thing a schema reader is usually after: `t_id` says nothing
@@ -11293,7 +12144,7 @@ impl Workspace {
         ));
 
         if !tab.indexes.is_empty() {
-            body = body.child(self.section(&format!("Indexes ({})", tab.indexes.len())));
+            body = body.child(self.section(&format!("{} ({})", self.tr("ui.indexes"), tab.indexes.len())));
             for i in &tab.indexes {
                 let mut tags = Vec::new();
                 if i.primary {
@@ -11348,7 +12199,7 @@ impl Workspace {
         }
 
         if let Some(ddl) = &tab.ddl {
-            body = body.child(self.section("CREATE"));
+            body = body.child(self.section(&self.tr("ui.create")));
             // Scrolled to, not clipped. A CREATE statement with a wide column
             // list ran off the edge and the rest of it was simply unreachable —
             // the same loss as a grid column you cannot scroll to.
@@ -11359,6 +12210,9 @@ impl Workspace {
                     .overflow_scroll()
                     .child(
                         div()
+                            // Not shrinkable, or the one long line is squeezed
+                            // to the box instead of scrolling past it.
+                            .flex_none()
                             .whitespace_nowrap()
                             .text_size(ms.small())
                             .text_color(t.fg())
@@ -11439,7 +12293,7 @@ impl Workspace {
                 ))
                 // A key column says so. It is why it cannot be edited, and
                 // saying it here is cheaper than a refusal later.
-                .when(key_col, |d| d.child(self.small("key", t.accent())));
+                .when(key_col, |d| d.child(self.small(self.tr("ui.key"), t.accent())));
 
             let value: gpui::AnyElement = if editing_this {
                 // The same editor the tree uses — one definition, so the two
@@ -11471,61 +12325,6 @@ impl Workspace {
         }
         panel = panel.child(fields);
 
-        // A write the engine has described but not done.
-        if let Some(p) = &tab.pending_write {
-            let mut ask = div()
-                .flex()
-                .flex_col()
-                .gap_1()
-                .px_3()
-                .py_1()
-                .bg(t.panel())
-                .border_t_1()
-                .border_color(t.error())
-                .child(self.small(
-                    p.reason.clone().unwrap_or_else(|| {
-                        "this changes stored data".to_string()
-                    }),
-                    t.error(),
-                ))
-                // The statement is the ENGINE's, shown verbatim. A client that
-                // displayed its own version and sent another would be asking
-                // about one thing and doing a different one.
-                .child(
-                    div()
-                        .text_size(ms.small())
-                        .text_color(t.fg())
-                        .child(SharedString::from(p.statement.clone())),
-                );
-            ask = ask.child(
-                div()
-                    .flex()
-                    .gap_2()
-                    .child(
-                        btn(
-                            t,
-                            ms,
-                            "write-yes",
-                            if p.delete { "Delete it" } else { "Write it" },
-                            Btn::Danger,
-                        )
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                                this.apply_write(tab_id, cx);
-                                cx.notify();
-                            })),
-                    )
-                    .child(
-                        btn(t, ms, "write-no", self.tr("write.leave_it"), Btn::Quiet)
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                if let Some(tb) = this.tabs.iter_mut().find(|x| x.id == tab_id) {
-                                    tb.pending_write = None;
-                                }
-                                cx.notify();
-                            })),
-                    ),
-            );
-            panel = panel.child(ask);
-        }
 
         // Copy as Query. See `copy_as_select` for why the client is allowed to
         // write SQL here: this goes to a person, not to a database.
@@ -11555,7 +12354,7 @@ impl Workspace {
                         })),
                 );
         } else {
-            foot = foot.child(self.small("this driver does not speak SQL", t.muted()));
+            foot = foot.child(self.small(self.tr("ui.no_sql"), t.muted()));
         }
         if editable && tab.pending_write.is_none() {
             foot = foot.child(div().flex_1()).child(
@@ -11653,7 +12452,7 @@ impl Workspace {
         }
         if has_narrow {
             narrow = narrow.child(div().flex_1()).child(self.small(
-                "the statement above is what runs — edit it and these stop rewriting it",
+                self.tr("builder.above_runs"),
                 t.muted(),
             ));
         }
@@ -11922,11 +12721,23 @@ impl Workspace {
                                         .child(sum.kind),
                                 ),
                         );
-                        // Only when some of the page is MISSING the field. A bar
-                        // that is always full and a line that always says
-                        // "100% of 200" are a row of the grid spent saying
-                        // nothing — and they hid the columns that do have gaps.
-                        if sum.total > 0 && sum.present < sum.total {
+                        // EVERY column gets the bar, and only the ones with
+                        // gaps get the number.
+                        //
+                        // It used to be drawn only where something was
+                        // missing, on the argument that a full bar says
+                        // nothing. The argument was wrong in one way that
+                        // matters: a column with no bar is ambiguous — full,
+                        // or a bar that failed to draw? — and ambiguity costs
+                        // more than a quiet line does.
+                        //
+                        // So the bar is always there and the LOUDNESS carries
+                        // the meaning: a full one in the divider's own grey,
+                        // which is barely a line, and a partial one in the
+                        // warning colour with "11 of 12" under it. The eye is
+                        // still taken straight to the gaps.
+                        if sum.total > 0 {
+                            let full = sum.present == sum.total;
                             let frac = (sum.present as f32 / sum.total as f32).clamp(0.0, 1.0);
                             head = head
                                 .child(
@@ -11943,14 +12754,21 @@ impl Workspace {
                                             div()
                                                 .w(gpui::relative(frac))
                                                 .h_full()
-                                                .bg(if sum.present == sum.total {
-                                                    t.success()
-                                                } else {
-                                                    t.warning()
-                                                }),
+                                                // A full column is GREEN and
+                                                // a gappy one is the warning
+                                                // colour. The divider's grey
+                                                // was too quiet to see — it
+                                                // read as no bar at all,
+                                                // which is the ambiguity the
+                                                // bar was made to remove.
+                                                .bg(if full { t.success() } else { t.warning() }),
                                         ),
                                 )
-                                .child(
+                                // The NUMBER only where it says something.
+                                // "12 of 12" under every column is a second
+                                // row of the grid spent on nothing, and the
+                                // bar above already says it.
+                                .children((!full).then(|| {
                                     div()
                                         .w(px(w))
                                         .truncate()
@@ -11960,8 +12778,8 @@ impl Workspace {
                                         .child(SharedString::from(format!(
                                             "{} of {}",
                                             sum.present, sum.total
-                                        ))),
-                                );
+                                        )))
+                                }));
                         }
                         head
                     })
@@ -12248,6 +13066,18 @@ impl Workspace {
                     .flex_col()
                     .w(px(total_w))
                     .h_full()
+                    // IT MUST NOT SHRINK. The scroller is a flex row and this
+                    // is its item, so `w(total_w)` is a size taffy is free to
+                    // take back — and it does, down to the container's width,
+                    // which leaves nothing overflowing and therefore nothing
+                    // to scroll. gpui then clamps every offset to its own
+                    // `scroll_max` of zero, so the wheel and the bar both go
+                    // dead while the columns past the edge stay clipped and
+                    // unreachable.
+                    //
+                    // The same rule as `widgets::scroll`, on the other axis: a
+                    // flex item shrinks before its container scrolls.
+                    .flex_none()
                     .child(header)
                     .child(div().flex_1().child(list)),
             )
@@ -12413,6 +13243,11 @@ impl Workspace {
     fn tree_el(&self, tab: &Tab, cx: &mut Context<Self>) -> gpui::AnyElement {
         let t = self.t();
         let ms = self.scale;
+        // The same question the JSON view asks, answered the same way: the
+        // ENGINE says whether this result can be written to, and a result
+        // that is not a table of some object cannot be.
+        let can_write =
+            self.meta(&tab.driver).map_or(false, |m| m.caps.edit) && tab.object.is_some();
         let mut out = div().flex().flex_col().size_full().overflow_hidden();
         // Everything on screen, in one go — the answer to "I want this
         // somewhere else" when the something else is the whole result.
@@ -12428,10 +13263,10 @@ impl Workspace {
                     .py_1()
                     .child(self.small(format!("{} document(s)", tab.rows.len()), t.muted()))
                     .child(
-                        btn(t, ms, "tree-copy-all", "copy all", Btn::Link)
+                        btn(t, ms, "tree-copy-all", self.tr("ui.copy_all"), Btn::Link)
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 cx.write_to_clipboard(gpui::ClipboardItem::new_string(all.clone()));
-                                this.toast("copied".to_string(), false);
+                                this.toast(this.tr("toast.copied").to_string(), false);
                                 cx.notify();
                             })),
                     ),
@@ -12453,18 +13288,61 @@ impl Workspace {
                     .hover(|d| d.bg(t.hover_mark()))
                     .child(self.small(format!("{}", i + 1), t.row_number()))
                     .child(self.small(if open { "\u{f0d7}" } else { "\u{f0da}" }, t.muted()))
-                    // The first few fields, not `{6}`. Thirty rows of `{6}`,
-                    // `{5}`, `{7}` cannot be told apart without opening every
-                    // one, which is the opposite of what a list is for.
-                    .child(self.line_tip(
-                        crate::workspace::doc_preview(&doc, 120),
-                        ms.small(),
-                        t.fg(),
-                        (self.canvas_w - ms.base() * 6.0).max(ms.base() * 10.0),
-                        format!("dp-{tab_id}-{i}"),
-                    ))
+                    // THE PREVIEW TAKES WHAT IS LEFT, and the links after it
+                    // sit against the right edge.
+                    //
+                    // It used to be given a width worked out by subtracting
+                    // guesses — the number, the arrow, the gaps, the word
+                    // "copy" — from the canvas. Every guess was a number
+                    // nobody could check, and the first one was wrong by
+                    // exactly half a word. `flex_1` with `min_w_0` is the
+                    // same statement made to the layout instead of to
+                    // arithmetic: take the slack, shrink before the row
+                    // overflows, put the ellipsis where the text actually
+                    // runs out.
+                    //
+                    // `min_w_0` for the reason it is needed everywhere in
+                    // this file: without it a flex item's minimum is its
+                    // content, and the preview would push the links off the
+                    // edge rather than give way.
                     .child(
-                        btn(t, ms, format!("dcopy-{tab_id}-{i}"), "copy", Btn::Link)
+                        div()
+                            .id(SharedString::from(format!("dp-{tab_id}-{i}")))
+                            .flex_1()
+                            .min_w_0()
+                            .overflow_hidden()
+                            .truncate()
+                            .text_size(ms.small())
+                            .text_color(t.fg())
+                            .tooltip(crate::tip::Tip::build(
+                                crate::workspace::doc_preview(&doc, 400),
+                                None,
+                                self.theme.clone(),
+                                self.scale,
+                            ))
+                            .child(SharedString::from(crate::workspace::doc_preview(&doc, 400))),
+                    )
+                    // THE WHOLE DOCUMENT, from the tree. A field in the tree
+                    // is already editable by clicking it; this is the other
+                    // half of the same offer, so the view somebody reads in
+                    // never decides what they are allowed to change.
+                    .children(can_write.then(|| {
+                        btn(t, ms, format!("dedit-{tab_id}-{i}"), self.tr("ui.edit_row"), Btn::Link)
+                            .flex_none()
+                            // THE ROW UNDERNEATH OPENS AND CLOSES THE RECORD,
+                            // and without this it did that instead: the click
+                            // passed through the link to the row, so the two
+                            // links on every document behaved as two more
+                            // places to toggle it.
+                            .occlude()
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.begin_doc_edit(tab_id, i, true, cx);
+                            }))
+                    }))
+                    .child(
+                        btn(t, ms, format!("dcopy-{tab_id}-{i}"), self.tr("ui.copy"), Btn::Link)
+                            .flex_none()
+                            .occlude()
                             .on_click(cx.listener({
                                 let text = serde_json::to_string_pretty(&doc)
                                     .unwrap_or_else(|_| "{}".into());
@@ -12472,7 +13350,7 @@ impl Workspace {
                                     cx.write_to_clipboard(gpui::ClipboardItem::new_string(
                                         text.clone(),
                                     ));
-                                    this.toast("copied".to_string(), false);
+                                    this.toast(this.tr("toast.copied").to_string(), false);
                                     cx.notify();
                                 }
                             })),
@@ -12487,7 +13365,7 @@ impl Workspace {
                     })),
             );
             if open {
-                out = out.child(self.value_el(&doc, tab, 1, Some(i), cx));
+                out = out.child(self.tree_level(self.value_el(&doc, tab, 1, Some(i), cx)));
             }
         }
         out.into_any_element()
@@ -12501,6 +13379,148 @@ impl Workspace {
     /// same classification, the same confirmation and the same audit row. There
     /// is no second, softer path, which is the only way the promise about
     /// writing means anything.
+    /// The card that edits one cell.
+    ///
+    /// Under the grid and across the pane, because that is where there is
+    /// room: the cell it belongs to is one line tall and as wide as its
+    /// column, and a box that size cannot show a sentence, let alone let
+    /// somebody correct one. It says WHICH cell, so a card that wide is not
+    /// ambiguous about what it will write.
+    fn cell_card(&self, tab: &Tab, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
+        let (t, ms) = (self.t(), self.scale);
+        let (row, col) = tab.editing?;
+        let (_, ed) = self.cell_editor.as_ref().filter(|(id, _)| *id == tab.id)?;
+        let name = tab.columns.get(col).map(|c| c.name.clone()).unwrap_or_default();
+        let tab_id = tab.id;
+        Some(
+            div()
+                .flex()
+                .flex_col()
+                .w_full()
+                .flex_none()
+                .gap_1()
+                .px_3()
+                .py_2()
+                .bg(t.panel())
+                .border_t_1()
+                .border_color(t.accent())
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .child(self.small(
+                            format!("{name} \u{b7} {} {}", self.lang.tr("result.row"), row + 1),
+                            t.title(),
+                        ))
+                        .child(div().flex_1())
+                        .child(self.small(self.tr("edit.keys"), t.muted())),
+                )
+                .child(div().w_full().text_size(ms.body()).child(ed.clone()))
+                .child(
+                    div()
+                        .flex()
+                        .gap_2()
+                        .child(
+                            btn(t, ms, "cell-save", self.tr("ui.save"), Btn::Primary).on_click(
+                                cx.listener(move |this, _, _, cx| {
+                                    this.commit_edit(tab_id, cx);
+                                    cx.notify();
+                                }),
+                            ),
+                        )
+                        .child(
+                            btn(t, ms, "cell-cancel", self.tr("ui.cancel"), Btn::Quiet).on_click(
+                                cx.listener(move |this, _, _, cx| {
+                                    if let Some(tb) =
+                                        this.tabs.iter_mut().find(|x| x.id == tab_id)
+                                    {
+                                        tb.editing = None;
+                                    }
+                                    this.cell_editor = None;
+                                    cx.notify();
+                                }),
+                            ),
+                        ),
+                )
+                .into_any_element(),
+        )
+    }
+
+    /// The card that edits a WHOLE row, as JSON.
+    ///
+    /// The same place as the cell card and for the same reason: there is no
+    /// room for a document inside the row it came from. It is drawn in every
+    /// view — the tree, the table and the JSON — because which view somebody
+    /// is reading in has nothing to do with whether they want to change what
+    /// they are reading.
+    fn doc_card(&self, tab: &Tab, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
+        if !self.doc_whole {
+            return None;
+        }
+        let (t, ms) = (self.t(), self.scale);
+        let row = tab.editing_doc?;
+        let (_, ed) = self.doc_editor.as_ref().filter(|(id, _)| *id == tab.id)?;
+        let tab_id = tab.id;
+        Some(
+            div()
+                .flex()
+                .flex_col()
+                .w_full()
+                .flex_none()
+                .gap_1()
+                .px_3()
+                .py_2()
+                .bg(t.panel())
+                .border_t_1()
+                .border_color(t.accent())
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .child(self.small(
+                            format!("{} {}", self.lang.tr("result.row"), row + 1),
+                            t.title(),
+                        ))
+                        .child(div().flex_1())
+                        .child(self.small(self.tr("edit.keys"), t.muted())),
+                )
+                // Tall enough to hold a document and no taller: the editor
+                // scrolls past what fits, and a card that took the whole pane
+                // would hide the row it is about.
+                .child(
+                    div()
+                        .w_full()
+                        .max_h(ms.line_h() * 16.0)
+                        .overflow_hidden()
+                        .text_size(ms.body())
+                        .child(ed.clone()),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .gap_2()
+                        .child(
+                            btn(t, ms, "doc-save", self.tr("ui.save"), Btn::Primary).on_click(
+                                cx.listener(move |this, _, _, cx| {
+                                    this.commit_doc_json(tab_id, cx);
+                                    cx.notify();
+                                }),
+                            ),
+                        )
+                        .child(
+                            btn(t, ms, "doc-cancel", self.tr("ui.cancel"), Btn::Quiet).on_click(
+                                cx.listener(move |this, _, _, cx| {
+                                    this.leave_doc_edit(tab_id, cx);
+                                }),
+                            ),
+                        ),
+                )
+                .into_any_element(),
+        )
+    }
+
     fn editor_el(&self, tab_id: u64, cx: &mut Context<Self>) -> gpui::AnyElement {
         let (t, ms) = (self.t(), self.scale);
         let Some(input) = self.inputs.get(&(tab_id, "edit".to_string())) else {
@@ -12537,6 +13557,33 @@ impl Workspace {
             .into_any_element()
     }
 
+    /// ONE LEVEL of the document tree: the rows, indented, with a line down
+    /// the side of them.
+    ///
+    /// The indent was a fixed step and the line was not drawn at all, so a
+    /// level was told apart from the one above it by counting pixels. A line
+    /// is followed instead of counted, which is the whole of why trees have
+    /// them — and it is the same rail the Fields and Indexes tree already
+    /// stands on, so the two read alike.
+    ///
+    /// The step is `json_indent` spaces, so the setting that says four means
+    /// four here as well as in the JSON.
+    fn tree_level(&self, child: gpui::AnyElement) -> gpui::Div {
+        let (t, ms) = (self.t(), self.scale);
+        let gap = ms.gutter();
+        let step = ms.indent_by(self.json_indent);
+        div()
+            .flex()
+            .flex_col()
+            // The rail stands one gutter in, and the rows start one gutter
+            // after it, so the text lands where the old padding put it.
+            .ml(px((step - gap).max(0.0)))
+            .pl(px(gap))
+            .border_l_1()
+            .border_color(t.divider())
+            .child(child)
+    }
+
     /// One value inside a document, with its type beside it.
     fn value_el(
         &self,
@@ -12568,7 +13615,9 @@ impl Workspace {
                             .flex()
                             .items_center()
                             .gap_2()
-                            .pl(px(ms.marker_w() + depth as f32 * ms.indent()))
+                            // The LEVEL carries the indent now, not the row:
+                            // see `tree_level`.
+                            .pl(px(ms.marker_w()))
                             .py(px(1.0))
                             .child(
                                 div()
@@ -12603,9 +13652,20 @@ impl Workspace {
                                 let scalar = !matches!(val, Value::Object(_) | Value::Array(_));
                                 let col = if scalar { col } else { None };
                                 match (row, col) {
-                                    (Some(r), Some(ci)) if tab.editing == Some((r, ci)) => {
-                                        self.editor_el(tab.id, cx)
-                                    }
+                                    // MARKED, not replaced. The value is
+                                    // edited in the card below, and a cell
+                                    // that turned into a box would hide the
+                                    // very thing being changed.
+                                    (Some(r), Some(ci)) if tab.editing == Some((r, ci)) => div()
+                                        .flex_1()
+                                        .px_1()
+                                        .bg(t.selected_mark())
+                                        .border_1()
+                                        .border_color(t.accent())
+                                        .text_size(ms.small())
+                                        .text_color(t.fg())
+                                        .child(SharedString::from(preview(val)))
+                                        .into_any_element(),
                                     (Some(r), Some(ci)) => div()
                                         .id(SharedString::from(format!("tv-{}-{r}-{ci}", tab.id)))
                                         .flex_1()
@@ -12659,12 +13719,12 @@ impl Workspace {
                                     .hover(|d| d.bg(t.hover_mark()))
                                     .text_size(ms.tiny())
                                     .text_color(t.muted())
-                                    .child("copy")
+                                    .child(self.tr("ui.copy"))
                                     .on_click(cx.listener(move |this, _, _, cx| {
                                         cx.write_to_clipboard(gpui::ClipboardItem::new_string(
                                             raw.clone(),
                                         ));
-                                        this.toast("copied".to_string(), false);
+                                        this.toast(this.tr("toast.copied").to_string(), false);
                                         cx.notify();
                                     }))
                             }),
@@ -12680,14 +13740,15 @@ impl Workspace {
                         // `row.write` sets a top-level field, and pretending to
                         // write `a.b.c` by sending `c` would write the wrong
                         // thing. Shown, not editable, is the honest pairing.
-                        out = out.child(self.value_el(val, tab, depth + 1, None, cx));
+                        out = out
+                            .child(self.tree_level(self.value_el(val, tab, depth + 1, None, cx)));
                     }
                 }
             }
             other => {
                 out = out.child(
                     div()
-                        .pl(px(ms.marker_w() + depth as f32 * ms.indent()))
+                        .pl(px(ms.marker_w()))
                         .text_size(ms.small())
                         .text_color(t.fg())
                         .child(SharedString::from(preview(other))),
@@ -12768,37 +13829,111 @@ impl Workspace {
             // Two hundred documents each carrying two controls is four hundred
             // links down the view, and the eye reads the column of them before
             // it reads any of the data.
-            let mut head = div()
+            // ONE ROW, THREE LINKS OF THE SAME KIND.
+            //
+            // They were three different things in three places: a copy drawn
+            // by hand in the accent colour, and two buttons in a wrapper of
+            // their own that put them on another line. Three controls that
+            // do three comparable things read as three of a kind or they
+            // read as a mess, and the mess is what was there.
+            //
+            // All three come out UNDER THE POINTER together: two hundred
+            // documents each carrying three controls is six hundred links
+            // down the view, and the eye reads the column of them before it
+            // reads any of the data.
+            let mut links = div().flex().items_center().gap_2();
+            links = links.child(
+                btn(t, ms, format!("jcopy-{tab_id}-{i}"), self.tr("ui.copy"), Btn::Link).occlude()
+                .on_click(
+                    cx.listener({
+                        let text = text.clone();
+                        move |this, _, _, cx| {
+                            cx.write_to_clipboard(gpui::ClipboardItem::new_string(text.clone()));
+                            this.toast(this.tr("toast.copied").to_string(), false);
+                            cx.notify();
+                        }
+                    }),
+                ),
+            );
+            if can_edit && !editing {
+                links = links
+                    .child(
+                        btn(t, ms, format!("jedit-{tab_id}-{i}"), self.tr("ui.edit"), Btn::Link)
+                            .occlude()
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.begin_doc_edit(tab_id, i, false, cx);
+                            })),
+                    )
+                    .child(
+                        btn(
+                            t,
+                            ms,
+                            format!("jedit-all-{tab_id}-{i}"),
+                            self.tr("ui.edit_row"),
+                            Btn::Link,
+                        )
+                        .occlude()
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.begin_doc_edit(tab_id, i, true, cx);
+                        })),
+                    );
+            }
+            // FOLDED UNTIL SOMEBODY OPENS IT.
+            //
+            // A page of fifty documents printed in full is a page nobody can
+            // find anything in: one record ran to eighty lines and the
+            // second one started below the fold. Folded, the view is a list
+            // of records again, and the caret on each says it has more.
+            //
+            // The same `expanded` set the tree uses, so a record opened in
+            // one view is open in the other — it is the same record, and
+            // "this one is open" is a fact about it rather than about the
+            // view it is being read in.
+            let open = tab.expanded.contains(&i);
+            let head = div()
+                .id(SharedString::from(format!("jhead-{tab_id}-{i}")))
                 .flex()
                 .items_center()
                 .gap_2()
+                .cursor_pointer()
+                .hover(|d| d.bg(t.hover_mark()))
                 .child(self.small(format!("{}", i + 1), t.row_number()))
-                .child(
+                .child(self.small(if open { "\u{f0d7}" } else { "\u{f0da}" }, t.muted()))
+                // WHAT IS IN IT, while it is shut. `{6}` on fifty lines is a
+                // list of things that cannot be told apart.
+                .children((!open).then(|| {
                     div()
-                        .invisible()
-                        .group_hover(group.clone(), |d| d.visible())
-                        .child(self.copy_el(
-                            format!("jcopy-{tab_id}-{i}"),
-                            text.clone(),
-                            "copy",
-                            cx,
-                        )),
-                );
-            if can_edit && !editing {
-                head = head.child(
-                    div()
-                        .invisible()
-                        .group_hover(group.clone(), |d| d.visible())
-                        .child(
-                            btn(t, ms, format!("jedit-{tab_id}-{i}"), "edit", Btn::Link).on_click(
-                                cx.listener(move |this, _, _, cx| {
-                                    this.begin_doc_edit(tab_id, i, cx);
-                                }),
-                            ),
-                        ),
-                );
-            }
+                        .flex_1()
+                        .min_w_0()
+                        .truncate()
+                        .text_size(ms.small())
+                        .text_color(t.fg())
+                        .child(SharedString::from(crate::workspace::doc_preview(&doc, 400)))
+                }))
+                .children(open.then(|| div().flex_1()))
+                // ALWAYS THERE, never revealed on hover.
+                //
+                // They used to appear only while the pointer was over the
+                // record, and they sit at the far right — so reaching them
+                // meant travelling the width of the row, and anything that
+                // took the pointer off the group on the way made them vanish
+                // under it. A control that disappears as you reach for it is
+                // worse than a row of quiet links.
+                .child(div().flex_none().child(links))
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    if let Some(tb) = this.tabs.iter_mut().find(|t| t.id == tab_id) {
+                        if !tb.expanded.remove(&i) {
+                            tb.expanded.insert(i);
+                        }
+                    }
+                    cx.notify();
+                }));
             block = block.child(head);
+            // Shut, and not being edited: the head is the whole of it.
+            if !open && !editing {
+                out = out.child(block);
+                continue;
+            }
 
             if editing {
                 // Every writable field at once. Saving sends only what CHANGED,
@@ -12819,10 +13954,18 @@ impl Workspace {
                                 .flex()
                                 .gap_2()
                                 .py(px(1.0))
-                                .child(div().w(px(ms.base() * 9.0)).child(
+                                .child(div().w(px(ms.base() * 9.0)).flex_none().child(
                                     self.small(col.name.clone(), t.muted()),
                                 ))
-                                .child(self.small(shown, t.muted())),
+                                .child(
+                                    div()
+                                        .flex_1()
+                                        .min_w_0()
+                                        .truncate()
+                                        .text_size(ms.small())
+                                        .text_color(t.muted())
+                                        .child(SharedString::from(shown)),
+                                ),
                         );
                         continue;
                     };
@@ -12838,7 +13981,15 @@ impl Workspace {
                                     .flex_none()
                                     .child(self.small(col.name.clone(), t.fg())),
                             )
-                            .child(div().flex_1().child(self.field(ms.small(), input.clone()))),
+                            // `min_w_0`, or a field holding a long value
+                            // refuses to shrink and the row runs off the
+                            // pane — across the rows beside it.
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .child(self.field(ms.small(), input.clone())),
+                            ),
                     );
                 }
                 block = block.child(
@@ -12847,14 +13998,14 @@ impl Workspace {
                         .gap_2()
                         .py_1()
                         .child(
-                            btn(t, ms, format!("jsave-{tab_id}-{i}"), "save this document", Btn::Secondary)
+                            btn(t, ms, format!("jsave-{tab_id}-{i}"), self.tr("ui.save"), Btn::Secondary)
                                 .on_click(cx.listener(move |this, _, _, cx| {
                                     this.commit_doc_edit(tab_id, cx);
                                     cx.notify();
                                 })),
                         )
                         .child(
-                            btn(t, ms, format!("jcancel-{tab_id}-{i}"), "cancel", Btn::Quiet)
+                            btn(t, ms, format!("jcancel-{tab_id}-{i}"), self.tr("ui.cancel"), Btn::Quiet)
                                 .on_click(cx.listener(move |this, _, _, cx| {
                                     if let Some(tb) =
                                         this.tabs.iter_mut().find(|x| x.id == tab_id)
@@ -13297,6 +14448,196 @@ impl Workspace {
     /// Three buttons rather than two, because "cancel" is ambiguous here —
     /// cancel the disconnect, or cancel the query? Both are real answers, so
     /// both are offered by name.
+    /// THE FORM FOR A SCHEMA CHANGE, built from what the driver asked for.
+    ///
+    /// There is no branch here on which operation it is. The op carries its
+    /// holes, each hole carries the KIND of thing that goes in it, and this
+    /// draws a box, a list of the dialect's types, a list of the table's
+    /// columns or a tick accordingly. That is the whole of why the engine
+    /// declares them: a client that knew `add_column` takes a name and a
+    /// type would need teaching again for every operation added.
+    fn ddl_el(&self, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
+        let form = self.ddl.as_ref()?;
+        let (t, ms) = (self.t(), self.scale);
+        let driver = self.live(&form.conn).map(|l| l.driver.clone()).unwrap_or_default();
+        let types = self.meta(&driver).map(|m| m.types.clone()).unwrap_or_default();
+        let columns = self.table_columns(&form.conn, &form.table, form.schema.as_deref());
+        let mut card = div()
+            .occlude()
+            .w(px(ms.base() * 46.0))
+            .flex()
+            .flex_col()
+            .gap_2()
+            .p_3()
+            .bg(t.raised())
+            .border_1()
+            .border_color(t.accent())
+            .child(
+                div()
+                    .text_size(ms.body())
+                    .text_color(t.title())
+                    .child(SharedString::from(form.label.clone())),
+            )
+            .child(self.small(
+                match form.schema.as_deref() {
+                    Some(sc) if !sc.is_empty() => format!("{sc}.{}", form.table),
+                    _ => form.table.clone(),
+                },
+                t.muted(),
+            ));
+        for (i, ask) in form.asks.iter().enumerate() {
+            let mut row = div()
+                .flex()
+                .items_center()
+                .gap_2()
+                .child(
+                    div()
+                        .w(px(ms.base() * 8.0))
+                        .flex_none()
+                        .child(self.small(ask.label.clone(), t.muted())),
+                );
+            row = match ask.kind {
+                // A TICK, not a box: a flag has two states and typing one of
+                // them out is a way to get it wrong.
+                lode_proto::AskKind::Flag => {
+                    let on = form.flags.get(i).copied().unwrap_or(false);
+                    row.child(
+                        div()
+                            .id(SharedString::from(format!("ddl-flag-{i}")))
+                            .px_1()
+                            .cursor_pointer()
+                            .text_size(ms.small())
+                            .text_color(if on { t.accent() } else { t.muted() })
+                            .child(if on { "\u{f14a}" } else { "\u{f0c8}" })
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                if let Some(f) = this.ddl.as_mut() {
+                                    if let Some(v) = f.flags.get_mut(i) {
+                                        *v = !*v;
+                                    }
+                                }
+                                cx.notify();
+                            })),
+                    )
+                }
+                _ => {
+                    let Some(input) = self.inputs.get(&(0, format!("ddl-{i}"))) else {
+                        return None;
+                    };
+                    row.child(div().flex_1().child(self.field(ms.small(), input.clone())))
+                }
+            };
+            card = card.child(row);
+            // WHAT THERE IS TO PICK FROM, under the box it fills: the
+            // dialect's types, or the table's columns. Still a box, because
+            // a list that cannot be typed past is a list that is wrong for
+            // somebody — `numeric(12, 2)` is not in any list.
+            let picks: Vec<String> = match ask.kind {
+                lode_proto::AskKind::Type => types
+                    .iter()
+                    .map(|ty| match ty.args {
+                        0 => ty.name.clone(),
+                        1 => format!("{}(n)", ty.name),
+                        _ => format!("{}(p, s)", ty.name),
+                    })
+                    .collect(),
+                lode_proto::AskKind::Column | lode_proto::AskKind::Columns => columns.clone(),
+                _ => Vec::new(),
+            };
+            if !picks.is_empty() {
+                let add = matches!(ask.kind, lode_proto::AskKind::Columns);
+                card = card.child(
+                    crate::widgets::scroll(SharedString::from(format!("ddl-picks-{i}")))
+                        .outer(|d| d.max_h(ms.line_h() * 5.0))
+                        .children(picks.into_iter().map(|p| {
+                            let text = p.clone();
+                            div()
+                                .id(SharedString::from(format!("ddl-pick-{i}-{p}")))
+                                .px_2()
+                                .py(px(1.0))
+                                .cursor_pointer()
+                                .text_size(ms.small())
+                                .text_color(t.fg())
+                                .hover(|d| d.bg(t.hover_mark()))
+                                .child(SharedString::from(p))
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    let Some(input) =
+                                        this.inputs.get(&(0, format!("ddl-{i}"))).cloned()
+                                    else {
+                                        return;
+                                    };
+                                    let text = text.clone();
+                                    input.update(cx, |x, cx| {
+                                        // A LIST of columns grows; anything
+                                        // else is replaced. Picking a second
+                                        // column for an index means both, and
+                                        // picking a second type means the
+                                        // second one.
+                                        let now = x.text().to_string();
+                                        let next = if add && !now.trim().is_empty() {
+                                            format!("{now}, {text}")
+                                        } else {
+                                            text
+                                        };
+                                        x.set_text(next, cx);
+                                    });
+                                    cx.notify();
+                                }))
+                                .into_any_element()
+                        })),
+                );
+            }
+        }
+        card = card.child(
+            div()
+                .flex()
+                .gap_2()
+                .pt_1()
+                .child(
+                    btn(t, ms, "ddl-ok", self.tr("ddl.write"), Btn::Primary).on_click(
+                        cx.listener(|this, _, _, cx| {
+                            this.write_ddl(cx);
+                            cx.notify();
+                        }),
+                    ),
+                )
+                .child(
+                    btn(t, ms, "ddl-no", self.tr("ui.cancel"), Btn::Quiet).on_click(cx.listener(
+                        |this, _, _, cx| {
+                            this.ddl = None;
+                            cx.notify();
+                        },
+                    )),
+                ),
+        );
+        Some(
+            div()
+                .absolute()
+                .top(px(ms.palette_top()))
+                .left_0()
+                .right_0()
+                .flex()
+                .justify_center()
+                .child(card)
+                .into_any_element(),
+        )
+    }
+
+    /// The columns of a table this client has already been told about.
+    ///
+    /// From the structure it holds, not from a fresh question: the form is
+    /// opened from the tree, which is the thing that was filled in by that
+    /// structure in the first place.
+    fn table_columns(&self, conn: &str, table: &str, schema: Option<&str>) -> Vec<String> {
+        // The same key the tree files its columns under — see where
+        // `Pending::NodeColumns` is asked for.
+        let _ = schema;
+        let key = format!("{conn}/table/{table}");
+        self.node_fields
+            .get(&key)
+            .map(|f| f.iter().map(|c| c.name.clone()).collect())
+            .unwrap_or_default()
+    }
+
     fn busy_el(&self, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
         let (name, busy) = self.confirm_disconnect.clone()?;
         let (t, ms) = (self.t(), self.scale);
@@ -13474,7 +14815,7 @@ impl Workspace {
                 );
             }
             Act::Ddl { conn, table, schema, field, op, index } => {
-                self.write_ddl(&conn, &table, schema.as_deref(), &field, &op, index, cx);
+                self.open_ddl(&conn, &table, schema.as_deref(), &field, &op, index, cx);
             }
             Act::MoveToFolder(name) => {
                 // The naming row again, with the folder it is in now as the
@@ -13501,7 +14842,7 @@ impl Workspace {
             }
             Act::CopyText(text) => {
                 cx.write_to_clipboard(gpui::ClipboardItem::new_string(text));
-                self.toast("copied".to_string(), false);
+                self.toast(self.tr("toast.copied").to_string(), false);
             }
             Act::OpenNode { conn, name, schema, kind } => {
                 self.open_object(&conn, &name, schema.as_deref(), &kind, cx)
@@ -13548,6 +14889,10 @@ impl Workspace {
                     tb.detail = Some(row);
                 }
                 cx.notify();
+            }
+            Act::EditDoc { tab, row } => {
+                self.select_row(tab, row, cx);
+                self.begin_doc_edit(tab, row, true, cx);
             }
             Act::EditRow { tab, row } => {
                 self.select_row(tab, row, cx);
@@ -13733,6 +15078,22 @@ impl Render for Workspace {
         // rail + panel + the canvas's own padding.
         self.canvas_w = (f32::from(window.viewport_size().width) - self.grid_left() - 8.0).max(120.0);
 
+        // The cell card, if one has just opened, gets the keyboard — so the
+        // typing that follows a double click goes into the box rather than
+        // into the grid's own shortcuts.
+        if self.cell_focus {
+            self.cell_focus = false;
+            if let Some((_, ed)) = self.cell_editor.clone() {
+                ed.update(cx, |ed, cx| ed.focus_at_end(window, cx));
+            }
+        }
+        if self.doc_focus {
+            self.doc_focus = false;
+            if let Some((_, ed)) = self.doc_editor.clone() {
+                ed.update(cx, |ed, cx| ed.focus_at_end(window, cx));
+            }
+        }
+
         // Toasts expire on the next frame they are late for; the pump redraws
         // often enough that nothing sits there after its time.
         let now = Instant::now();
@@ -13824,6 +15185,26 @@ impl Render for Workspace {
                     // Escape on a question means the answer that CHANGES
                     // NOTHING, which here is to keep waiting.
                     this.confirm_disconnect = None;
+                } else if this.ddl.is_some() {
+                    this.ddl = None;
+                } else if this.doc_editor.is_some() && this.doc_whole {
+                    let active = this.tabs.get(this.active).map(|t| t.id);
+                    if let Some(id) = active {
+                        this.leave_doc_edit(id, cx);
+                    }
+                } else if this.cell_editor.is_some() {
+                    // The CELL CARD, from anywhere. Its editor already leaves
+                    // on escape, but only while it has the keyboard — and
+                    // somebody who has clicked away and wants the card gone
+                    // presses escape without thinking about where the focus
+                    // is. A card that can only be dismissed from inside
+                    // itself is a card that traps the one person who looked
+                    // away from it.
+                    let active = this.tabs.get(this.active).map(|t| t.id);
+                    if let Some(tb) = this.tabs.iter_mut().find(|t| Some(t.id) == active) {
+                        tb.editing = None;
+                    }
+                    this.cell_editor = None;
                 } else if this.palette_open {
                     this.palette_open = false;
                 } else if this.export_open {
@@ -13857,7 +15238,7 @@ impl Render for Workspace {
                     .and_then(|t| t.selected.or(t.detail).map(|r| (t.id, r)));
                 match what {
                     Some((id, row)) => this.copy_row_tsv(id, row, cx),
-                    None => this.toast("pick a row first".to_string(), true),
+                    None => this.toast(this.tr("toast.pick_row").to_string(), true),
                 }
             }))
             .on_action(cx.listener(|this, _: &CopyPageTsv, _, cx| this.copy_page_tsv(cx)))
@@ -13973,10 +15354,10 @@ impl Render for Workspace {
                     .items_center()
                     .justify_center()
                     .gap_2()
-                    .child(div().text_color(t.error()).child("No engine"))
+                    .child(div().text_color(t.error()).child(self.tr("ui.no_engine")))
                     .child(div().text_color(t.fg()).child(SharedString::from(fatal)))
                     .child(self.small(
-                        "Build it with scripts/build and put loded on $PATH, or set $LODE_DAEMON.",
+                        self.tr("engine.build_it"),
                         t.muted(),
                     )),
             );
@@ -14031,13 +15412,37 @@ impl Render for Workspace {
                         .flex()
                         .flex_col()
                         .flex_1()
+                        // `min_w_0` IS THE OTHER HALF OF `flex_1`, and leaving
+                        // it out is why the grid would not scroll sideways.
+                        //
+                        // A flex item's automatic minimum size is its CONTENT,
+                        // so this pane refused to shrink below the width of
+                        // the widest grid in it: the row overflowed, the pane
+                        // grew to the content, and the scroller inside it had
+                        // nothing left over to scroll. The columns past the
+                        // edge were clipped by the WINDOW, and gpui's own
+                        // scroll_max stayed zero, so the wheel and the bar
+                        // were both dead.
+                        //
+                        // The same companion `min_h_0` already has on every
+                        // vertical flex child here. Said at length because the
+                        // symptom — content visibly cut off — looks like a
+                        // clipping bug and is a sizing one.
+                        .min_w_0()
                         .h_full()
                         .child(self.tabs_el(cx))
-                        .child(div().flex_1().overflow_hidden().child(self.result_el(cx))),
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .overflow_hidden()
+                                .child(self.result_el(cx)),
+                        ),
                 ),
         )
         .child(self.bottom_el(cx))
         .children(self.busy_el(cx))
+        .children(self.ddl_el(cx))
         .children(self.toasts_el(cx))
         // A click ANYWHERE ELSE closes the menu. The menu itself `occlude`s, so
         // this never fires for a click on one of its own lines — without that,
