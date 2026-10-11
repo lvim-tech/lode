@@ -1210,6 +1210,19 @@ impl SettingsWindow {
                     ));
                 }
                 out = out.child(self.note("Changes take effect when the engine restarts."));
+                out = out.child(self.head("AN OLDER STORE"));
+                out = out.child(self.note(
+                    "A database written by the Neovim client can be read in: the connections, \
+                     queries and history that are missing are copied, keyed by name, so running \
+                     it twice imports nothing the second time. The source file is only read.",
+                ));
+                out = out.child(
+                    btn(&t, ms, "store-import", "Choose a file\u{2026}", Btn::Secondary).on_click(
+                        cx.listener(|this, _, _, cx| {
+                            let _ = this.workspace.update(cx, |w, cx| w.import_store(cx));
+                        }),
+                    ),
+                );
             }
             Category::Access => {
                 let f = &self.facts;
@@ -1218,15 +1231,56 @@ impl SettingsWindow {
                         "Nothing found. The engine reads ~/.aws/config and ~/.aws/credentials.",
                     ));
                 }
-                for (name, kind, usable, why) in &f.access {
-                    out = out.child(self.row(
-                        name.clone(),
-                        if *usable {
-                            format!("{kind} \u{2014} usable")
-                        } else {
-                            format!("{kind} \u{2014} {why}")
-                        },
-                    ));
+                for (name, kind, usable, why) in f.access.clone() {
+                    let (test_n, imp_n) = (name.clone(), name.clone());
+                    out = out.child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .py(px(1.0))
+                            .child(
+                                div()
+                                    .w(px(ms.base() * 13.0))
+                                    .flex_none()
+                                    .text_size(ms.small())
+                                    .text_color(t.muted())
+                                    .child(SharedString::from(name.clone())),
+                            )
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .text_size(ms.small())
+                                    .text_color(if usable { t.fg() } else { t.warning() })
+                                    .child(SharedString::from(if usable {
+                                        format!("{kind} \u{2014} usable")
+                                    } else {
+                                        format!("{kind} \u{2014} {why}")
+                                    })),
+                            )
+                            // TEST asks the engine to resolve it for real: a
+                            // provider that reads as usable and fails when
+                            // picked is the thing this page exists to prevent.
+                            .children(usable.then(|| {
+                                btn(&t, ms, format!("acc-test-{name}"), "test", Btn::Secondary)
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        let n = test_n.clone();
+                                        let _ = this
+                                            .workspace
+                                            .update(cx, |w, _| w.access_test(&n));
+                                    }))
+                            }))
+                            // IMPORT stores the profile's NAME, never its key.
+                            .children(usable.then(|| {
+                                btn(&t, ms, format!("acc-imp-{name}"), "import", Btn::Link)
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        let n = imp_n.clone();
+                                        let _ = this
+                                            .workspace
+                                            .update(cx, |w, _| w.access_import(&n));
+                                    }))
+                            })),
+                    );
                 }
                 out = out.child(self.note(
                     "The whole list is shown and the ones that will not work are marked, rather \

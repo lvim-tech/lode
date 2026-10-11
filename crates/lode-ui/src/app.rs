@@ -926,6 +926,14 @@ enum Pending {
     /// What the settings window's Access and MCP pages report.
     AccessList,
     Approvals,
+    /// An answer given; the queue is asked for again.
+    ApprovalDecided,
+    /// A sign-in the engine was asked to resolve, and one it was asked to
+    /// store as a profile.
+    AccessTest { profile: String },
+    AccessImport { profile: String },
+    /// An older client's database, read in.
+    StoreImport,
     StoreStatus,
     Connections,
     Connect { name: String, driver: String },
@@ -1056,11 +1064,19 @@ pub struct Workspace {
     /// settings window's About page, because "where is my saved connection"
     /// has no answer anywhere else.
     store_path: String,
-    /// What the engine found for `access.list` and `approvals.list`, cached for
-    /// the settings window. Asked when that window opens: both cost a round
-    /// trip and neither is wanted until somebody looks.
+    /// What the engine found for `access.list`, cached for the settings window.
+    /// Asked when that window opens: it costs a round trip and is not wanted
+    /// until somebody looks.
     access: Vec<Value>,
+    /// The MCP approval queue — what an agent has asked a PERSON to allow.
+    ///
+    /// Kept in the window rather than only in the settings page, because it is
+    /// not a setting: something is waiting for an answer, and a queue nobody
+    /// is told about is a queue that never empties. The status line counts it.
     approvals: Vec<Value>,
+    /// When the queue was last asked for, so the poll is a poll and not a race
+    /// with the frame rate.
+    approvals_at: Option<Instant>,
 
     saved: Vec<SavedConnection>,
     conns: Vec<Live>,
@@ -1375,6 +1391,7 @@ impl Workspace {
             store_path: String::new(),
             access: Vec::new(),
             approvals: Vec::new(),
+            approvals_at: None,
             saved: Vec::new(),
             conns: Vec::new(),
             open_nodes: HashSet::new(),
@@ -1670,6 +1687,7 @@ impl Workspace {
         }
         self.poll_metrics();
         self.poll_board();
+        self.poll_approvals();
         loop {
             let Some(engine) = &self.engine else { break };
             let Some(msg) = engine.try_recv() else { break };
@@ -2188,9 +2206,48 @@ impl Workspace {
                 self.poke_settings(cx);
             }
             Pending::Approvals => {
+                let was = self.approvals.len();
                 self.approvals =
                     v.get("approvals").and_then(|x| x.as_array()).cloned().unwrap_or_default();
+                // SAID once, when one arrives. The count in the status line is
+                // for afterwards; a thing waiting for a person needs telling
+                // the person, not a number they have to notice.
+                if self.approvals.len() > was {
+                    self.toast(
+                        format!("{} statement(s) waiting for your answer", self.approvals.len()),
+                        true,
+                    );
+                }
                 self.poke_settings(cx);
+            }
+            Pending::AccessTest { profile } => {
+                // The ENGINE's own words about what it got, not a tick: "it
+                // worked" tells nobody which identity they are now using.
+                let detail = v
+                    .get("detail")
+                    .and_then(Value::as_str)
+                    .unwrap_or("resolved")
+                    .to_string();
+                self.status = format!("{profile}: {detail}");
+                self.toast(format!("{profile}: {detail}"), false);
+            }
+            Pending::AccessImport { profile } => {
+                self.toast(format!("imported {profile}"), false);
+                // It became a profile; the lists that show profiles are asked
+                // again rather than left to be refreshed by hand.
+                self.ask_profiles();
+            }
+            Pending::StoreImport => {
+                let n = |k: &str| v.get(k).and_then(Value::as_u64).unwrap_or(0);
+                let (c, q, h) = (n("connections"), n("queries"), n("history"));
+                self.toast(
+                    format!("imported {c} connection(s), {q} quer(ies), {h} history row(s)"),
+                    false,
+                );
+                self.ask(Pending::Connections, "store.connections.list", json!({}));
+            }
+            Pending::ApprovalDecided => {
+                self.ask(Pending::Approvals, "approvals.list", json!({ "state": "pending" }));
             }
             Pending::DdlCopy => {
                 // Straight to the clipboard: the menu said "copy the DDL", and
@@ -4666,6 +4723,43 @@ impl Workspace {
         cx.notify();
     }
 
+    /// Ask the engine what is waiting for a person's answer.
+    ///
+    /// Every five seconds, and ONLY while the panel that shows them is open —
+    /// the queue is filled by an agent working on its own, so it has to be
+    /// polled rather than waited for, and polling a database every five
+    /// seconds for a panel nobody is looking at is a cost with no reader.
+    ///
+    /// Once at startup too, whatever panel is open: something may have been
+    /// waiting since before this window started, and a queue that only appears
+    /// after somebody thinks to look is a queue that holds things for days.
+    fn poll_approvals(&mut self) {
+        if self.engine.is_none() || self.hello.as_ref().map_or(true, |h| h.proto < 12) {
+            return;
+        }
+        let first = self.approvals_at.is_none();
+        let watching = self.rail == Rail::Audit && !self.panel_hidden;
+        let due = self
+            .approvals_at
+            .map_or(true, |at| watching && at.elapsed() >= Duration::from_secs(5));
+        if !(first || due) {
+            return;
+        }
+        self.approvals_at = Some(Instant::now());
+        self.ask(Pending::Approvals, "approvals.list", json!({ "state": "pending" }));
+    }
+
+    /// A person's answer to one. It goes to the ENGINE, which writes it in the
+    /// audit log — "who let this through" is the question asked straight after
+    /// "what ran".
+    fn decide_approval(&mut self, id: i64, approve: bool) {
+        self.ask(
+            Pending::ApprovalDecided,
+            "approvals.decide",
+            json!({ "id": id, "approve": approve }),
+        );
+    }
+
     /// Run the board in FRONT again, if its interval has come round.
     ///
     /// Only the front one. A board left open in a background tab refreshing
@@ -5402,6 +5496,56 @@ impl Workspace {
             font_family: self.font_family.clone(),
             icon_family: self.icon_family.clone(),
         }
+    }
+
+    /// Ask the engine to resolve a sign-in for real.
+    ///
+    /// "Usable" is read off a config file; this is the engine actually trying
+    /// it. A provider that reads as usable and fails when picked is what the
+    /// Access page exists to prevent, and only the engine can tell the two
+    /// apart.
+    pub fn access_test(&mut self, profile: &str) {
+        self.ask(
+            Pending::AccessTest { profile: profile.to_string() },
+            "access.test",
+            json!({ "profile": profile }),
+        );
+        self.status = format!("testing {profile}\u{2026}");
+    }
+
+    /// Store a sign-in as a reusable profile.
+    ///
+    /// The engine stores the profile's NAME, never its key: the credential
+    /// stays where the AWS tools rotate it.
+    pub fn access_import(&mut self, profile: &str) {
+        self.ask(
+            Pending::AccessImport { profile: profile.to_string() },
+            "access.import",
+            json!({ "profile": profile }),
+        );
+    }
+
+    /// Read an older client's store, and say what came across.
+    pub fn import_store(&mut self, cx: &mut Context<Self>) {
+        let rx = cx.prompt_for_paths(gpui::PathPromptOptions {
+            files: true,
+            directories: false,
+            multiple: false,
+            prompt: Some("Import".into()),
+        });
+        cx.spawn(async move |this, cx| {
+            // A cancelled dialog is not an error, and neither is a dialog the
+            // platform refuses to open: nothing was chosen, so nothing happens.
+            if let Ok(Ok(Some(paths))) = rx.await {
+                if let Some(path) = paths.into_iter().next() {
+                    let path = path.to_string_lossy().to_string();
+                    let _ = this.update(cx, |w: &mut Workspace, _| {
+                        w.ask(Pending::StoreImport, "store.import", json!({ "path": path }));
+                    });
+                }
+            }
+        })
+        .detach();
     }
 
     /// Change what a key does, or put its default back.
@@ -6322,6 +6466,85 @@ impl Workspace {
                 } else {
                     format!("Audit ({} of {})", shown.len(), self.audit.len())
                 }));
+                // WAITING FOR AN ANSWER, above the log. The audit panel is
+                // where "what was stopped" is read, and an approval is the
+                // same question before the fact rather than after it.
+                if !self.approvals.is_empty() {
+                    panel = panel.child(self.section(&format!(
+                        "{} ({})",
+                        self.lang.tr("approve.title"),
+                        self.approvals.len()
+                    )));
+                    for a in self.approvals.clone().iter().take(20) {
+                        let id = a.get("id").and_then(Value::as_i64).unwrap_or(0);
+                        let stmt = a
+                            .get("statement")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default()
+                            .to_string();
+                        let who = a.get("asker").and_then(Value::as_str).unwrap_or("an agent");
+                        let conn = a.get("conn").and_then(Value::as_str).unwrap_or("");
+                        let why = a.get("reason").and_then(Value::as_str).unwrap_or("");
+                        panel = panel.child(
+                            div()
+                                .flex()
+                                .flex_col()
+                                .gap_1()
+                                .mx_2()
+                                .mb_1()
+                                .p_2()
+                                .border_1()
+                                .border_color(t.warning())
+                                .child(self.small(format!("{who} \u{2192} {conn}"), t.muted()))
+                                // The STATEMENT in full, wrapped: an approval
+                                // about a statement nobody can read whole is an
+                                // approval given blind.
+                                .child(
+                                    div()
+                                        .text_size(ms.small())
+                                        .text_color(t.fg())
+                                        .child(SharedString::from(stmt)),
+                                )
+                                .children((!why.is_empty()).then(|| {
+                                    self.small(why.to_string(), t.warning())
+                                }))
+                                .child(
+                                    div()
+                                        .flex()
+                                        .gap_2()
+                                        .child(
+                                            btn(
+                                                t,
+                                                ms,
+                                                format!("appr-yes-{id}"),
+                                                self.tr("approve.yes"),
+                                                Btn::Danger,
+                                            )
+                                            .on_click(cx.listener(move |this, _, _, cx| {
+                                                this.decide_approval(id, true);
+                                                cx.notify();
+                                            })),
+                                        )
+                                        .child(
+                                            btn(
+                                                t,
+                                                ms,
+                                                format!("appr-no-{id}"),
+                                                self.tr("approve.no"),
+                                                Btn::Secondary,
+                                            )
+                                            .on_click(cx.listener(move |this, _, _, cx| {
+                                                this.decide_approval(id, false);
+                                                cx.notify();
+                                            })),
+                                        ),
+                                ),
+                        );
+                    }
+                    panel = panel.child(div().px_2().pb_1().child(
+                        self.small(self.lang.tr("approve.note"), t.muted()),
+                    ));
+                }
                 // Why a statement might be blank. The engine decides this, and a
                 // reader who is not told reads the blank as a broken client.
                 if self.audit_mode != "full" {
@@ -10540,6 +10763,20 @@ impl Workspace {
                     }))
                     // Zero is not drawn: a permanent "0 unread" teaches the eye
                     // to skip the place where the number appears.
+                    // WAITING. Louder than the rest, because something is
+                    // held up until a person answers.
+                    .children((!self.approvals.is_empty()).then(|| {
+                        btn(
+                            t,
+                            ms,
+                            "st-approvals",
+                            format!("{} {}", self.approvals.len(), self.lang.tr("approve.title")),
+                            Btn::Danger,
+                        )
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.go_rail(Rail::Audit, cx);
+                        }))
+                    }))
                     .children((self.log_unread > 0).then(|| {
                         btn(
                             t,
