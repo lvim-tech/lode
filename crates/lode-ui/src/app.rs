@@ -4136,10 +4136,31 @@ impl Workspace {
         cx.notify();
     }
 
+    /// Close the profile window FROM OUTSIDE it — the workspace asking it to
+    /// go, which is how a save closes it.
+    ///
+    /// A window may not do this to ITSELF: `h.update` on the window that is
+    /// already being updated is the re-entrant update gpui refuses, and the
+    /// `let _ =` on the result meant Cancel silently did nothing. A window
+    /// closing itself calls `window.remove_window()` on its own `&mut Window`
+    /// and then `forget_profile` so the handle does not outlive it.
     pub fn close_profile(&mut self, cx: &mut Context<Self>) {
         if let Some(h) = self.profile_window.take() {
             let _ = h.update(cx, |_, window, _| window.remove_window());
         }
+        cx.notify();
+    }
+
+    /// Drop the handle without touching the window: the window is closing
+    /// itself and is mid-update, so anything that reached into it would be
+    /// refused.
+    pub fn forget_profile(&mut self, cx: &mut Context<Self>) {
+        self.profile_window = None;
+        cx.notify();
+    }
+
+    pub fn forget_form(&mut self, cx: &mut Context<Self>) {
+        self.form_window = None;
         cx.notify();
     }
 
@@ -5775,7 +5796,11 @@ impl Workspace {
         }
         // What acting on a row is called, and whether it is offered at all.
         let act = views.iter().find(|v| v.name == name).map(|v| v.act.clone()).unwrap_or_default();
-        let mut list = div().flex().flex_col();
+        // THE SAME RULE as every other panel list: a tall list of rows goes in
+        // a scroll container whose rows do not shrink. Added straight to the
+        // panel it would be squeezed by `h_full` + `overflow_hidden`, with no
+        // scroll to save it — fifty sessions in the space of five.
+        let mut list = self.panel_list("inspect-list");
         for (n, row) in rows.iter().enumerate() {
             // The FIRST column is the key: every driver's view is written with
             // the identifying column first, precisely so this is not a guess.
@@ -7003,21 +7028,8 @@ impl Workspace {
         div().id(id).flex().flex_col().flex_1().min_h_0().w_full().overflow_hidden()
     }
 
-    fn panel_list(&self, id: &'static str) -> gpui::Stateful<gpui::Div> {
-        div()
-            .id(id)
-            .flex()
-            .flex_col()
-            .flex_1()
-            .min_h_0()
-            .w_full()
-            // Vertical scrolling only. `overflow_y_scroll` alone leaves the X
-            // axis visible, and a child is then free to size itself to its
-            // content — which is exactly how a long statement ends up wider
-            // than the panel and gets clipped with no ellipsis instead of
-            // being laid out to fit and truncated.
-            .overflow_x_hidden()
-            .overflow_y_scroll()
+    fn panel_list(&self, id: &'static str) -> crate::widgets::Scroll {
+        crate::widgets::scroll(id)
     }
 
     /// One line of free text that must not escape its panel: it ends in an
@@ -7297,8 +7309,16 @@ impl Workspace {
                     ),
                 );
                 if self.scripts.is_empty() {
-                    panel = panel.child(self.empty_state("script.none", "script.none"));
+                    // Two DIFFERENT lines: the empty state says what is
+                    // missing and then what to do about it, and passing one
+                    // key twice printed "No saved scripts yet." under itself.
+                    return panel.child(self.empty_state("script.none", "script.none_hint"));
                 }
+                // A LIST OF ITS OWN, which scrolls: a connection with thirty
+                // scripts is thirty rows, and rows added straight to the panel
+                // are squeezed by `h_full` + `overflow_hidden` with no scroll
+                // to save them.
+                let mut list = self.panel_list("scripts-list");
                 for sc in self.scripts.clone() {
                     let name = sc.get("name").and_then(Value::as_str).unwrap_or("").to_string();
                     let conn = sc.get("conn").and_then(Value::as_str).unwrap_or("").to_string();
@@ -7313,7 +7333,7 @@ impl Workspace {
                         conn.clone()
                     };
                     let open = (name.clone(), lang.clone(), conn.clone(), body.clone());
-                    panel = panel.child(
+                    list = list.child(
                         div()
                             .id(SharedString::from(format!("sc-{conn}-{name}")))
                             .flex()
@@ -7339,6 +7359,13 @@ impl Workspace {
                             })),
                     );
                 }
+                // RETURNS ITS OWN LIST. Without this the match falls through
+                // and the connections panel is drawn underneath — which is
+                // exactly what `--check-panels` was written to catch after
+                // Settings did the same thing, and what it then failed to
+                // catch here because it prints a sentence somebody has to
+                // compare by eye.
+                return panel.child(list);
             }
             Rail::Instance => {
                 let who = self.metrics_conn.clone().unwrap_or_else(|| "nothing connected".into());
@@ -9759,16 +9786,8 @@ impl Workspace {
             body = body.child(div().px_2().pb_1().text_size(ms.body()).child(ed.clone()));
         }
 
-        let mut out = div()
-            .id(SharedString::from(format!("sc-out-{tab_id}")))
-            .flex()
-            .flex_col()
-            .flex_1()
-            .min_h_0()
-            .overflow_y_scroll()
-            .px_2()
-            .border_t_1()
-            .border_color(t.border());
+        let mut out = crate::widgets::scroll(SharedString::from(format!("sc-out-{tab_id}")))
+            .outer(|d| d.px_2().border_t_1().border_color(t.border()));
         if sc.out.is_empty() && !running {
             out = out.child(self.small(
                 if sc.ended.is_some() {
@@ -12921,17 +12940,17 @@ impl Workspace {
         // The page itself, at a FIXED height. A drawer that grows with its
         // content takes the result's room without being asked, and the result
         // is what the window is for.
-        let mut body = div()
-            .id("drawer-body")
-            .flex()
-            .flex_col()
-            .w_full()
-            .h(px(f32::from(ms.line_h()) * 7.0))
-            .flex_none()
-            .overflow_y_scroll()
-            .bg(t.panel())
-            .px_3()
-            .py_1();
+        let mut body = crate::widgets::scroll("drawer-body").outer(|d| {
+            d.w_full()
+                // A FIXED height, not a share of what is left: the drawer is
+                // seven lines whatever is in it, and a drawer that grew with
+                // its content would push the grid off the screen.
+                .h(px(f32::from(ms.line_h()) * 7.0))
+                .flex_none()
+                .bg(t.panel())
+                .px_3()
+                .py_1()
+        });
         match which {
             Drawer::Tasks => {
                 if self.tasks.is_empty() {

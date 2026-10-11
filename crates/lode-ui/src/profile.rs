@@ -200,6 +200,99 @@ impl ProfileForm {
         })
     }
 
+    /// A SECRET row: where the value comes from, the value, and an eye.
+    ///
+    /// The same three parts the connection window has, because this window
+    /// already stores the same shape — it reads a `{{ env … }}` back through
+    /// `Source::unwrap` and writes one through `source.wrap`. What it did not
+    /// do was SHOW any of it: a passphrase typed here was drawn in clear, with
+    /// no way to say it lives in the environment or in the keyring. A window
+    /// that writes a thing and hides it is a window that lies about what it
+    /// saved.
+    fn secret_row(
+        &self,
+        label: SharedString,
+        key: &'static str,
+        f: &Field,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let t = self.theme.clone();
+        let ms = self.scale;
+        let mut row = div().flex().items_center().gap_2().py(px(2.0)).child(
+            div()
+                .w(px(ms.label_w()))
+                .flex_none()
+                .text_size(ms.small())
+                .text_color(t.muted())
+                .child(label),
+        );
+        for src in Source::all() {
+            let on = f.source == src;
+            row = row.child(chip(&t, ms, format!("psrc-{key}-{}", src.label()), src.label(), on)
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.set_source(key, src, cx);
+                    cx.notify();
+                })));
+        }
+        // Dots only under `Literal`. Under the other three the field holds the
+        // NAME of a variable, a command line or a keyring path — public text
+        // somebody has to be able to read and check, and masking it hides
+        // nothing while making it unusable.
+        let hide = f.source == Source::Literal;
+        let shown = f.input.read(cx).revealed();
+        f.input.update(cx, |i, cx| i.set_mask(hide, cx));
+        row = row.child(div().flex_1().text_size(ms.body()).child(f.input.clone()));
+        if hide {
+            let input = f.input.clone();
+            row = row.child(
+                div()
+                    .id(SharedString::from(format!("peye-{key}")))
+                    .flex_none()
+                    .cursor_pointer()
+                    .hover(|d| d.bg(t.hover_mark()))
+                    // Open eye while it is showing, struck-through while it is
+                    // not: the icon says what you are looking at, not what
+                    // pressing it would do.
+                    .child(
+                        div()
+                            .font_family(SharedString::from(self.font_family.clone()))
+                            .text_size(ms.small())
+                            .text_color(if shown { t.warning() } else { t.muted() })
+                            .child(if shown { "\u{f06e}" } else { "\u{f070}" }),
+                    )
+                    .on_click(cx.listener(move |_, _, _, cx| {
+                        input.update(cx, |i, cx| i.toggle_reveal(cx));
+                        cx.notify();
+                    })),
+            );
+        }
+        row
+    }
+
+    /// Move one of the two secrets to a different source, keeping what was
+    /// typed under the old one — the same swap the connection window makes,
+    /// from the same function.
+    fn set_source(&mut self, key: &str, to: Source, cx: &mut gpui::App) {
+        let f = match key {
+            "passphrase" => &mut self.passphrase,
+            "password" => &mut self.password,
+            _ => return,
+        };
+        crate::form::ConnectionForm::swap_source(f, to, cx);
+    }
+
+    /// Close this window, from INSIDE it.
+    ///
+    /// `window.remove_window()` on its own window, and then the workspace is
+    /// told to drop the handle. Asking the workspace to close it instead means
+    /// `WindowHandle::update` on the window that is already being updated —
+    /// the re-entrant update gpui refuses — and the `let _ =` on the result
+    /// meant Cancel and Escape silently did nothing at all.
+    fn leave(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let _ = self.workspace.update(cx, |w, cx| w.forget_profile(cx));
+        window.remove_window();
+    }
+
     /// Tab and shift-tab between the fields — see `ConnectionForm::step_focus`.
     fn step_focus(&mut self, back: bool, window: &mut Window, cx: &mut Context<Self>) {
         let fields = self.all_inputs();
@@ -343,15 +436,9 @@ impl Render for ProfileForm {
         // Scrolls, for the same reason the connection window's body does: with
         // a key path, a passphrase and a warning the content is taller than the
         // window at a large text size, and what fell off the bottom was Save.
-        let mut body = div()
-            .id("profile-body")
-            .flex()
-            .flex_col()
-            .flex_1()
-            .min_h_0()
-            .overflow_y_scroll()
-            .p_3()
-            .gap_1();
+        let mut body = crate::widgets::scroll("profile-body")
+            .outer(|d| d.p_3())
+            .rows(|d| d.gap_1());
         body = body.child(row(self.tr("form.name"), self.name.clone()));
 
         if self.kind == "proxy" {
@@ -384,7 +471,7 @@ impl Render for ProfileForm {
             body = body
                 .child(small(self.tr("form.proxy_auth_opt"), t.muted()))
                 .child(row(self.tr("form.ssh_user"), self.user.clone()))
-                .child(row(self.tr("form.password"), self.password.input.clone()));
+                .child(self.secret_row(self.tr("form.password"), "password", &self.password, cx));
             if !self.users.is_empty() {
                 body = body.child(small(
                     format!(
@@ -468,10 +555,20 @@ impl Render for ProfileForm {
             if let Some(why) = self.key_problem(cx) {
                 body = body.child(small(why.into(), t.error()));
             }
-            body = body.child(row(self.tr("form.passphrase"), self.passphrase.input.clone()));
+            body = body.child(self.secret_row(
+                self.tr("form.passphrase"),
+                "passphrase",
+                &self.passphrase,
+                cx,
+            ));
         }
         if self.auth == "password" {
-            body = body.child(row(self.tr("form.password"), self.password.input.clone()));
+            body = body.child(self.secret_row(
+                self.tr("form.password"),
+                "password",
+                &self.password,
+                cx,
+            ));
         }
 
         // WHO depends on this, before anything is changed rather than after.
@@ -497,7 +594,7 @@ impl Render for ProfileForm {
 impl ProfileForm {
     /// The title, the buttons and the key handling — the same for both kinds,
     /// which is why they are in one place rather than in each branch.
-    fn frame(&self, body: gpui::Stateful<gpui::Div>, cx: &mut Context<Self>) -> gpui::Div {
+    fn frame(&self, body: crate::widgets::Scroll, cx: &mut Context<Self>) -> gpui::Div {
         let t = self.theme.clone();
         let ms = self.scale;
         let head = div()
@@ -515,9 +612,14 @@ impl ProfileForm {
                 None => format!("New {}", self.kind),
             }));
 
+        // Cancel and Save to the RIGHT, Save last — the arrangement every
+        // dialog has, and the one the connection window already uses. These
+        // were at the left edge, which puts the thing you press most where the
+        // eye leaves rather than where it arrives.
         let footer = div()
             .flex()
             .items_center()
+            .justify_end()
             .gap_2()
             .w_full()
             .px_3()
@@ -525,15 +627,13 @@ impl ProfileForm {
             .border_t_1()
             .border_color(t.border())
             .child(
-                btn(&t, ms, "profile-save", "Save", Btn::Primary)
-                    .on_click(cx.listener(|this, _, _, cx| this.save(cx))),
+                btn(&t, ms, "profile-cancel", "Cancel", Btn::Quiet).on_click(cx.listener(
+                    |this, _, window: &mut Window, cx| this.leave(window, cx),
+                )),
             )
             .child(
-                btn(&t, ms, "profile-cancel", "Cancel", Btn::Quiet).on_click(cx.listener(
-                    |this, _, _, cx| {
-                        let _ = this.workspace.update(cx, |w, cx| w.close_profile(cx));
-                    },
-                )),
+                btn(&t, ms, "profile-save", "Save", Btn::Primary)
+                    .on_click(cx.listener(|this, _, _, cx| this.save(cx))),
             );
 
         div()
@@ -553,8 +653,8 @@ impl ProfileForm {
             .on_action(cx.listener(|this, _: &crate::input::FocusPrev, window, cx| {
                 this.step_focus(true, window, cx)
             }))
-            .on_action(cx.listener(|this, _: &crate::app::Escape, _, cx| {
-                let _ = this.workspace.update(cx, |w, cx| w.close_profile(cx));
+            .on_action(cx.listener(|this, _: &crate::app::Escape, window, cx| {
+                this.leave(window, cx)
             }))
             .child(head)
             .child(body)

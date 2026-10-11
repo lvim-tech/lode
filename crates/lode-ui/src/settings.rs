@@ -336,18 +336,14 @@ impl Render for SettingsWindow {
         let shown = self.matching(&needle);
 
         // ── the categories, down the left ───────────────────────────────────
-        let mut side = div()
-            .id("cat-list")
-            .flex()
-            .flex_col()
-            .w(px(ms.base() * 15.0))
-            .flex_none()
-            .h_full()
-            .min_h_0()
-            .overflow_y_scroll()
-            .bg(t.panel())
-            .border_r_1()
-            .border_color(t.border());
+        let mut side = crate::widgets::scroll("cat-list").outer(|d| {
+            d.w(px(ms.base() * 15.0))
+                .flex_none()
+                .h_full()
+                .bg(t.panel())
+                .border_r_1()
+                .border_color(t.border())
+        });
         for c in Category::all() {
             if !shown.contains(&c) {
                 continue;
@@ -393,15 +389,9 @@ impl Render for SettingsWindow {
             );
         }
 
-        let body = div()
-            .id("cat-body")
-            .flex()
-            .flex_col()
-            .flex_1()
-            .min_h_0()
-            .overflow_y_scroll()
-            .p_3()
-            .gap_1()
+        let body = crate::widgets::scroll("cat-body")
+            .outer(|d| d.p_3())
+            .rows(|d| d.gap_1())
             .child(
                 div()
                     .text_size(ms.heading())

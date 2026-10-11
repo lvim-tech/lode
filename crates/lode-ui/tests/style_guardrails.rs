@@ -1,4 +1,4 @@
-//! Two rules about this client's style, enforced by reading its own source.
+//! Three rules about this client's style, enforced by reading its own source.
 //!
 //! Both of them have been broken before, in the same way: a number or a colour
 //! written at the point of use, correct on the machine it was written on, and
@@ -18,6 +18,11 @@
 //!   * A COLOUR comes from the theme (`theme.rs`), which reads the editor's own
 //!     palette. A literal `rgb(…)` is a colour that does not change when the
 //!     theme does, which is the one thing this client must never have.
+//!   * A SCROLLING COLUMN is built by `widgets::scroll`. A flex item shrinks
+//!     before its container scrolls, so rows added straight to an
+//!     `overflow_y_scroll` column get squeezed instead — which is how a
+//!     hundred and four history rows came out as a nine-pixel smear with the
+//!     lines drawn through each other.
 //!
 //! `metrics.rs` and `theme.rs` are where the derivation LIVES, so they are not
 //! walked.
@@ -195,5 +200,69 @@ fn a_window_does_not_read_the_workspace() {
          state over and push it again when it changes (see settings::Appearance):\n{}",
         bad.len(),
         bad.join("\n")
+    );
+}
+
+/// A column that scrolls must be built by `widgets::scroll`.
+///
+/// **A flex item shrinks before its container scrolls.** Five columns in this
+/// client were `flex_1 min_h_0 overflow_y_scroll` with their rows added
+/// straight in, which is a flex container full of flex items: taffy did what
+/// flexbox says and squeezed every row rather than letting the box scroll. It
+/// showed first in the history panel, where a hundred and four rows came out
+/// at a nine-pixel pitch with the lines drawn through each other; the
+/// Keybindings page's thirty-one rows were next.
+///
+/// `widgets::scroll` puts the rows in an inner column that sizes to its
+/// content, so nothing in it is ever asked to shrink. This test is what stops
+/// the next scrolling column being written the old way — the comment that said
+/// so was already there, on the container, about a different rule.
+#[test]
+fn a_scrolling_column_comes_from_the_helper() {
+    let mut stray: Vec<String> = Vec::new();
+    for f in DRAWING {
+        let path = src_dir().join(f);
+        let Ok(text) = std::fs::read_to_string(&path) else { continue };
+        let lines: Vec<&str> = text.lines().collect();
+        for (n, line) in lines.iter().enumerate() {
+            let t = line.trim_start();
+            if t.starts_with("//") || !t.contains("overflow_y_scroll()") {
+                continue;
+            }
+            // Is it a flex COLUMN? That is the shape with the fault: rows
+            // stacked along the axis the container is constrained on.
+            //
+            // `overflow_scroll()` — both axes — is left alone deliberately.
+            // In this client it is never a list of rows: it is the schema's
+            // CREATE statement on one nowrap line and the diagram's canvas,
+            // each a single self-sized child that has to be reachable in x as
+            // well, which the helper (y only, x hidden) would take away.
+            //
+            // The chain is read backwards to the statement it belongs to:
+            // `.flex_col()` and `.overflow_y_scroll()` are rarely on one line.
+            let mut chain = String::new();
+            for back in (0..=n).rev() {
+                let l = lines[back].trim();
+                chain.push_str(l);
+                // The end of the PREVIOUS statement: stop before it.
+                if back < n && (l.ends_with(';') || l.ends_with('{')) {
+                    break;
+                }
+                if n - back > 20 {
+                    break;
+                }
+            }
+            if chain.contains(".flex_col()") {
+                stray.push(format!("{f}:{}  {}", n + 1, t.chars().take(60).collect::<String>()));
+            }
+        }
+    }
+    assert!(
+        stray.is_empty(),
+        "{} scrolling column(s) built by hand instead of with `widgets::scroll`.\n\
+         A flex item shrinks before its container scrolls, so the rows will be squeezed \
+         rather than scrolled:\n  {}",
+        stray.len(),
+        stray.join("\n  ")
     );
 }

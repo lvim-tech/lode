@@ -19,6 +19,7 @@
 //! is also why these are free functions over `(&Theme, Metrics)` rather than
 //! methods: a method would have to live on one of the four.
 
+
 use gpui::prelude::*;
 use gpui::{div, px, Div, Rgba, SharedString, Stateful};
 
@@ -319,5 +320,84 @@ mod tests {
                 assert_ne!(a, b);
             }
         }
+    }
+}
+
+/// A column that SCROLLS, whose rows keep their height.
+///
+/// **A flex item shrinks before its container scrolls.** Rows added straight
+/// to a `flex_1 min_h_0 overflow_y_scroll` column are flex items, so taffy
+/// does what flexbox says and squeezes them instead of letting the container
+/// scroll. With a hundred and four rows in the history panel that came out as
+/// a nine-pixel-pitch smear with the lines drawn through each other and the
+/// second line of every row squeezed to nothing. Four other scrolling
+/// columns — the connection window's body, the profile window's, and both
+/// halves of Settings — had the same latent fault, and the Keybindings page's
+/// thirty-one rows were about to show it.
+///
+/// The cure is one line, and the question is WHERE it goes. On each row it is
+/// a bug per panel the moment somebody adds another; in the container it is
+/// impossible. So the rows go into an INNER column that is `flex_none` and
+/// sizes to its content, and nothing in it is ever asked to shrink — the same
+/// argument the side panel already makes about `overflow_hidden` and
+/// `line_height` living on the container.
+///
+/// `child` and `children` keep the call sites exactly as they were.
+#[derive(IntoElement)]
+pub struct Scroll {
+    outer: gpui::Stateful<Div>,
+    inner: Div,
+}
+
+/// A scrolling column, by id.
+pub fn scroll(id: impl Into<gpui::ElementId>) -> Scroll {
+    Scroll {
+        outer: div()
+            .id(id)
+            .flex()
+            .flex_col()
+            .flex_1()
+            .min_h_0()
+            .w_full()
+            // Vertical only. `overflow_y_scroll` alone leaves the X axis
+            // visible, and a child is then free to size itself to its content
+            // — which is how a long statement ends up wider than its panel and
+            // gets clipped with no ellipsis instead of being truncated.
+            .overflow_x_hidden()
+            .overflow_y_scroll(),
+        inner: div().flex().flex_col().w_full().flex_none(),
+    }
+}
+
+impl Scroll {
+    pub fn child(mut self, c: impl IntoElement) -> Self {
+        self.inner = self.inner.child(c);
+        self
+    }
+
+    pub fn children(mut self, c: impl IntoIterator<Item = impl IntoElement>) -> Self {
+        self.inner = self.inner.children(c);
+        self
+    }
+
+    /// Style the SCROLL BOX — its padding, its gaps, its background.
+    ///
+    /// Not the inner column: padding belongs to the box somebody sees, and a
+    /// gap applies to the rows, so `gap` is passed through to the inner one.
+    pub fn outer(mut self, f: impl FnOnce(gpui::Stateful<Div>) -> gpui::Stateful<Div>) -> Self {
+        self.outer = f(self.outer);
+        self
+    }
+
+    /// Style the column the rows are in — the gaps between them.
+    pub fn rows(mut self, f: impl FnOnce(Div) -> Div) -> Self {
+        self.inner = f(self.inner);
+        self
+    }
+}
+
+impl RenderOnce for Scroll {
+    fn render(self, _: &mut gpui::Window, _: &mut gpui::App) -> impl IntoElement {
+        self.outer.child(self.inner)
     }
 }

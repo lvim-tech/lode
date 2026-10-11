@@ -1383,7 +1383,7 @@ impl ConnectionForm {
     /// then save it as the password. The hint changes too, because an empty box
     /// that wants `PGPASSWORD` and an empty box that wants a password look the
     /// same.
-    fn swap_source(f: &mut Field, to: Source, cx: &mut gpui::App) {
+    pub(crate) fn swap_source(f: &mut Field, to: Source, cx: &mut gpui::App) {
         if f.source == to {
             return;
         }
@@ -1663,6 +1663,18 @@ impl ConnectionForm {
         }
         out.extend(self.hooks_kept.iter().cloned());
         Value::Array(out)
+    }
+
+    /// Close this window, from INSIDE it.
+    ///
+    /// Its own `&mut Window`, not a round trip through the workspace: asking
+    /// the workspace to close it means `WindowHandle::update` on the window
+    /// that is already being updated, which gpui refuses — and the `let _ =`
+    /// on the result meant Cancel and Escape did nothing and said nothing.
+    /// The same fault the profile window had.
+    fn leave(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let _ = self.workspace.update(cx, |w, cx| w.forget_form(cx));
+        window.remove_window();
     }
 
     /// Hand the typed secret to the engine, to be put in the wallet.
@@ -2057,15 +2069,9 @@ impl Render for ConnectionForm {
         // the only way a tunnel becomes reusable. `min_h_0` is the half that is
         // easy to leave out: a flex child refuses to shrink below its content
         // without it, so the footer went off the bottom instead.
-        let mut body = div()
-            .id("form-body")
-            .flex()
-            .flex_col()
-            .flex_1()
-            .min_h_0()
-            .overflow_y_scroll()
-            .p_3()
-            .gap_1();
+        let mut body = crate::widgets::scroll("form-body")
+            .outer(|d| d.p_3())
+            .rows(|d| d.gap_1());
         match self.tab {
             FormTab::Main => {
                 // The TYPE comes along, because how a field is drawn is the
@@ -2702,9 +2708,7 @@ impl Render for ConnectionForm {
                     .flex()
                     .gap_2()
                     .child(btn(&t, ms, "form-cancel", self.tr("tip.cancel_edit"), Btn::Quiet).on_click(
-                        cx.listener(|this, _, _, cx| {
-                            let _ = this.workspace.update(cx, |w, cx| w.close_form(cx));
-                        }),
+                        cx.listener(|this, _, window: &mut Window, cx| this.leave(window, cx)),
                     ))
                     .child(btn(&t, ms, "form-save", self.tr("form.save"), Btn::Primary).on_click(cx.listener(
                         |this, _, _, cx| {
@@ -2736,8 +2740,8 @@ impl Render for ConnectionForm {
             .on_action(cx.listener(|this, _: &crate::input::FocusPrev, window, cx| {
                 this.step_focus(true, window, cx)
             }))
-            .on_action(cx.listener(|this, _: &crate::app::Escape, _, cx| {
-                let _ = this.workspace.update(cx, |w, cx| w.close_form(cx));
+            .on_action(cx.listener(|this, _: &crate::app::Escape, window, cx| {
+                this.leave(window, cx)
             }))
             .child(head)
             .child(tabs)
