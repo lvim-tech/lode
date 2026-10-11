@@ -144,7 +144,20 @@ use serde_json::json;
 ///      happened under the name in use at the time. Refuses a name already
 ///      taken, because `save` overwrites by name and would eat the other
 ///      connection. Additive: a client that does not call it behaves as before.
-pub const PROTO: u32 = 15;
+/// **16** — `store.connections.save` takes an optional `group`, and every
+///      connection row carries one. A folder is where a client FILES a
+///      connection, and it belongs in the shared store rather than in a
+///      client's own file: two clients filing one connection in two places is
+///      two answers to a question that has one.
+///
+///      `group` has THREE states, and all three are needed. Absent leaves the
+///      folder alone, `null` takes the connection out of one, and a name files
+///      it there. Without the first, a save from a client that knows nothing
+///      about folders — an older build, or the Neovim client — would empty the
+///      folder as a side effect of saving a password. Additive: a client that
+///      never sends it behaves exactly as before, and one that never reads the
+///      field sees a flat list.
+pub const PROTO: u32 = 16;
 
 /// One decoded incoming request.
 #[derive(Debug, Deserialize)]

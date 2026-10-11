@@ -53,6 +53,13 @@ pub struct Session {
     /// otherwise silently open somebody else's groups.
     #[serde(default)]
     pub settings_open: Option<Vec<String>>,
+    /// Which connection FOLDERS are folded shut, by key.
+    ///
+    /// The folders themselves are the store's — shared, so two clients agree
+    /// about them. Whether one is folded is this window's own business and
+    /// belongs here.
+    #[serde(default)]
+    pub shut_groups: Option<Vec<String>>,
     /// The panel, folded away. `None` means it is open, which is the default
     /// and what every session written before this field says.
     #[serde(default)]
@@ -238,6 +245,7 @@ mod tests {
             icon_size: Some(24.0),
             settings_open: Some(vec!["theme".into()]),
             panel_hidden: None,
+            shut_groups: None,
             panel_w: Some(320.0),
         };
         let text = serde_json::to_string(&s).unwrap();
@@ -280,6 +288,7 @@ mod tests {
             icon_size: None,
             settings_open: None,
             panel_hidden: None,
+            shut_groups: None,
             panel_w: None,
         };
         let round: Session = serde_json::from_str(&serde_json::to_string(&typed).unwrap()).unwrap();

@@ -316,6 +316,24 @@ check "a taken name is refused" "$(await '.id == 40' | jq -r 'has("error")')" "t
 send '{"id":41,"method":"store.connections.rename","params":{"from":"smoke2","to":"smoke"}}'
 await '.id == 41' >/dev/null
 
+# A FOLDER is the shared store's, not a client's file — and a save that says
+# nothing about it must leave it alone, or the Neovim client saving a password
+# would empty it.
+send '{"id":44,"method":"store.connections.save","params":{"name":"smoke","driver":"sqlite","spec":{"params":{"file":"/tmp/x.db"}},"group":"prod"}}'
+await '.id == 44' >/dev/null
+send '{"id":45,"method":"store.connections.get","params":{"name":"smoke"}}'
+check "a folder is stored" "$(await '.id == 45' | jq -r '.result.connection.group')" "prod"
+send '{"id":46,"method":"store.connections.save","params":{"name":"smoke","driver":"sqlite","spec":{"params":{"file":"/tmp/y.db"}}}}'
+await '.id == 46' >/dev/null
+send '{"id":47,"method":"store.connections.get","params":{"name":"smoke"}}'
+GOT=$(await '.id == 47')
+check "a blind save keeps the folder" "$(printf '%s' "$GOT" | jq -r '.result.connection.group')" "prod"
+check "and still saved the spec" "$(printf '%s' "$GOT" | jq -r '.result.connection.spec.params.file')" "/tmp/y.db"
+send '{"id":48,"method":"store.connections.save","params":{"name":"smoke","driver":"sqlite","spec":{"params":{"file":"/tmp/y.db"}},"group":null}}'
+await '.id == 48' >/dev/null
+send '{"id":49,"method":"store.connections.get","params":{"name":"smoke"}}'
+check "and null takes it out" "$(await '.id == 49' | jq -r '.result.connection.group')" "null"
+
 # A REMOVE takes everything scoped to the name too. It used to take only the
 # saved queries, so a chart or a dashboard was left pointing at a name nothing
 # answers to — invisible in every list, and waiting to attach itself to the next

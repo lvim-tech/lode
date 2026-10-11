@@ -22,8 +22,9 @@ use serde_json::Value;
 /// stays correct.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Target {
-    /// A saved connection, and whether it is open.
-    Connection { name: String, live: bool },
+    /// A saved connection, whether it is open, and whether the engine is new
+    /// enough to file it in a folder.
+    Connection { name: String, live: bool, folders: bool },
     /// A node of the schema tree.
     Node { conn: String, name: String, schema: Option<String>, kind: String, has_ddl: bool },
     /// A row of the grid: which tab, which row, and whether this result can be
@@ -51,6 +52,8 @@ pub enum Act {
     EditConnection(String),
     RemoveConnection(String),
     RefreshConnection(String),
+    /// Ask which folder to file it in. An empty answer takes it out of one.
+    MoveToFolder(String),
     /// Put a name on the clipboard. The commonest thing anybody wants from a
     /// tree and the one thing it could not do.
     CopyText(String),
@@ -98,7 +101,7 @@ impl Item {
 /// The menu for a target.
 pub fn menu_for(target: &Target) -> Vec<Item> {
     match target {
-        Target::Connection { name, live } => {
+        Target::Connection { name, live, folders } => {
             let n = name.clone();
             vec![
                 if *live {
@@ -112,6 +115,14 @@ pub fn menu_for(target: &Target) -> Vec<Item> {
                     Item::off("menu.refresh", Act::RefreshConnection(n.clone()))
                 },
                 Item::on("menu.edit", Act::EditConnection(n.clone())),
+                // The FOLDER lives in the engine's store, so an engine that
+                // does not have the field cannot be asked — dimmed rather than
+                // hidden, so the menu is the same shape against either.
+                if *folders {
+                    Item::on("menu.move_to", Act::MoveToFolder(n.clone()))
+                } else {
+                    Item::off("menu.move_to", Act::MoveToFolder(n.clone()))
+                },
                 Item::on("menu.copy_name", Act::CopyText(n.clone())),
                 Item::on("menu.remove", Act::RemoveConnection(n)),
             ]
@@ -272,20 +283,34 @@ mod tests {
 
     #[test]
     fn a_connection_offers_what_it_can_do_now() {
-        let shut = menu_for(&Target::Connection { name: "prod".into(), live: false });
+        let shut =
+            menu_for(&Target::Connection { name: "prod".into(), live: false, folders: true });
         let keys: Vec<&str> = shut.iter().map(|i| i.key).collect();
         assert_eq!(
             keys,
-            vec!["menu.connect", "menu.refresh", "menu.edit", "menu.copy_name", "menu.remove"]
+            vec![
+                "menu.connect",
+                "menu.refresh",
+                "menu.edit",
+                "menu.move_to",
+                "menu.copy_name",
+                "menu.remove"
+            ]
         );
         // Refresh means nothing on a connection that is not open — SHOWN and
         // dimmed, so the menu is the same shape either way.
         assert!(!shut[1].enabled);
 
-        let open = menu_for(&Target::Connection { name: "prod".into(), live: true });
+        let open = menu_for(&Target::Connection { name: "prod".into(), live: true, folders: true });
         assert_eq!(open[0].key, "menu.disconnect");
         assert!(open[1].enabled);
         assert_eq!(open.len(), shut.len(), "the shape does not change with the state");
+
+        // An engine too old for folders dims that line and keeps the shape.
+        let old =
+            menu_for(&Target::Connection { name: "prod".into(), live: true, folders: false });
+        assert_eq!(old.len(), open.len());
+        assert!(!old.iter().find(|i| i.key == "menu.move_to").unwrap().enabled);
     }
 
     #[test]

@@ -502,6 +502,13 @@ pub struct SavedConnection {
     pub spec: Value,
     #[serde(default)]
     pub created: Option<i64>,
+    /// The folder a client files it in (`proto >= 16`), or `None` for none.
+    ///
+    /// In the SHARED store rather than a client's own file, because two clients
+    /// filing one connection in two places is two answers to a question that
+    /// has one.
+    #[serde(default)]
+    pub group: Option<String>,
 }
 
 /// A saved query, scoped to a connection by name.

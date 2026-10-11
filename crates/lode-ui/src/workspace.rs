@@ -13,7 +13,8 @@ use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
 use lode_proto::{
-    BuilderOp, Column, DriverMeta, Index, Node, SavedChart, SavedQuery, TableColumn,
+    BuilderOp, Column, DriverMeta, Index, Node, SavedChart, SavedConnection, SavedQuery,
+    TableColumn,
 };
 use serde_json::Value;
 
@@ -1069,6 +1070,28 @@ pub fn column_summary(
     }
 }
 
+/// The saved connections, grouped by the folder each is filed in.
+///
+/// Folders first, in the order they were met, and the ones in NO folder last —
+/// an ungrouped connection is not in a folder called "other", it is simply not
+/// in one, and giving it a heading would be inventing a folder nobody made.
+///
+/// Returns names, not the connections: the panel draws its rows from the saved
+/// list anyway, and this decides only the order and the headings.
+pub fn group_connections(saved: &[SavedConnection]) -> Vec<(Option<String>, Vec<String>)> {
+    let mut out: Vec<(Option<String>, Vec<String>)> = Vec::new();
+    for c in saved {
+        let key = c.group.clone().filter(|g| !g.trim().is_empty());
+        match out.iter_mut().find(|(k, _)| *k == key) {
+            Some((_, names)) => names.push(c.name.clone()),
+            None => out.push((key, vec![c.name.clone()])),
+        }
+    }
+    // The folderless go last, whatever order they arrived in.
+    out.sort_by_key(|(k, _)| k.is_none());
+    out
+}
+
 /// What this connection has, for completing a word against it.
 ///
 /// Names rather than the tree itself: the tree is a `Node` with children and a
@@ -1719,6 +1742,39 @@ mod tests {
         assert!(super::respawn_delay(1).unwrap() > super::respawn_delay(0).unwrap());
         assert!(super::respawn_delay(2).unwrap() > super::respawn_delay(1).unwrap());
         assert_eq!(super::respawn_delay(3), None, "a fourth try is a spawn storm");
+    }
+
+    /// Folders come first and keep their order; what is in none comes last.
+    #[test]
+    fn the_folderless_go_last() {
+        let c = |name: &str, group: Option<&str>| SavedConnection {
+            id: 0,
+            name: name.into(),
+            driver: "sqlite".into(),
+            spec: serde_json::Value::Null,
+            created: None,
+            group: group.map(str::to_string),
+        };
+        let saved = vec![
+            c("loose", None),
+            c("p1", Some("prod")),
+            c("s1", Some("staging")),
+            c("p2", Some("prod")),
+            // An empty name is not a folder.
+            c("blank", Some("  ")),
+        ];
+        let got = super::group_connections(&saved);
+        assert_eq!(
+            got,
+            vec![
+                (Some("prod".to_string()), vec!["p1".to_string(), "p2".to_string()]),
+                (Some("staging".to_string()), vec!["s1".to_string()]),
+                (None, vec!["loose".to_string(), "blank".to_string()]),
+            ],
+            "{got:?}"
+        );
+        // Nothing saved is no groups, not one empty group.
+        assert!(super::group_connections(&[]).is_empty());
     }
 
     /// A name this database has beats a word every SQL has.

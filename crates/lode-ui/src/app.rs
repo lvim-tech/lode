@@ -632,17 +632,22 @@ impl ProfileRow {
 /// typed by hand and the first forty characters of the statement otherwise —
 /// so two drafts saved in a row overwrote each other without a word, and
 /// nothing in the window ever asked what to call them.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum NameFor {
     Query,
     Chart,
+    /// Which folder a saved connection is filed in. An empty answer takes it
+    /// out of one, which is why this one accepts an empty name where the other
+    /// two refuse it.
+    Folder(String),
 }
 
 impl NameFor {
-    fn what(self) -> &'static str {
+    fn what(&self) -> String {
         match self {
-            NameFor::Query => "query",
-            NameFor::Chart => "chart",
+            NameFor::Query => "query".into(),
+            NameFor::Chart => "chart".into(),
+            NameFor::Folder(conn) => conn.clone(),
         }
     }
 }
@@ -936,6 +941,8 @@ pub struct Workspace {
     fatal: Option<String>,
     /// How many times the engine has been started again after it exited, and
     /// when the next attempt is due. See [`respawn_delay`].
+    /// Folders folded away, by key. Remembered, like the panel itself.
+    shut_groups: std::collections::BTreeSet<String>,
     /// Something asked for the keyboard back, from a place that had no
     /// `Window` to give it. Acted on by `pump`, which has one.
     focus_back: bool,
@@ -1278,6 +1285,12 @@ impl Workspace {
             exporting: None,
             confirm_disconnect: None,
             console_hist: None,
+            shut_groups: restore
+                .shut_groups
+                .clone()
+                .unwrap_or_default()
+                .into_iter()
+                .collect(),
             focus_back: false,
             menu: None,
             mru: Vec::new(),
@@ -3176,6 +3189,8 @@ impl Workspace {
             theme: Some(self.theme_name.clone()),
             json_indent: Some(self.json_indent),
             panel_hidden: Some(self.panel_hidden).filter(|x| *x),
+            shut_groups: Some(self.shut_groups.iter().cloned().collect())
+                .filter(|v: &Vec<String>| !v.is_empty()),
             // Nothing opens or closes a settings group any more — the panel
             // became a window with categories. The field stays in the file's
             // shape so a session written by an older build still parses.
@@ -3625,18 +3640,46 @@ impl Workspace {
         cx.notify();
     }
 
-    /// The name came back from the row. Nothing is saved under an empty one.
+    /// The name came back from the row.
     fn named(&mut self, name: String, cx: &mut Context<Self>) {
         let Some(what) = self.naming.take() else { return };
-        if name.is_empty() {
+        // A FOLDER may be empty — that is how a connection comes out of one.
+        // A query or a chart may not: the name is how it is found again.
+        if name.is_empty() && !matches!(what, NameFor::Folder(_)) {
+            let whose = what.what();
             self.naming = Some(what);
-            self.toast(format!("a {} needs a name", what.what()), true);
+            self.toast(format!("a {whose} needs a name"), true);
             return;
         }
         match what {
             NameFor::Query => self.save_query_as(name, cx),
             NameFor::Chart => self.save_chart_as(name, cx),
+            NameFor::Folder(conn) => self.file_connection(&conn, &name),
         }
+    }
+
+    /// File a saved connection in a folder, or take it out of one.
+    ///
+    /// The spec goes back UNCHANGED, read from what is stored: this is a save
+    /// of the folder, and re-deriving the spec from a window that is not open
+    /// would be a save of something nobody edited.
+    fn file_connection(&mut self, conn: &str, folder: &str) {
+        let Some(c) = self.saved.iter().find(|c| c.name == conn) else { return };
+        let (name, driver, spec) = (c.name.clone(), c.driver.clone(), c.spec.clone());
+        let group = if folder.trim().is_empty() {
+            // `null`, which the engine reads as "take it out" — and which it
+            // tells apart from a save that says nothing. See `present_or_absent`
+            // in the engine.
+            Value::Null
+        } else {
+            Value::String(folder.trim().to_string())
+        };
+        self.ask(
+            Pending::Connections,
+            "store.connections.save",
+            json!({ "name": name, "driver": driver, "spec": spec, "group": group }),
+        );
+        self.ask(Pending::Connections, "store.connections.list", json!({}));
     }
 
     fn save_query_as(&mut self, name: String, cx: &mut Context<Self>) {
@@ -6438,11 +6481,58 @@ impl Workspace {
         if self.saved.is_empty() {
             list = list.child(self.empty_state("empty.connections", "empty.connections_hint"));
         }
-        for c in self
-            .saved
-            .iter()
-            .filter(|c| crate::workspace::matches_filter(&c.name, &filter))
-        {
+        // GROUPED, where somebody has filed them. The folder is the store's,
+        // so the Neovim client and this one show the same arrangement — see
+        // `store.connections.save`.
+        let groups = crate::workspace::group_connections(&self.saved);
+        let mut order: Vec<&SavedConnection> = Vec::new();
+        for (group, names) in &groups {
+            let shown: Vec<&SavedConnection> = names
+                .iter()
+                .filter_map(|n| self.saved.iter().find(|c| &c.name == n))
+                .filter(|c| crate::workspace::matches_filter(&c.name, &filter))
+                .collect();
+            // A folder with nothing matching the filter is not drawn: a heading
+            // over nothing is a folder that looks empty rather than filtered.
+            if shown.is_empty() {
+                continue;
+            }
+            if let Some(name) = group {
+                let key = format!("group:{name}");
+                let open = !self.shut_groups.contains(&key);
+                list = list.child(
+                    div()
+                        .id(SharedString::from(key.clone()))
+                        .flex()
+                        .items_center()
+                        .gap_1()
+                        .px_2()
+                        .py(px(1.0))
+                        .cursor_pointer()
+                        .hover(|d| d.bg(t.hover_mark()))
+                        .child(self.icon_inline(
+                            if open { "\u{f0d7}" } else { "\u{f0da}" },
+                            t.muted(),
+                        ))
+                        .child(self.small(
+                            format!("{} ({})", name, shown.len()),
+                            t.title(),
+                        ))
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            if !this.shut_groups.remove(&key) {
+                                this.shut_groups.insert(key.clone());
+                            }
+                            this.remember();
+                            cx.notify();
+                        })),
+                );
+                if !open {
+                    continue;
+                }
+            }
+            order.extend(shown);
+        }
+        for c in order {
             let live = self.conns.iter().find(|l| l.name == c.name);
             let is_live = live.is_some();
             let is_front = self.tabs.get(self.active).map(|x| x.conn_name.as_str()) == Some(c.name.as_str());
@@ -6565,9 +6655,16 @@ impl Workspace {
                         MouseButton::Right,
                         cx.listener({
                             let (n, live) = (c.name.clone(), is_live);
+                            // Folders are the store's, so an engine without the
+                            // field cannot be asked for one.
+                            let folders = self.hello.as_ref().map_or(false, |h| h.proto >= 16);
                             move |this, ev: &gpui::MouseDownEvent, _, cx| {
                                 this.open_menu(
-                                    crate::menu::Target::Connection { name: n.clone(), live },
+                                    crate::menu::Target::Connection {
+                                        name: n.clone(),
+                                        live,
+                                        folders,
+                                    },
                                     ev.position,
                                     cx,
                                 );
@@ -7364,7 +7461,7 @@ impl Workspace {
         // Above the views, only while a save is waiting for a name. Not a modal
         // over the result: the thing being named is the result, and covering it
         // up to ask what to call it is exactly backwards.
-        if let Some(what) = self.naming {
+        if let Some(what) = self.naming.clone() {
             body = body.child(
                 div()
                     .flex()
@@ -7378,7 +7475,14 @@ impl Workspace {
                     .border_b_1()
                     .border_color(t.accent())
                     .child(self.small(
-                        format!("{} {}", self.lang.tr("result.name_it"), what.what()),
+                        match &what {
+                            NameFor::Folder(conn) => {
+                                format!("{} {conn}", self.lang.tr("name.folder"))
+                            }
+                            other => {
+                                format!("{} {}", self.lang.tr("result.name_it"), other.what())
+                            }
+                        },
                         t.muted(),
                     ))
                     .child(div().flex_1().text_size(ms.body()).child(self.save_name.clone()))
@@ -10612,6 +10716,19 @@ impl Workspace {
                     "store.queries.list",
                     json!({ "conn": name }),
                 );
+            }
+            Act::MoveToFolder(name) => {
+                // The naming row again, with the folder it is in now as the
+                // suggestion — moving a connection between two folders is
+                // mostly typing the other one's name.
+                let now = self
+                    .saved
+                    .iter()
+                    .find(|c| c.name == name)
+                    .and_then(|c| c.group.clone())
+                    .unwrap_or_default();
+                self.naming = Some(NameFor::Folder(name));
+                self.save_name.update(cx, |i, cx| i.set_text(now, cx));
             }
             Act::RefreshConnection(name) => {
                 if let Some(l) = self.live(&name) {

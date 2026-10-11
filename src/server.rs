@@ -14,6 +14,23 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use serde::Deserialize;
+
+/// Tell "the field was not sent" from "the field was sent as null".
+///
+/// `Option<Option<T>>` alone does NOT do it: serde reads a `null` into the
+/// OUTER `None`, so `{"group": null}` and a message with no `group` at all
+/// arrive identical — and the two mean opposite things. With this, absent stays
+/// `None` (because of `default`) and `null` becomes `Some(None)`.
+///
+/// Found by a smoke check, not by reading: `null` was leaving the folder in
+/// place, which is the one thing it is for.
+fn present_or_absent<'de, D, T>(de: D) -> Result<Option<Option<T>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Option::<T>::deserialize(de).map(Some)
+}
 use serde_json::{json, Value as Json};
 use tokio::sync::mpsc::UnboundedSender;
 use tokio::sync::Mutex as AsyncMutex;
@@ -1687,12 +1704,23 @@ impl Server {
             driver: String,
             #[serde(default)]
             spec: Json,
+            /// Which folder a client files it in (`proto >= 15`).
+            ///
+            /// Three states, and they are all needed: ABSENT leaves the folder
+            /// as it is, `null` takes it out of one, and a name puts it in that
+            /// one. Without the first, a save from a client that knows nothing
+            /// about folders — an older build, or the Neovim client — would
+            /// empty the folder as a side effect of saving a password.
+            #[serde(default, deserialize_with = "present_or_absent")]
+            group: Option<Option<String>>,
         }
         let p: P = serde_json::from_value(params)?;
         if p.name.trim().is_empty() {
             return Err(anyhow::anyhow!("a connection needs a name"));
         }
-        self.store()?.save_connection(p.name, p.driver, p.spec).await?;
+        self.store()?
+            .save_connection(p.name, p.driver, p.spec, p.group)
+            .await?;
         Ok(json!({ "saved": true }))
     }
 

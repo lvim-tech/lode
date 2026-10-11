@@ -82,7 +82,7 @@ notification   {"method":"…","params":{…}}
 
 `proto` grows **additively**: a client accepts any engine reporting
 `proto >= its minimum`, so a newer engine keeps working with an older client.
-The current protocol is **15**. What each version added is listed in
+The current protocol is **16**. What each version added is listed in
 `src/rpc.rs` beside the constant.
 
 ### Handshake
@@ -176,7 +176,7 @@ own SQLite database — so two clients share them.
 | `store.status` | — | `{ available, path, error }` |
 | `store.connections.list` | — | `{ connections }` |
 | `store.connections.get` | `{ name }` | `{ connection }` or `null` |
-| `store.connections.save` | `{ name, driver, spec }` | `{ saved }` |
+| `store.connections.save` | `{ name, driver, spec, group? }` | `{ saved }` |
 | `store.connections.remove` | `{ name }` | `{ removed }` |
 | `store.connections.rename` | `{ from, to }` | `{ renamed, moved }` (`proto >= 15`) |
 | `store.queries.list` | `{ conn }` | `{ queries }` |
@@ -195,6 +195,14 @@ own SQLite database — so two clients share them.
 A saved connection keeps only the **template**: `spec` is the
 `{ params, auth, tls, tunnel }` JSON with secrets still as templates. Nothing
 resolved is ever stored.
+
+`group` is which FOLDER a client files a connection in, and it is in the shared
+store rather than a client's own file: two clients filing one connection in two
+places is two answers to a question that has one. It has three states and all
+three are needed — absent leaves the folder alone, `null` takes the connection
+out of one, and a name files it there. Without the first, a save from a client
+that knows nothing about folders would empty the folder as a side effect of
+saving a password.
 
 `store.connections.rename` exists because everything else here is scoped to the
 connection's **name**: a save under the new name plus a remove of the old one

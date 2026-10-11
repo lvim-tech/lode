@@ -100,6 +100,19 @@ impl Store {
     /// statement is `IF NOT EXISTS`, so this is safe on a database an older
     /// client already wrote, and a table added in a later version appears on
     /// the next open without a migration step.
+    /// A column added after the table existed.
+    ///
+    /// `CREATE TABLE IF NOT EXISTS` cannot add one, and a database written by
+    /// an older build has the table without it — so it is added here and the
+    /// "duplicate column" error is the ordinary case, not a failure. SQLite has
+    /// no `ADD COLUMN IF NOT EXISTS`, which is why this reads as it does.
+    fn add_column(conn: &Connection, table: &str, column: &str, decl: &str) {
+        let sql = format!("ALTER TABLE {table} ADD COLUMN {column} {decl}");
+        // Deliberately ignored: the only expected error is that it is already
+        // there, and anything else shows up the moment the column is read.
+        let _ = conn.execute(&sql, []);
+    }
+
     fn apply_schema(conn: &Connection) -> anyhow::Result<()> {
         conn.execute_batch(
             r#"
@@ -108,7 +121,13 @@ impl Store {
                 name    TEXT NOT NULL UNIQUE,
                 driver  TEXT NOT NULL,
                 spec    TEXT NOT NULL,
-                created INTEGER
+                created INTEGER,
+                -- Which FOLDER a client shows it in. Here rather than in a
+                -- client's own file because the store is SHARED: two clients
+                -- filing one connection in two places is two answers to a
+                -- question with one. Null means no folder, which is where
+                -- every connection written before this column is.
+                grp     TEXT
             );
             CREATE TABLE IF NOT EXISTS queries (
                 id         INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -276,6 +295,9 @@ impl Store {
             CREATE INDEX IF NOT EXISTS audit_fp ON audit (fingerprint);
             "#,
         )?;
+        // Columns added after the table first shipped. A database written by an
+        // older build has the table without them.
+        Self::add_column(conn, "connections", "grp", "TEXT");
         conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
         Ok(())
     }
@@ -301,7 +323,7 @@ impl Store {
     pub async fn list_connections(&self) -> anyhow::Result<Vec<Json>> {
         self.with(|c| {
             let mut stmt = c.prepare(
-                "SELECT id, name, driver, spec, created FROM connections \
+                "SELECT id, name, driver, spec, created, grp FROM connections \
                  ORDER BY COALESCE(created, 0) DESC, id DESC",
             )?;
             let rows = stmt
@@ -312,6 +334,7 @@ impl Store {
                         r.get::<_, String>(2)?,
                         r.get::<_, String>(3)?,
                         r.get::<_, Option<i64>>(4)?,
+                        r.get::<_, Option<String>>(5)?,
                     ))
                 })?
                 .collect::<Result<Vec<_>, _>>()?;
@@ -325,7 +348,7 @@ impl Store {
         self.with(move |c| {
             let row = c
                 .query_row(
-                    "SELECT id, name, driver, spec, created FROM connections WHERE name = ?1",
+                    "SELECT id, name, driver, spec, created, grp FROM connections WHERE name = ?1",
                     params![name],
                     |r| {
                         Ok(conn_json(
@@ -334,6 +357,7 @@ impl Store {
                             r.get::<_, String>(2)?,
                             r.get::<_, String>(3)?,
                             r.get::<_, Option<i64>>(4)?,
+                            r.get::<_, Option<String>>(5)?,
                         ))
                     },
                 )
@@ -346,7 +370,20 @@ impl Store {
     /// Insert or update a saved connection, keyed by `name`. An update keeps the
     /// original `created` stamp — the list is ordered by it, and re-saving a
     /// connection is not the same event as creating one.
-    pub async fn save_connection(&self, name: String, driver: String, spec: Json) -> anyhow::Result<()> {
+    /// Store a connection, optionally in a folder.
+    ///
+    /// `group` is `Option<Option<String>>`: absent means LEAVE IT ALONE, and
+    /// `Some(None)` means take it out of its folder. Two levels because a save
+    /// from a client that knows nothing about folders — an older one, or the
+    /// Neovim client — must not empty the folder as a side effect of saving a
+    /// password.
+    pub async fn save_connection(
+        &self,
+        name: String,
+        driver: String,
+        spec: Json,
+        group: Option<Option<String>>,
+    ) -> anyhow::Result<()> {
         let spec = serde_json::to_string(&spec)?;
         self.with(move |c| {
             c.execute(
@@ -354,6 +391,9 @@ impl Store {
                  ON CONFLICT(name) DO UPDATE SET driver = excluded.driver, spec = excluded.spec",
                 params![name, driver, spec, now()],
             )?;
+            if let Some(grp) = group {
+                c.execute("UPDATE connections SET grp = ?2 WHERE name = ?1", params![name, grp])?;
+            }
             Ok(())
         })
         .await
@@ -1183,9 +1223,25 @@ fn has_table(conn: &Connection, name: &str) -> anyhow::Result<bool> {
 /// One stored connection as a client sees it. `spec` is parsed; a spec that is
 /// not valid JSON comes back as an empty object rather than failing the whole
 /// listing, because one corrupt row must not hide the other connections.
-fn conn_json(id: i64, name: String, driver: String, spec: String, created: Option<i64>) -> Json {
+fn conn_json(
+    id: i64,
+    name: String,
+    driver: String,
+    spec: String,
+    created: Option<i64>,
+    group: Option<String>,
+) -> Json {
     let spec: Json = serde_json::from_str(&spec).unwrap_or_else(|_| json!({}));
-    json!({ "id": id, "name": name, "driver": driver, "spec": spec, "created": created })
+    json!({
+        "id": id,
+        "name": name,
+        "driver": driver,
+        "spec": spec,
+        "created": created,
+        // A client that does not know about folders ignores it; one that does
+        // sees `null` for a connection in none.
+        "group": group,
+    })
 }
 
 fn now() -> i64 {
@@ -1268,10 +1324,10 @@ mod tests {
     #[tokio::test]
     async fn connections_round_trip_and_upsert() {
         let (s, _dir) = temp_store("conns");
-        s.save_connection("prod".into(), "postgres".into(), json!({ "params": { "host": "h" } }))
+        s.save_connection("prod".into(), "postgres".into(), json!({ "params": { "host": "h" } }), None)
             .await
             .unwrap();
-        s.save_connection("prod".into(), "postgres".into(), json!({ "params": { "host": "h2" } }))
+        s.save_connection("prod".into(), "postgres".into(), json!({ "params": { "host": "h2" } }), None)
             .await
             .unwrap();
         let all = s.list_connections().await.unwrap();
@@ -1280,6 +1336,50 @@ mod tests {
         assert_eq!(got["spec"]["params"]["host"], "h2");
         assert_eq!(s.remove_connection("prod".into()).await.unwrap()["removed"], true);
         assert!(s.get_connection("prod".into()).await.unwrap().is_none());
+    }
+
+    /// A folder is set, cleared, and LEFT ALONE — the three states a save has
+    /// to tell apart.
+    ///
+    /// The third is the one that matters: a save from a client that knows
+    /// nothing about folders must not empty the folder as a side effect of
+    /// saving a password.
+    #[tokio::test]
+    async fn a_folder_survives_a_save_that_says_nothing_about_it() {
+        let (s, _dir) = temp_store("conn-group");
+        let grp = |v: &Json| v["group"].as_str().map(str::to_string);
+
+        s.save_connection("a".into(), "postgres".into(), json!({}), None).await.unwrap();
+        let got = s.get_connection("a".into()).await.unwrap().unwrap();
+        assert_eq!(grp(&got), None, "no folder to begin with");
+
+        // Into one.
+        s.save_connection("a".into(), "postgres".into(), json!({}), Some(Some("prod".into())))
+            .await
+            .unwrap();
+        let got = s.get_connection("a".into()).await.unwrap().unwrap();
+        assert_eq!(grp(&got).as_deref(), Some("prod"));
+
+        // A save that says NOTHING about the folder leaves it where it is.
+        s.save_connection("a".into(), "postgres".into(), json!({ "params": { "x": 1 } }), None)
+            .await
+            .unwrap();
+        let got = s.get_connection("a".into()).await.unwrap().unwrap();
+        assert_eq!(grp(&got).as_deref(), Some("prod"), "a blind save emptied the folder");
+        assert_eq!(got["spec"]["params"]["x"], json!(1), "and it still saved the spec");
+
+        // And out of it again, explicitly.
+        s.save_connection("a".into(), "postgres".into(), json!({}), Some(None)).await.unwrap();
+        let got = s.get_connection("a".into()).await.unwrap().unwrap();
+        assert_eq!(grp(&got), None);
+
+        // The list carries it too, not only `get`.
+        s.save_connection("b".into(), "postgres".into(), json!({}), Some(Some("staging".into())))
+            .await
+            .unwrap();
+        let all = s.list_connections().await.unwrap();
+        let b = all.iter().find(|c| c["name"] == "b").expect("listed");
+        assert_eq!(grp(b).as_deref(), Some("staging"));
     }
 
     /// Removing a connection takes everything scoped to its NAME with it.
@@ -1291,8 +1391,8 @@ mod tests {
     #[tokio::test]
     async fn removing_a_connection_takes_what_belonged_to_it() {
         let (s, _dir) = temp_store("conn-cascade");
-        s.save_connection("gone".into(), "postgres".into(), json!({})).await.unwrap();
-        s.save_connection("stays".into(), "postgres".into(), json!({})).await.unwrap();
+        s.save_connection("gone".into(), "postgres".into(), json!({}), None).await.unwrap();
+        s.save_connection("stays".into(), "postgres".into(), json!({}), None).await.unwrap();
         s.save_query("gone".into(), "q".into(), "SELECT 1".into()).await.unwrap();
         s.save_query("stays".into(), "q".into(), "SELECT 1".into()).await.unwrap();
         s.save_chart("gone".into(), "c".into(), "SELECT 1".into(), "n".into()).await.unwrap();
