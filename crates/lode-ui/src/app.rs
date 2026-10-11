@@ -558,7 +558,9 @@ pub fn report_panels(cx: &gpui::App) {
     // Which panels END by returning their own list. Settings once did not: it
     // fell through to the connections path and ended up with two scrolling
     // lists sharing one height.
-    println!("panels that return their own list: connections, instance, history, audit, tasks");
+    println!(
+        "panels that return their own list: connections, instance, history, audit, tasks, scripts"
+    );
     println!("it cannot see the layout.");
     // `LODE_THEMES` and its five layouts were listed here. They were ways to
     // arrange a theme list inside a NARROW COLUMN, and the column is gone: the
@@ -704,6 +706,8 @@ pub enum NameFor {
     /// out of one, which is why this one accepts an empty name where the other
     /// two refuse it.
     Folder(String),
+    /// What to call the script in this tab.
+    Script(u64),
 }
 
 impl NameFor {
@@ -712,6 +716,7 @@ impl NameFor {
             NameFor::Query => "query".into(),
             NameFor::Chart => "chart".into(),
             NameFor::Folder(conn) => conn.clone(),
+            NameFor::Script(_) => "script".into(),
         }
     }
 }
@@ -875,6 +880,11 @@ pub enum Rail {
     /// a refusal buried in a thousand SELECTs is a refusal nobody finds.
     Audit,
     Tasks,
+    /// The person's own code, saved: the connection's and the global ones.
+    ///
+    /// A panel rather than a tab list, because a script is opened the way a
+    /// saved query is — picked from a list and opened in a tab of its own.
+    Scripts,
     // There is no `Settings` here any more. The gear at the bottom of the rail
     // opens a WINDOW: almost everything that belongs in settings is a list
     // beside the detail of what is picked in it — tunnels, proxies, hooks,
@@ -890,6 +900,8 @@ impl Rail {
             Rail::History => "\u{f1da}",
             Rail::Audit => "\u{f132}",
             Rail::Tasks => "\u{f0ae}",
+            // A terminal: a script is a program, not a document.
+            Rail::Scripts => "\u{f120}",
         }
     }
     /// The key its name is under. Not the name itself: a `&'static str` here
@@ -902,6 +914,7 @@ impl Rail {
             Rail::History => "rail.history",
             Rail::Audit => "rail.audit",
             Rail::Tasks => "rail.tasks",
+            Rail::Scripts => "rail.scripts",
         }
     }
 
@@ -912,6 +925,7 @@ impl Rail {
             Rail::History => "History",
             Rail::Audit => "Audit",
             Rail::Tasks => "Tasks",
+            Rail::Scripts => "Scripts",
         }
     }
 }
@@ -936,6 +950,11 @@ enum Pending {
     StoreImport,
     /// The saved scripts, for the names a hook can point at.
     ScriptNames,
+    /// A script started: the answer carries the `run_id` its output arrives
+    /// under.
+    ScriptRun { tab: u64 },
+    /// A script stored under a name.
+    ScriptSaved { tab: u64, name: String },
     StoreStatus,
     Connections,
     Connect { name: String, driver: String },
@@ -1076,6 +1095,14 @@ pub struct Workspace {
     access: Vec<Value>,
     /// The saved scripts' names, for a hook that points at one by name.
     script_names: Vec<String>,
+    /// The saved scripts themselves, for the panel that lists them: the
+    /// connection's and the global ones, as the engine returned them.
+    scripts: Vec<Value>,
+    /// Which tab a running script's output belongs to, by the engine's run id.
+    script_runs: HashMap<u64, u64>,
+    /// Whether the remembered script tabs have been reopened. Once, and not on
+    /// a connection: see `reopen_scripts`.
+    scripts_reopened: bool,
     /// The MCP approval queue — what an agent has asked a PERSON to allow.
     ///
     /// Kept in the window rather than only in the settings page, because it is
@@ -1399,6 +1426,9 @@ impl Workspace {
             store_path: String::new(),
             access: Vec::new(),
             script_names: Vec::new(),
+            scripts: Vec::new(),
+            script_runs: HashMap::new(),
+            scripts_reopened: false,
             approvals: Vec::new(),
             approvals_at: None,
             saved: Vec::new(),
@@ -1509,6 +1539,7 @@ impl Workspace {
             "audit" => Rail::Audit,
             "instance" => Rail::Instance,
             "tasks" => Rail::Tasks,
+            "scripts" => Rail::Scripts,
             // "settings" is no longer a panel — the gear opens a window. A
             // session saved while it WAS a panel would otherwise restore to a
             // view that nothing can leave, because the rail no longer has a
@@ -1697,6 +1728,7 @@ impl Workspace {
         self.poll_metrics();
         self.poll_board();
         self.poll_approvals();
+        self.reopen_scripts(cx);
         loop {
             let Some(engine) = &self.engine else { break };
             let Some(msg) = engine.try_recv() else { break };
@@ -1919,11 +1951,54 @@ impl Workspace {
                     return;
                 }
                 let err = params.get("stream").and_then(Value::as_str) == Some("stderr");
+                // A SCRIPT TAB's own output goes to that tab, which is where
+                // somebody pressed Run and is looking.
+                if let Some(run_id) = params.get("run_id").and_then(Value::as_u64) {
+                    if let Some(&tab) = self.script_runs.get(&run_id) {
+                        if let Some(t) = self.tabs.iter_mut().find(|t| t.id == tab) {
+                            if let Some(sc) = t.script.as_mut() {
+                                sc.push(err, text);
+                                return;
+                            }
+                        }
+                    }
+                }
                 match params.get("hook").and_then(Value::as_str) {
                     Some(when) => {
                         self.log_push(if err { "warn" } else { "info" }, format!("{when}: {text}"))
                     }
                     None => self.log_push(if err { "warn" } else { "info" }, text),
+                }
+            }
+            // A script finished, one way or another.
+            "script.state" => {
+                let Some(run_id) = params.get("run_id").and_then(Value::as_u64) else { return };
+                let state = params.get("state").and_then(Value::as_str).unwrap_or("done");
+                let ms = params.get("ms").and_then(Value::as_u64).unwrap_or(0);
+                let code = params.get("code").and_then(Value::as_i64);
+                let error = params.get("error").and_then(Value::as_str);
+                let name = params.get("name").and_then(Value::as_str).unwrap_or("a script");
+                let said = match (error, code) {
+                    (Some(e), _) => format!("{state} after {ms} ms \u{2014} {e}"),
+                    (None, Some(c)) => format!("{state} after {ms} ms (exit {c})"),
+                    (None, None) => format!("{state} after {ms} ms"),
+                };
+                match self.script_runs.remove(&run_id) {
+                    Some(tab) => {
+                        if let Some(t) = self.tabs.iter_mut().find(|t| t.id == tab) {
+                            if let Some(sc) = t.script.as_mut() {
+                                sc.run_id = None;
+                                sc.ended = Some(said.clone());
+                            }
+                        }
+                        self.status = format!("{name}: {said}");
+                    }
+                    // A HOOK's run, or a script somebody started elsewhere:
+                    // the log is where that belongs.
+                    None => self.log_push(
+                        if error.is_some() { "warn" } else { "info" },
+                        format!("{name}: {said}"),
+                    ),
                 }
             }
             _ => {}
@@ -2275,7 +2350,35 @@ impl Workspace {
                 // again rather than left to be refreshed by hand.
                 self.ask_profiles();
             }
+            Pending::ScriptRun { tab } => {
+                let run_id = v.get("run_id").and_then(Value::as_u64);
+                if let Some(t) = self.tabs.iter_mut().find(|t| t.id == tab) {
+                    if let Some(sc) = t.script.as_mut() {
+                        sc.run_id = run_id;
+                    }
+                }
+                // WHOSE output is whose. The notification carries only the
+                // run_id, so this is the only place the two can be tied
+                // together — and without it a second script tab would show the
+                // first one's lines.
+                if let Some(id) = run_id {
+                    self.script_runs.insert(id, tab);
+                }
+            }
+            Pending::ScriptSaved { tab, name } => {
+                self.toast(format!("saved {name}"), false);
+                let conn = self
+                    .tabs
+                    .iter()
+                    .find(|t| t.id == tab)
+                    .and_then(|t| t.script.as_ref())
+                    .map(|sc| sc.conn.clone())
+                    .unwrap_or_default();
+                self.ask(Pending::ScriptNames, "store.scripts.list", json!({ "conn": conn }));
+            }
             Pending::ScriptNames => {
+                self.scripts =
+                    v.get("scripts").and_then(Value::as_array).cloned().unwrap_or_default();
                 self.script_names = v
                     .get("scripts")
                     .and_then(Value::as_array)
@@ -3161,6 +3264,13 @@ impl Workspace {
     /// is asked, and a named reason stops the tab the way it stops the console.
     fn run_tab(&mut self, tab_id: u64, cx: &mut Context<Self>) {
         let Some(idx) = self.tabs.iter().position(|t| t.id == tab_id) else { return };
+        // A SCRIPT tab runs a script. One entry point, because the editor's
+        // Run reaches here whatever the tab holds — and routing it anywhere
+        // else would mean a second editor for scripts.
+        if self.tabs[idx].script.is_some() {
+            self.run_script(tab_id, cx);
+            return;
+        }
         self.tabs[idx].confirm = None;
         // **The SELECTION, if there is one.** A file of several statements is
         // only usable this way, and it is the one thing about a query editor
@@ -3350,6 +3460,24 @@ impl Workspace {
                             title: t.title.clone(),
                             draft: String::new(),
                             sub: String::new(),
+                            lang: String::new(),
+                            detail: None,
+                        };
+                    }
+                    // A SCRIPT tab, with its body: unlike a dashboard, there is
+                    // nothing to reload from the engine — the text in the box is
+                    // the thing, and it may never have been saved at all.
+                    if let Some(sc) = t.script.as_ref() {
+                        return SessionTab {
+                            conn: sc.conn.clone(),
+                            name: sc.name.clone(),
+                            schema: None,
+                            kind: "script".into(),
+                            view: String::new(),
+                            title: t.title.clone(),
+                            draft: t.sql.clone(),
+                            sub: String::new(),
+                            lang: sc.lang.clone(),
                             detail: None,
                         };
                     }
@@ -3362,6 +3490,7 @@ impl Workspace {
                         title: t.title.clone(),
                         draft: t.sql.clone(),
                         sub: t.sub.label().to_lowercase(),
+                        lang: String::new(),
                         detail: t.detail,
                     }
                 })
@@ -3392,6 +3521,7 @@ impl Workspace {
                 Rail::History => "history",
                 Rail::Audit => "audit",
                 Rail::Tasks => "tasks",
+                Rail::Scripts => "scripts",
             }
             .into(),
         });
@@ -3878,6 +4008,7 @@ impl Workspace {
             NameFor::Query => self.save_query_as(name, cx),
             NameFor::Chart => self.save_chart_as(name, cx),
             NameFor::Folder(conn) => self.file_connection(&conn, &name),
+            NameFor::Script(tab) => self.name_script(tab, name, cx),
         }
     }
 
@@ -4221,6 +4352,126 @@ impl Workspace {
         cx.notify();
     }
 
+    /// A new, unsaved script. Bash, because it is the one interpreter that is
+    /// always there.
+    fn new_script_tab(&mut self, cx: &mut Context<Self>) {
+        self.open_script_tab(String::new(), "bash".into(), String::new(), String::new(), cx);
+    }
+
+    /// Open a script in a tab of its own.
+    ///
+    /// A script tab needs no connection, unlike every other tab: a script is
+    /// the person's own program and the engine runs it whether or not anything
+    /// is connected. It is FILED under the connection it belongs to, though, so
+    /// `conn` comes from the script and not from what happens to be live — a
+    /// global script opened from one connection's panel is still global, and
+    /// saving it back under that connection would quietly make a second copy.
+    fn open_script_tab(
+        &mut self,
+        name: String,
+        lang: String,
+        conn: String,
+        body: String,
+        cx: &mut Context<Self>,
+    ) {
+        // Already open: the same script in two tabs is two editors over one
+        // saved name, and the second save silently loses the first.
+        if let Some(at) = self.tabs.iter().position(|t| {
+            t.script.as_ref().is_some_and(|sc| !sc.name.is_empty() && sc.name == name)
+        }) {
+            self.go_tab_at(at, cx);
+            return;
+        }
+        let id = self.next_tab;
+        self.next_tab += 1;
+        let title = if name.is_empty() { "script".to_string() } else { name.clone() };
+        let mut tab = Tab::new(id, conn.clone(), String::new(), title, None);
+        tab.sql = body.clone();
+        tab.script = Some(crate::workspace::Script {
+            name,
+            lang,
+            conn,
+            ..Default::default()
+        });
+        self.tabs.push(tab);
+        self.active = self.tabs.len() - 1;
+        // The SAME editor a statement gets — one editor, so the undo, the
+        // selection and the keys are one piece of code. Two creation paths is
+        // how half the tabs ended up without a statement box.
+        self.make_editor(id, Some("shell"), &body, cx);
+        crate::workspace::mru_touch(&mut self.mru, id);
+        self.remember();
+        cx.notify();
+    }
+
+    /// Run the script this tab holds.
+    ///
+    /// The BODY as it stands in the editor, never the saved name, even when the
+    /// script has one: somebody pressing Run after typing means the text in
+    /// front of them, and running the saved copy instead would be running
+    /// something they can see is not what they wrote.
+    fn run_script(&mut self, tab_id: u64, cx: &mut Context<Self>) {
+        let Some(body) = self.editors.get(&tab_id).map(|e| e.read(cx).text()) else { return };
+        let Some(tab) = self.tabs.iter_mut().find(|t| t.id == tab_id) else { return };
+        let Some(sc) = tab.script.as_mut() else { return };
+        if body.trim().is_empty() {
+            return;
+        }
+        if sc.run_id.is_some() {
+            // Already running. A second run would give this tab two streams of
+            // output and one place to show them.
+            return;
+        }
+        let (lang, conn) = (sc.lang.clone(), sc.conn.clone());
+        sc.out.clear();
+        sc.ended = None;
+        self.ask(
+            Pending::ScriptRun { tab: tab_id },
+            "script.run",
+            json!({ "conn": conn, "body": body, "lang": lang }),
+        );
+        self.status = "running a script\u{2026}".into();
+        cx.notify();
+    }
+
+    /// Stop a running script.
+    fn cancel_script(&mut self, tab_id: u64, cx: &mut Context<Self>) {
+        let Some(tab) = self.tabs.iter().find(|t| t.id == tab_id) else { return };
+        let Some(run_id) = tab.script.as_ref().and_then(|sc| sc.run_id) else { return };
+        self.ask(Pending::Ignore("script.cancel"), "script.cancel", json!({ "run_id": run_id }));
+        cx.notify();
+    }
+
+    /// Save the script in this tab, asking for a name if it has none.
+    fn save_script(&mut self, tab_id: u64, cx: &mut Context<Self>) {
+        let Some(body) = self.editors.get(&tab_id).map(|e| e.read(cx).text()) else { return };
+        let Some(tab) = self.tabs.iter().find(|t| t.id == tab_id) else { return };
+        let Some(sc) = tab.script.clone() else { return };
+        if sc.name.trim().is_empty() {
+            // The naming row, as a saved query uses it.
+            self.naming = Some(NameFor::Script(tab_id));
+            self.save_name.update(cx, |i, cx| i.set_text(String::new(), cx));
+            cx.notify();
+            return;
+        }
+        self.ask(
+            Pending::ScriptSaved { tab: tab_id, name: sc.name.clone() },
+            "store.scripts.save",
+            json!({ "conn": sc.conn, "name": sc.name, "lang": sc.lang, "body": body }),
+        );
+    }
+
+    /// The name came back from the row: this script is called that from now on.
+    fn name_script(&mut self, tab_id: u64, name: String, cx: &mut Context<Self>) {
+        if let Some(tab) = self.tabs.iter_mut().find(|t| t.id == tab_id) {
+            if let Some(sc) = tab.script.as_mut() {
+                sc.name = name.clone();
+            }
+            tab.title = name;
+        }
+        self.save_script(tab_id, cx);
+    }
+
     fn go_tab_at(&mut self, at: usize, cx: &mut Context<Self>) {
         if at < self.tabs.len() {
             self.active = at;
@@ -4238,6 +4489,14 @@ impl Workspace {
     }
 
     fn go_rail(&mut self, rail: Rail, cx: &mut Context<Self>) {
+        // The SCRIPTS are the store's and change behind this window's back —
+        // the Neovim client saves them too. Asked for when the panel is opened
+        // rather than kept warm: a list nobody is looking at does not need to
+        // be right.
+        if rail == Rail::Scripts {
+            let conn = self.target_conn().unwrap_or_default();
+            self.ask(Pending::ScriptNames, "store.scripts.list", json!({ "conn": conn }));
+        }
         self.rail = rail;
         self.panel_hidden = false;
         if rail == Rail::Audit && self.audit.is_empty() {
@@ -4335,7 +4594,14 @@ impl Workspace {
                 act: PaletteAct::View(v),
             });
         }
-        for r in [Rail::Connections, Rail::Instance, Rail::History, Rail::Audit, Rail::Tasks] {
+        for r in [
+            Rail::Connections,
+            Rail::Instance,
+            Rail::History,
+            Rail::Audit,
+            Rail::Tasks,
+            Rail::Scripts,
+        ] {
             // The KEY where there is one. The palette is where a keystroke is
             // learned: a row that says "panel" teaches nothing, and the whole
             // point of showing a shortcut here is that next time nobody opens
@@ -4818,6 +5084,28 @@ impl Workspace {
         self.save_board(tab, cx);
         self.run_board(tab);
         cx.notify();
+    }
+
+    /// Reopen the remembered SCRIPT tabs.
+    ///
+    /// Not through `reopen_tabs_for`, which waits for a connection to come
+    /// back: a script needs no connection, and a global one belongs to none —
+    /// waiting for a connection that is never made would mean a script tab that
+    /// never returns. So they come back as soon as the window is running, and
+    /// the body comes from the session rather than the store, because it may
+    /// never have been saved.
+    fn reopen_scripts(&mut self, cx: &mut Context<Self>) {
+        if self.scripts_reopened {
+            return;
+        }
+        self.scripts_reopened = true;
+        let mine: Vec<SessionTab> =
+            self.restore.tabs.iter().filter(|t| t.kind == "script").cloned().collect();
+        self.restore.tabs.retain(|t| t.kind != "script");
+        for t in mine {
+            let lang = if t.lang.is_empty() { "bash".to_string() } else { t.lang.clone() };
+            self.open_script_tab(t.name.clone(), lang, t.conn.clone(), t.draft.clone(), cx);
+        }
     }
 
     /// Ask the engine what is waiting for a person's answer.
@@ -6243,7 +6531,14 @@ impl Workspace {
         // panel shows; settings is not a view onto data, and putting it in the
         // same column says it is. It goes to the bottom, after a gap and a
         // rule, and it opens a window rather than taking the panel over.
-        for mode in [Rail::Connections, Rail::Instance, Rail::History, Rail::Audit, Rail::Tasks] {
+        for mode in [
+            Rail::Connections,
+            Rail::Instance,
+            Rail::History,
+            Rail::Audit,
+            Rail::Tasks,
+            Rail::Scripts,
+        ] {
             let on = self.rail == mode;
             col = col.child(
                 div()
@@ -6366,6 +6661,58 @@ impl Workspace {
             .border_color(t.border());
 
         match self.rail {
+            Rail::Scripts => {
+                panel = panel.child(self.section(self.lang.tr("rail.scripts")));
+                panel = panel.child(
+                    div().px_2().py_1().child(
+                        btn(t, ms, "script-new", self.lang.tr("script.new"), Btn::Secondary)
+                            .on_click(cx.listener(|this, _, _, cx| this.new_script_tab(cx))),
+                    ),
+                );
+                if self.scripts.is_empty() {
+                    panel = panel.child(self.empty_state("script.none", "script.none"));
+                }
+                for sc in self.scripts.clone() {
+                    let name = sc.get("name").and_then(Value::as_str).unwrap_or("").to_string();
+                    let conn = sc.get("conn").and_then(Value::as_str).unwrap_or("").to_string();
+                    let lang = sc.get("lang").and_then(Value::as_str).unwrap_or("bash").to_string();
+                    let body = sc.get("body").and_then(Value::as_str).unwrap_or("").to_string();
+                    // WHOSE it is. A global script shows up in every
+                    // connection's list, and opening one without knowing that
+                    // is how somebody edits the shared copy by accident.
+                    let whose = if conn.is_empty() {
+                        self.lang.tr("script.global").to_string()
+                    } else {
+                        conn.clone()
+                    };
+                    let open = (name.clone(), lang.clone(), conn.clone(), body.clone());
+                    panel = panel.child(
+                        div()
+                            .id(SharedString::from(format!("sc-{conn}-{name}")))
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .px_2()
+                            .py(px(1.0))
+                            .cursor_pointer()
+                            .hover(|d| d.bg(t.hover_mark()))
+                            .child(self.icon_inline("\u{f120}", t.muted()))
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .truncate()
+                                    .text_size(ms.small())
+                                    .child(SharedString::from(name.clone())),
+                            )
+                            .child(self.small(format!("{lang} \u{b7} {whose}"), t.muted()))
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                let (n, l, c, b) = open.clone();
+                                this.open_script_tab(n, l, c, b, cx);
+                            })),
+                    );
+                }
+            }
             Rail::Instance => {
                 let who = self.metrics_conn.clone().unwrap_or_else(|| "nothing connected".into());
                 panel = panel.child(self.section(&format!("Instance \u{2014} {who}")));
@@ -7808,6 +8155,10 @@ impl Workspace {
         if tab.board.is_some() {
             return self.board_el(tab, cx);
         }
+        // Nor is a SCRIPT tab: a body in a language, and what it printed.
+        if tab.script.is_some() {
+            return self.script_el(tab, cx);
+        }
 
         let mut body = div().flex().flex_col().size_full();
 
@@ -8127,6 +8478,107 @@ impl Workspace {
     /// two tiles side by side meet on a pixel rather than nearly. The gutter is
     /// the tile's own padding, not a gap in the layout, which keeps the
     /// arithmetic to one division.
+    /// A script tab: the body above, what it printed below.
+    ///
+    /// The output is UNDER the body rather than beside it, because a script's
+    /// lines are long — a shell command's error carries a path — and a column
+    /// half the window wide would wrap every one of them.
+    fn script_el(&self, tab: &Tab, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let t = self.t();
+        let ms = self.scale;
+        let Some(sc) = tab.script.as_ref() else {
+            return div().into_any_element();
+        };
+        let tab_id = tab.id;
+        let running = sc.run_id.is_some();
+
+        let mut head = div().flex().items_center().gap_2().px_2().py_1().child(
+            div().child(self.small(
+                if sc.name.is_empty() { "(unsaved)".to_string() } else { sc.name.clone() },
+                t.title(),
+            )),
+        );
+        for l in crate::workspace::SCRIPT_LANGS {
+            let on = sc.lang == *l;
+            head = head.child(chip(t, ms, format!("sl-{tab_id}-{l}"), *l, on).on_click(
+                cx.listener(move |this, _, _, cx| {
+                    if let Some(tb) = this.tabs.iter_mut().find(|x| x.id == tab_id) {
+                        if let Some(sc) = tb.script.as_mut() {
+                            sc.lang = l.to_string();
+                        }
+                    }
+                    cx.notify();
+                }),
+            ));
+        }
+        // WHOSE it is, said rather than implied: a global script edited from
+        // one connection's panel is still every connection's script.
+        head = head.child(self.small(
+            if sc.conn.is_empty() {
+                self.lang.tr("script.global").to_string()
+            } else {
+                sc.conn.clone()
+            },
+            t.muted(),
+        ));
+        head = head.child(div().flex_1());
+        head = head.child(if running {
+            btn(t, ms, format!("sc-cancel-{tab_id}"), self.tr("script.cancel"), Btn::Danger)
+                .on_click(cx.listener(move |this, _, _, cx| this.cancel_script(tab_id, cx)))
+        } else {
+            btn(t, ms, format!("sc-run-{tab_id}"), self.tr("script.run"), Btn::Primary)
+                .on_click(cx.listener(move |this, _, _, cx| this.run_script(tab_id, cx)))
+        });
+        head = head.child(
+            btn(t, ms, format!("sc-save-{tab_id}"), self.tr("script.save"), Btn::Secondary)
+                .on_click(cx.listener(move |this, _, _, cx| this.save_script(tab_id, cx))),
+        );
+
+        let mut body = div().flex().flex_col().size_full().child(head);
+        if let Some(ed) = self.editors.get(&tab.id) {
+            body = body.child(div().px_2().pb_1().text_size(ms.body()).child(ed.clone()));
+        }
+
+        let mut out = div()
+            .id(SharedString::from(format!("sc-out-{tab_id}")))
+            .flex()
+            .flex_col()
+            .flex_1()
+            .min_h_0()
+            .overflow_y_scroll()
+            .px_2()
+            .border_t_1()
+            .border_color(t.border());
+        if sc.out.is_empty() && !running {
+            out = out.child(self.small(
+                if sc.ended.is_some() {
+                    self.lang.tr("script.silent").to_string()
+                } else {
+                    String::new()
+                },
+                t.muted(),
+            ));
+        }
+        for (err, line) in &sc.out {
+            out = out.child(
+                div()
+                    .text_size(ms.small())
+                    // stderr is a WARNING, not an error: a script writing to
+                    // stderr is a script talking, and only its exit status says
+                    // whether it went wrong.
+                    .text_color(if *err { t.warning() } else { t.fg() })
+                    .child(SharedString::from(line.clone())),
+            );
+        }
+        if running {
+            out = out.child(self.small(self.lang.tr("script.running"), t.accent()));
+        }
+        if let Some(said) = &sc.ended {
+            out = out.child(self.small(said.clone(), t.muted()));
+        }
+        body.child(out).into_any_element()
+    }
+
     fn board_el(&self, tab: &Tab, cx: &mut Context<Self>) -> gpui::AnyElement {
         let t = self.t();
         let ms = self.scale;

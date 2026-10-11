@@ -302,7 +302,59 @@ pub struct Tab {
     /// connection, it has a title, it survives a restart, Ctrl-Tab reaches
     /// it — stays true of a board without being written twice.
     pub board: Option<crate::board::Board>,
+    /// When this tab is a SCRIPT rather than a result, what it holds.
+    ///
+    /// Same reasoning as `board`: a script tab belongs to a connection, has a
+    /// title, survives a restart and is reached by Ctrl-Tab, and all of that is
+    /// already true of a tab. What differs is that it has a body in a language
+    /// instead of a statement, and output instead of rows.
+    pub script: Option<Script>,
 }
+
+/// A script as a tab holds it.
+///
+/// The BODY is not here: it lives in the tab's editor, like a statement does,
+/// so one editor serves both and the undo, the selection and the keys are the
+/// same code. This is everything about a script that is not its text.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Script {
+    /// The saved name, or empty for one that has never been saved.
+    pub name: String,
+    /// `bash`, `python` or `lua` — the engine's own words.
+    pub lang: String,
+    /// Which connection it belongs to, or empty for a global script. Not the
+    /// tab's connection: a GLOBAL script opened from a connection's panel is
+    /// still global, and saving it back under the connection would quietly make
+    /// a second copy of it.
+    pub conn: String,
+    /// The run in flight, if any, as the engine numbered it.
+    pub run_id: Option<u64>,
+    /// What it has printed, newest last. `(stderr, text)`.
+    pub out: Vec<(bool, String)>,
+    /// How it ended, once it has.
+    pub ended: Option<String>,
+}
+
+/// How many printed lines a script tab keeps.
+///
+/// A script that prints in a loop would otherwise grow this list until the
+/// window is a log viewer with no memory left. The oldest go, because the
+/// newest are the ones somebody is watching.
+pub const SCRIPT_OUT_KEEP: usize = 2000;
+
+impl Script {
+    /// Add a printed line, dropping the oldest once there are too many.
+    pub fn push(&mut self, stderr: bool, text: String) {
+        self.out.push((stderr, text));
+        if self.out.len() > SCRIPT_OUT_KEEP {
+            let over = self.out.len() - SCRIPT_OUT_KEEP;
+            self.out.drain(..over);
+        }
+    }
+}
+
+/// The languages a script can be, in the order they are offered.
+pub const SCRIPT_LANGS: &[&str] = &["bash", "python", "lua"];
 
 /// A short-lived message in the corner.
 ///
@@ -778,6 +830,7 @@ impl Tab {
             pending_write: None,
             rendered: String::new(),
             board: None,
+            script: None,
         }
     }
 
@@ -1742,6 +1795,29 @@ mod tests {
         assert!(super::respawn_delay(1).unwrap() > super::respawn_delay(0).unwrap());
         assert!(super::respawn_delay(2).unwrap() > super::respawn_delay(1).unwrap());
         assert_eq!(super::respawn_delay(3), None, "a fourth try is a spawn storm");
+    }
+
+    /// A script that prints forever does not grow the window forever.
+    ///
+    /// The OLDEST go, because the newest are the ones somebody is watching —
+    /// and because a cap that dropped the new ones would show a script's first
+    /// two thousand lines and then look frozen.
+    #[test]
+    fn a_chatty_script_keeps_only_what_can_be_read() {
+        let mut sc = super::Script::default();
+        for i in 0..(super::SCRIPT_OUT_KEEP + 50) {
+            sc.push(i % 7 == 0, format!("line {i}"));
+        }
+        assert_eq!(sc.out.len(), super::SCRIPT_OUT_KEEP);
+        // The LAST line is the last one printed, not the last one kept before
+        // the cap was hit.
+        assert_eq!(sc.out.last().unwrap().1, format!("line {}", super::SCRIPT_OUT_KEEP + 49));
+        // And the first fifty are gone rather than the newest fifty.
+        assert_eq!(sc.out.first().unwrap().1, "line 50");
+        // Which stream each line came from survives the trimming: stderr drawn
+        // as stdout is a script that looks like it succeeded.
+        assert!(sc.out.iter().any(|(err, _)| *err));
+        assert!(sc.out.iter().any(|(err, _)| !*err));
     }
 
     /// Folders come first and keep their order; what is in none comes last.

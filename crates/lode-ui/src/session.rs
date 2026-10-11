@@ -109,6 +109,14 @@ pub struct SessionTab {
     /// The statement in the box, run or not.
     #[serde(default)]
     pub draft: String,
+    /// For a SCRIPT tab: the language, and whose script it is.
+    ///
+    /// The body is in `draft`, like a statement, and the name is in `name`. The
+    /// language has nowhere else to go: a script restored without it would come
+    /// back as bash whatever it was written in, and running a Python script
+    /// through a shell is not a small mistake.
+    #[serde(default)]
+    pub lang: String,
     /// Which sub-tab was showing — "documents" | "schema" | …
     #[serde(default)]
     pub sub: String,
@@ -242,6 +250,7 @@ mod tests {
                 title: String::new(),
                 draft: String::new(),
                 sub: "schema".into(),
+                lang: String::new(),
                 detail: Some(2),
             }],
             active: 0,
@@ -286,6 +295,7 @@ mod tests {
                 title: "Draft".into(),
                 draft: "SELECT 1 WHERE".into(),
                 sub: String::new(),
+                lang: String::new(),
                 detail: None,
             }],
             active: 0,
