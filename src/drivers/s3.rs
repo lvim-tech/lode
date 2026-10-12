@@ -98,6 +98,8 @@ const META: DriverMeta = DriverMeta {
         indexes: false,
         ddl: false,
         metrics: false,
+        // A row here is an OBJECT in a listing, not a record: there is no cell
+        // to change, and rewriting an object is not an edit of a row.
         edit: false,
     },
     hint: "ls",

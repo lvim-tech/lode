@@ -86,6 +86,10 @@ const META: DriverMeta = DriverMeta {
         kv: false,
         indexes: true,
         ddl: true, // system.data_skipping_indices / SHOW CREATE TABLE
+        // ClickHouse changes a row with a MUTATION (`ALTER TABLE … UPDATE`),
+        // which is asynchronous, reports no count, and cannot be rolled back.
+        // "one row was written" is exactly what it cannot say, so the
+        // capability is not claimed. The editor is where a mutation belongs.
         edit: false,
         metrics: false,
     },

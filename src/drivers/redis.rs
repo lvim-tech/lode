@@ -16,8 +16,8 @@ use tokio::net::TcpStream;
 use crate::driver::{Connection, Driver, ResultStream};
 use crate::net::NetContext;
 use crate::spec::{
-    AuthKind, AuthSpec, Caps, Column, ConnSpec, DriverMeta, Node, ObjRef, ParamSpec, ParamType, TableColumn, TlsSpec,
-    Value,
+    AuthKind, AuthSpec, Caps, Column, ConnSpec, DriverMeta, Node, ObjRef, ParamSpec, ParamType, RowOutcome, RowPlan,
+    TableColumn, TlsSpec, Value,
 };
 
 const PARAMS: &[ParamSpec] = &[
@@ -79,7 +79,9 @@ const META: DriverMeta = DriverMeta {
         kv: true,
         indexes: false,
         ddl: false, // a KV store has neither indexes nor a schema to describe
-        edit: false,
+        // A key/value store edits a row like anything else, once the row says
+        // WHICH value it is: see `shape_of`, which is the whole of it.
+        edit: true,
         // INFO — a read. Unverified here.
         metrics: true,
     },
@@ -318,6 +320,179 @@ fn scalar(v: &RValue) -> Value {
     }
 }
 
+/// What ONE row of a key looks like, and what addresses it.
+///
+/// This is the whole of Redis editing. Everywhere else a row is a row and a
+/// table says what its key is; here the shape depends on the KIND of the key,
+/// and the kind is what `structure` already labels every node with. A hash's
+/// row is a field and a value, and `HSET key field value` writes it. A list's
+/// row is an index, and `LSET` writes it. A set's row IS its member, so there
+/// is nothing to change about it and only SREM to do to it.
+///
+/// Declared once, read three times — by `columns`, by the rendering of a
+/// browse, and by the write — so the grid cannot show one shape while the
+/// write expects another.
+struct Shape {
+    /// The identifying column: what `plan.key` must carry.
+    key: &'static str,
+    /// The column that can be changed, if any. A set member cannot.
+    value: Option<&'static str>,
+    /// The command that changes it: `HSET`, `LSET`, `SET`, `ZADD`.
+    write: Option<&'static str>,
+    /// The command that removes the row: `HDEL`, `SREM`, `ZREM`, `XDEL`, `DEL`.
+    remove: Option<&'static str>,
+    /// Why a list cannot have a row removed, or a stream entry changed. Said
+    /// instead of doing, and said in the driver because it is a fact about
+    /// Redis.
+    note: &'static str,
+}
+
+/// The shape of a key of this kind, or `None` for a kind this driver does not
+/// know how to address a row of.
+fn shape_of(kind: &str) -> Option<Shape> {
+    match kind {
+        // One key, one value. The key column is the address, and it is the
+        // only row there is.
+        "string" => Some(Shape {
+            key: "key",
+            value: Some("value"),
+            write: Some("SET"),
+            remove: Some("DEL"),
+            note: "",
+        }),
+        "hash" => Some(Shape {
+            key: "field",
+            value: Some("value"),
+            write: Some("HSET"),
+            remove: Some("HDEL"),
+            note: "",
+        }),
+        // LSET writes by index. Nothing REMOVES by index: LREM removes by
+        // value, which is a different row from the one that was pointed at.
+        "list" => Some(Shape {
+            key: "index",
+            value: Some("value"),
+            write: Some("LSET"),
+            remove: None,
+            note: "a list element is removed by VALUE (LREM), not by position, so removing this row \
+                   would mean removing every element equal to it",
+        }),
+        // The member IS the row. Changing it would be removing one member and
+        // adding another, which is not an edit of this one.
+        "set" => Some(Shape {
+            key: "member",
+            value: None,
+            write: None,
+            remove: Some("SREM"),
+            note: "a set member is its own value: there is nothing else about it to change",
+        }),
+        "zset" => Some(Shape {
+            key: "member",
+            value: Some("score"),
+            write: Some("ZADD"),
+            remove: Some("ZREM"),
+            note: "",
+        }),
+        // An entry already written cannot be rewritten; it can be dropped.
+        "stream" => Some(Shape {
+            key: "id",
+            value: None,
+            write: None,
+            remove: Some("XDEL"),
+            note: "a stream entry is immutable once written \u{2014} it can be dropped (XDEL), not edited",
+        }),
+        _ => None,
+    }
+}
+
+/// The columns a browse of a key of this kind produces, as the grid sees them.
+fn shape_columns(kind: &str) -> Vec<Column> {
+    match shape_of(kind) {
+        Some(sh) => std::iter::once(sh.key)
+            .chain(sh.value)
+            .map(|name| Column {
+                name: name.to_string(),
+                type_name: String::new(),
+            })
+            .collect(),
+        None => Vec::new(),
+    }
+}
+
+/// One argument of a command, out of a cell the client sent.
+///
+/// It goes out as an ARGUMENT, not as text in a command line, so there is
+/// nothing for it to be injected into.
+fn arg_of(v: &serde_json::Value) -> String {
+    match super::rowsql::bind_of(&crate::spec::value_from_json(v)) {
+        super::rowsql::Bind::Null => String::new(),
+        super::rowsql::Bind::Text(s) => s,
+        super::rowsql::Bind::Bytes(raw) => String::from_utf8_lossy(&raw).into_owned(),
+    }
+}
+
+/// The command a row write becomes, and the line to SHOW for it.
+///
+/// The shown line carries `?` where a value goes: an argument never appears in
+/// the audit log, which is the same promise the SQL drivers keep by binding
+/// their parameters.
+fn row_command(kind: &str, key: &str, plan: &RowPlan) -> anyhow::Result<(Vec<String>, String)> {
+    let sh = shape_of(kind).ok_or_else(|| {
+        anyhow::anyhow!("a {kind} key has no rows this driver knows how to address")
+    })?;
+    let (_, addr) = plan
+        .key
+        .iter()
+        .find(|(c, _)| c == sh.key)
+        .map(|(c, v)| (c.clone(), arg_of(v)))
+        .ok_or_else(|| anyhow::anyhow!("that row is addressed by {}, which was not sent", sh.key))?;
+
+    if plan.delete {
+        let verb = sh.remove.ok_or_else(|| anyhow::anyhow!("{}", sh.note))?;
+        // DEL takes the key itself; everything else takes the key and then
+        // what inside it to remove.
+        let argv = if verb == "DEL" {
+            vec![verb.to_string(), key.to_string()]
+        } else {
+            vec![verb.to_string(), key.to_string(), addr.clone()]
+        };
+        let shown = argv.join(" ");
+        return Ok((argv, shown));
+    }
+
+    let verb = sh.write.ok_or_else(|| anyhow::anyhow!("{}", sh.note))?;
+    let column = sh
+        .value
+        .ok_or_else(|| anyhow::anyhow!("{}", sh.note))?;
+    let value = plan
+        .set
+        .iter()
+        .find(|(c, _)| c == column)
+        .map(|(_, v)| arg_of(v))
+        .ok_or_else(|| anyhow::anyhow!("{column} is the only thing about this row that can change"))?;
+
+    let (argv, shown) = match verb {
+        // SET key value
+        "SET" => (
+            vec![verb.to_string(), key.to_string(), value],
+            format!("SET {key} ?"),
+        ),
+        // HSET key field value / LSET key index value
+        "HSET" | "LSET" => (
+            vec![verb.to_string(), key.to_string(), addr.clone(), value],
+            format!("{verb} {key} {addr} ?"),
+        ),
+        // ZADD key score member — the score is the value and the member is the
+        // address, so this one is the other way round.
+        "ZADD" => (
+            vec![verb.to_string(), key.to_string(), value, addr.clone()],
+            format!("ZADD {key} ? {addr}"),
+        ),
+        other => anyhow::bail!("{other} is not a write this driver builds"),
+    };
+    Ok((argv, shown))
+}
+
 /// Tokenise a Redis command line (double-quote aware).
 fn tokenize(line: &str) -> Vec<String> {
     let mut out = Vec::new();
@@ -341,6 +516,17 @@ fn tokenize(line: &str) -> Vec<String> {
 }
 
 impl RedisConnection {
+    /// What kind of key this is, in the server's own word — the same word
+    /// `structure` labels the node with, and what every shape follows from.
+    async fn kind_of(&self, key: &str) -> anyhow::Result<String> {
+        match self.command(&["TYPE".to_string(), key.to_string()]).await? {
+            RValue::SimpleString(s) => Ok(s),
+            RValue::BulkString(b) => Ok(String::from_utf8_lossy(&b).into_owned()),
+            RValue::Nil => anyhow::bail!("there is no key called '{key}' any more"),
+            other => anyhow::bail!("the server did not say what '{key}' is: {other:?}"),
+        }
+    }
+
     async fn command(&self, tokens: &[String]) -> anyhow::Result<RValue> {
         if tokens.is_empty() {
             return Err(anyhow::anyhow!("empty command"));
@@ -351,6 +537,112 @@ impl RedisConnection {
         }
         let mut con = self.con.clone();
         c.query_async(&mut con).await.map_err(|e| anyhow::anyhow!("{e}"))
+    }
+}
+
+/// Render the reply to a command that BROWSES one key, so that every row says
+/// which value it is.
+///
+/// The generic rendering below cannot do this: `LRANGE` comes back as a bare
+/// array, and an array of values with no positions is a grid in which no row
+/// can be pointed at — which is why this driver could show a key and not edit
+/// one. The command is what says which key and which kind, and the command is
+/// right here, so the answer is rendered in the shape `shape_of` declares.
+///
+/// Anything else — `KEYS *`, `INFO`, a command somebody typed — falls through
+/// to `render`, unchanged.
+fn render_browse(tokens: &[String], v: RValue) -> (Vec<Column>, Vec<Vec<Value>>) {
+    let verb = match tokens.first() {
+        Some(w) => w.to_ascii_uppercase(),
+        None => return render(v),
+    };
+    let key = match tokens.get(1) {
+        Some(k) => k.clone(),
+        None => return render(v),
+    };
+    let flat = |v: &RValue| -> Vec<Value> {
+        match v {
+            RValue::Array(a) | RValue::Set(a) => a.iter().map(scalar).collect(),
+            RValue::Map(m) => m.iter().flat_map(|(k, val)| [scalar(k), scalar(val)]).collect(),
+            one => vec![scalar(one)],
+        }
+    };
+    let pairs = |cells: Vec<Value>| -> Vec<Vec<Value>> {
+        cells.chunks(2).map(|c| c.to_vec()).collect()
+    };
+    match verb.as_str() {
+        // GET key → one row, and the key column is the address of it.
+        "GET" => (
+            shape_columns("string"),
+            vec![vec![Value::Text(key), flat(&v).into_iter().next().unwrap_or(Value::Null)]],
+        ),
+        // HGETALL → field, value. RESP2 sends a flat array and RESP3 a map;
+        // both arrive here as a flat list of cells.
+        "HGETALL" => (shape_columns("hash"), pairs(flat(&v))),
+        // LRANGE key start stop → index, value. The index is absolute, which
+        // is what LSET takes — so a NEGATIVE start, where this cannot be
+        // worked out, is rendered as a plain list rather than as positions
+        // that would be wrong.
+        "LRANGE" => match tokens.get(2).and_then(|s| s.parse::<i64>().ok()) {
+            Some(start) if start >= 0 => (
+                shape_columns("list"),
+                flat(&v)
+                    .into_iter()
+                    .enumerate()
+                    .map(|(i, cell)| vec![Value::Int(start + i as i64), cell])
+                    .collect(),
+            ),
+            _ => render(v),
+        },
+        "SMEMBERS" => (
+            shape_columns("set"),
+            flat(&v).into_iter().map(|m| vec![m]).collect(),
+        ),
+        // ZRANGE … WITHSCORES → member, score. Without the scores there is
+        // nothing to edit, so it stays a list of members.
+        "ZRANGE" | "ZRANGEBYSCORE" | "ZREVRANGE" => {
+            if tokens.iter().any(|t| t.eq_ignore_ascii_case("WITHSCORES")) {
+                (shape_columns("zset"), pairs(flat(&v)))
+            } else {
+                (
+                    vec![Column {
+                        name: "member".to_string(),
+                        type_name: String::new(),
+                    }],
+                    flat(&v).into_iter().map(|m| vec![m]).collect(),
+                )
+            }
+        }
+        // XRANGE → id, fields. The id is what XDEL takes; the fields are
+        // shown as they are, because a stream entry cannot be edited and
+        // pretending otherwise would be a column that refuses every write.
+        "XRANGE" | "XREVRANGE" => {
+            let entries = match &v {
+                RValue::Array(a) => a.clone(),
+                _ => return render(v),
+            };
+            let columns = vec![
+                Column {
+                    name: "id".to_string(),
+                    type_name: String::new(),
+                },
+                Column {
+                    name: "fields".to_string(),
+                    type_name: String::new(),
+                },
+            ];
+            let rows = entries
+                .iter()
+                .map(|e| match e {
+                    RValue::Array(pair) if pair.len() == 2 => {
+                        vec![scalar(&pair[0]), Value::Json(rvalue_to_json(&pair[1]))]
+                    }
+                    other => vec![scalar(other), Value::Null],
+                })
+                .collect();
+            (columns, rows)
+        }
+        _ => render(v),
     }
 }
 
@@ -447,9 +739,32 @@ impl Connection for RedisConnection {
         }])
     }
 
-    async fn columns(&mut self, _obj: &ObjRef) -> anyhow::Result<Vec<TableColumn>> {
-        // A key/value store has no columns to describe, and therefore no key to address a "row" by.
-        Ok(Vec::new())
+    /// What one row of this key looks like, and which column addresses it.
+    ///
+    /// A key/value store has no schema, but a KEY has a kind, and the kind is
+    /// what decides both — so this asks the server what the key is and answers
+    /// from `shape_of`. Returning nothing here (as this did) is what made the
+    /// engine refuse every edit with "has no primary key".
+    async fn columns(&mut self, obj: &ObjRef) -> anyhow::Result<Vec<TableColumn>> {
+        let kind = self.kind_of(&obj.name).await?;
+        let Some(sh) = shape_of(&kind) else {
+            return Ok(Vec::new());
+        };
+        let mut out = vec![TableColumn {
+            name: sh.key.to_string(),
+            type_name: kind.clone(),
+            primary: true,
+            references: None,
+        }];
+        if let Some(value) = sh.value {
+            out.push(TableColumn {
+                name: value.to_string(),
+                type_name: kind,
+                primary: false,
+                references: None,
+            });
+        }
+        Ok(out)
     }
 
     /// `CLIENT LIST`, parsed into columns.
@@ -597,6 +912,40 @@ impl Connection for RedisConnection {
         Ok(out)
     }
 
+    async fn plan_row(&mut self, plan: &RowPlan) -> anyhow::Result<String> {
+        let kind = self.kind_of(&plan.obj.name).await?;
+        Ok(row_command(&kind, &plan.obj.name, plan)?.1)
+    }
+
+    /// Change or remove one row of a key.
+    ///
+    /// There is no transaction here and none is needed: every command this
+    /// builds addresses exactly ONE thing by name — a field, an index, a
+    /// member, the key itself — so it cannot touch a second row by being
+    /// wrong about a WHERE. That is the same promise the SQL drivers keep with
+    /// a transaction, kept instead by the shape of the command.
+    async fn write_row(&mut self, plan: &RowPlan) -> anyhow::Result<RowOutcome> {
+        let kind = self.kind_of(&plan.obj.name).await?;
+        let (argv, statement) = row_command(&kind, &plan.obj.name, plan)?;
+        let reply = self.command(&argv).await?;
+        // A removal says HOW MANY it removed, and zero means the row was
+        // already gone — which is not a failure and is not a success either.
+        let affected = match reply {
+            RValue::Int(n) if plan.delete => {
+                if n == 0 {
+                    anyhow::bail!("that row was not there any more \u{2014} nothing was removed");
+                }
+                n.max(0) as u64
+            }
+            // HSET answers 0 for a field it replaced and 1 for one it created;
+            // both wrote the value that was asked for, so both are one row.
+            RValue::Int(_) | RValue::Okay => 1,
+            RValue::SimpleString(ref s) if s == "OK" => 1,
+            other => anyhow::bail!("the server answered something this driver cannot read: {other:?}"),
+        };
+        Ok(RowOutcome { statement, affected })
+    }
+
     async fn execute(&mut self, stmt: &str) -> anyhow::Result<Box<dyn ResultStream>> {
         let tokens = tokenize(stmt);
         // Redis has no parse stage of its own — the server answers — so a
@@ -612,7 +961,7 @@ impl Connection for RedisConnection {
                 e
             }
         })?;
-        let (columns, rows) = render(reply);
+        let (columns, rows) = render_browse(&tokens, reply);
         Ok(Box::new(super::buffered::BufferedStream::new(columns, rows, None)))
     }
 
@@ -681,5 +1030,124 @@ mod tests {
             .await
             .expect("ok");
         assert_eq!(fallback.db, 0, "a number nobody can read is database 0, not a refusal");
+    }
+}
+
+#[cfg(test)]
+mod row_tests {
+    use super::*;
+
+    fn plan(obj: &str, key: (&str, serde_json::Value), set: Vec<(&str, serde_json::Value)>, delete: bool) -> RowPlan {
+        serde_json::from_value(json!({
+            "obj": { "name": obj, "schema": "keyspace" },
+            "key": [[key.0, key.1]],
+            "set": set.into_iter().map(|(c, v)| json!([c, v])).collect::<Vec<_>>(),
+            "delete": delete,
+        }))
+        .expect("a plan")
+    }
+
+    /// The point of the whole thing: a hash row is a field, and the command
+    /// that writes it names the field and sends the value as an argument.
+    #[test]
+    fn a_hash_field_is_written_by_name() {
+        let p = plan("user:1", ("field", json!("name")), vec![("value", json!("Ада"))], false);
+        let (argv, shown) = row_command("hash", "user:1", &p).expect("a hash row can be written");
+        assert_eq!(argv, vec!["HSET", "user:1", "name", "Ада"]);
+        assert_eq!(shown, "HSET user:1 name ?", "the value does not appear in the log");
+    }
+
+    #[test]
+    fn a_list_element_is_written_by_position() {
+        let p = plan("queue", ("index", json!(3)), vec![("value", json!("x"))], false);
+        let (argv, shown) = row_command("list", "queue", &p).expect("a list row can be written");
+        assert_eq!(argv, vec!["LSET", "queue", "3", "x"]);
+        assert_eq!(shown, "LSET queue 3 ?");
+    }
+
+    /// ZADD takes the score BEFORE the member, which is the other way round
+    /// from every other write here.
+    #[test]
+    fn a_sorted_set_takes_its_score_first() {
+        let p = plan("board", ("member", json!("ada")), vec![("score", json!(42))], false);
+        let (argv, shown) = row_command("zset", "board", &p).expect("a zset row can be written");
+        assert_eq!(argv, vec!["ZADD", "board", "42", "ada"]);
+        assert_eq!(shown, "ZADD board ? ada");
+    }
+
+    #[test]
+    fn a_string_key_is_its_own_row() {
+        let p = plan("greeting", ("key", json!("greeting")), vec![("value", json!("hello"))], false);
+        let (argv, _) = row_command("string", "greeting", &p).expect("a string can be written");
+        assert_eq!(argv, vec!["SET", "greeting", "hello"]);
+    }
+
+    #[test]
+    fn each_kind_removes_a_row_its_own_way() {
+        for (kind, key, col, want) in [
+            ("hash", "user:1", "field", vec!["HDEL", "user:1", "name"]),
+            ("set", "tags", "member", vec!["SREM", "tags", "name"]),
+            ("zset", "board", "member", vec!["ZREM", "board", "name"]),
+            ("stream", "events", "id", vec!["XDEL", "events", "name"]),
+            ("string", "greeting", "key", vec!["DEL", "greeting"]),
+        ] {
+            let p = plan(key, (col, json!("name")), vec![], true);
+            let (argv, _) = row_command(kind, key, &p).unwrap_or_else(|e| panic!("{kind}: {e}"));
+            assert_eq!(argv, want, "{kind}");
+        }
+    }
+
+    /// What Redis cannot do is SAID, not quietly done as something else.
+    #[test]
+    fn what_redis_cannot_do_it_explains() {
+        let by_index = plan("queue", ("index", json!(0)), vec![], true);
+        let e = row_command("list", "queue", &by_index).expect_err("a list has no removal by position");
+        assert!(e.to_string().contains("LREM"), "it says what Redis does instead: {e}");
+
+        let member = plan("tags", ("member", json!("rust")), vec![("member", json!("go"))], false);
+        let e = row_command("set", "tags", &member).expect_err("a set member is its own value");
+        assert!(e.to_string().contains("nothing else about it"), "{e}");
+
+        let entry = plan("events", ("id", json!("1-0")), vec![("fields", json!("{}"))], false);
+        let e = row_command("stream", "events", &entry).expect_err("a stream entry is immutable");
+        assert!(e.to_string().contains("immutable"), "{e}");
+
+        let p = plan("x", ("key", json!("x")), vec![("value", json!("v"))], false);
+        let e = row_command("vector", "x", &p).expect_err("an unknown kind has no shape");
+        assert!(e.to_string().contains("vector"), "{e}");
+    }
+
+    /// The browse and the write have to agree about what a row is, or the grid
+    /// shows one shape and the write asks for another.
+    #[test]
+    fn the_grid_shows_what_the_write_addresses() {
+        for (kind, cmd) in [
+            ("hash", vec!["HGETALL", "user:1"]),
+            ("list", vec!["LRANGE", "queue", "0", "99"]),
+            ("set", vec!["SMEMBERS", "tags"]),
+            ("zset", vec!["ZRANGE", "board", "0", "99", "WITHSCORES"]),
+            ("string", vec!["GET", "greeting"]),
+        ] {
+            let tokens: Vec<String> = cmd.iter().map(|s| s.to_string()).collect();
+            let (columns, _) = render_browse(&tokens, RValue::Array(vec![]));
+            let names: Vec<String> = columns.iter().map(|c| c.name.clone()).collect();
+            let want: Vec<String> = shape_columns(kind).iter().map(|c| c.name.clone()).collect();
+            assert_eq!(names, want, "{kind}: the browse and the shape disagree");
+        }
+    }
+
+    /// LSET takes an ABSOLUTE position, so a browse that cannot work one out
+    /// does not invent one.
+    #[test]
+    fn a_list_browsed_from_the_end_shows_no_positions() {
+        let from_start: Vec<String> = ["LRANGE", "q", "10", "20"].iter().map(|s| s.to_string()).collect();
+        let reply = RValue::Array(vec![RValue::SimpleString("a".into()), RValue::SimpleString("b".into())]);
+        let (_, rows) = render_browse(&from_start, reply.clone());
+        assert!(matches!(rows[0][0], Value::Int(10)), "the first row is at 10");
+        assert!(matches!(rows[1][0], Value::Int(11)));
+
+        let from_end: Vec<String> = ["LRANGE", "q", "-5", "-1"].iter().map(|s| s.to_string()).collect();
+        let (columns, _) = render_browse(&from_end, reply);
+        assert_eq!(columns.len(), 1, "no index column, because the position is not knowable");
     }
 }

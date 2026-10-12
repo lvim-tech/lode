@@ -11,13 +11,14 @@ use async_trait::async_trait;
 use base64::Engine as _;
 use scylla::client::session::Session;
 use scylla::client::session_builder::SessionBuilder;
+use scylla::frame::response::result::{ColumnType, NativeType};
 use scylla::value::{CqlValue, Row};
 
 use crate::driver::{Connection, Driver, ResultStream};
 use crate::net::NetContext;
 use crate::spec::{
-    AuthKind, AuthSpec, Caps, Column, ConnSpec, DriverMeta, Index, Node, ObjRef, ParamSpec, ParamType, TableColumn,
-    Value,
+    AuthKind, AuthSpec, Caps, Column, ConnSpec, DriverMeta, Index, Node, ObjRef, ParamSpec, ParamType, RowOutcome,
+    RowPlan, TableColumn, Value,
 };
 
 /// Cassandra's WHERE is NOT SQL's. It filters on key columns and indexed ones,
@@ -73,7 +74,10 @@ const CAPS: Caps = Caps {
     kv: false,
     indexes: true,
     ddl: false, // system_schema.indexes; DESCRIBE is reconstructed CLIENT-side in CQL
-    edit: false,
+    // A CQL row edit is `IF EXISTS`: the server itself answers whether it
+    // applied, which is the guarantee the other drivers get from a
+    // transaction Cassandra does not have. See `write_row`.
+    edit: true,
     metrics: false,
 };
 
@@ -215,6 +219,86 @@ fn cell(v: &CqlValue) -> Value {
         // CQL expression, not a plain number), but that is honest and round-trippable, unlike the Debug form.
         other => Value::Text(other.to_string()),
     }
+}
+
+/// The statement for a row write, with the condition that makes it one.
+///
+/// `IF EXISTS` is appended to the shared UPDATE/DELETE: in CQL an UPDATE of a
+/// row that is not there CREATES it, so the condition is what makes an edit an
+/// edit rather than an insert nobody asked for.
+fn row_statement(plan: &RowPlan) -> String {
+    let (stmt, _) = super::rowsql::row_statement(plan, super::rowsql::ANSI);
+    format!("{stmt} IF EXISTS")
+}
+
+/// One value, bound as the type the SERVER said the parameter is.
+///
+/// CQL has no text parameters: a `uuid` column takes a uuid and an `int` takes
+/// four bytes, so the value cannot simply be handed over as the text somebody
+/// typed. The types come from the PREPARED statement — the server's own
+/// answer about what it is expecting — and anything this cannot build is
+/// refused BY NAME, rather than bound as something else and written wrong.
+fn bound(v: &Value, ty: &ColumnType) -> anyhow::Result<Option<CqlValue>> {
+    let native = match ty {
+        ColumnType::Native(n) => n,
+        other => anyhow::bail!("this driver cannot bind a {other:?} from the grid \u{2014} edit it with a CQL statement"),
+    };
+    let text = match super::rowsql::bind_of(v) {
+        // In CQL, writing NULL deletes the cell. That is what clearing a cell
+        // in the grid means, so it is the right answer rather than a refusal.
+        super::rowsql::Bind::Null => return Ok(None),
+        super::rowsql::Bind::Text(s) => s,
+        super::rowsql::Bind::Bytes(raw) => {
+            return match native {
+                NativeType::Blob => Ok(Some(CqlValue::Blob(raw))),
+                _ => Ok(Some(CqlValue::Text(String::from_utf8_lossy(&raw).into_owned()))),
+            }
+        }
+    };
+    let whole = |what: &str| -> anyhow::Result<i64> {
+        text.trim()
+            .parse::<i64>()
+            .map_err(|_| anyhow::anyhow!("a {what} column takes a whole number, and '{text}' is not one"))
+    };
+    let real = |what: &str| -> anyhow::Result<f64> {
+        text.trim()
+            .parse::<f64>()
+            .map_err(|_| anyhow::anyhow!("a {what} column takes a number, and '{text}' is not one"))
+    };
+    let out = match native {
+        NativeType::Ascii => CqlValue::Ascii(text),
+        NativeType::Text => CqlValue::Text(text),
+        NativeType::Boolean => CqlValue::Boolean(matches!(
+            text.trim().to_ascii_lowercase().as_str(),
+            "true" | "t" | "yes" | "1"
+        )),
+        NativeType::TinyInt => CqlValue::TinyInt(i8::try_from(whole("tinyint")?)?),
+        NativeType::SmallInt => CqlValue::SmallInt(i16::try_from(whole("smallint")?)?),
+        NativeType::Int => CqlValue::Int(i32::try_from(whole("int")?)?),
+        NativeType::BigInt => CqlValue::BigInt(whole("bigint")?),
+        NativeType::Float => CqlValue::Float(real("float")? as f32),
+        NativeType::Double => CqlValue::Double(real("double")?),
+        NativeType::Blob => CqlValue::Blob(text.into_bytes()),
+        NativeType::Uuid => CqlValue::Uuid(
+            uuid::Uuid::parse_str(text.trim()).map_err(|_| anyhow::anyhow!("'{text}' is not a uuid"))?,
+        ),
+        NativeType::Timeuuid => CqlValue::Timeuuid(
+            uuid::Uuid::parse_str(text.trim())
+                .map_err(|_| anyhow::anyhow!("'{text}' is not a timeuuid"))?
+                .into(),
+        ),
+        // Milliseconds since the epoch, which is what the column IS. A date
+        // somebody typed is not accepted here, because this driver would have
+        // to guess the time zone to turn it into one.
+        NativeType::Timestamp => CqlValue::Timestamp(scylla::value::CqlTimestamp(whole(
+            "timestamp (milliseconds since the epoch)",
+        )?)),
+        other => anyhow::bail!(
+            "this driver cannot bind a {other:?} from the grid \u{2014} edit it with a CQL statement, \
+             where the literal is yours to write"
+        ),
+    };
+    Ok(Some(out))
 }
 
 /// A live CQL session.
@@ -385,6 +469,74 @@ impl Connection for CqlConnection {
                 })
             })
             .collect())
+    }
+
+    async fn plan_row(&mut self, plan: &RowPlan) -> anyhow::Result<String> {
+        Ok(row_statement(plan))
+    }
+
+    /// Change or remove one row.
+    ///
+    /// `IF EXISTS` is the whole of it. Cassandra has no transaction to roll a
+    /// write back with, and its UPDATE is an UPSERT: without that condition,
+    /// editing a row that somebody else has just deleted would silently
+    /// CREATE it again, which is the one thing a row edit must not do. With
+    /// it, the server performs the write as a lightweight transaction and
+    /// answers whether it applied — the same promise, in Cassandra's own
+    /// terms, and the reason this driver can claim the capability at all.
+    ///
+    /// The key is the full PRIMARY KEY (the engine checks that before this is
+    /// reached), so the write addresses exactly one row by definition.
+    async fn write_row(&mut self, plan: &RowPlan) -> anyhow::Result<RowOutcome> {
+        let statement = row_statement(plan);
+        let (_, binds) = super::rowsql::row_statement(plan, super::rowsql::ANSI);
+        let prepared = self
+            .session
+            .prepare(statement.as_str())
+            .await
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        let wanted: Vec<ColumnType<'static>> = prepared
+            .get_variable_col_specs()
+            .iter()
+            .map(|c| c.typ().clone().into_owned())
+            .collect();
+        if wanted.len() != binds.len() {
+            anyhow::bail!(
+                "the server expects {} value(s) for that statement and this driver has {}",
+                wanted.len(),
+                binds.len()
+            );
+        }
+        let mut values: Vec<Option<CqlValue>> = Vec::with_capacity(binds.len());
+        for (v, ty) in binds.iter().zip(wanted.iter()) {
+            values.push(bound(v, ty)?);
+        }
+        let result = self
+            .session
+            .execute_unpaged(&prepared, values)
+            .await
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        // A lightweight transaction answers with one row whose first column is
+        // `[applied]`. False means the row was not there — somebody else had
+        // removed it — and nothing was written.
+        let applied = match result.into_rows_result() {
+            Ok(rows) => rows
+                .rows::<Row>()
+                .map_err(|e| anyhow::anyhow!("{e}"))?
+                .next()
+                .transpose()
+                .map_err(|e| anyhow::anyhow!("{e}"))?
+                .and_then(|r| r.columns.into_iter().next().flatten())
+                .map(|c| !matches!(c, CqlValue::Boolean(false)))
+                .unwrap_or(true),
+            // No result set at all: the server said nothing to read, which for
+            // a conditional write it does not do. Take it as applied.
+            Err(_) => true,
+        };
+        if !applied {
+            anyhow::bail!("that row was not there any more \u{2014} nothing was written");
+        }
+        Ok(RowOutcome { statement, affected: 1 })
     }
 
     async fn execute(&mut self, stmt: &str) -> anyhow::Result<Box<dyn ResultStream>> {

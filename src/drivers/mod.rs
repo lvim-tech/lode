@@ -7,6 +7,12 @@
 // any driver that reuses it is compiled in.
 pub mod buffered;
 
+// One row write, spelled in each SQL dialect. Shared for the same reason as
+// `group_indexes`: every relational driver has the same thought to express, and
+// writing it out N times is N chances to get the quoting or the bind order
+// wrong — in the one place where a value could become syntax.
+pub mod rowsql;
+
 /// Fold a catalog query's `(index_name, unique, primary, column)` rows — ONE ROW PER INDEX COLUMN, already
 /// ordered by index then by the index's own column position — into one `Index` per name.
 ///

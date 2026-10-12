@@ -15,8 +15,8 @@ use mysql_async::{Conn, Opts, OptsBuilder, Row};
 use crate::driver::{CancelHandle, Connection, Driver, ResultStream};
 use crate::net::NetContext;
 use crate::spec::{
-    AuthKind, AuthSpec, Caps, Column, ConnSpec, DriverMeta, Index, Node, ObjRef, ParamSpec, ParamType, TableColumn,
-    Value,
+    AuthKind, AuthSpec, Caps, Column, ConnSpec, DriverMeta, Index, Node, ObjRef, ParamSpec, ParamType, RowOutcome,
+    RowPlan, TableColumn, Value,
 };
 
 const PARAMS: &[ParamSpec] = &[
@@ -58,7 +58,7 @@ const CAPS: Caps = Caps {
     kv: false,
     indexes: true,
     ddl: true, // information_schema.STATISTICS / SHOW CREATE TABLE
-    edit: false,
+    edit: true,
     metrics: false,
 };
 
@@ -259,6 +259,19 @@ impl Driver for MysqlDriver {
                 }
             }
         }
+    }
+}
+
+/// One value, bound as a parameter.
+///
+/// Text, and not a Rust type: MySQL coerces a string to the column's own type
+/// on assignment, and this driver does not know what that type is. Guessing it
+/// is how a date becomes a string in a DATETIME column.
+fn bound(v: &Value) -> mysql_async::Value {
+    match super::rowsql::bind_of(v) {
+        super::rowsql::Bind::Null => mysql_async::Value::NULL,
+        super::rowsql::Bind::Text(s) => mysql_async::Value::Bytes(s.into_bytes()),
+        super::rowsql::Bind::Bytes(raw) => mysql_async::Value::Bytes(raw),
     }
 }
 
@@ -519,6 +532,34 @@ impl Connection for MysqlConnection {
             }
         }
         Ok(None)
+    }
+
+    async fn plan_row(&mut self, plan: &RowPlan) -> anyhow::Result<String> {
+        Ok(super::rowsql::row_statement(plan, super::rowsql::MYSQL).0)
+    }
+
+    async fn write_row(&mut self, plan: &RowPlan) -> anyhow::Result<RowOutcome> {
+        use mysql_async::TxOpts;
+        let (statement, binds) = super::rowsql::row_statement(plan, super::rowsql::MYSQL);
+        let params: Vec<mysql_async::Value> = binds.iter().map(bound).collect();
+        // A TRANSACTION, not because two statements run, but because one can
+        // still turn out to be wrong about how many rows it hits. Dropped
+        // uncommitted, mysql_async rolls it back.
+        let mut tx = self
+            .conn
+            .start_transaction(TxOpts::default())
+            .await
+            .map_err(|e| anyhow::anyhow!("cannot begin: {e}"))?;
+        tx.exec_drop(statement.as_str(), params)
+            .await
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        let affected = tx.affected_rows();
+        if affected != 1 {
+            tx.rollback().await.map_err(|e| anyhow::anyhow!("{e}"))?;
+            anyhow::bail!("that key matched {affected} row(s), not one \u{2014} nothing was written");
+        }
+        tx.commit().await.map_err(|e| anyhow::anyhow!("cannot commit: {e}"))?;
+        Ok(RowOutcome { statement, affected })
     }
 
     async fn execute(&mut self, stmt: &str) -> anyhow::Result<Box<dyn ResultStream>> {

@@ -16,7 +16,8 @@ use duckdb::Connection as DuckConn;
 use crate::driver::{Connection, Driver, ResultStream};
 use crate::net::NetContext;
 use crate::spec::{
-    AuthKind, Caps, Column, ConnSpec, DriverMeta, Index, Node, ObjRef, ParamSpec, ParamType, TableColumn, Value,
+    AuthKind, Caps, Column, ConnSpec, DriverMeta, Index, Node, ObjRef, ParamSpec, ParamType, RowOutcome, RowPlan,
+    TableColumn, Value,
 };
 
 const PARAMS: &[ParamSpec] = &[ParamSpec {
@@ -44,7 +45,7 @@ const META: DriverMeta = DriverMeta {
         kv: false,
         indexes: true,
         ddl: true, // duckdb_indexes() / duckdb_tables().sql
-        edit: false,
+        edit: true,
         metrics: false,
     },
     hint: "SELECT * FROM table LIMIT 100",
@@ -222,6 +223,27 @@ fn cell(v: DuckValue) -> Value {
 }
 
 /// A live DuckDB connection.
+/// One value, bound as a parameter.
+///
+/// TYPED, unlike the drivers that hand their values over as text: DuckDB is
+/// strictly typed and casts a parameter rather than parsing it, so a number
+/// that arrived as a number goes out as one.
+fn bound(v: &Value) -> DuckValue {
+    match v {
+        Value::Null => DuckValue::Null,
+        Value::Bool(b) => DuckValue::Boolean(*b),
+        Value::Int(i) => DuckValue::BigInt(*i),
+        Value::Float(f) => DuckValue::Double(*f),
+        Value::Text(s) | Value::Timestamp(s) | Value::Oid(s) => DuckValue::Text(s.clone()),
+        Value::Ext { text, .. } => DuckValue::Text(text.clone()),
+        Value::Json(j) => DuckValue::Text(j.to_string()),
+        Value::Bytes { b64, .. } => match base64::engine::general_purpose::STANDARD.decode(b64) {
+            Ok(raw) => DuckValue::Blob(raw),
+            Err(_) => DuckValue::Text(b64.clone()),
+        },
+    }
+}
+
 struct DuckdbConnection {
     conn: Arc<Mutex<DuckConn>>,
 }
@@ -401,6 +423,34 @@ impl Connection for DuckdbConnection {
             Some(Value::Text(s)) => Some(s.clone()),
             _ => None,
         }))
+    }
+
+    async fn plan_row(&mut self, plan: &RowPlan) -> anyhow::Result<String> {
+        Ok(super::rowsql::row_statement(plan, super::rowsql::ANSI).0)
+    }
+
+    async fn write_row(&mut self, plan: &RowPlan) -> anyhow::Result<RowOutcome> {
+        let (statement, binds) = super::rowsql::row_statement(plan, super::rowsql::ANSI);
+        let params: Vec<DuckValue> = binds.iter().map(bound).collect();
+        let arc = self.conn.clone();
+        let sql = statement.clone();
+        let affected = tokio::task::spawn_blocking(move || -> anyhow::Result<u64> {
+            let mut conn = arc.lock().unwrap();
+            // A TRANSACTION, not because two statements run, but because one
+            // can still turn out to be wrong about how many rows it hits.
+            // Dropped without a commit, it is rolled back.
+            let tx = conn.transaction().map_err(|e| anyhow::anyhow!("{e}"))?;
+            let n = tx
+                .execute(&sql, duckdb::params_from_iter(params.iter()))
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+            if n != 1 {
+                anyhow::bail!("that key matched {n} row(s), not one \u{2014} nothing was written");
+            }
+            tx.commit().map_err(|e| anyhow::anyhow!("{e}"))?;
+            Ok(n as u64)
+        })
+        .await??;
+        Ok(RowOutcome { statement, affected })
     }
 
     async fn execute(&mut self, stmt: &str) -> anyhow::Result<Box<dyn ResultStream>> {

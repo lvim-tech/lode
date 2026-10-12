@@ -16,8 +16,8 @@ use tokio_util::compat::{Compat, TokioAsyncWriteCompatExt};
 use crate::driver::{Connection, Driver, ResultStream};
 use crate::net::NetContext;
 use crate::spec::{
-    AuthKind, AuthSpec, Caps, Column, ConnSpec, DriverMeta, Index, Node, ObjRef, ParamSpec, ParamType, TableColumn,
-    Value,
+    AuthKind, AuthSpec, Caps, Column, ConnSpec, DriverMeta, Index, Node, ObjRef, ParamSpec, ParamType, RowOutcome,
+    RowPlan, TableColumn, Value,
 };
 
 const PARAMS: &[ParamSpec] = &[
@@ -63,7 +63,7 @@ const META: DriverMeta = DriverMeta {
         kv: false,
         indexes: true,
         ddl: false, // sys.indexes; SQL Server scripts CREATE client-side (SSMS), no server command
-        edit: false,
+        edit: true,
         metrics: false,
     },
     hint: "SELECT TOP 100 * FROM table",
@@ -198,6 +198,26 @@ impl Driver for MssqlDriver {
     }
 }
 
+/// One value, bound as a parameter.
+///
+/// Text and NULL, not a Rust type: SQL Server converts a string to the
+/// column's own type on assignment, and this driver does not know what that
+/// type is. tiberius has no `ToSql` for `Option`, so NULL is spelled out here
+/// as an absent string — the one thing that cannot be left to a `None` of
+/// something else.
+struct MsParam(super::rowsql::Bind);
+
+impl tiberius::ToSql for MsParam {
+    fn to_sql(&self) -> tiberius::ColumnData<'_> {
+        use std::borrow::Cow;
+        match &self.0 {
+            super::rowsql::Bind::Null => tiberius::ColumnData::String(None),
+            super::rowsql::Bind::Text(s) => tiberius::ColumnData::String(Some(Cow::Borrowed(s.as_str()))),
+            super::rowsql::Bind::Bytes(raw) => tiberius::ColumnData::Binary(Some(Cow::Borrowed(raw.as_slice()))),
+        }
+    }
+}
+
 /// A live SQL Server connection.
 struct MssqlConnection {
     client: Client<Compat<TcpStream>>,
@@ -290,6 +310,15 @@ fn render_cell(row: &tiberius::Row, i: usize) -> Value {
 }
 
 impl MssqlConnection {
+    /// Undo the transaction a row write opened. Nothing is reported from
+    /// here: the caller is already returning the reason the write did not
+    /// happen, and a rollback that itself failed would bury it.
+    async fn rollback(&mut self) {
+        if let Ok(stream) = self.client.simple_query("ROLLBACK").await {
+            let _ = stream.into_results().await;
+        }
+    }
+
     async fn run(&mut self, sql: &str) -> anyhow::Result<(Vec<Column>, Vec<Vec<Value>>)> {
         let stream = self.client.query(sql, &[]).await.map_err(|e| anyhow::anyhow!("{e}"))?;
         // A multi-statement buffer produces several result sets (all statements DO run); `into_first_result`
@@ -479,6 +508,47 @@ impl Connection for MssqlConnection {
         );
         let (_c, rows) = self.run(&sql).await?;
         Ok(super::group_indexes(rows))
+    }
+
+    async fn plan_row(&mut self, plan: &RowPlan) -> anyhow::Result<String> {
+        Ok(super::rowsql::row_statement(plan, super::rowsql::MSSQL).0)
+    }
+
+    async fn write_row(&mut self, plan: &RowPlan) -> anyhow::Result<RowOutcome> {
+        let (statement, binds) = super::rowsql::row_statement(plan, super::rowsql::MSSQL);
+        let owned: Vec<MsParam> = binds.iter().map(|v| MsParam(super::rowsql::bind_of(v))).collect();
+        let params: Vec<&dyn tiberius::ToSql> = owned.iter().map(|p| p as &dyn tiberius::ToSql).collect();
+        // A TRANSACTION, not because two statements run, but because one can
+        // still turn out to be wrong about how many rows it hits. tiberius has
+        // no transaction object, so these are the server's own words — and the
+        // rollback is explicit for the same reason.
+        self.client
+            .simple_query("BEGIN TRANSACTION")
+            .await
+            .map_err(|e| anyhow::anyhow!("cannot begin: {e}"))?
+            .into_results()
+            .await
+            .map_err(|e| anyhow::anyhow!("cannot begin: {e}"))?;
+        let done = self.client.execute(statement.as_str(), &params).await;
+        let affected = match done {
+            Ok(r) => r.rows_affected().iter().sum::<u64>(),
+            Err(e) => {
+                self.rollback().await;
+                return Err(anyhow::anyhow!("{e}"));
+            }
+        };
+        if affected != 1 {
+            self.rollback().await;
+            anyhow::bail!("that key matched {affected} row(s), not one \u{2014} nothing was written");
+        }
+        self.client
+            .simple_query("COMMIT")
+            .await
+            .map_err(|e| anyhow::anyhow!("cannot commit: {e}"))?
+            .into_results()
+            .await
+            .map_err(|e| anyhow::anyhow!("cannot commit: {e}"))?;
+        Ok(RowOutcome { statement, affected })
     }
 
     async fn execute(&mut self, stmt: &str) -> anyhow::Result<Box<dyn ResultStream>> {

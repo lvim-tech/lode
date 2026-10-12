@@ -17,7 +17,7 @@ use crate::driver::{Connection, Driver, ResultStream};
 use crate::net::NetContext;
 use crate::spec::{
     AuthKind, AuthSpec, Caps, Column as SpecColumn, ConnSpec, DriverMeta, Index, Node, ObjRef, ParamSpec, ParamType,
-    TableColumn, Value,
+    RowOutcome, RowPlan, TableColumn, Value,
 };
 
 const PARAMS: &[ParamSpec] = &[
@@ -63,7 +63,7 @@ const META: DriverMeta = DriverMeta {
         kv: false,
         indexes: true,
         ddl: false, // RDB$INDICES; Firebird has no server-side CREATE statement
-        edit: false,
+        edit: true,
         metrics: false,
     },
     hint: "SELECT FIRST 100 * FROM table",
@@ -153,6 +153,25 @@ fn cell(col: &Column) -> Value {
 
 /// A live Firebird connection (synchronous engine behind a mutex; driven on
 /// spawn_blocking with a 'static handle).
+///
+/// One value, bound as a parameter. TYPED, because rsfbclient binds a typed
+/// parameter rather than letting the server parse text.
+fn bound(v: &Value) -> SqlType {
+    match v {
+        Value::Null => SqlType::Null,
+        Value::Bool(b) => SqlType::Boolean(*b),
+        Value::Int(i) => SqlType::Integer(*i),
+        Value::Float(f) => SqlType::Floating(*f),
+        Value::Text(s) | Value::Timestamp(s) | Value::Oid(s) => SqlType::Text(s.clone()),
+        Value::Ext { text, .. } => SqlType::Text(text.clone()),
+        Value::Json(j) => SqlType::Text(j.to_string()),
+        Value::Bytes { b64, .. } => match base64::engine::general_purpose::STANDARD.decode(b64) {
+            Ok(raw) => SqlType::Binary(raw),
+            Err(_) => SqlType::Text(b64.clone()),
+        },
+    }
+}
+
 struct FirebirdConnection {
     conn: Arc<Mutex<SimpleConnection>>,
 }
@@ -290,6 +309,40 @@ impl Connection for FirebirdConnection {
         );
         let (_c, rows) = self.run(sql).await?;
         Ok(super::group_indexes(rows))
+    }
+
+    async fn plan_row(&mut self, plan: &RowPlan) -> anyhow::Result<String> {
+        Ok(super::rowsql::row_statement(plan, super::rowsql::ANSI).0)
+    }
+
+    async fn write_row(&mut self, plan: &RowPlan) -> anyhow::Result<RowOutcome> {
+        let (statement, binds) = super::rowsql::row_statement(plan, super::rowsql::ANSI);
+        let params: Vec<SqlType> = binds.iter().map(bound).collect();
+        let arc = self.conn.clone();
+        let sql = statement.clone();
+        let affected = tokio::task::spawn_blocking(move || -> anyhow::Result<u64> {
+            let mut conn = arc.lock().unwrap();
+            // A TRANSACTION, not because two statements run, but because one
+            // can still turn out to be wrong about how many rows it hits.
+            // `begin_transaction` also turns OFF the per-statement commit this
+            // connection otherwise does, so the rollback here can undo it.
+            conn.begin_transaction().map_err(|e| anyhow::anyhow!("cannot begin: {e}"))?;
+            let n = match conn.execute(&sql, params) {
+                Ok(n) => n,
+                Err(e) => {
+                    let _ = conn.rollback();
+                    return Err(anyhow::anyhow!("{e}"));
+                }
+            };
+            if n != 1 {
+                let _ = conn.rollback();
+                anyhow::bail!("that key matched {n} row(s), not one \u{2014} nothing was written");
+            }
+            conn.commit().map_err(|e| anyhow::anyhow!("cannot commit: {e}"))?;
+            Ok(n as u64)
+        })
+        .await??;
+        Ok(RowOutcome { statement, affected })
     }
 
     async fn execute(&mut self, stmt: &str) -> anyhow::Result<Box<dyn ResultStream>> {

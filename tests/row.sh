@@ -14,6 +14,11 @@
 #   a driver that does not claim `edit`             refused
 #   a value that looks like SQL                     stored as a VALUE
 #
+# Every driver that CAN keep the promise now makes it, so the "cannot" case is
+# checked where it still is one — ClickHouse, whose UPDATE is an asynchronous
+# mutation that reports no count — and duckdb, which used to stand in for it,
+# is here as a second engine that really does edit a row.
+#
 # Needs no network and no database server: a throwaway SQLite file and `jq`.
 #
 #   scripts/build && tests/row.sh
@@ -101,8 +106,15 @@ HELLO=$(await '.id == 1')
 check "protocol carries row.write" "$(printf '%s' "$HELLO" | jq '.result.proto >= 5')" "true"
 check "sqlite claims edit" \
     "$(printf '%s' "$HELLO" | jq '[.result.drivers[] | select(.kind=="sqlite")][0].caps.edit')" "true"
-check "duckdb does not claim edit" \
-    "$(printf '%s' "$HELLO" | jq '[.result.drivers[] | select(.kind=="duckdb")][0].caps.edit')" "false"
+check "duckdb claims edit" \
+    "$(printf '%s' "$HELLO" | jq '[.result.drivers[] | select(.kind=="duckdb")][0].caps.edit')" "true"
+check "postgres claims edit" \
+    "$(printf '%s' "$HELLO" | jq '[.result.drivers[] | select(.kind=="postgres")][0].caps.edit')" "true"
+check "redis claims edit" \
+    "$(printf '%s' "$HELLO" | jq '[.result.drivers[] | select(.kind=="redis")][0].caps.edit')" "true"
+# A mutation cannot say it hit one row, so this one does not claim it.
+check "clickhouse does not claim edit" \
+    "$(printf '%s' "$HELLO" | jq '[.result.drivers[] | select(.kind=="clickhouse")][0].caps.edit')" "false"
 
 send "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"conn.connect\",\"params\":{\"driver\":\"sqlite\",\"name\":\"rowtest\",\"params\":{\"file\":\"$DB\"},\"auth\":{\"kind\":\"none\"}}}"
 CID=$(await '.id == 2' | jq '.result.conn_id')
@@ -165,13 +177,26 @@ check "delete: one row" "$(printf '%s' "$L" | jq '.result.affected')" "1"
 check "delete: two left" "$(rows_of "SELECT count(*) FROM people")" "2"
 check "delete: the right one went" "$(rows_of "SELECT count(*) FROM people WHERE id=3")" "0"
 
-# ── a driver that does not claim edit ────────────────────────────────────────
+# ── a second engine, which also edits now ────────────────────────────────────
+# The same request against another driver, to prove the row write is the
+# ENGINE's rule and not one driver's: duckdb writes it with its own quoting,
+# its own placeholders and its own transaction.
 send "{\"jsonrpc\":\"2.0\",\"id\":18,\"method\":\"conn.connect\",\"params\":{\"driver\":\"duckdb\",\"params\":{\"file\":\"$WORK/d.duckdb\"},\"auth\":{\"kind\":\"none\"}}}"
 DID=$(await '.id == 18' | jq '.result.conn_id // empty')
 if [ -n "$DID" ]; then
-    send "{\"jsonrpc\":\"2.0\",\"id\":19,\"method\":\"row.write\",\"params\":{\"conn_id\":$DID,\"obj\":{\"name\":\"x\"},\"key\":[[\"id\",1]],\"set\":[[\"a\",1]],\"confirm\":true}}"
-    L=$(await '.id == 19')
-    mentions "duckdb refuses to edit" "$L" "does not edit rows"
+    send "{\"jsonrpc\":\"2.0\",\"id\":19,\"method\":\"query.execute\",\"params\":{\"conn_id\":$DID,\"statement\":\"CREATE TABLE people(id INTEGER PRIMARY KEY, name TEXT)\",\"confirm\":true}}"
+    await '.id == 19' >/dev/null
+    send "{\"jsonrpc\":\"2.0\",\"id\":20,\"method\":\"query.execute\",\"params\":{\"conn_id\":$DID,\"statement\":\"INSERT INTO people VALUES (1,'Ada'),(2,'Grace')\",\"confirm\":true}}"
+    await '.id == 20' >/dev/null
+    send "{\"jsonrpc\":\"2.0\",\"id\":21,\"method\":\"row.write\",\"params\":{\"conn_id\":$DID,\"obj\":{\"name\":\"people\"},\"key\":[[\"id\",1]],\"set\":[[\"name\",\"Ada L\"]],\"confirm\":true}}"
+    L=$(await '.id == 21')
+    check "duckdb: one row written" "$(printf '%s' "$L" | jq '.result.affected')" "1"
+    send "{\"jsonrpc\":\"2.0\",\"id\":22,\"method\":\"row.write\",\"params\":{\"conn_id\":$DID,\"obj\":{\"name\":\"people\"},\"key\":[[\"id\",9]],\"set\":[[\"name\",\"nobody\"]],\"confirm\":true}}"
+    L=$(await '.id == 22')
+    mentions "duckdb: a key that matches nothing" "$L" "not one"
+    send "{\"jsonrpc\":\"2.0\",\"id\":23,\"method\":\"row.write\",\"params\":{\"conn_id\":$DID,\"obj\":{\"name\":\"people\"},\"key\":[[\"id\",1]],\"set\":[[\"id\",7]],\"confirm\":true}}"
+    L=$(await '.id == 23')
+    mentions "duckdb: moving the key is refused" "$L" "part of the key"
 else
     printf '     %-42s %s\n' "duckdb not built in" "skipped"
 fi

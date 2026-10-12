@@ -187,62 +187,16 @@ fn display(v: &Value) -> String {
     }
 }
 
-/// Build the statement for a row write, and the values to bind to it.
+/// The statement for a row write, and the values to bind to it.
 ///
-/// Every value is a `?` — a name can be an identifier here because it came from
-/// the engine's own `columns()`, but a VALUE never becomes syntax. The order of
-/// the binds is the order of the placeholders: the SET values first, then the
-/// key's, because that is the order they appear in.
+/// The SQL is `super::rowsql`'s, in every dialect's shared shape — this was
+/// the only driver that could edit a row, so the building of it lived here
+/// while fourteen others could not. The BINDS stay sqlite's own: it is
+/// typed by affinity, so a number that arrived as a number goes out as one
+/// rather than as text for the column to re-read.
 fn row_statement(plan: &RowPlan) -> (String, Vec<SqlValue>) {
-    let table = qualify(&plan.obj);
-    let mut binds: Vec<SqlValue> = Vec::new();
-    let stmt = if plan.delete {
-        format!("DELETE FROM {table} WHERE {}", where_of(&plan.key, &mut binds))
-    } else {
-        let sets: Vec<String> = plan
-            .set
-            .iter()
-            .map(|(c, v)| {
-                binds.push(bind(&crate::spec::value_from_json(v)));
-                format!("{} = ?", ident(c))
-            })
-            .collect();
-        format!(
-            "UPDATE {table} SET {} WHERE {}",
-            sets.join(", "),
-            where_of(&plan.key, &mut binds)
-        )
-    };
-    (stmt, binds)
-}
-
-/// The WHERE for an identifying key. A NULL in a key is compared with `IS NULL`,
-/// since `= NULL` matches nothing and would silently write no rows — which this
-/// driver would then refuse as "matched 0 rows", correctly but confusingly.
-fn where_of(key: &[(String, serde_json::Value)], binds: &mut Vec<SqlValue>) -> String {
-    key.iter()
-        .map(|(c, v)| {
-            let v = crate::spec::value_from_json(v);
-            if matches!(v, Value::Null) {
-                format!("{} IS NULL", ident(c))
-            } else {
-                binds.push(bind(&v));
-                format!("{} = ?", ident(c))
-            }
-        })
-        .collect::<Vec<_>>()
-        .join(" AND ")
-}
-
-fn qualify(obj: &ObjRef) -> String {
-    match obj.schema.as_deref().filter(|s| !s.is_empty()) {
-        Some(s) => format!("{}.{}", ident(s), ident(&obj.name)),
-        None => ident(&obj.name),
-    }
-}
-
-fn ident(name: &str) -> String {
-    format!("\"{}\"", name.replace('"', "\"\""))
+    let (stmt, values) = super::rowsql::row_statement(plan, super::rowsql::ANSI);
+    (stmt, values.iter().map(bind).collect())
 }
 
 fn bind(v: &Value) -> SqlValue {

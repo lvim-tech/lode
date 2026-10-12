@@ -10,13 +10,15 @@
 
 use async_trait::async_trait;
 use tokio::task::JoinHandle;
+use bytes::BytesMut;
+use tokio_postgres::types::{Format, IsNull, ToSql, Type};
 use tokio_postgres::{Client, Config, NoTls, SimpleQueryMessage};
 
 use crate::driver::{CancelHandle, Connection, Driver, ResultStream};
 use crate::net::NetContext;
 use crate::spec::{
-    AuthKind, AuthSpec, Caps, Column, ConnSpec, DriverMeta, Index, Node, ObjRef, ParamSpec, ParamType, TableColumn,
-    Value,
+    AuthKind, AuthSpec, Caps, Column, ConnSpec, DriverMeta, Index, Node, ObjRef, ParamSpec, ParamType, RowOutcome,
+    RowPlan, TableColumn, Value,
 };
 
 // ── driver metadata ──────────────────────────────────────────────────────────
@@ -82,7 +84,7 @@ const PG_META: DriverMeta = DriverMeta {
         kv: false,
         indexes: true, // pg_index + pg_attribute
         ddl: false,    // postgres has NO server-side CREATE TABLE (pg_dump is a client) — see the trait doc
-        edit: false,
+        edit: true,
         // pg_stat_database / pg_stat_activity — reads. Unverified here.
         metrics: true,
     },
@@ -750,6 +752,35 @@ impl Connection for PgConnection {
         Ok(Box::new(super::buffered::BufferedStream::new(columns, rows, affected)))
     }
 
+    async fn plan_row(&mut self, plan: &RowPlan) -> anyhow::Result<String> {
+        Ok(super::rowsql::row_statement(plan, super::rowsql::POSTGRES).0)
+    }
+
+    async fn write_row(&mut self, plan: &RowPlan) -> anyhow::Result<RowOutcome> {
+        let (statement, binds) = super::rowsql::row_statement(plan, super::rowsql::POSTGRES);
+        let bound: Vec<Bound> = binds.iter().map(|v| Bound(super::rowsql::bind_of(v))).collect();
+        let params: Vec<&(dyn ToSql + Sync)> = bound.iter().map(|b| b as &(dyn ToSql + Sync)).collect();
+        // A TRANSACTION, not because two statements run, but because one can
+        // still turn out to be wrong about how many rows it hits.
+        // tokio-postgres rolls this back when it is dropped uncommitted.
+        let tx = self
+            .client
+            .transaction()
+            .await
+            .map_err(|e| anyhow::anyhow!("cannot begin: {e}"))?;
+        let affected = tx
+            .execute(statement.as_str(), &params)
+            .await
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        if affected != 1 {
+            // Dropping `tx` rolls it back. A write that hit three rows is not a
+            // write that succeeded with a surprising number.
+            anyhow::bail!("that key matched {affected} row(s), not one \u{2014} nothing was written");
+        }
+        tx.commit().await.map_err(|e| anyhow::anyhow!("cannot commit: {e}"))?;
+        Ok(RowOutcome { statement, affected })
+    }
+
     fn cancel_token(&self) -> Option<Box<dyn CancelHandle>> {
         Some(Box::new(PgCancel {
             token: self.client.cancel_token(),
@@ -764,6 +795,53 @@ impl Connection for PgConnection {
         self.task.abort();
         Ok(())
     }
+}
+
+/// One value, bound as a parameter in TEXT format.
+///
+/// The server is what knows the column's type, and it tells us: `$1` in
+/// `SET "total" = $1` is inferred from the column it is assigned to. So the
+/// value goes out as text and the server parses it into that type — exactly
+/// what it does with a literal in a hand-written UPDATE, except that a
+/// parameter cannot become syntax. Binding a Rust type instead would mean
+/// guessing, and a guess puts `12` into an `integer` column as a failed cast
+/// and a date into a `timestamptz` as a string.
+#[derive(Debug)]
+struct Bound(super::rowsql::Bind);
+
+impl ToSql for Bound {
+    fn to_sql(&self, _ty: &Type, out: &mut BytesMut) -> Result<IsNull, Box<dyn std::error::Error + Sync + Send>> {
+        let text = match &self.0 {
+            // Nothing is written to `out` for a NULL — the contract of IsNull.
+            super::rowsql::Bind::Null => return Ok(IsNull::Yes),
+            super::rowsql::Bind::Text(s) => s.clone(),
+            // bytea reads `\x` + hex on input, and this is the one type whose
+            // text form the value does not already carry.
+            super::rowsql::Bind::Bytes(raw) => {
+                use std::fmt::Write as _;
+                let mut hex = String::with_capacity(2 + raw.len() * 2);
+                hex.push_str("\\x");
+                for b in raw {
+                    let _ = write!(hex, "{b:02x}");
+                }
+                hex
+            }
+        };
+        out.extend_from_slice(text.as_bytes());
+        Ok(IsNull::No)
+    }
+
+    /// Any type: what the parameter is for is the server's to say, and it has
+    /// said it by inferring the type this is being encoded for.
+    fn accepts(_ty: &Type) -> bool {
+        true
+    }
+
+    fn encode_format(&self, _ty: &Type) -> Format {
+        Format::Text
+    }
+
+    tokio_postgres::types::to_sql_checked!();
 }
 
 /// Postgres protocol-level cancel: issues a CancelRequest on its own connection.

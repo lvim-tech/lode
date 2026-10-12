@@ -58,6 +58,9 @@ const META: DriverMeta = DriverMeta {
         indexes: false,
         ddl: false,
         metrics: false,
+        // A point is identified by its measurement, tags and time — all of
+        // which are the row itself. InfluxDB overwrites a point by writing it
+        // again and deletes by predicate, never by addressing one row.
         edit: false,
     },
     hint: "from(bucket: \"b\") |> range(start: -1h)",

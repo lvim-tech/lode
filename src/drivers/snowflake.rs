@@ -98,6 +98,11 @@ const META: DriverMeta = DriverMeta {
         kv: false,
         indexes: false,
         ddl: true, // no indexes (micro-partitions); GET_DDL — UNVERIFIED (cloud-only)
+        // Snowflake runs each statement of the /statements API on its own:
+        // there is no transaction here to undo a write that turned out to hit
+        // three rows. Its PRIMARY KEY is declarative and NOT enforced, so even
+        // the key cannot be trusted to match one row. Both halves of the
+        // promise are missing, and half a promise is a hazard.
         edit: false,
         metrics: false,
     },

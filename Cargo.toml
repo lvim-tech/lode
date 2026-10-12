@@ -73,6 +73,10 @@ rustls = { version = "0.23", optional = true, default-features = false, features
     "tls12",
     "logging",
 ] }
+bytes = { version = "1", optional = true }
+# A CQL primary key is most often a uuid, and a row edit has to BIND one
+# (src/drivers/cql.rs) — the scylla crate takes it as a real Uuid, not as text.
+uuid = { version = "1", optional = true }
 rustls-pemfile = { version = "2", optional = true }
 rustls-native-certs = { version = "0.8", optional = true }
 tokio-rustls = { version = "0.26", optional = true, default-features = false, features = [
@@ -164,7 +168,9 @@ default = [
 # tunnel (an encrypted channel for any TCP driver, native-TLS or not).
 tls = ["dep:rustls", "dep:rustls-pemfile", "dep:rustls-native-certs", "dep:tokio-rustls"]
 tunnel = ["dep:russh", "tls"]
-postgres = ["dep:tokio-postgres", "dep:tokio-postgres-rustls", "tls"]
+# `bytes` is the BytesMut in ToSql's signature: this driver binds a row edit's
+# values itself, in text form, and lets the server parse them (src/drivers/postgres.rs).
+postgres = ["dep:tokio-postgres", "dep:tokio-postgres-rustls", "dep:bytes", "tls"]
 cockroachdb = ["postgres"] # registry alias over the postgres wire driver
 # The drivers whose database is an HTTP API. `aws` is the signing they share.
 aws = ["dep:sha2", "dep:hmac", "dep:reqwest", "tls"]

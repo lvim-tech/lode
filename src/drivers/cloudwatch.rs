@@ -43,6 +43,9 @@ const META: DriverMeta = DriverMeta {
         indexes: false,
         ddl: false,
         metrics: false,
+        // Log events are a record of what happened. They are not editable at
+        // the service, and a client that offered to edit one would be
+        // offering to change the past.
         edit: false,
     },
     hint: "groups",

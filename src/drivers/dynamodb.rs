@@ -123,6 +123,10 @@ const META: DriverMeta = DriverMeta {
         indexes: true,
         ddl: false,
         metrics: false,
+        // UpdateItem with a condition would address exactly one item, and the
+        // key schema would say which attributes name it — but this driver
+        // cannot open a connection at all (see `connect`), so a row write
+        // would be code that has never run claiming a capability.
         edit: false,
     },
     hint: r#"{"TableName": "things", "Limit": 50}"#,

@@ -4377,6 +4377,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "base64 0.22.1",
+ "bytes",
  "chrono",
  "duckdb",
  "futures-util",
@@ -4404,6 +4405,7 @@ dependencies = [
  "tokio-postgres-rustls",
  "tokio-rustls 0.26.4",
  "tokio-util",
+ "uuid",
 ]
 
 [[package]]

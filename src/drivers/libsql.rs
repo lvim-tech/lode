@@ -75,7 +75,10 @@ const META: DriverMeta = DriverMeta {
         // one goes through a transport this has not verified, and `edit` is a
         // promise about a write being undoable if it hits the wrong rows. One
         // answer for both halves, and it is the careful one.
-        edit: false,
+        // Every connection this driver can actually open is a SQLite one (the
+        // remote half refuses, being unverified), and that connection edits a
+        // row under the same promise as the sqlite driver's own.
+        edit: true,
     },
     hint: "SELECT * FROM table LIMIT 100",
     browse: "SELECT * FROM {qualified} {clauses} LIMIT {limit};",
@@ -411,12 +414,29 @@ mod tests {
             .contains("empty batch"));
     }
 
-    /// One answer for both halves, and it is the careful one: `edit` is a
-    /// promise that a write which hit the wrong rows can be undone, and the
-    /// remote transport here has not been verified at all.
-    #[test]
-    fn it_does_not_claim_to_edit_rows() {
-        assert!(!META.caps.edit);
+    /// `edit` is a promise that a write which hit the wrong rows can be
+    /// undone, and it is made here because every connection this driver can
+    /// OPEN is a sqlite one, which keeps it. The remote half makes no promise
+    /// because it does not open — and this test holds the two together: the
+    /// day the remote transport is verified, it must answer for itself, and
+    /// this will say so by failing.
+    #[tokio::test]
+    async fn it_edits_rows_for_as_long_as_every_connection_is_a_sqlite_one() {
+        assert!(META.caps.edit);
         assert!(META.caps.sql);
+        let remote = LibsqlDriver::new()
+            .connect(
+                &spec_with(json!({ "url": "libsql://db-org.turso.io", "token": "t" })),
+                crate::net::NetContext::default(),
+            )
+            .await;
+        let e = match remote {
+            Ok(_) => panic!("the remote half opened a connection it cannot keep a promise about"),
+            Err(e) => e.to_string(),
+        };
+        assert!(
+            e.contains("NOT VERIFIED"),
+            "the claim above rests on this refusal: {e}"
+        );
     }
 }
