@@ -1382,6 +1382,71 @@ mod tests {
         serde_json::from_value(json).unwrap()
     }
 
+    /// A statement is built from what the DRIVER declared, and a flag that is
+    /// off leaves no hole and no double space behind it.
+    ///
+    /// The templates here are the real ones, copied from `spec.rs`: this is
+    /// the client's half of that contract, and a test with an invented
+    /// template would be a test of nothing.
+    #[test]
+    fn a_schema_change_is_written_in_the_dialects_own_words() {
+        let pg = meta_from(json!({
+            "kind": "postgres", "display": "PostgreSQL",
+            "ddl_ops": [
+                { "op": "alter_type", "label": "", "asks": [],
+                  "template": "ALTER TABLE {qualified} ALTER COLUMN {column} TYPE {type};" },
+                { "op": "create_index", "label": "", "asks": [],
+                  "template": "CREATE {unique} INDEX {index} ON {qualified} ({columns});" }
+            ]
+        }));
+        assert_eq!(
+            render_ddl(&pg, "alter_type", "users", Some("public"), &[
+                ("column".into(), "age".into()),
+                ("type".into(), "numeric(6, 2)".into()),
+            ]),
+            Some("ALTER TABLE public.users ALTER COLUMN age TYPE numeric(6, 2);".into())
+        );
+        // UNIQUE on, and off: the word simply is not there, and `CREATE
+        // INDEX` has one space where the hole was.
+        assert_eq!(
+            render_ddl(&pg, "create_index", "users", None, &[
+                ("index".into(), "idx_users_email".into()),
+                ("columns".into(), "email".into()),
+                ("unique".into(), "UNIQUE".into()),
+            ]),
+            Some("CREATE UNIQUE INDEX idx_users_email ON users (email);".into())
+        );
+        assert_eq!(
+            render_ddl(&pg, "create_index", "users", None, &[
+                ("index".into(), "idx_users_email".into()),
+                ("columns".into(), "email, name".into()),
+                ("unique".into(), String::new()),
+            ]),
+            Some("CREATE INDEX idx_users_email ON users (email, name);".into())
+        );
+
+        // MONGO's is a command document, and the braces around the key are
+        // its syntax rather than a hole — which is the one thing a renderer
+        // that squeezed spaces inside quotes would get wrong.
+        let mongo = meta_from(json!({
+            "kind": "mongodb", "display": "MongoDB",
+            "ddl_ops": [{ "op": "create_index", "label": "", "asks": [],
+                "template": "{\"createIndexes\": \"{table}\", \"indexes\": \
+                             [{\"key\": {{columns}}, \"name\": \"{index}\", \"unique\": {unique}}]}" }]
+        }));
+        let out = render_ddl(&mongo, "create_index", "people", None, &[
+            ("index".into(), "idx_people_email".into()),
+            ("columns".into(), "\"email\": 1".into()),
+            ("unique".into(), "true".into()),
+        ])
+        .unwrap();
+        let v: Value = serde_json::from_str(&out).expect("a command document that parses");
+        assert_eq!(v["createIndexes"], "people");
+        assert_eq!(v["indexes"][0]["name"], "idx_people_email");
+        assert_eq!(v["indexes"][0]["unique"], true);
+        assert_eq!(v["indexes"][0]["key"]["email"], 1);
+    }
+
     /// The time range reaches a chart only where its author put the marker, and
     /// the condition is the DRIVER'S words with values in them.
     #[test]
