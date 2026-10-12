@@ -285,6 +285,9 @@ impl Driver for MongoDriver {
     }
 
     async fn connect(&self, spec: &ConnSpec, net: NetContext) -> anyhow::Result<Box<dyn Connection>> {
+        // The name on the certificate cannot be checked against a local port
+        // (see NetContext::refuse_unverifiable_name).
+        net.refuse_unverifiable_name(&spec.tls)?;
         let host = spec.param("host")?;
         let port = spec.port(27017);
         let db = spec.param("database")?.to_string();

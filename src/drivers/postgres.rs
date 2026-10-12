@@ -255,7 +255,19 @@ async fn build_config(spec: &ConnSpec, net: &NetContext) -> anyhow::Result<Confi
         .ok_or_else(|| anyhow::anyhow!("net resolved a malformed address"))?;
 
     let mut cfg = Config::new();
-    cfg.host(rhost);
+    // BOTH, when the address is a number: `hostaddr` is where to dial and
+    // `host` is whose name the certificate must carry — libpq's own answer to
+    // a tunnel, and the reason postgres needs no refusal for verify_full. With
+    // no tunnel the two are the same thing.
+    match rhost.parse::<std::net::IpAddr>() {
+        Ok(ip) => {
+            cfg.hostaddr(ip);
+            cfg.host(host);
+        }
+        Err(_) => {
+            cfg.host(rhost);
+        }
+    }
     cfg.port(rport.parse().unwrap_or(port));
     cfg.user(&user);
     cfg.dbname(db);

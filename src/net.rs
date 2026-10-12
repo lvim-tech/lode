@@ -14,7 +14,7 @@
 #[cfg(feature = "tunnel")]
 use std::sync::Arc;
 
-use crate::spec::{ProxySpec, TunnelSpec};
+use crate::spec::{ProxySpec, TlsSpec, TunnelSpec};
 
 /// What a dial really went through, as a sentence for the audit log and the
 /// test stages. Assembled here because this is the only place that knows.
@@ -186,6 +186,39 @@ impl NetContext {
     /// end regardless of the driver's native TLS).
     pub fn tunneled(&self) -> bool {
         self.tunnel.is_some()
+    }
+
+    /// Whether the address `resolve` hands back STANDS IN for the server: a
+    /// loopback port this engine listens on, because the link travels through
+    /// an SSH tunnel or a proxy.
+    pub fn forwarded(&self) -> bool {
+        self.tunnel.is_some() || self.proxy.is_some()
+    }
+
+    /// Refuse a posture that cannot be kept, instead of failing in the
+    /// handshake.
+    ///
+    /// `verify_full` checks the name ON the certificate against the address
+    /// dialled — and through a tunnel or a proxy that address is a loopback
+    /// port of this machine's own, which no server certificate names. The
+    /// handshake then dies with "NotValidForName", a message that says nothing
+    /// about the tunnel that caused it, and the honest answer is `verify_ca`:
+    /// the chain is still verified (see `crate::tls`), and the channel to that
+    /// port is the SSH channel, authenticated by the server's host key.
+    ///
+    /// A driver whose library can be told the name SEPARATELY from the address
+    /// does not call this — postgres has `hostaddr`, and the Redis driver does
+    /// its own handshake. Both verify the real name through a tunnel.
+    pub fn refuse_unverifiable_name(&self, tls: &TlsSpec) -> anyhow::Result<()> {
+        if tls.verifies_hostname() && self.forwarded() {
+            anyhow::bail!(
+                "verify_full cannot be kept through {}: the certificate names the server, and what this \
+                 driver dials is a local port of this machine — use verify_ca, which still verifies the \
+                 certificate chain against the CA",
+                if self.tunnel.is_some() { "an SSH tunnel" } else { "a proxy" }
+            );
+        }
+        Ok(())
     }
 
     /// How a dial on this context actually travels, in words.
@@ -467,9 +500,74 @@ mod tunnel {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::spec::TlsMode;
     use std::time::Duration;
 
     const QUICK: Duration = Duration::from_secs(3);
+
+    fn a_tunnel() -> TunnelSpec {
+        serde_json::from_value(serde_json::json!({
+            "host": "bastion.example",
+            "user": "me",
+            "auth": { "kind": "agent" }
+        }))
+        .expect("a tunnel")
+    }
+
+    fn a_proxy() -> ProxySpec {
+        serde_json::from_value(serde_json::json!({
+            "kind": "socks5",
+            "host": "127.0.0.1",
+            "port": 1080
+        }))
+        .expect("a proxy")
+    }
+
+    fn posture(mode: TlsMode) -> TlsSpec {
+        TlsSpec {
+            mode,
+            ..Default::default()
+        }
+    }
+
+    /// The message somebody reads instead of "NotValidForName".
+    #[test]
+    fn verify_full_is_refused_where_the_name_cannot_be_checked() {
+        for (what, net) in [
+            ("tunnel", NetContext::new(Some(a_tunnel()))),
+            ("proxy", NetContext::with_proxy(None, Some(a_proxy()))),
+        ] {
+            let said = net.refuse_unverifiable_name(&posture(TlsMode::VerifyFull));
+            let e = said.expect_err("verify_full cannot be kept through a local port").to_string();
+            assert!(e.contains("verify_ca"), "{what}: the message has to say what to do: {e}");
+        }
+    }
+
+    /// And every other posture goes through, including the strict one that
+    /// does not depend on the name.
+    #[test]
+    fn every_other_posture_travels_through_a_tunnel() {
+        let net = NetContext::new(Some(a_tunnel()));
+        for mode in [
+            TlsMode::Disable,
+            TlsMode::Prefer,
+            TlsMode::Require,
+            TlsMode::VerifyCa,
+        ] {
+            assert!(
+                net.refuse_unverifiable_name(&posture(mode)).is_ok(),
+                "{} is not about the name",
+                mode.label()
+            );
+        }
+    }
+
+    #[test]
+    fn a_direct_link_verifies_the_name_as_it_always_did() {
+        let net = NetContext::new(None);
+        assert!(!net.forwarded());
+        assert!(net.refuse_unverifiable_name(&posture(TlsMode::VerifyFull)).is_ok());
+    }
 
     /// Without a tunnel the probe is a real dial, and it has to say no when
     /// there is nothing there. Real sockets on loopback; no network.

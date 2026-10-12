@@ -181,11 +181,14 @@ mysql = ["dep:mysql_async", "tls"] # same impl as mariadb, distinct registry kin
 mongodb = ["dep:mongodb", "tls"]
 sqlite = [] # rusqlite is unconditional (the store needs it); this gates only the DRIVER
 duckdb = ["dep:duckdb", "dep:chrono"] # chrono renders DuckDB temporal cells as canonical text
-redis = ["dep:redis", "redis/tls-rustls", "redis/tokio-rustls-comp", "tls"]
+# No TLS feature of redis-rs: this driver does its own handshake with the
+# engine's shared rustls config (src/tls.rs), so the CA, the client identity and
+# the meaning of each mode are decided in ONE place for every driver.
+redis = ["dep:redis", "tls"]
 clickhouse = ["dep:reqwest", "tls"]
 sqlserver = ["dep:tiberius", "dep:tokio-util", "dep:chrono"]
-cassandra = ["dep:scylla"] # CQL; one impl serves cassandra + scylla kinds
-scylla = ["dep:scylla"]
+cassandra = ["dep:scylla", "dep:uuid"] # CQL; one impl serves cassandra + scylla kinds
+scylla = ["dep:scylla", "dep:uuid"]
 firebird = ["dep:rsfbclient"] # pure-Rust wire protocol (self-contained)
 firebird-native = ["firebird", "rsfbclient/linking"] # opt-in: uses libfbclient at runtime
 snowflake = ["dep:reqwest", "dep:snowflake-jwt"]

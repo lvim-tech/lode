@@ -161,6 +161,9 @@ fn ssl_opts_for(tls: &crate::spec::TlsSpec) -> mysql_async::SslOpts {
 /// Build mysql_async Opts for `spec`, dialing through `net`. `with_tls` decides
 /// whether the built opts negotiate TLS (used for the prefer/require attempts).
 async fn build_opts(spec: &ConnSpec, net: &NetContext, with_tls: bool) -> anyhow::Result<Opts> {
+    // The name on the certificate cannot be checked against a local port
+    // (see NetContext::refuse_unverifiable_name).
+    net.refuse_unverifiable_name(&spec.tls)?;
     let host = spec.param("host")?;
     let port = spec.port(3306);
     let (user, password) = credentials(spec).await?;

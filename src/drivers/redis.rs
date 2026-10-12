@@ -11,11 +11,13 @@ use async_trait::async_trait;
 use base64::Engine as _;
 use redis::{aio::MultiplexedConnection, Value as RValue};
 use serde_json::json;
+use tokio::net::TcpStream;
 
 use crate::driver::{Connection, Driver, ResultStream};
 use crate::net::NetContext;
 use crate::spec::{
-    AuthKind, AuthSpec, Caps, Column, ConnSpec, DriverMeta, Node, ObjRef, ParamSpec, ParamType, TableColumn, Value,
+    AuthKind, AuthSpec, Caps, Column, ConnSpec, DriverMeta, Node, ObjRef, ParamSpec, ParamType, TableColumn, TlsSpec,
+    Value,
 };
 
 const PARAMS: &[ParamSpec] = &[
@@ -115,6 +117,76 @@ impl RedisDriver {
     }
 }
 
+/// What Redis needs to know about the session itself: which database, and who
+/// is asking.
+///
+/// These travel as FIELDS. Percent-encoding a password into a `redis://` URL —
+/// and having to get `@`, `#`, `:` and `%` right, or connect somebody to the
+/// wrong host with half a password — was the only reason this driver ever built
+/// a URL, and nothing needs one now.
+async fn connection_info(spec: &ConnSpec) -> anyhow::Result<redis::RedisConnectionInfo> {
+    let db: i64 = spec.param_opt("db").unwrap_or("0").parse().unwrap_or(0);
+    let (username, password) = match &spec.auth {
+        AuthSpec::Password { user, password } => {
+            let pw = password.resolve().await?;
+            ((!user.is_empty()).then(|| user.clone()), Some(pw))
+        }
+        _ => (None, None),
+    };
+    Ok(redis::RedisConnectionInfo {
+        db,
+        username,
+        password,
+        ..Default::default()
+    })
+}
+
+/// One TCP connection to the address the net seam resolved.
+async fn dial(addr: &str) -> anyhow::Result<TcpStream> {
+    TcpStream::connect(addr)
+        .await
+        .map_err(|e| anyhow::anyhow!("cannot reach {addr}: {e}"))
+}
+
+/// The TLS handshake, done HERE rather than inside redis-rs.
+///
+/// Two reasons, and the second is the one that matters. redis-rs accepts a CA
+/// only through `build_with_tls`, and then checks the name against whatever the
+/// URL dialled — through a tunnel or a proxy that is a loopback port of this
+/// machine's own, which no server certificate names. And this way Redis is
+/// encrypted by the SAME rustls configuration as every other driver in this
+/// engine (`crate::tls`), instead of by a URL fragment and a cargo feature of
+/// its own: one place decides what each mode means, down to `verify_ca`
+/// checking the chain and not the name.
+async fn tls_stream(
+    tls: &TlsSpec,
+    addr: &str,
+    name: &str,
+) -> anyhow::Result<tokio_rustls::client::TlsStream<TcpStream>> {
+    let config = crate::tls::client_config(tls)?;
+    let server = rustls::pki_types::ServerName::try_from(name.to_string())
+        .map_err(|_| anyhow::anyhow!("'{name}' is not a name a certificate can be checked against"))?;
+    tokio_rustls::TlsConnector::from(config)
+        .connect(server, dial(addr).await?)
+        .await
+        .map_err(|e| anyhow::anyhow!("redis tls handshake failed: {e}"))
+}
+
+/// A multiplexed connection over a stream this driver opened, with the task
+/// that pumps it. The AUTH and the SELECT are redis-rs's, out of `info`.
+async fn multiplex<S>(
+    info: &redis::RedisConnectionInfo,
+    stream: S,
+) -> anyhow::Result<(MultiplexedConnection, tokio::task::JoinHandle<()>)>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
+    let (con, driver) = MultiplexedConnection::new(info, stream)
+        .await
+        .map_err(|e| anyhow::anyhow!("redis connect failed: {e}"))?;
+    Ok((con, tokio::spawn(driver)))
+}
+
 #[async_trait]
 impl Driver for RedisDriver {
     fn meta(&self) -> &'static DriverMeta {
@@ -153,74 +225,43 @@ impl Driver for RedisDriver {
     async fn connect(&self, spec: &ConnSpec, net: NetContext) -> anyhow::Result<Box<dyn Connection>> {
         let host = spec.param("host")?;
         let port = spec.port(6379);
-        let db = spec.param_opt("db").unwrap_or("0");
         let addr = net.resolve(host, port).await?;
-        let (rhost, rport) = addr
-            .rsplit_once(':')
-            .ok_or_else(|| anyhow::anyhow!("net resolved a malformed address"))?;
-
-        // Build the redis:// URL, embedding credentials when present.
-        // Percent-encode the userinfo — a password with `@`, `/`, `#`, `:` or `%` would otherwise mis-parse
-        // the URL (wrong host, truncation at `#`, split auth), so a legitimate strong password can't connect.
-        fn pct(s: &str) -> String {
-            let mut out = String::with_capacity(s.len());
-            for b in s.bytes() {
-                match b {
-                    b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => out.push(b as char),
-                    _ => out.push_str(&format!("%{b:02X}")),
-                }
-            }
-            out
-        }
-        let auth = match &spec.auth {
-            AuthSpec::Password { user, password } => {
-                let pw = pct(&password.resolve().await?);
-                if user.is_empty() {
-                    format!(":{pw}@")
-                } else {
-                    format!("{}:{pw}@", pct(user))
-                }
-            }
-            _ => String::new(),
-        };
+        let info = connection_info(spec).await?;
         let tls = &spec.tls;
-        // rediss:// negotiates TLS; the "#insecure" fragment skips verification for
-        // the encrypt-only modes. A CA / mutual cert would use build_with_tls (a
-        // later add); noted in findings.
-        let scheme = if tls.wanted() { "rediss" } else { "redis" };
-        let frag = if tls.wanted() && !tls.verifies_cert() {
-            "#insecure"
-        } else {
-            ""
-        };
-        let url = format!("{scheme}://{auth}{rhost}:{rport}/{db}{frag}");
-
-        async fn open_con(url: &str) -> anyhow::Result<MultiplexedConnection> {
-            let client = redis::Client::open(url.to_string()).map_err(|e| anyhow::anyhow!("redis url invalid: {e}"))?;
-            client
-                .get_multiplexed_async_connection()
-                .await
-                .map_err(|e| anyhow::anyhow!("redis connect failed: {e}"))
-        }
 
         if !tls.wanted() {
+            let (con, task) = multiplex(&info, dial(&addr).await?).await?;
             return Ok(Box::new(RedisConnection {
-                con: open_con(&url).await?,
+                con,
+                task,
                 encrypted: false,
             }));
         }
-        match open_con(&url).await {
-            Ok(con) => Ok(Box::new(RedisConnection { con, encrypted: true })),
-            Err(e) => {
-                if tls.required() {
-                    Err(anyhow::anyhow!("redis: TLS is required but the connection failed: {e}"))
-                } else {
-                    let plain = format!("redis://{auth}{rhost}:{rport}/{db}");
-                    Ok(Box::new(RedisConnection {
-                        con: open_con(&plain).await?,
-                        encrypted: false,
-                    }))
-                }
+        // The name on the certificate is the SERVER's — `host`, what somebody
+        // typed — and not `addr`, which through a tunnel or a proxy is a
+        // loopback port here. Saying both is what lets a tunnelled link be
+        // verified at all.
+        let attempt = async {
+            let stream = tls_stream(tls, &addr, host).await?;
+            multiplex(&info, stream).await
+        }
+        .await;
+        match attempt {
+            Ok((con, task)) => Ok(Box::new(RedisConnection {
+                con,
+                task,
+                encrypted: true,
+            })),
+            Err(e) if tls.required() => Err(anyhow::anyhow!("redis: TLS is required but the connection failed: {e}")),
+            // Prefer: a server with no TLS is still a server. The link comes up
+            // in the clear and `encrypted` says so.
+            Err(_) => {
+                let (con, task) = multiplex(&info, dial(&addr).await?).await?;
+                Ok(Box::new(RedisConnection {
+                    con,
+                    task,
+                    encrypted: false,
+                }))
             }
         }
     }
@@ -229,6 +270,9 @@ impl Driver for RedisDriver {
 /// A live Redis connection (the multiplexed connection is cheaply cloned per call).
 struct RedisConnection {
     con: MultiplexedConnection,
+    /// The task pumping the socket. It belongs to this connection: left
+    /// running after `close` it would outlive what it is reading for.
+    task: tokio::task::JoinHandle<()>,
     encrypted: bool,
 }
 
@@ -577,6 +621,65 @@ impl Connection for RedisConnection {
     }
 
     async fn close(self: Box<Self>) -> anyhow::Result<()> {
+        self.task.abort();
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn spec(auth: serde_json::Value, db: &str) -> ConnSpec {
+        serde_json::from_value(json!({
+            "driver": "redis",
+            "params": { "host": "cache.example", "db": db },
+            "auth": auth,
+        }))
+        .expect("a redis spec")
+    }
+
+    /// The reason the URL went: a password with `@` and `%` in it used to be
+    /// percent-encoded into the userinfo, and one mistake there connects
+    /// somebody to the wrong host with half a password. As a field it is the
+    /// bytes they typed.
+    #[tokio::test]
+    async fn a_password_travels_as_itself() {
+        let info = connection_info(&spec(json!({ "kind": "password", "user": "app", "password": "p@ss%3a#1" }), "0"))
+            .await
+            .expect("the secret resolves");
+        assert_eq!(info.username.as_deref(), Some("app"));
+        assert_eq!(info.password.as_deref(), Some("p@ss%3a#1"));
+    }
+
+    /// Redis before 6 has no users: a password alone is `AUTH <password>`, and
+    /// an empty username would make it `AUTH "" <password>`, which fails.
+    #[tokio::test]
+    async fn a_password_without_a_user_carries_no_user() {
+        let info = connection_info(&spec(json!({ "kind": "password", "user": "", "password": "only-a-password" }), "0"))
+            .await
+            .expect("the secret resolves");
+        assert!(info.username.is_none());
+        assert_eq!(info.password.as_deref(), Some("only-a-password"));
+    }
+
+    #[tokio::test]
+    async fn no_auth_means_no_auth() {
+        let info = connection_info(&spec(json!({ "kind": "none" }), "0"))
+            .await
+            .expect("nothing to resolve");
+        assert!(info.username.is_none() && info.password.is_none());
+    }
+
+    /// The DB index is a number on the wire, and the form hands it over as the
+    /// text somebody typed.
+    #[tokio::test]
+    async fn the_database_is_the_one_that_was_chosen() {
+        let info = connection_info(&spec(json!({ "kind": "none" }), "7")).await.expect("ok");
+        assert_eq!(info.db, 7);
+        let fallback = connection_info(&spec(json!({ "kind": "none" }), "not a number"))
+            .await
+            .expect("ok");
+        assert_eq!(fallback.db, 0, "a number nobody can read is database 0, not a refusal");
     }
 }

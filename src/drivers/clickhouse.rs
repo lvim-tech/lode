@@ -118,6 +118,9 @@ impl Driver for ClickhouseDriver {
     }
 
     async fn connect(&self, spec: &ConnSpec, net: NetContext) -> anyhow::Result<Box<dyn Connection>> {
+        // The name on the certificate cannot be checked against a local port
+        // (see NetContext::refuse_unverifiable_name).
+        net.refuse_unverifiable_name(&spec.tls)?;
         let host = spec.param("host")?;
         let port = spec.port(8123);
         let addr = net.resolve(host, port).await?;
