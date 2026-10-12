@@ -356,6 +356,7 @@ const GLYPHS: &[(&str, &str)] = &[
     ("\u{f06e}", "V"),
     ("\u{f070}", "-"),
     ("\u{f0d7}", "v"),
+    ("\u{f0d9}", "<"),
     ("\u{f0da}", ">"),
     ("\u{f0de}", "^"),
     ("\u{f0dd}", "v"),
@@ -1311,6 +1312,15 @@ pub struct Workspace {
     tabs: Vec<Tab>,
     active: usize,
     next_tab: u64,
+    /// Where the tab strip is scrolled to. Held here so the strip can be
+    /// MOVED — opening the twentieth tab has to bring it into view, and
+    /// nothing else can scroll an element it does not have the handle to.
+    tab_scroll: gpui::ScrollHandle,
+    /// Which tab the strip was last scrolled to follow. The strip follows the
+    /// chosen tab when the CHOICE changes, and only then: following on every
+    /// frame would drag the strip back every time somebody scrolled it by hand
+    /// to look at a neighbour.
+    tab_shown: std::cell::Cell<Option<usize>>,
 
     pending: HashMap<u64, Pending>,
     /// call_id → tab id.
@@ -1443,6 +1453,20 @@ pub struct Workspace {
     /// because `table_el` takes `&self`, and the alternative is threading a
     /// width back out of a render function.
     grid_overflow: std::cell::Cell<f32>,
+    /// How far the TAB STRIP can be scrolled, measured on the frame that was
+    /// painted. Kept for the same reason as `grid_overflow`: the arrows and
+    /// the wheel both need to know whether there is anything past the edge,
+    /// and that is a fact about the layout, not about the tabs.
+    tab_overflow: std::cell::Cell<f32>,
+    /// The tree view's scroller and the JSON view's, so each can be given a
+    /// VISIBLE bar — gpui draws none, and a view that scrolls without saying
+    /// so is a view whose records past the fold look like records that are not
+    /// there.
+    tree_scroll: gpui::ScrollHandle,
+    json_scroll: gpui::ScrollHandle,
+    /// Whether a vertical bar is being dragged. One flag, because one bar is
+    /// under the pointer at a time.
+    vbar_drag: std::cell::Cell<bool>,
     /// Whether the horizontal bar is being dragged right now.
     ///
     /// A drawn bar that cannot be grabbed is decoration, and decoration that
@@ -1668,6 +1692,8 @@ impl Workspace {
             tabs: Vec::new(),
             active: 0,
             next_tab: 1,
+            tab_scroll: gpui::ScrollHandle::new(),
+            tab_shown: std::cell::Cell::new(None),
             pending: HashMap::new(),
             calls: HashMap::new(),
             board_calls: HashMap::new(),
@@ -1729,6 +1755,10 @@ impl Workspace {
             grid_scroll: gpui::ScrollHandle::new(),
             grid_rows: gpui::UniformListScrollHandle::new(),
             grid_overflow: std::cell::Cell::new(0.0),
+            tab_overflow: std::cell::Cell::new(0.0),
+            tree_scroll: gpui::ScrollHandle::new(),
+            json_scroll: gpui::ScrollHandle::new(),
+            vbar_drag: std::cell::Cell::new(false),
             hbar_drag: std::cell::Cell::new(false),
             lang,
             json_indent: restore.json_indent.unwrap_or(4).clamp(2, 4),
@@ -7558,6 +7588,28 @@ impl Workspace {
     /// is visible WITHOUT hovering (hover brightens it rather than revealing
     /// it), and the clickable square is bigger than the glyph, because a target
     /// the size of its own drawing is a target people miss.
+    /// `action_el`, in a box as narrow as the glyph allows.
+    ///
+    /// For a row where every pixel is contested. In the tab strip the cross in
+    /// its full target square took as much room as three letters of the name,
+    /// and with twenty tabs open the name is all there is.
+    fn action_tight(&self, glyph: &'static str, colour: Rgba) -> gpui::Div {
+        let ms = self.scale;
+        let box_w = ms.action_box() * 0.62;
+        div()
+            .flex()
+            .items_center()
+            .justify_center()
+            .flex_none()
+            .w(px(box_w))
+            .h(px(box_w))
+            .line_height(px(box_w))
+            .font_family(self.icon_family.clone())
+            .text_size(ms.icon_beside(ms.action()))
+            .text_color(colour)
+            .child(self.ic(glyph))
+    }
+
     fn action_el(&self, glyph: &'static str, colour: Rgba) -> gpui::Div {
         let ms = self.scale;
         div()
@@ -7713,6 +7765,28 @@ impl Workspace {
             .tooltip(crate::tip::Tip::build(full, None, self.theme.clone(), self.scale))
             .child(self.line(text, size, colour, w))
             .into_any_element()
+    }
+
+    /// A NAME THAT GIVES WAY, for a row with marks after it.
+    ///
+    /// `line_in` is given a width worked out by subtracting guesses from the
+    /// panel's — the icon, the gaps, the type, the word "key", the reference
+    /// arrow — and every guess was a number nobody could check. The first one
+    /// was short by about a word, so `key` and `unique` were cut off at the
+    /// panel's edge while the names beside them had room to spare.
+    ///
+    /// Taking the slack and shrinking first is the same statement made to the
+    /// layout instead of to arithmetic, and it stays right when a mark is
+    /// added or the panel is dragged.
+    fn line_flex(&self, text: impl Into<SharedString>, size: gpui::Pixels, colour: Rgba) -> impl IntoElement {
+        div()
+            .flex_1()
+            .min_w_0()
+            .overflow_hidden()
+            .truncate()
+            .text_size(size)
+            .text_color(colour)
+            .child(text.into())
     }
 
     fn line_in(&self, text: impl Into<SharedString>, size: gpui::Pixels, colour: Rgba, w: f32) -> impl IntoElement {
@@ -8150,7 +8224,7 @@ impl Workspace {
                             // The NAME gives way first: a server that answers
                             // with a long path or a long version string is
                             // answering with the part worth reading.
-                            .child(self.line_in(row.name.clone(), ms.small(), t.muted(), ms.line_w() - ms.base() * 9.0 - 8.0))
+                            .child(self.line_flex(row.name.clone(), ms.small(), t.muted()))
                             .child(self.line_in(row.value.clone(), ms.small(), t.fg(), ms.base() * 9.0)),
                     );
                 }
@@ -9274,7 +9348,6 @@ impl Workspace {
     ) -> gpui::AnyElement {
         let (t, ms) = (self.t(), self.scale);
         let pad = 16.0 + depth as f32 * 12.0;
-        let w = (ms.line_w() - pad - ms.base() * 3.0).max(ms.base() * 4.0);
         // A GUIDE down the level, so a long list of fields still says which
         // object it belongs to. A tree indented by whitespace alone is read by
         // counting pixels; a line is read by following it.
@@ -9409,7 +9482,7 @@ impl Workspace {
                             if c.primary { t.accent() } else { t.muted() },
                             ms.small(),
                         ))
-                        .child(self.line_in(c.name.clone(), ms.small(), t.fg(), w))
+                        .child(self.line_flex(c.name.clone(), ms.small(), t.fg()))
                         .when_some(shown, |d, ty| {
                             d.child(
                                 div()
@@ -9527,13 +9600,30 @@ impl Workspace {
                         .gap_2()
                         .pl(px(pad + 12.0))
                         .py(px(1.0))
-                        .child(self.line_tip(
-                            format!("{} ({})", i.name, i.columns.join(", ")),
-                            ms.small(),
-                            t.muted(),
-                            w,
-                            format!("idx-{key}-{}", i.name),
-                        ))
+                        // The same as a field's name: it gives way, and the
+                        // word beside it does not — `unique` was the thing
+                        // being cut off.
+                        .child(
+                            div()
+                                .id(SharedString::from(format!("idx-{key}-{}", i.name)))
+                                .flex_1()
+                                .min_w_0()
+                                .overflow_hidden()
+                                .truncate()
+                                .text_size(ms.small())
+                                .text_color(t.muted())
+                                .tooltip(crate::tip::Tip::build(
+                                    format!("{} ({})", i.name, i.columns.join(", ")),
+                                    None,
+                                    self.theme.clone(),
+                                    self.scale,
+                                ))
+                                .child(SharedString::from(format!(
+                                    "{} ({})",
+                                    i.name,
+                                    i.columns.join(", ")
+                                ))),
+                        )
                         .when(i.unique, |d| {
                             d.child(
                                 div()
@@ -9552,19 +9642,52 @@ impl Workspace {
     fn tabs_el(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let t = self.t();
         let ms = self.scale;
-        // It SCROLLS. Twelve tabs pushed the twelfth off the right edge with no
-        // sign that it was there, and nothing could reach it but the palette.
+        // THE TABS GIVE WAY, AND THEN THE STRIP SCROLLS.
+        //
+        // Twelve tabs pushed the twelfth off the right edge with no sign that
+        // it was there, and nothing could reach it but the palette. Scrolling
+        // alone was not the answer: a tab somebody has just opened is off the
+        // edge the moment it opens, and a strip nobody knows to scroll is a
+        // strip with the new tab missing from it.
+        //
+        // So two things, both of them the layout's arithmetic and not mine:
+        // each tab SHRINKS (down to `floor` below, where the title has given
+        // all it has), and past that the strip scrolls — and it is scrolled to
+        // the chosen tab whenever the choice changes, which is the case that
+        // looked like a missing tab.
+        if self.tab_shown.get() != Some(self.active) {
+            self.tab_shown.set(Some(self.active));
+            self.tab_scroll.scroll_to_item(self.active);
+        }
+        // Icon, mark, a few letters of the title and the cross. Narrower than
+        // this is a tab nobody can read or close, so this is where shrinking
+        // stops and scrolling starts.
+        let floor = ms.base() * 5.0;
         let mut strip = div()
             .id("tab-strip")
+            .track_scroll(&self.tab_scroll)
             .flex()
             .items_center()
-            .w_full()
-            .h(px(ms.tab_h()))
-            .flex_none()
+            .flex_1()
+            // The other half of `flex_1`, and the reason the strip can be
+            // narrower than the tabs in it at all.
+            .min_w_0()
+            .h_full()
             .overflow_x_scroll()
-            .bg(t.panel())
-            .border_b_1()
-            .border_color(t.border());
+            // EVERY delta moves it: a sideways one from a trackpad, and a
+            // plain vertical wheel too, because the pointer is over a strip
+            // where up and down mean nothing.
+            .on_scroll_wheel(cx.listener(move |this, ev: &gpui::ScrollWheelEvent, _, cx| {
+                let d = ev.delta.pixel_delta(px(ms.tab_h()));
+                let (dx, dy) = (f32::from(d.x), f32::from(d.y));
+                if dx.abs() > 0.0 {
+                    this.scroll_tabs(-dx);
+                    cx.notify();
+                } else if dy.abs() > 0.0 {
+                    this.scroll_tabs(dy);
+                    cx.notify();
+                }
+            }));
 
         for (i, tab) in self.tabs.iter().enumerate() {
             let on = i == self.active;
@@ -9572,6 +9695,15 @@ impl Workspace {
             // What this tab's statement is doing, in one glyph. A tab said
             // nothing about its own state, so a query running in the third tab
             // looked exactly like the four that were idle.
+            // THE OBJECT'S NAME, when the tab is a browse of one. The title is
+            // the first forty characters of the statement, which for a browse
+            // is `SELECT * FROM "shop"."orders" LIMIT 200` — forty characters
+            // of punctuation to say "orders". The statement is still on hover,
+            // where a long name belongs.
+            let label = match &tab.object {
+                Some((name, _)) => name.clone(),
+                None => tab.title.clone(),
+            };
             let mark = crate::workspace::tab_mark(tab.state);
             let mark_colour = match tab.state {
                 RunState::Failed => t.error(),
@@ -9584,13 +9716,25 @@ impl Workspace {
                     .group(SharedString::from(format!("tab-g-{}", tab.id)))
                     .flex()
                     .items_center()
-                    .gap_2()
-                    .px_3()
+                    // TIGHT. Twelve pixels of padding on each side and eight
+                    // between the icon and the name is a third of a narrow
+                    // tab spent on air, and the air is what the name needed.
+                    .gap_1()
+                    .px_1()
                     .h_full()
-                    .flex_none()
+                    // Gives way as the strip fills, but never below `floor`.
+                    // An EXPLICIT minimum is what lets it shrink at all: a
+                    // flex item's automatic minimum is its content, which is
+                    // the whole title.
+                    .flex_shrink()
+                    .min_w(px(floor))
+                    .overflow_hidden()
                     .cursor_pointer()
-                    .border_r_1()
-                    .border_color(t.border())
+                    // No line between tabs: each one already has its own edge
+                    // — the chosen one a fill and an accent underline, the
+                    // rest the strip's background — and a separator as well
+                    // was a second rule saying the same thing, in a palette
+                    // where it read as a grid.
                     // The chosen tab is marked by an EDGE as well as a fill: on
                     // several palettes `base` and `panel` are a hair apart, and
                     // the fill alone left the strip looking like one block.
@@ -9606,20 +9750,47 @@ impl Workspace {
                     )
                     .children(mark.map(|g| self.icon_inline(g, mark_colour)))
                     .child(
-                        // CUT, with the whole statement on hover. A tab titled
-                        // by the first forty characters of a query made the
-                        // strip as wide as the query.
-                        self.line_tip(
-                            tab.title.clone(),
-                            ms.body(),
-                            if on { t.fg() } else { t.muted() },
-                            ms.base() * 14.0,
-                            format!("tabt-{}", tab.id),
-                        ),
+                        // THE TITLE IS WHAT GIVES WAY, with the whole of it on
+                        // hover.
+                        //
+                        // It used to be given a FIXED width — a tab titled by
+                        // the first forty characters of a query made the strip
+                        // as wide as the query — and a fixed width cannot
+                        // shrink, so twenty tabs still did not fit.
+                        //
+                        // `flex_1` is not the answer either, and was tried: it
+                        // sets the basis to ZERO, so the title counts for
+                        // nothing in the tab's natural width and every tab
+                        // came out at its floor with the title cut, two tabs
+                        // or twenty. What is wanted is the opposite — the
+                        // title's OWN width, up to a ceiling, and shrinking
+                        // from there when the strip fills.
+                        //
+                        // The tooltip is unconditional now, because how much
+                        // was cut is the layout's answer and is not known here.
+                        div()
+                            .id(SharedString::from(format!("tabt-{}", tab.id)))
+                            .flex_shrink()
+                            .min_w_0()
+                            .max_w(px(ms.base() * 14.0))
+                            .truncate()
+                            .text_size(ms.body())
+                            .text_color(if on { t.fg() } else { t.muted() })
+                            .tooltip(crate::tip::Tip::build(
+                                tab.title.to_string(),
+                                None,
+                                self.theme.clone(),
+                                ms,
+                            ))
+                            .child(SharedString::from(label)),
                     )
                     .child(
                         div()
                             .id(SharedString::from(format!("tabx-{}", tab.id)))
+                            // The cross keeps its size while the title gives
+                            // way: a tab that cannot be closed is worse than a
+                            // tab that cannot be read.
+                            .flex_none()
                             // Shown on the chosen tab and under the pointer. On
                             // every tab at once it is a row of crosses, and the
                             // one people press by accident is a neighbour's.
@@ -9631,7 +9802,7 @@ impl Workspace {
                             })
                             .tooltip(self.tip("tip.close_tab", None))
                             .hover(|d| d.bg(t.hover_mark()))
-                            .child(self.action_el("\u{f00d}", t.muted()))
+                            .child(self.action_tight("\u{f00d}", t.muted()))
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 this.close_tab(id);
                                 cx.notify();
@@ -9662,7 +9833,49 @@ impl Workspace {
                     ),
             );
         }
-        strip
+        // THE ARROWS, when there is anything past the edge.
+        //
+        // A strip that scrolls with no sign that it scrolls is a strip whose
+        // extra tabs are still invisible — the same complaint the grid had,
+        // and the same answer. `max_offset` is filled during PAINT, so the
+        // first frame shows none and every frame after shows the truth.
+        //
+        // They are OUTSIDE the strip on purpose: a child of the strip would
+        // scroll away with the tabs, and would shift every index by one —
+        // which is what `scroll_to_item` counts in.
+        let over = f32::from(self.tab_scroll.max_offset().width);
+        self.tab_overflow.set(over);
+        let step = ms.base() * 14.0;
+        let arrow = |id: &'static str, glyph: &'static str| {
+            div()
+                .id(SharedString::from(id))
+                .flex_none()
+                .cursor_pointer()
+                .hover(|d| d.bg(t.hover_mark()))
+                .child(self.action_el(glyph, t.muted()))
+        };
+        div()
+            .flex()
+            .items_center()
+            .w_full()
+            .h(px(ms.tab_h()))
+            .flex_none()
+            .bg(t.panel())
+            .border_b_1()
+            .border_color(t.border())
+            .children((over > 0.5).then(|| {
+                arrow("tabs-left", "\u{f0d9}").on_click(cx.listener(move |this, _, _, cx| {
+                    this.scroll_tabs(step);
+                    cx.notify();
+                }))
+            }))
+            .child(strip)
+            .children((over > 0.5).then(|| {
+                arrow("tabs-right", "\u{f0da}").on_click(cx.listener(move |this, _, _, cx| {
+                    this.scroll_tabs(-step);
+                    cx.notify();
+                }))
+            }))
     }
 
     /// THE WRITE THE ENGINE HAS DESCRIBED BUT NOT DONE, as a card.
@@ -10163,15 +10376,33 @@ let mut ask = div()
         // The detail panel sits BESIDE the grid, not over it: the row it is
         // showing stays visible in its place among the others, which is half of
         // what you are looking at when you open one.
+        // THE VIEW TAKES THE SLACK, AND IS ALLOWED TO BE SHORTER THAN ITS
+        // CONTENT.
+        //
+        // It used to be added RAW — `None => view` — and every view sizes
+        // itself `size_full`, which is 100% of this column. With the rows of
+        // controls above it and the editing cards below it, 100% is more than
+        // what is left, so the view hung off the bottom of the window and the
+        // scroller inside it scrolled a box that was already too tall: the
+        // last rows were under the edge of the screen and nothing could reach
+        // them.
+        //
+        // `flex_1` gives it what is left over, and `min_h_0` is the half that
+        // makes `flex_1` mean anything — a flex item's automatic minimum is
+        // its CONTENT, so without it the item refuses to be shorter than the
+        // hundred rows in it, the column overflows, and gpui's own scroll_max
+        // stays zero. The exact twin of the grid's sideways scrolling, one
+        // axis over.
         body = body.child(match self.detail_el(tab, cx) {
             Some(detail) => div()
                 .flex()
                 .flex_1()
+                .min_h_0()
                 .overflow_hidden()
-                .child(div().flex_1().overflow_hidden().child(view))
+                .child(div().flex_1().min_w_0().overflow_hidden().child(view))
                 .child(detail)
                 .into_any_element(),
-            None => view,
+            None => div().flex_1().min_h_0().overflow_hidden().child(view).into_any_element(),
         });
         // THE EDITING CARDS GO UNDER WHICHEVER VIEW IS SHOWING.
         //
@@ -13106,7 +13337,16 @@ let mut ask = div()
                 }
             }));
 
-        let mut out = div().flex().flex_col().size_full().child(body);
+        // The ROWS scroll vertically too, and said nothing about it either.
+        // `uniform_list` keeps its own handle, and that handle is the one the
+        // bar has to be measured from: the list's viewport is what is shown
+        // and the list's content is what there is.
+        let rows_handle = self.grid_rows.0.borrow().base_handle.clone();
+        let mut out = div()
+            .flex()
+            .flex_col()
+            .size_full()
+            .child(self.scrolled_y(&rows_handle, "grid-rows", body.into_any_element(), cx));
         // A visible bar. GPUI draws none for a scrolling div, and a grid that
         // scrolls with no sign that it scrolls is a grid whose extra columns
         // are still invisible — which was the whole complaint.
@@ -13223,6 +13463,116 @@ let mut ask = div()
             .set_offset(gpui::point(px(next), self.grid_scroll.offset().y));
     }
 
+    /// The content, a VISIBLE vertical bar beside it, and the dragging of it.
+    ///
+    /// gpui draws no scrollbar for a scrolling div, so every scroller in this
+    /// client was a box that moved under the wheel and said nothing about
+    /// where in the content it was — or that there was any more of it. The
+    /// grid grew a bar of its own for exactly that complaint, sideways; this
+    /// is the same answer for the other axis, written once so the next
+    /// scroller gets it for free.
+    ///
+    /// Every number is MEASURED from the handle (`bounds` and `max_offset`,
+    /// both filled during paint), never derived from the window: a derived
+    /// height is a subtraction of guesses, and being wrong HIGH gives a thumb
+    /// that looks full while the last rows cannot be reached.
+    fn scrolled_y(
+        &self,
+        handle: &gpui::ScrollHandle,
+        id: &'static str,
+        inner: gpui::AnyElement,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let (t, ms) = (self.t(), self.scale);
+        let shown = f32::from(handle.bounds().size.height);
+        let top = f32::from(handle.bounds().origin.y);
+        let max = f32::from(handle.max_offset().height);
+        let total = shown + max;
+        // The arithmetic has no axis: `hbar` is given a total, what is shown
+        // and where it is, and answers with a thumb.
+        let bar = crate::workspace::hbar(total, shown, f32::from(handle.offset().y));
+        let row = div()
+            .flex()
+            .size_full()
+            .min_h_0()
+            .child(div().flex_1().min_w_0().min_h_0().child(inner));
+        let Some(b) = bar else {
+            return row.into_any_element();
+        };
+        let (frac, at) = (b.frac, b.at);
+        let dragging = self.vbar_drag.get();
+        let row = row.child(
+            div()
+                .id(SharedString::from(format!("{id}-vbar")))
+                .flex()
+                .flex_col()
+                .flex_none()
+                // Grabbable, not hairline: a bar the width of its own drawing
+                // is a bar people miss. Derived, so it holds at every text size.
+                .w(px(ms.hbar_h() * 2.0))
+                .h_full()
+                .bg(t.status())
+                .cursor_pointer()
+                .child(div().h(gpui::relative(at)).w_full())
+                .child(
+                    div()
+                        .h(gpui::relative(frac))
+                        .w_full()
+                        .bg(if dragging { t.fg() } else { t.accent() }),
+                )
+                // Pressing anywhere on the track jumps there, which is what a
+                // press on a scrollbar's empty half should do anyway.
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener({
+                        let h = handle.clone();
+                        move |this, ev: &gpui::MouseDownEvent, _, cx| {
+                            this.vbar_drag.set(true);
+                            jump_y(&h, f32::from(ev.position.y), top, shown, total, max);
+                            cx.notify();
+                        }
+                    }),
+                ),
+        );
+        // The move and the release are on the WHOLE view, not on the bar: a
+        // drag that stopped the moment the pointer left a twelve-pixel strip
+        // would be a drag nobody could finish.
+        row.on_mouse_move(cx.listener({
+            let h = handle.clone();
+            move |this, ev: &gpui::MouseMoveEvent, _, cx| {
+                if this.vbar_drag.get() {
+                    jump_y(&h, f32::from(ev.position.y), top, shown, total, max);
+                    cx.notify();
+                }
+            }
+        }))
+        .on_mouse_up(
+            MouseButton::Left,
+            cx.listener(|this, _: &gpui::MouseUpEvent, _, cx| {
+                if this.vbar_drag.replace(false) {
+                    cx.notify();
+                }
+            }),
+        )
+        .into_any_element()
+    }
+
+    /// Move the TAB STRIP sideways by `dx` pixels, clamped to what there is.
+    ///
+    /// Written out rather than left to gpui's own wheel handling, which maps a
+    /// vertical wheel onto a sideways scroller only when nothing else about
+    /// the element scrolls — a condition nobody can see and which changes
+    /// under you. The arrows at the ends of the strip call this too, so there
+    /// is one answer to "move the tabs" and the arrows cannot disagree with
+    /// the wheel.
+    fn scroll_tabs(&self, dx: f32) {
+        let max = f32::from(self.tab_scroll.max_offset().width);
+        let now = f32::from(self.tab_scroll.offset().x);
+        let next = crate::workspace::clamped_scroll(now, dx, max);
+        self.tab_scroll
+            .set_offset(gpui::point(px(next), self.tab_scroll.offset().y));
+    }
+
     /// Move the grid sideways by `dx` pixels, clamped to what there is.
     ///
     /// One handle on the workspace rather than one per tab: only one grid is
@@ -13248,7 +13598,22 @@ let mut ask = div()
         // that is not a table of some object cannot be.
         let can_write =
             self.meta(&tab.driver).map_or(false, |m| m.caps.edit) && tab.object.is_some();
-        let mut out = div().flex().flex_col().size_full().overflow_hidden();
+        // IT SCROLLS. It was `overflow_hidden`, which CLIPS: every record
+        // past the height of the pane was drawn and then thrown away, so a
+        // result with twenty records showed the first few and nothing could
+        // reach the rest. The JSON view beside it has scrolled all along,
+        // which is why this looked like a tree with no records rather than a
+        // tree with no scrollbar.
+        // Through the HELPER, not by hand. It was `overflow_hidden`, which
+        // CLIPS: every record past the height of the pane was drawn and then
+        // thrown away, so a result with twenty records showed the first few
+        // and nothing could reach the rest. Adding `overflow_y_scroll` to the
+        // same column would have swapped that for the other fault the helper
+        // exists to prevent — a flex item shrinks before its container
+        // scrolls, so the records would have been squeezed into the pane
+        // instead. The rows go in an inner column that sizes to its content.
+        let mut out = crate::widgets::scroll("tree-view")
+            .outer(|d| d.track_scroll(&self.tree_scroll));
         // Everything on screen, in one go — the answer to "I want this
         // somewhere else" when the something else is the whole result.
         if !tab.rows.is_empty() {
@@ -13368,7 +13733,7 @@ let mut ask = div()
                 out = out.child(self.tree_level(self.value_el(&doc, tab, 1, Some(i), cx)));
             }
         }
-        out.into_any_element()
+        self.scrolled_y(&self.tree_scroll.clone(), "tree", out.into_any_element(), cx)
     }
 
     /// The in-place editor: the field, a tick and a cross.
@@ -13808,7 +14173,12 @@ let mut ask = div()
             }
         };
 
-        let mut out = div().id("json-view").size_full().overflow_y_scroll().p_2();
+        let mut out = div()
+            .id("json-view")
+            .track_scroll(&self.json_scroll)
+            .size_full()
+            .overflow_y_scroll()
+            .p_2();
         // One block per DOCUMENT rather than one blob for all of them. A blob
         // can be read and nothing in it can be pointed at; a document that can
         // be pointed at is a document that can be edited.
@@ -14035,7 +14405,7 @@ let mut ask = div()
             }
             out = out.child(block);
         }
-        out.into_any_element()
+        self.scrolled_y(&self.json_scroll.clone(), "json", out.into_any_element(), cx)
     }
 
     /// The bottom: one status line, and a drawer under it when something is
@@ -14478,10 +14848,21 @@ impl Workspace {
                     .text_color(t.title())
                     .child(SharedString::from(form.label.clone())),
             )
+            // WHAT IT IS ABOUT, named in full: the table, and the column
+            // the menu was opened on. A form that says only "users" leaves
+            // somebody who opened it from the wrong row to find out after
+            // the statement is written.
             .child(self.small(
-                match form.schema.as_deref() {
-                    Some(sc) if !sc.is_empty() => format!("{sc}.{}", form.table),
-                    _ => form.table.clone(),
+                {
+                    let where_ = match form.schema.as_deref() {
+                        Some(sc) if !sc.is_empty() => format!("{sc}.{}", form.table),
+                        _ => form.table.clone(),
+                    };
+                    if form.column.is_empty() {
+                        where_
+                    } else {
+                        format!("{where_}.{}", form.column)
+                    }
                 },
                 t.muted(),
             ));
@@ -15434,6 +15815,14 @@ impl Render for Workspace {
                         .child(
                             div()
                                 .flex_1()
+                                // `min_h_0` for the same reason as `min_w_0`,
+                                // on the other axis: this is the item of a
+                                // COLUMN, so its automatic minimum is the
+                                // height of everything in the result, and
+                                // without saying otherwise the pane grows past
+                                // the window instead of the result scrolling
+                                // inside it.
+                                .min_h_0()
                                 .min_w_0()
                                 .overflow_hidden()
                                 .child(self.result_el(cx)),
@@ -15459,4 +15848,16 @@ impl Render for Workspace {
         .children(self.menu_el(cx))
         .children(self.palette_el(cx))
     }
+}
+
+/// Put a scroller where a pointer at `y` says, treating the bar as a map of
+/// the whole content.
+///
+/// The same arithmetic as the grid's sideways drag — `hbar_offset` has no axis
+/// either — and the same reason it is a function: drawing the bar from one
+/// number and dragging it from another is how a thumb ends up somewhere the
+/// content is not.
+fn jump_y(handle: &gpui::ScrollHandle, y: f32, top: f32, track: f32, total: f32, max: f32) {
+    let to = crate::workspace::hbar_offset(y, top, track, total, max);
+    handle.set_offset(gpui::point(handle.offset().x, px(to)));
 }
