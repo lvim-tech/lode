@@ -1811,11 +1811,21 @@ impl ConnectionForm {
 
     /// The wallet opened. The key that was pressed is pressed again, by the
     /// window rather than by the person — they already said what they wanted.
+    ///
+    /// AFTER this update, not inside it. The workspace is what calls this, from
+    /// inside its own update, and `to_keyring` asks the workspace to store the
+    /// secret — which gpui refuses with "cannot update Workspace while it is
+    /// already being updated", and refuses by PANICKING, so the window died on
+    /// the one keystroke that was supposed to make it work. Deferred, the press
+    /// happens once the workspace has been handed back to the app.
     pub fn wallet_opened(&mut self, field: Option<String>, cx: &mut Context<Self>) {
         self.unlocking = None;
         self.note = Some(self.lang.tr("wallet.open").to_string());
         if let Some(k) = field {
-            self.to_keyring(&k, cx);
+            let me = cx.entity().downgrade();
+            cx.defer(move |cx| {
+                let _ = me.update(cx, |f, cx| f.to_keyring(&k, cx));
+            });
         }
         cx.notify();
     }
